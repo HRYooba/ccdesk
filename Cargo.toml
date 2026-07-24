@@ -1,0 +1,20 @@
+[package]
+name = "ccdesk"
+version = "0.1.0"
+edition = "2024"
+description = "Claude Code session manager TUI modeled after Claude Desktop and Agent View — see, switch, and drive all your sessions in one terminal"
+license = "MIT"
+repository = "https://github.com/HRYooba/ccdesk"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+crossterm = "0.29.0"
+portable-pty = "0.9.0"
+ratatui = "0.30.2"
+serde_json = "1.0.151"
+terminal-colorsaurus = "1.0.3"
+tui-term = "0.3.4"
+unicode-width = "0.2.2"
+vt100 = "0.16.2"
