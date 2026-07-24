@@ -788,6 +788,8 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         }
         // New 画面: クリックでフォルダ選択・プロンプト欄フォーカス
         if let RightView::New(state) = &mut app.right_view {
+            // 起動ボタン行のクリックは state の借用を抜けてからディスパッチする
+            let mut launch = false;
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     // 描画と同じジオメトリでヒットテスト（右ペイン矩形を chunks[1] と同一に再構成）
@@ -824,11 +826,13 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                         let row_in = (mouse.row - layout.list_top) as usize;
                         if row_in < state.shown {
                             let idx = state.scroll + row_in;
-                            if state.focus == NewFocus::Browser && state.dir_idx == idx {
+                            let reclick = state.focus == NewFocus::Browser && state.dir_idx == idx;
+                            state.dir_idx = idx;
+                            state.focus = NewFocus::Browser;
+                            if state.selected_is_launch() {
+                                launch = true; // ボタンなので 1 クリックで起動
+                            } else if reclick {
                                 state.descend(); // 選択済みを再クリック = 潜る
-                            } else {
-                                state.dir_idx = idx;
-                                state.focus = NewFocus::Browser;
                             }
                         } else {
                             state.focus = NewFocus::Browser;
@@ -845,6 +849,9 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                         (state.dir_idx + 1).min(state.entries.len().saturating_sub(1));
                 }
                 _ => {}
+            }
+            if launch {
+                start_new_session(app)?;
             }
             return Ok(false);
         }
