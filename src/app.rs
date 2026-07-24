@@ -238,6 +238,32 @@ fn write_inject_settings() -> Option<std::path::PathBuf> {
     Some(path)
 }
 
+/// 1 フレームぶんの出力。同期出力（DECSET 2026）で包み、終端カーソルを必ず確定させる。
+///
+/// ratatui は 1 フレームを「差分 + 非表示/表示 + MoveTo」の複数 flush に分けて書く。
+/// 途中状態を端末に観測させないため全体を同期出力で囲む（非対応端末は無視するだけ）。
+/// カーソル位置は可視性に関係なく常に渡し、隠したいときは draw の後で Hide する
+/// （位置を渡さないと MoveTo が出ず、物理カーソルが差分の最終セルに残る）
+fn draw_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
+    use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+
+    let mut out = std::io::stdout();
+    let _ = crossterm::execute!(out, BeginSynchronizedUpdate);
+    let mut visible = true;
+    let drawn = terminal.draw(|frame| {
+        let cursor = draw(frame, app);
+        frame.set_cursor_position(cursor.pos);
+        visible = cursor.visible;
+    });
+    if !visible {
+        let _ = crossterm::execute!(out, crossterm::cursor::Hide);
+    }
+    // draw が失敗しても同期出力は必ず閉じる（閉じ忘れると画面が更新されなくなる）
+    let _ = crossterm::execute!(out, EndSynchronizedUpdate);
+    drawn?;
+    Ok(())
+}
+
 pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
     let mut last_draw = std::time::Instant::now();
     let mut force_draw = true;
@@ -374,7 +400,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             .iter()
             .any(|s| s.dirty.swap(false, std::sync::atomic::Ordering::Relaxed));
         if force_draw || pty_dirty || last_draw.elapsed() > Duration::from_millis(250) {
-            terminal.draw(|frame| draw(frame, app))?;
+            draw_frame(terminal, app)?;
             last_draw = std::time::Instant::now();
             force_draw = false;
         }

@@ -8,6 +8,7 @@ use ratatui::Frame;
 
 use crate::app::{start_new_session, App, RightView};
 use crate::theme::{ui, C_WORKING, FOCUS_BORDER, MUTED_FG};
+use crate::ui::FrameCursor;
 
 /// カーソル付きテキストフィールド（挿入・削除・←→・Home/End・クリック位置反映、全角幅対応）
 #[derive(Default)]
@@ -449,7 +450,13 @@ impl NewLayout {
 
 /// 新規セッション画面の描画（フォルダブラウザ + 初回チャット入力）。
 /// starting = `claude --bg` 実行中（別スレッド）: プロンプト欄に進行中表示を出す
-pub(crate) fn draw_new_view(frame: &mut Frame, area: Rect, state: &mut NewState, focused: bool, starting: bool) {
+pub(crate) fn draw_new_view(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut NewState,
+    focused: bool,
+    starting: bool,
+) -> FrameCursor {
     let border = if focused {
         Style::default().fg(FOCUS_BORDER)
     } else {
@@ -464,7 +471,7 @@ pub(crate) fn draw_new_view(frame: &mut Frame, area: Rect, state: &mut NewState,
     // 描画とマウス判定で同一のジオメトリを使う（フォーム型レイアウト）
     let layout = NewLayout::compute(area);
     if !layout.ok {
-        return;
+        return FrameCursor::hidden_at(Position::new(area.x, area.y));
     }
     let inner = layout.inner;
 
@@ -620,23 +627,29 @@ pub(crate) fn draw_new_view(frame: &mut Frame, area: Rect, state: &mut NewState,
         Rect::new(inner.x, layout.hint_y, inner.width, 1),
     );
 
-    if focused {
-        match state.focus {
-            NewFocus::Path => {
-                let cursor_x = layout.path_text_x + state.path.cursor_x();
-                frame.set_cursor_position(Position::new(
-                    cursor_x.min(inner.right().saturating_sub(1)),
-                    layout.path_y,
-                ));
-            }
-            NewFocus::Prompt => {
-                let cursor_x = layout.input_text_x + state.prompt.cursor_x();
-                frame.set_cursor_position(Position::new(
-                    cursor_x.min(prompt_inner.right().saturating_sub(1)),
-                    layout.input_y,
-                ));
-            }
-            NewFocus::Browser => {} // 一覧操作中はカーソル非表示
-        }
+    // 入力欄の位置を返す。フォーカス外・一覧操作中は「隠すだけ」で位置は確定させる
+    // （位置を返さないと物理カーソルがサイドバーに置き去りになる。FrameCursor 参照）
+    let (pos, in_field) = match state.focus {
+        NewFocus::Path => (
+            Position::new(
+                (layout.path_text_x + state.path.cursor_x()).min(inner.right().saturating_sub(1)),
+                layout.path_y,
+            ),
+            true,
+        ),
+        NewFocus::Prompt => (
+            Position::new(
+                (layout.input_text_x + state.prompt.cursor_x())
+                    .min(prompt_inner.right().saturating_sub(1)),
+                layout.input_y,
+            ),
+            true,
+        ),
+        NewFocus::Browser => (Position::new(layout.input_text_x, layout.input_y), false),
+    };
+    if focused && in_field {
+        FrameCursor::shown_at(pos)
+    } else {
+        FrameCursor::hidden_at(pos)
     }
 }

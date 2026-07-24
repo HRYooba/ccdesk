@@ -83,7 +83,31 @@ fn fmt_age(secs: u64) -> String {
     }
 }
 
-pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
+/// 1 フレーム終端のカーソル状態。**位置は可視性に関係なく必ず返す**。
+///
+/// ratatui は位置が None だとカーソル非表示コマンドしか出さず MoveTo を出さない。
+/// 一方で差分描画は「変更セルごとに MoveTo」なので、位置を渡さないフレームでは
+/// 物理カーソルが最終変更セルに置き去りになる。日本語変換中は右ペインに差分が出ず
+/// サイドバー（スピナー 400ms・経過時間 1s）だけが変わるため、その置き去り先は
+/// サイドバー内になる。Windows の IME 変換窓はコンソールカーソル位置に
+/// アンカーされるので、これが「変換中に一瞬サイドバーへ飛ぶ」症状になる。
+pub(crate) struct FrameCursor {
+    pub(crate) pos: Position,
+    pub(crate) visible: bool,
+}
+
+impl FrameCursor {
+    pub(crate) fn shown_at(pos: Position) -> Self {
+        Self { pos, visible: true }
+    }
+
+    /// 見せないが位置は確定させる（IME のアンカーを迷子にしない）
+    pub(crate) fn hidden_at(pos: Position) -> Self {
+        Self { pos, visible: false }
+    }
+}
+
+pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // 最下行は横断のキーヒントバー
     let vert = Layout::default()
         .direction(Direction::Vertical)
@@ -656,8 +680,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     let terminal_focused = app.focus == Focus::Terminal;
     let starting = app.spawn_rx.is_some();
     if let RightView::New(state) = &mut app.right_view {
-        draw_new_view(frame, chunks[1], state, terminal_focused, starting);
-        return;
+        return draw_new_view(frame, chunks[1], state, terminal_focused, starting);
     }
     if app.sessions.is_empty() {
         frame.render_widget(
@@ -667,7 +690,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                 .border_style(Style::default().fg(ui().dim)),
             chunks[1],
         );
-        return;
+        return FrameCursor::hidden_at(Position::new(chunks[1].x, chunks[1].y));
     }
     let session = &app.sessions[app.active];
     let parser = session.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -688,11 +711,17 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         .block(block);
     frame.render_widget(widget, chunks[1]);
 
-    // カーソル位置を反映（フォーカス外は隠す。ペイン外へはみ出す座標はクランプ）
+    // カーソル位置を反映。フォーカス外・子が非表示指定のときも「隠すだけ」で
+    // 位置は必ず確定させる（描かないとサイドバーに置き去りになる。FrameCursor 参照）。
+    // ペイン外へはみ出す座標はペイン内へクランプする
+    let (crow, ccol) = screen.cursor_position();
+    let pos = Position::new(
+        inner.x + ccol.min(inner.width.saturating_sub(1)),
+        inner.y + crow.min(inner.height.saturating_sub(1)),
+    );
     if app.focus == Focus::Terminal && !screen.hide_cursor() {
-        let (crow, ccol) = screen.cursor_position();
-        if ccol < inner.width && crow < inner.height {
-            frame.set_cursor_position(Position::new(inner.x + ccol, inner.y + crow));
-        }
+        FrameCursor::shown_at(pos)
+    } else {
+        FrameCursor::hidden_at(pos)
     }
 }
