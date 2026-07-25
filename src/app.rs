@@ -238,6 +238,84 @@ fn write_inject_settings() -> Option<std::path::PathBuf> {
     Some(path)
 }
 
+/// 同期出力（DECSET 2026）のスコープガード。Drop で閉じるため、draw のクロージャが
+/// panic して巻き戻した場合も開いたままにならない。閉じ忘れると mode 2026 に
+/// タイムアウトを持たない端末では画面が固まり、panic メッセージも表示されないまま
+/// 操作不能になる。
+///
+/// 既知の制限（挙動は変えない）: crossterm 0.29 の Begin/EndSynchronizedUpdate は
+/// `is_ansi_code_supported()` を true 決め打ちで実装しているため、VT 処理の無い
+/// レガシー Windows コンソールでは他コマンドが winapi 経路を通る一方この 2 つだけ
+/// 生 ANSI を書き、`[?2026h` が文字として表示され得る。ccdesk は ConPTY を
+/// 前提とするため許容する。
+///
+/// カーソルの `Show` はここでは出さない。panic 時は ratatui の hook が
+/// alt screen を離脱し、その後の巻き戻しで Terminal の Drop が
+/// （hidden_cursor が立っていれば）`?25h` を出すので、通常画面に戻った後に
+/// 復帰する順序が既に成立している。ここで二重に出す必要はない
+struct SyncOutput;
+
+impl SyncOutput {
+    fn begin() -> Self {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::BeginSynchronizedUpdate
+        );
+        Self
+    }
+}
+
+impl Drop for SyncOutput {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EndSynchronizedUpdate
+        );
+    }
+}
+
+/// 1 フレームぶんの出力。同期出力（DECSET 2026）で包み、終端カーソルを必ず確定させる。
+///
+/// ratatui は 1 フレームを「差分 + 非表示/表示 + MoveTo」の複数 flush に分けて書く。
+/// 途中状態を端末に観測させないため全体を同期出力で囲む（非対応端末は無視するだけ）。
+/// 見せるフレームだけ ratatui に位置を渡し、隠すフレームは位置を渡さず（= None）
+/// 自前の MoveTo でカーソルをペイン内へ駐車させる。この非対称が要点で、理由は 2 つ:
+///
+/// 1. 終了後にカーソルが隠れたまま残るのを防ぐ。ratatui は自前の hidden_cursor
+///    フラグを持ち、Terminal の Drop ではそれが立っているときだけ `?25h` を出す。
+///    フラグが立つのは位置 None（= 内部で hide_cursor を通る）のときだけなので、
+///    位置を常に渡して生の `cursor::Hide` で隠すとフラグが永久に false のまま
+///    「実際は隠れているのに ratatui は表示中だと思っている」状態になり、
+///    alt screen 離脱で DECTCEM を復元しない端末では終了後のシェルにカーソルが戻らない。
+/// 2. 毎フレームの `?25h` を出さない。位置ありの draw は毎回 show_cursor を呼ぶため、
+///    隠すフレームでも Show → MoveTo → Hide を送ることになり、DECTCEM の実装が
+///    素直でない端末ではこれがちらつきになる。None ならそもそも Show を出さない。
+///
+/// 元の IME バグ（位置を渡さないと MoveTo が出ず、物理カーソルが差分の最終セル
+/// = サイドバーに残る）は自前の MoveTo で駐車させるので再発しない。差分描画側の
+/// MoveTo 省略判定（last_pos）は Backend::draw のメソッドローカルで毎回リセット
+/// されるため、後から MoveTo を出しても次フレームの差分とは干渉しない。
+/// 生 stdout と CrosstermBackend<Stdout> は同一のグローバル stdout を共有するので
+/// 書き込み順序も保証される
+fn draw_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
+    let _sync = SyncOutput::begin();
+    // 隠すフレームでカーソルを駐車させたい位置（Some = 非表示フレーム）
+    let mut park: Option<ratatui::layout::Position> = None;
+    let drawn = terminal.draw(|frame| {
+        let cursor = draw(frame, app);
+        if cursor.visible {
+            frame.set_cursor_position(cursor.pos);
+        } else {
+            park = Some(cursor.pos);
+        }
+    });
+    drawn?;
+    if let Some(pos) = park {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::MoveTo(pos.x, pos.y));
+    }
+    Ok(())
+}
+
 pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
     let mut last_draw = std::time::Instant::now();
     let mut force_draw = true;
@@ -374,7 +452,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             .iter()
             .any(|s| s.dirty.swap(false, std::sync::atomic::Ordering::Relaxed));
         if force_draw || pty_dirty || last_draw.elapsed() > Duration::from_millis(250) {
-            terminal.draw(|frame| draw(frame, app))?;
+            draw_frame(terminal, app)?;
             last_draw = std::time::Instant::now();
             force_draw = false;
         }

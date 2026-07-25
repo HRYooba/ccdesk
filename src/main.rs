@@ -178,5 +178,10 @@ fn main() -> anyhow::Result<()> {
         DisableBracketedPaste
     );
     ratatui::restore();
+    // ratatui::restore() は raw mode 解除 + alt screen 離脱だけで DECTCEM を戻さない。
+    // カーソルの表示状態を戻すのは Terminal の Drop（hidden_cursor が立っているときだけ
+    // `?25h` を出す）。alt screen を出た後に出さないと通常画面に効かない端末があるため、
+    // restore() の後で明示的に drop する（この順序は意味を持つので暗黙の drop に任せない）
+    drop(terminal);
     result
 }
