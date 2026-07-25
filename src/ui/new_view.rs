@@ -451,8 +451,8 @@ impl NewLayout {
     /// 同じ値を共有するため、Block::inner の再計算をここへ集約する
     pub(crate) fn prompt_inner(&self) -> Rect {
         Rect {
-            x: self.prompt_box.x + 1,
-            y: self.prompt_box.y + 1,
+            x: self.prompt_box.x.saturating_add(1),
+            y: self.prompt_box.y.saturating_add(1),
             width: self.prompt_box.width.saturating_sub(2),
             height: self.prompt_box.height.saturating_sub(2),
         }
@@ -480,20 +480,28 @@ pub(crate) fn new_view_cursor(
     }
     // ここに来た時点で layout.ok なので inner.width >= 10 が保証され、
     // inner（幅 >= 10）も prompt_inner（幅 >= 4）も幅 0 になり得ない
-    // （= right() - 1 のクランプは inner の外を指さない）
+    // （= right() - 1 のクランプは inner の外を指さない）。
+    // cursor_x は入力テキストの表示幅なので加算は飽和させる
+    // （素の + だと極端に長い入力で debug ビルドが panic する）
     let inner = layout.inner;
     let prompt_inner = layout.prompt_inner();
     let (pos, in_field) = match focus {
         NewFocus::Path => (
             Position::new(
-                (layout.path_text_x + path_cursor_x).min(inner.right() - 1),
+                layout
+                    .path_text_x
+                    .saturating_add(path_cursor_x)
+                    .min(inner.right() - 1),
                 layout.path_y,
             ),
             true,
         ),
         NewFocus::Prompt => (
             Position::new(
-                (layout.input_text_x + prompt_cursor_x).min(prompt_inner.right() - 1),
+                layout
+                    .input_text_x
+                    .saturating_add(prompt_cursor_x)
+                    .min(prompt_inner.right() - 1),
                 layout.input_y,
             ),
             true,
@@ -722,18 +730,21 @@ mod tests {
         }
     }
 
-    /// 長い入力（= 大きな cursor_x）でも枠の外へ出ない。狭いペインでも同じ
+    /// 長い入力（= 大きな cursor_x）でも枠の外へ出ない。狭いペインでも同じ。
+    /// u16::MAX は加算の飽和も兼ねて見る（素の + だと debug ビルドで panic する）
     #[test]
     fn cursor_stays_in_pane_for_long_field_text() {
         for width in [10u16, 12, 20, 80] {
             let pane = Rect::new(34, 0, width, 30);
-            for focus in FOCUSES {
-                let cursor = new_view_cursor(pane, focus, 500, 500, true);
-                assert!(
-                    contains(pane, cursor.pos),
-                    "幅 {width} / focus 変化で pos {:?} がペイン外",
-                    cursor.pos
-                );
+            for cursor_x in [500u16, u16::MAX - 1, u16::MAX] {
+                for focus in FOCUSES {
+                    let cursor = new_view_cursor(pane, focus, cursor_x, cursor_x, true);
+                    assert!(
+                        contains(pane, cursor.pos),
+                        "幅 {width} / cursor_x {cursor_x} で pos {:?} がペイン外",
+                        cursor.pos
+                    );
+                }
             }
         }
     }
