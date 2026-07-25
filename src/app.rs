@@ -866,6 +866,8 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         }
         // New 画面: クリックでフォルダ選択・プロンプト欄フォーカス
         if let RightView::New(state) = &mut app.right_view {
+            // 起動ボタン行のクリックは state の借用を抜けてからディスパッチする
+            let mut launch = false;
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     // 描画と同じジオメトリでヒットテスト（右ペイン矩形を chunks[1] と同一に再構成）
@@ -898,15 +900,23 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                         && mouse.row < layout.list_top + layout.list_height
                     {
                         // フォルダ一覧エリア（空白部分も含む）→ 一覧フォーカス。
-                        // 実在する行の上なら選択も動かし、選択済みの再クリックは潜る
+                        // 実在する行の上なら選択も動かし、選択済み行の再クリックで実行する
                         let row_in = (mouse.row - layout.list_top) as usize;
                         if row_in < state.shown {
                             let idx = state.scroll + row_in;
-                            if state.focus == NewFocus::Browser && state.dir_idx == idx {
-                                state.descend(); // 選択済みを再クリック = 潜る
-                            } else {
-                                state.dir_idx = idx;
-                                state.focus = NewFocus::Browser;
+                            let reclick = state.focus == NewFocus::Browser && state.dir_idx == idx;
+                            state.dir_idx = idx;
+                            state.focus = NewFocus::Browser;
+                            // 起動ボタン行もフォルダ行と同じ 2 段階（選択 → 再クリック）にする。
+                            // 1 クリックで起動すると、プロンプト入力中に一覧へフォーカスを
+                            // 移すだけのクリックが書きかけのプロンプトでセッションを起動して
+                            // しまう（supervisor 管理なので取り消せない）
+                            if reclick {
+                                if state.selected_is_launch() {
+                                    launch = true;
+                                } else {
+                                    state.descend(); // 選択済みを再クリック = 潜る
+                                }
                             }
                         } else {
                             state.focus = NewFocus::Browser;
@@ -923,6 +933,9 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                         (state.dir_idx + 1).min(state.entries.len().saturating_sub(1));
                 }
                 _ => {}
+            }
+            if launch {
+                start_new_session(app)?;
             }
             return Ok(false);
         }
