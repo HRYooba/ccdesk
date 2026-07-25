@@ -9,7 +9,7 @@ use ratatui::Frame;
 use std::time::Duration;
 use tui_term::widget::PseudoTerminal;
 
-use ccdesk::same_dir;
+use ccdesk::dir_key;
 
 use crate::app::{active_unstored, App, Focus, Popup, RightView, RowAction, SelfUpdate};
 use crate::poll::{classify, AccountStatus, Bucket, Group, Grouping, StateView};
@@ -193,8 +193,8 @@ fn version_rows(
     ]
 }
 
-/// directory グルーピングの見出し行。返すのは (見出しの表示文字列, 対象フォルダ) で、
-/// 1 要素目は**画面に出る文字列そのもの**（見出しに何を出すかの知識をここだけに持つ）。
+/// directory グルーピングの見出し行。返すのは [`ProjectRow`]（表示文字列・対象フォルダ・
+/// 配下の行を振り分けるための同一判定キー）。
 ///
 /// 一覧は「登録リスト ∪ セッションの cwd」の**和集合**。登録リスト側があるので
 /// セッションが 0 本になっても見出しは消えず、そのフォルダで新規を開く入口が残る
@@ -204,34 +204,89 @@ fn version_rows(
 /// 並びは末端ディレクトリ名のアルファベット順（大小無視）で従来どおり。**同名の末端が
 /// 別パスに複数あるときはフルパスで決める**: キーが末端名だけだと安定ソートの入力順
 /// （＝セッションの走査順）で並びが変わり、同じ画面が再描画で入れ替わり得る
-fn project_rows(projects: &[String], session_cwds: &[&str]) -> Vec<(String, String)> {
-    let mut dirs: Vec<&str> = Vec::new();
-    // 登録リストが先。state.json を手で直された場合の自己重複もここで落ちる
-    for cwd in projects.iter().map(String::as_str).chain(session_cwds.iter().copied()) {
-        if !dirs.iter().any(|d| same_dir(d, cwd)) {
-            dirs.push(cwd);
-        }
-    }
-    let leaf_key = |cwd: &str| {
-        std::path::Path::new(cwd)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_lowercase())
-            .unwrap_or_default()
-    };
-    dirs.sort_by(|a, b| leaf_key(a).cmp(&leaf_key(b)).then_with(|| a.cmp(b)));
-    dirs.into_iter()
-        .map(|cwd| {
+fn project_rows(projects: &[String], session_cwds: &[&str]) -> Vec<ProjectRow> {
+    // **派生値はパスごとに 1 度だけ作る。** 重複排除も並べ替えも照合の回数は入力数の
+    // 2 乗で増えるので、比較のたびにキーを作ると描画 1 回で数千〜数万の String に
+    // なる（この一覧は PTY の dirty ごと ＝ 秒 30 回まで描き直される）
+    let mut dirs: Vec<ProjectRow> = projects
+        .iter()
+        .map(String::as_str)
+        .chain(session_cwds.iter().copied())
+        .map(ProjectRow::new)
+        .collect();
+    // 同じフォルダは 1 度だけ。キーで束ねてから畳むので、**残るのは先に出てきた表記**
+    // ＝ 登録リストを先に積んである以上ユーザーが登録した表記が勝つ（sort_by は安定）。
+    // state.json を手で直された場合の自己重複もここで落ちる
+    dirs.sort_by(|a, b| a.key.cmp(&b.key));
+    dirs.dedup_by(|a, b| a.key == b.key);
+    dirs.sort_by(|a, b| a.sort_key.cmp(&b.sort_key).then_with(|| a.cwd.cmp(&b.cwd)));
+    dirs
+}
+
+/// directory グルーピングの見出し 1 行分。**パスから作る派生値をここにまとめて持つ**
+/// のが要点で、作るのはパスごとに 1 度きり（[`project_rows`] 参照）
+struct ProjectRow {
+    /// 見出しの表示文字列そのもの（見出しに何を出すかの知識をここだけに持つ）
+    heading: String,
+    /// 見出しの対象フォルダ。表記は登録リスト / セッションの cwd のまま
+    cwd: String,
+    /// 同一判定キー（[`dir_key`]）。**重複排除と、配下のセッション行の振り分けが
+    /// 同じこの値を使う**（別々に作ると判定がずれるうえ回数も倍になる）
+    key: String,
+    /// 並べ替えキー（末端ディレクトリ名の小文字）。比較子の中で作ると比較のたびに
+    /// アロケートするので、ここに持たせて比較は借用で済ませる
+    sort_key: String,
+}
+
+impl ProjectRow {
+    fn new(cwd: &str) -> Self {
+        // 末端ディレクトリ名は表示と並べ替えの共通の材料なので 1 度だけ取り出す。
+        // 取れないのはドライブ直下（`C:\`）等
+        let leaf = leaf_name(cwd);
+        // 末端が取れないパスの並べ替えキーは空（見出しに出すパスとは別扱い ＝
+        // 従来の並びを変えない）
+        let sort_key = leaf.as_deref().map(str::to_lowercase).unwrap_or_default();
+        Self {
             // 見出しはプロジェクト名（末端ディレクトリ名）だけ。**ここに `+` は出さない**:
             // 行の動作はメニューを開くことなので、「押したら即セッションが立つ」という
-            // ヒントは嘘になる。末端が取れないのはドライブ直下（`C:\`）等だけなので、
-            // その場合はパスをそのまま出す（ホーム短縮が効く形にはならない）
-            let leaf = std::path::Path::new(cwd)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| cwd.to_string());
-            (leaf, cwd.to_string())
-        })
-        .collect()
+            // ヒントは嘘になる。末端が取れないときはパスをそのまま出す
+            // （ホーム短縮が効く形にはならない）
+            heading: leaf.unwrap_or_else(|| cwd.to_string()),
+            cwd: cwd.to_string(),
+            key: dir_key_of(cwd),
+            sort_key,
+        }
+    }
+}
+
+/// 末端ディレクトリ名。表示名と並べ替えキーの共通の材料
+fn leaf_name(cwd: &str) -> Option<String> {
+    #[cfg(test)]
+    count_key_call(&LEAF_NAME_CALLS);
+    std::path::Path::new(cwd)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+}
+
+/// 同一判定キーを作る唯一の入口（中身は [`dir_key`] ＝ 判定は lib 側 1 箇所のまま）。
+/// **テスト時だけ呼び出し回数を数える**: 「パスごとに 1 度」が崩れると照合が
+/// 入力数の 2 乗でアロケートし始めるので、回数そのものをテストで固定する
+fn dir_key_of(cwd: &str) -> String {
+    #[cfg(test)]
+    count_key_call(&DIR_KEY_CALLS);
+    dir_key(cwd)
+}
+
+// キー作りの呼び出し回数カウンタ。スレッドローカルなのでテストの並列実行で混ざらない
+#[cfg(test)]
+thread_local! {
+    static DIR_KEY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LEAF_NAME_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_key_call(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) {
+    counter.with(|c| c.set(c.get() + 1));
 }
 
 /// ccdesk 自身の版行の状態。更新の進行状態が版チェックの結果より優先する
@@ -792,7 +847,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             // 選択・stop・delete 等の操作では並び替えない
             let mut cwds: Vec<&str> = app.jobs.iter().map(|j| j.cwd.as_str()).collect();
             cwds.extend(data.iter().map(|d| d.cwd.as_str()));
-            for (heading, cwd) in project_rows(&app.projects, &cwds) {
+            // セッション行の振り分けキーも**行ごとに 1 度だけ**作る（見出し × 行の
+            // 総当たりになるので、突き合わせのたびに作ると描画 1 回で数千の String に
+            // なる。見出し側のキーは project_rows が持っている）
+            let data_keys: Vec<String> = data.iter().map(|d| dir_key_of(&d.cwd)).collect();
+            for row in project_rows(&app.projects, &cwds) {
                 items.push(ListItem::new(Line::from("")));
                 rows.push(None);
                 let cur = rows.len();
@@ -801,12 +860,14 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 if highlighted {
                     style = style.bg(ui().hl_bg).fg(ui().emph);
                 }
-                items.push(ListItem::new(Line::from(heading).style(style)));
-                rows.push(Some(RowAction::Project(cwd.clone())));
-                // 配下のセッション行。見出しの一覧と同じ同一判定を使う
+                items.push(ListItem::new(Line::from(row.heading).style(style)));
+                rows.push(Some(RowAction::Project(row.cwd)));
+                // 配下のセッション行。見出しの一覧と同じ同一判定キーで振り分ける
                 // （ここだけ厳密一致にすると大小違いのセッションが行き場を失う）
-                for d in data.iter().filter(|d| same_dir(&d.cwd, &cwd)) {
-                    push_data_row(&mut items, &mut rows, d);
+                for (d, key) in data.iter().zip(&data_keys) {
+                    if *key == row.key {
+                        push_data_row(&mut items, &mut rows, d);
+                    }
                 }
             }
         }
@@ -1321,7 +1382,15 @@ mod tests {
         let projects: Vec<String> = projects.iter().map(|p| p.to_string()).collect();
         project_rows(&projects, cwds)
             .into_iter()
-            .map(|(heading, _)| heading)
+            .map(|row| row.heading)
+            .collect()
+    }
+
+    /// 見出し行の (表示文字列, 対象フォルダ) を取り出す
+    fn heading_pairs(projects: &[String], cwds: &[&str]) -> Vec<(String, String)> {
+        project_rows(projects, cwds)
+            .into_iter()
+            .map(|row| (row.heading, row.cwd))
             .collect()
     }
 
@@ -1385,7 +1454,7 @@ mod tests {
     #[test]
     fn project_rows_keep_same_named_leaves_apart_by_full_path() {
         let projects = ["C:\\work\\api".to_string(), "C:\\dev\\api".to_string()];
-        let rows = project_rows(&projects, &[]);
+        let rows = heading_pairs(&projects, &[]);
         assert_eq!(
             rows,
             [
@@ -1396,14 +1465,14 @@ mod tests {
         );
         // 入力順を入れ替えても並びは同じ
         let flipped = ["C:\\dev\\api".to_string(), "C:\\work\\api".to_string()];
-        assert_eq!(project_rows(&flipped, &[]), rows, "入力順で並びが変わった");
+        assert_eq!(heading_pairs(&flipped, &[]), rows, "入力順で並びが変わった");
     }
 
     /// 見出しは末端ディレクトリ名だけ。**`+` は出さない**（行の動作はメニューを開くことで、
     /// 「押したら即セッションが立つ」というヒントは嘘になる）
     #[test]
     fn project_headings_carry_no_plus_hint() {
-        let rows = project_rows(&["C:\\dev\\api".to_string()], &["C:\\dev\\web"]);
+        let rows = heading_pairs(&["C:\\dev\\api".to_string()], &["C:\\dev\\web"]);
         for (heading, cwd) in &rows {
             assert!(!heading.contains('+'), "見出しに + が残っている: {heading:?}");
             assert_eq!(heading.trim(), heading, "見出しに余分な空白がある: {heading:?}");
@@ -1417,8 +1486,118 @@ mod tests {
     #[test]
     fn project_rows_fall_back_to_the_path_when_there_is_no_leaf() {
         assert_eq!(
-            project_rows(&["C:\\".to_string()], &[]),
+            heading_pairs(&["C:\\".to_string()], &[]),
             [("C:\\".to_string(), "C:\\".to_string())]
+        );
+    }
+
+    /// **同一判定キーがパスごとに 1 度しか作られないことの固定。** ここは PTY の
+    /// dirty ごと（秒 30 回まで）に走る経路で、以前は照合のたびにキーを作っていたので
+    /// 呼び出しが入力数の 2 乗で増えていた（上限 50+50 の実測で 1 描画あたり
+    /// dir_key 12,550 回 ＝ String 約 2.5 万個）。回数そのものを式で固定して
+    /// 「うっかり比較子の中でキーを作る」変更が入ったら落ちるようにする
+    #[test]
+    fn the_directory_grouping_builds_each_key_once_per_path() {
+        for n in [1usize, 10, 50] {
+            let projects: Vec<String> = (0..n).map(|i| format!("C:\\dev\\p{i}")).collect();
+            let cwds: Vec<String> = (0..n).map(|i| format!("c:\\dev\\p{i}\\")).collect();
+            let cwds: Vec<&str> = cwds.iter().map(String::as_str).collect();
+            let (dir_keys, leaves) = key_calls(|| {
+                let rows = project_rows(&projects, &cwds);
+                // 表記違いは同じフォルダなので見出しは n 本（重複排除も効いている）
+                assert_eq!(rows.len(), n, "n={n} で見出しの数が合わない");
+            });
+            // 入力 2n 本ぶんだけ ＝ 線形。2 乗なら n=50 で 1 万回を超える
+            assert_eq!(dir_keys, 2 * n, "n={n} で dir_key の回数が入力数を超えた");
+            assert_eq!(leaves, 2 * n, "n={n} で末端名の取り出しが入力数を超えた");
+        }
+    }
+
+    /// 描画 1 フレーム全体でも線形。見出しの重複排除と**セッション行の振り分け**の
+    /// 両方を通した回数を固定する（振り分けは見出し × 行の総当たりなので、
+    /// キーを持ち回らないとここが一番効く）
+    #[test]
+    fn a_directory_grouped_frame_builds_keys_linearly() {
+        for n in [1usize, 10, 50] {
+            let mut app = App {
+                term_size: (120, 250),
+                sidebar_width: 34,
+                grouping: Grouping::Directory,
+                projects: (0..n).map(|i| format!("C:\\dev\\p{i}")).collect(),
+                jobs: (0..n).map(|i| job_in(&format!("C:\\dev\\p{i}"))).collect(),
+                ..Default::default()
+            };
+            let (dir_keys, leaves) = key_calls(|| {
+                let rows = render_sidebar(&mut app);
+                let headings = rows
+                    .iter()
+                    .filter(|(action, _)| matches!(action, Some(RowAction::Project(_))))
+                    .count();
+                assert_eq!(headings, n, "n={n} で見出しの数が合わない");
+            });
+            // project_rows へ渡るのは登録 n + (jobs n + セッション行 n) で、
+            // セッション行の振り分けキーがさらに n。末端名は project_rows のぶんだけ
+            assert_eq!(dir_keys, 4 * n, "n={n} で dir_key の回数が入力数に比例していない");
+            assert_eq!(leaves, 3 * n, "n={n} で末端名の取り出しが入力数に比例していない");
+        }
+    }
+
+    /// キー作りの呼び出し回数を (dir_key, 末端名) で数える。カウンタはスレッド
+    /// ローカルで、テストは 1 本ごとに別スレッドなので並列実行でも混ざらない
+    fn key_calls(body: impl FnOnce()) -> (usize, usize) {
+        DIR_KEY_CALLS.set(0);
+        LEAF_NAME_CALLS.set(0);
+        body();
+        (DIR_KEY_CALLS.get(), LEAF_NAME_CALLS.get())
+    }
+
+    /// そのフォルダで動いているセッション 1 本
+    fn job_in(cwd: &str) -> ccdesk::BgJob {
+        ccdesk::BgJob {
+            short: format!("s-{cwd}"),
+            cwd: cwd.to_string(),
+            state: "working".to_string(),
+            tempo: String::new(),
+            name: String::new(),
+            needs: String::new(),
+            detail: String::new(),
+            result: String::new(),
+            children: Vec::new(),
+            mtime: std::time::SystemTime::now(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    /// **キーを持ち回る形にしても一覧の中身・並び・重複排除が変わらないことの固定。**
+    /// 表記違い（大小・区切りの種類・末尾の重複区切り）・同名末端の別パス・末端の
+    /// 取れないドライブ直下を 1 つの入力に混ぜて、出る行を丸ごと固定する
+    #[test]
+    fn project_rows_keep_their_content_and_order_for_mixed_notations() {
+        let projects = [
+            "C:\\dev\\Zebra".to_string(),
+            "C:\\work\\api".to_string(),
+            "C:\\dev\\api".to_string(),
+            "C:\\".to_string(),
+        ];
+        let cwds = [
+            "c:/dev/zebra/",     // 登録済みと同じフォルダ（表記違い）
+            "C:\\\\",            // ドライブ直下の重複区切り
+            "C:\\dev\\API\\",    // 登録済みと同じフォルダ（大小・末尾違い）
+            "C:\\dev\\mango",    // 未登録でセッションだけ
+        ];
+        assert_eq!(
+            heading_pairs(&projects, &cwds),
+            [
+                // 末端が取れないドライブ直下は並べ替えキーが空なので先頭
+                ("C:\\".to_string(), "C:\\".to_string()),
+                // 同名末端はフルパス順。表記は**先に出てきた登録リスト側**が残る
+                ("api".to_string(), "C:\\dev\\api".to_string()),
+                ("api".to_string(), "C:\\work\\api".to_string()),
+                ("mango".to_string(), "C:\\dev\\mango".to_string()),
+                ("Zebra".to_string(), "C:\\dev\\Zebra".to_string()),
+            ],
+            "表記違いを混ぜた一覧の中身か並びが変わった"
         );
     }
 
