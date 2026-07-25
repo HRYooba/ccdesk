@@ -331,7 +331,9 @@ fn account_row(status: &AccountStatus, unstored: bool) -> (String, Style) {
 ///
 /// 幅は内容が決める（[`crate::app::PopupKind::width`]）ので、サイドバーより広い
 /// メニューは右ペインに被る。アカウント表示名や email を切って読めなくするより、
-/// 被せて全部読ませる方を選んだ。
+/// 被せて全部読ませる方を選んだ。**この意図は描画順に依存する**（[`draw`] が
+/// 右ペインの後にメニューを描く）: 逆順にすると被った列が右ペインに塗り潰され、
+/// クリック判定だけがここの矩形に残る ＝ 見えない場所のクリックが効く不具合になる。
 ///
 /// ただし**端末の外へは出さない**: 矩形が画面外へ出ると ratatui の描画が壊れるので、
 /// 幅・高さを端末サイズで丸めてから位置を決める（項目数が端末の高さを超える場合は
@@ -898,44 +900,62 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         );
     }
 
-    // コンテキストメニュー（モーダル）。矩形はクリック判定と同じ popup_rect を使う
-    if let Some(popup) = &app.popup {
-        let entries = popup.kind.entries(app.grouping);
-        let area = popup_rect(app, popup);
-        frame.render_widget(ratatui::widgets::Clear, area);
-        let lines: Vec<ListItem> = entries
-            .iter()
-            .enumerate()
-            .map(|(i, (label, enabled))| {
-                let mut style = if *enabled {
-                    Style::default()
-                } else {
-                    Style::default().fg(ui().dim)
-                };
-                if i == popup.selected {
-                    style = style.bg(ui().hl_bg);
-                    if *enabled {
-                        style = style.fg(ui().emph);
-                    }
-                }
-                ListItem::new(Line::from(format!(" {label}")).style(style))
-            })
-            .collect();
-        frame.render_widget(
-            List::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(ui().dim)),
-            ),
-            area,
-        );
-    }
+    // 右ペイン → コンテキストメニューの順で描く。**この順序が意味を持つ**:
+    // メニューの幅は内容が決めるので、サイドバーが狭いと矩形が右ペインへ食い込む
+    // （[`popup_rect`]「被せて全部読ませる」の意図）。先に描くと食い込んだ列が
+    // 右ペインに塗り潰され、ラベルが割れたまま**クリック判定だけが残る**
+    // （見た目は claude の画面なのに押すと new session が走る）。
+    // クリック判定と描画は同じ [`popup_rect`] を見ているので、最後に描けば
+    // 「見えているものが効く」が回復する
+    let cursor = draw_right_pane(frame, chunks[1], app);
+    draw_popup(frame, app);
+    cursor
+}
 
-    // 右ペイン: 新規セッション画面 or アクティブセッションの画面
+/// コンテキストメニュー（モーダル）。矩形はクリック判定と同じ [`popup_rect`] を使う。
+/// **右ペインより後に描く**（呼び出し側の順序に理由を書いてある）
+fn draw_popup(frame: &mut Frame, app: &App) {
+    let Some(popup) = &app.popup else { return };
+    let entries = popup.kind.entries(app.grouping);
+    let area = popup_rect(app, popup);
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let lines: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (label, enabled))| {
+            let mut style = if *enabled {
+                Style::default()
+            } else {
+                Style::default().fg(ui().dim)
+            };
+            if i == popup.selected {
+                style = style.bg(ui().hl_bg);
+                if *enabled {
+                    style = style.fg(ui().emph);
+                }
+            }
+            ListItem::new(Line::from(format!(" {label}")).style(style))
+        })
+        .collect();
+    frame.render_widget(
+        List::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ui().dim)),
+        ),
+        area,
+    );
+}
+
+/// 右ペイン: 新規セッション画面 or アクティブセッションの画面。
+/// 終端カーソルの決定はこの中に閉じる（[`FrameCursor`] 参照）
+fn draw_right_pane(frame: &mut Frame, pane: Rect, app: &mut App) -> FrameCursor {
+    let focus_style = Style::default().fg(FOCUS_BORDER);
+    let blur_style = Style::default().fg(ui().dim);
     let terminal_focused = app.focus == Focus::Terminal;
     let starting = app.spawn_rx.is_some();
     if let RightView::New(state) = &mut app.right_view {
-        return draw_new_view(frame, chunks[1], state, terminal_focused, starting);
+        return draw_new_view(frame, pane, state, terminal_focused, starting);
     }
     if app.sessions.is_empty() {
         frame.render_widget(
@@ -943,9 +963,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 .borders(Borders::ALL)
                 .title("no session")
                 .border_style(Style::default().fg(ui().dim)),
-            chunks[1],
+            pane,
         );
-        return FrameCursor::hidden_at(pane_fallback_pos(chunks[1]));
+        return FrameCursor::hidden_at(pane_fallback_pos(pane));
     }
     let session = &app.sessions[app.active];
     let parser = session.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -958,19 +978,19 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         } else {
             blur_style
         });
-    let inner = block.inner(chunks[1]);
+    let inner = block.inner(pane);
     // tui-term 独自の █ カーソル描画は無効化し、ネイティブカーソル
     // （set_cursor_position = 本家と同じ点滅バー）だけを使う
     let widget = PseudoTerminal::new(screen)
         .cursor(tui_term::widget::Cursor::default().visibility(false))
         .block(block);
-    frame.render_widget(widget, chunks[1]);
+    frame.render_widget(widget, pane);
 
     // カーソル位置を反映。フォーカス外・子が非表示指定のときも「隠すだけ」で
     // 位置は必ず確定させる（描かないとサイドバーに置き去りになる。FrameCursor 参照）。
     // ペイン外へはみ出す座標はペイン内へクランプする
     let (crow, ccol) = screen.cursor_position();
-    let pos = terminal_cursor_pos(chunks[1], inner, crow, ccol);
+    let pos = terminal_cursor_pos(pane, inner, crow, ccol);
     if app.focus == Focus::Terminal && !screen.hide_cursor() {
         FrameCursor::shown_at(pos)
     } else {
@@ -1690,5 +1710,48 @@ mod tests {
         // 下部バーは最下行
         let bar = drawn_row(&mut app, 29);
         assert!(bar.contains("starting session…"), "起動中の表示が無い: {bar:?}");
+    }
+
+    /// **サイドバーより広いメニューは右ペインに被せて全部読ませる**（[`popup_rect`] の
+    /// 意図）。描画順が右ペインより前だと、サイドバー幅を超える列が右ペインに
+    /// 塗り潰されてラベルが割られる（実測: サイドバー 12 桁で `│ new sessi│n   │`）。
+    /// クリック判定は同じ矩形を見るので、**見た目は claude の画面なのにクリックすると
+    /// メニューが動く**状態になる
+    #[test]
+    fn a_menu_wider_than_the_sidebar_is_drawn_over_the_right_pane() {
+        use crate::app::{PopupKind, MIN_SIDEBAR};
+        let mut app = App {
+            term_size: (60, 20),
+            sidebar_width: MIN_SIDEBAR,
+            grouping: Grouping::Directory,
+            popup: Some(Popup {
+                kind: PopupKind::Project {
+                    cwd: "C:\\dev\\api".to_string(),
+                    has_sessions: false,
+                },
+                anchor_y: 1,
+                selected: 0,
+            }),
+            ..Default::default()
+        };
+        let rect = popup_rect(&app, app.popup.as_ref().expect("メニューが無い"));
+        assert!(
+            rect.right() > MIN_SIDEBAR,
+            "前提（メニューがサイドバーより広い）が崩れている: {rect:?}"
+        );
+        let (w, h) = app.term_size;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("端末が作れない");
+        terminal.draw(|frame| {
+            draw(frame, &mut app);
+        })
+        .expect("描画に失敗");
+        let buffer = terminal.backend().buffer().clone();
+        // 矩形の列だけを読む（クリック判定が見るのと同じ範囲）
+        let row = |y: u16| -> String {
+            (rect.x..rect.right()).map(|x| buffer[(x, y)].symbol()).collect()
+        };
+        assert_eq!(row(rect.y + 1), "│ new session   │", "1 行目が割られている");
+        assert_eq!(row(rect.y + 2), "│ remove project│", "2 行目が割られている");
     }
 }

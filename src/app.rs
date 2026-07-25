@@ -18,7 +18,9 @@ use crate::source::{AccountAction, DataSource, PollSinks, WindowItem, PROJECTS_L
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
 use crate::ui::{draw, popup_rect, row_at, sidebar_layout};
 
-const MIN_SIDEBAR: u16 = 12;
+/// サイドバー幅の下限（ドラッグで詰められる限界）。**描画のテストが「一番狭い状態」を
+/// 作るのに使う**ので、この値は ui 側からも読める（同じ 12 をテストへ書き写さない）
+pub(crate) const MIN_SIDEBAR: u16 = 12;
 const MIN_PANE: u16 = 40;
 
 // state.json は name(/rename)・needs・summary の正本なので短周期で読む
@@ -2974,6 +2976,41 @@ mod tests {
             app.projects.is_empty() && app.dispatch_cwd.is_empty(),
             "捨てたディスパッチが状態を変えている"
         );
+    }
+
+    /// **描画とクリック判定が同じ矩形を見ていることの検証。** サイドバーを最小幅まで
+    /// 詰めるとメニューは右ペインに被る（[`crate::ui::popup_rect`] の意図）。描画順が
+    /// 右ペインより前だと被った列が塗り潰され、**見た目は claude の画面なのに
+    /// クリックすると new session が走る**状態になるので、
+    /// 「クリックが当たる列 = メニューが塗った列」を実描画で確かめる
+    #[test]
+    fn a_click_on_a_menu_column_over_the_right_pane_hits_what_is_drawn() {
+        let mut app = test_app(MIN_SIDEBAR, (60, 20));
+        open(&mut app, project("C:\\dev\\api", false), 1);
+        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+        // 前提: メニューがサイドバーを越えている（越えていなければこのテストは無意味）
+        assert!(rect.right() > MIN_SIDEBAR, "{rect:?}");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(frame, &mut app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        // 先頭項目の行は右ペインへ食い込む列まで全部メニューが塗っている
+        let drawn: String = (rect.x..rect.right())
+            .map(|x| buffer[(x, rect.y + 1)].symbol())
+            .collect();
+        assert!(
+            drawn.contains("new session"),
+            "ラベルが右ペインに割られている: {drawn:?}"
+        );
+        // そのはみ出した列のクリックが、描かれている項目どおりに効く
+        let col = rect.right() - 2;
+        assert!(col >= MIN_SIDEBAR, "はみ出した列を突いていない: {col}");
+        handle_mouse(&mut app, &click(col, rect.y + 1)).unwrap();
+        assert_eq!(app.dispatch_cwd, "C:\\dev\\api", "描かれた項目が動いていない");
     }
 
     /// 登録・解除は撮影用の供給元では永続化されない ＝ **テストが開発者の
