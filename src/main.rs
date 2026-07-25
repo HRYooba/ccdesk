@@ -19,6 +19,7 @@ mod poll;
 mod session;
 mod theme;
 mod ui;
+mod update;
 
 use app::{clamp_sidebar, instant_ago, open_short, run, App, Focus, RightView, JOBS_LIMIT};
 use cli::{print_usage, run_doctor, show_logs, statusline_hook, update_self};
@@ -53,6 +54,11 @@ fn main() -> anyhow::Result<()> {
         }
         None => {}
     }
+
+    // 自己更新で退避した <exe>.old を掃除する。更新した当のプロセスが掴んでいる
+    // 間は消せないので、次回起動のここが唯一の機会（失敗は無視する）。
+    // TUI 初期化より前に済ませて画面に影響させない
+    update::cleanup_old_exe();
 
     // new session の初期フォルダは前回使ったものを復元（無ければ起動ディレクトリ）
     let cwd1 = if demo {
