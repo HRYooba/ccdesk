@@ -703,18 +703,37 @@ pub(crate) fn draw_new_view(frame: &mut Frame, area: Rect, state: &mut NewState,
 mod tests {
     use super::*;
 
-    /// 一時ディレクトリに sub_a / sub_b を作って返す
-    fn fixture(tag: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("ccdesk-new-view-{tag}"));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("sub_a")).unwrap();
-        std::fs::create_dir_all(root.join("sub_b")).unwrap();
-        root
+    /// テスト用の一時ディレクトリ。drop で必ず再帰削除するので、
+    /// アサーション失敗（= panic）で抜けても後片付けが漏れない
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        /// sub_a / sub_b を持つ一時ディレクトリを作る。
+        /// パスにプロセス ID を含めるため、別チェックアウトでの並行実行と衝突しない
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("ccdesk-new-view-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("sub_a")).unwrap();
+            std::fs::create_dir_all(root.join("sub_b")).unwrap();
+            Self(root)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
-    fn 一覧は起動ボタンと親フォルダを先頭に持つ() {
-        let root = fixture("list");
+    fn lists_launch_row_and_parent_first() {
+        let tmp = TempDir::new("list");
+        let root = tmp.path();
         let state = NewState::browse(&root.to_string_lossy());
         assert_eq!(
             state.entries,
@@ -730,16 +749,19 @@ mod tests {
     }
 
     #[test]
-    fn 起動ボタン行では潜らない() {
-        let root = fixture("no-descend");
+    fn does_not_descend_on_launch_row() {
+        let tmp = TempDir::new("no-descend");
+        let root = tmp.path();
         let mut state = NewState::browse(&root.to_string_lossy());
+        // 初期選択は起動ボタン行。→ / Enter でフォルダが変わってはいけない
         state.descend();
         assert_eq!(state.cur_dir, root.to_string_lossy());
     }
 
     #[test]
-    fn サブフォルダと親フォルダへ移動できる() {
-        let root = fixture("move");
+    fn descends_into_subdir_and_back_to_parent() {
+        let tmp = TempDir::new("move");
+        let root = tmp.path();
         let mut state = NewState::browse(&root.to_string_lossy());
         state.dir_idx = 2; // sub_a
         state.descend();
@@ -750,8 +772,9 @@ mod tests {
     }
 
     #[test]
-    fn フィルタで親フォルダ行が消えても左キーで上がれる() {
-        let root = fixture("go-up");
+    fn goes_up_even_when_parent_row_is_filtered_out() {
+        let tmp = TempDir::new("go-up");
+        let root = tmp.path();
         let mut state = NewState::browse(&root.to_string_lossy());
         // "…/sub" まで打鍵 = 断片フィルタ。".." 行は落ち、起動ボタンは残る
         state.path.set_text(&root.join("sub").to_string_lossy());
@@ -764,19 +787,24 @@ mod tests {
                 BrowseRow::Dir("sub_b".into()),
             ]
         );
-        // 旧実装は「index 0 = ..」前提だったため、ここで sub_a へ潜ってしまっていた
+        // go_up は一覧の index を見ず cur_dir の親を直接引くので、".." 行が
+        // 消えていても正しく上がれる。旧実装は「index 0 = ..」前提で
+        // entries[0] を実行していたため、ここで sub_a へ潜ってしまっていた
         state.go_up();
         let parent = root.parent().unwrap().to_string_lossy().to_string();
         assert_eq!(state.cur_dir, parent);
     }
 
     #[test]
-    fn フォルダ行が全滅してもフィルタ0件を判定できる() {
-        let root = fixture("empty");
+    fn detects_zero_folder_rows_when_filter_matches_nothing() {
+        let tmp = TempDir::new("empty");
+        let root = tmp.path();
         let mut state = NewState::browse(&root.to_string_lossy());
+        // 一致するサブフォルダが無い断片。起動ボタンだけが残る
         state.path.set_text(&root.join("zzz").to_string_lossy());
         state.refresh_from_input();
         assert_eq!(state.entries, vec![BrowseRow::Launch]);
+        // entries は空でないので、0 件判定は no_folder_rows() でしか出せない
         assert!(state.no_folder_rows());
     }
 }
