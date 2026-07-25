@@ -520,12 +520,20 @@ pub fn same_dir(a: &str, b: &str) -> bool {
 }
 
 /// [`same_dir`] の比較キー。`C:\` のようなルートは末尾の区切りを落とさない（落とすと
-/// ドライブ指定 `C:` になり、Windows では「そのドライブのカレント」を指す別物になる）
+/// ドライブ指定 `C:` になり、Windows では「そのドライブのカレント」を指す別物になる）。
+///
+/// **残すのは区切り 1 個だけ**で、`C:\\` のように重複した表記も同じキーへ丸める
+/// （素朴な join で作られ得る形で、別扱いにすると見出しが 2 つに割れて登録解除も
+/// 空振りする ＝ [`same_dir`] が 1 箇所で持つ不変条件が崩れる）。区切りが元から
+/// 無い `C:` は丸めない ＝ ドライブ指定はドライブ直下と別物のまま
 fn dir_key(path: &str) -> String {
     let unified = path.replace('/', "\\").to_lowercase();
     let trimmed = unified.trim_end_matches('\\');
-    if trimmed.is_empty() || trimmed.ends_with(':') {
-        unified
+    // trimmed は unified の先頭からの部分なので、長さの差 = 落とした区切りの個数
+    let root_with_separator = (trimmed.is_empty() || trimmed.ends_with(':'))
+        && trimmed.len() < unified.len();
+    if root_with_separator {
+        format!("{trimmed}\\")
     } else {
         trimmed.to_string()
     }
@@ -647,5 +655,21 @@ mod tests {
         assert_eq!(dir_key("\\"), "\\");
         assert_eq!(dir_key("/"), "\\");
         assert_eq!(dir_key(""), "");
+    }
+
+    /// ルートの区切りが重複した表記（`C:\\`）も同じフォルダ。素朴な join
+    /// （`format!("{dir}\\{name}")` に `dir = "C:\"` を渡す等）で作られ得る形で、
+    /// 別扱いにすると**見出しが 2 つに割れて登録解除も空振りする** ＝
+    /// この関数が 1 箇所で持っているはずの不変条件が崩れる
+    #[test]
+    fn same_dir_collapses_repeated_root_separators() {
+        assert_eq!(dir_key("C:\\\\"), "c:\\");
+        assert!(same_dir("C:\\", "C:\\\\"), "重複区切りのドライブ直下が別扱いになった");
+        assert!(same_dir("C:\\\\", "c://"), "区切りの種類と個数が混ざると別扱いになる");
+        assert!(same_dir("\\\\", "\\"), "ルートの重複区切りが別扱いになった");
+        // 区切りが元から無い `C:` はドライブ指定なので、丸めた結果と同一視しない
+        assert!(!same_dir("C:", "C:\\\\"), "ドライブ指定がドライブ直下と同一視された");
+        // 末端まであるパスは従来どおり（重複区切りは落ちる）
+        assert_eq!(dir_key("C:\\dev\\api\\\\"), "c:\\dev\\api");
     }
 }
