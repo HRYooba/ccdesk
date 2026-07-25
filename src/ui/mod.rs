@@ -10,7 +10,7 @@ use std::time::Duration;
 use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, Focus, Popup, RightView, RowAction, SIDEBAR_HEADER_ROWS};
-use crate::poll::{classify, Bucket, Group, Grouping, StateView};
+use crate::poll::{classify, AccountStatus, Bucket, Group, Grouping, StateView};
 use crate::session::SessionStatus;
 use crate::theme::{
     ui, usage_color, C_ATTENTION, C_FAIL, C_WORKING, FOCUS_BORDER, MUTED_FG,
@@ -590,11 +590,15 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             ),
             Rect::new(fx, sep_y, fw, 1),
         );
-        // アカウント行（表示名 · 組織名）
+        // アカウント行（表示名 · 組織名）。未ログインは要対応なので注意色、
+        // 未取得（起動直後・CLI 失敗）は誤情報を出さないため空行にする
+        let (account, account_style) = match &app.footer.account {
+            AccountStatus::LoggedIn(label) => (label.as_str(), Style::default().fg(ui().dim)),
+            AccountStatus::LoggedOut => ("not logged in", Style::default().fg(C_ATTENTION)),
+            AccountStatus::Unknown => ("", Style::default().fg(ui().dim)),
+        };
         frame.render_widget(
-            ratatui::widgets::Paragraph::new(
-                Line::from(clip(&app.footer.account)).style(Style::default().fg(ui().dim)),
-            ),
+            ratatui::widgets::Paragraph::new(Line::from(clip(account)).style(account_style)),
             Rect::new(fx, account_y, fw, 1),
         );
         if update_row_visible {

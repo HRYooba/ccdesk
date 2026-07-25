@@ -12,7 +12,7 @@ use ccdesk::{log_error, save_setting, save_state, scan_jobs, BgJob};
 
 use crate::keys::{encode_key, forward_mouse};
 use crate::poll::{
-    demo_jobs, read_usage, AgentInfo, FooterInfo, Grouping, UsageInfo,
+    demo_jobs, read_usage, AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo,
 };
 use crate::session::Session;
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
@@ -324,7 +324,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             if app.demo {
-                app.footer.account = "you · Acme, Inc.".to_string();
+                app.footer.account = AccountStatus::LoggedIn("you · Acme, Inc.".to_string());
                 app.footer.latest = None;
             }
             force_draw = true;

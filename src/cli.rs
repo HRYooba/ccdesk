@@ -1,36 +1,8 @@
-//! CLI サブコマンド（doctor / logs / update / statusline-hook）と付随ユーティリティ。
+//! CLI サブコマンド（doctor / logs / update / statusline-hook）。
 
-/// 更新チャネル。settings.json の autoUpdatesChannel（公式に文書化された設定。
-/// "latest"(既定) / "stable"）を読む。CLAUDE_CONFIG_DIR にも追従する
-pub(crate) fn claude_settings_channel() -> String {
-    ccdesk::claude_dir()
-        .map(|d| d.join("settings.json"))
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| {
-            v.get("autoUpdatesChannel")
-                .and_then(|c| c.as_str())
-                .map(str::to_string)
-        })
-        .filter(|c| c == "stable")
-        .unwrap_or_else(|| "latest".to_string())
-}
+use ccdesk::version_newer;
 
-/// バージョン文字列 "2.1.218" の数値比較（比較不能なら等価扱い）
-pub(crate) fn version_newer(latest: &str, current: &str) -> bool {
-    let parse = |s: &str| -> Vec<u64> {
-        s.split('.')
-            .map(|p| {
-                p.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse()
-                    .unwrap_or(0)
-            })
-            .collect()
-    };
-    parse(latest) > parse(current)
-}
+use crate::poll::{fetch_account, AccountStatus};
 
 /// update コマンドの取得元（配布は cargo install のみ）
 const REPO_URL: &str = "https://github.com/HRYooba/ccdesk";
@@ -212,6 +184,18 @@ pub(crate) fn run_doctor() -> anyhow::Result<()> {
         Err(e) => {
             println!("FAIL  claude agents --json: failed to run ({e})");
             failed = true;
+        }
+    }
+
+    // サイドバー下部に出るアカウント行。表示が実際どうなるかをここで確認できる
+    // （未ログインは FAIL ではない = ccdesk 自体は動く。ログインを促すだけ）
+    match fetch_account() {
+        AccountStatus::LoggedIn(label) => println!("ok    claude account: {label}"),
+        AccountStatus::LoggedOut => {
+            println!("warn  claude account: not logged in (run /login in a claude session)");
+        }
+        AccountStatus::Unknown => {
+            println!("warn  claude account: could not determine (`claude auth status --json`)");
         }
     }
 
