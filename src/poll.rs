@@ -107,7 +107,9 @@ pub(crate) enum AccountStatus {
     LoggedIn(String),
 }
 
-/// サイドバー下部に出すアカウント・バージョン情報。
+/// claude 側のアカウント・バージョン情報。アカウントはサイドバー下部の行、
+/// バージョンは上部の claude 版行に出る（`latest` は「更新がある」の有無だけを
+/// 決め、新しい番号そのものは幅の都合で表示しない）。
 /// アカウントは `claude auth status --json`（公式サブコマンド）、
 /// 現行版は `claude --version`、最新版は Anthropic 公式配布の npm パッケージ
 /// メタデータ（registry.npmjs.org/@anthropic-ai/claude-code/latest）から取る
@@ -120,7 +122,7 @@ pub(crate) struct FooterInfo {
 
 /// ccdesk 自身の版チェック（起動時 1 回の使い捨てスレッド）。
 /// このビルドより新しいリリースタグがあれば共有状態へ書く（無ければ何も書かない
-/// ＝告知行は出ない）。値の形は claude 側の [`FooterInfo::latest`] と同じ
+/// ＝版行は最新表示のまま）。値の形は claude 側の [`FooterInfo::latest`] と同じ
 /// 「新しい版があるときだけ Some」。
 ///
 /// **周期ポーリングはしない。** ccdesk のリリース頻度は低く、適用には再起動が

@@ -254,13 +254,15 @@ fn demo_jobs() -> Vec<BgJob> {
         .collect()
 }
 
-/// 撮影用の架空フッター。実アカウントを出さない。
-/// demo はフッターのポーラーを起動しないので、これが最終値になる
-/// （`latest` が None なので更新ボタン行は出ず、`current` は描画に現れない）
+/// 撮影用の架空アカウント・架空 claude 版。実アカウント・実インストールを出さない。
+/// demo はフッターのポーラーを起動しないので、これが最終値になる。
+/// `current` はサイドバー上部の claude 版行にそのまま出るので**架空でも埋める**
+/// （空だと版番号なしの行になり、撮影が「取得前」の状態に見える）。
+/// `latest` は None なので更新マーカーと動詞は出ない = 最新の見た目で撮れる
 fn demo_footer() -> FooterInfo {
     FooterInfo {
         account: AccountStatus::LoggedIn("you · Acme, Inc.".to_string()),
-        current: String::new(),
+        current: "2.1.220".to_string(),
         latest: None,
     }
 }
@@ -303,7 +305,12 @@ mod tests {
             DemoSource.footer().account,
             AccountStatus::LoggedIn("you · Acme, Inc.".to_string())
         );
-        assert!(DemoSource.footer().latest.is_none(), "更新行は出さない");
+        // claude 版行は架空の版で埋める。更新マーカーは出さない（最新の見た目で撮る）
+        assert_eq!(DemoSource.footer().current, "2.1.220");
+        assert!(
+            DemoSource.footer().latest.is_none(),
+            "撮影で更新マーカーを出さない"
+        );
 
         let usage = DemoSource.usage().expect("使用率ゲージは常に出す");
         assert_eq!(usage.five.map(|(pct, _)| pct), Some(34.0));

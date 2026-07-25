@@ -15,7 +15,7 @@ use crate::poll::{AgentInfo, FooterInfo, Grouping, UsageInfo};
 use crate::session::Session;
 use crate::source::{DataSource, PollSinks, WindowItem};
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
-use crate::ui::{draw, popup_rect, sidebar_layout};
+use crate::ui::{draw, popup_rect, row_at, sidebar_layout};
 
 const MIN_SIDEBAR: u16 = 12;
 const MIN_PANE: u16 = 40;
@@ -37,12 +37,28 @@ pub(crate) enum Focus {
 /// サイドバー行のクリック動作。セッションは short id で参照する。
 /// jobs / sessions は 2 秒毎に再構築され並びも変わるため、描画時の生 index を
 /// 保持すると実行時に別セッションを stop/rm し得る
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub(crate) enum RowAction {
     New,           // 新規セッション画面を開く
     NewIn(String), // 指定フォルダで新規セッション画面を開く（プロジェクト見出しの +）
     ToggleGroup,   // グルーピング切替（state ⇔ directory）
     Open(String),  // short id: ウィンドウが開いていれば切替、無ければ claude attach
+    UpdateCcdesk,  // ccdesk 自身を更新（サイドバー先頭の版行）
+    UpdateClaude,  // claude 本体を更新（同じく版行）
+}
+
+/// ccdesk 自身の更新の進行状態。**バックグラウンドスレッドが書き、UI が読む正本**。
+///
+/// AtomicBool を並べずに 1 つの状態にしてあるのは、実行中・完了・失敗が排他で、
+/// 多重起動の防止もこのロックの中で決まるため（同じ知識を 2 つのフラグに分けない）
+pub(crate) enum SelfUpdate {
+    /// 未実行、または失敗を通知し終えた後（＝再試行できる）
+    Idle,
+    Running,
+    /// 差し替え済み。反映は次回起動なので、以降このセッション中はずっと再起動を促す
+    Done,
+    /// 失敗。run ループが下部バーへ 1 度出して Idle へ戻す
+    Failed(String),
 }
 
 /// モーダルの種類
@@ -102,10 +118,9 @@ pub(crate) struct App {
     pub(crate) term_size: (u16, u16), // (width, height)
     // サイドバー行 → クリック動作の対応（draw で構築）
     pub(crate) sidebar_rows: Vec<Option<RowAction>>,
-    // サイドバー上部の固定行数（ccdesk 版表示・更新告知・区切り線・+ new session・
-    // 区切り線・⊞ group・集計行）。更新告知の有無で増減するので定数にはできない。
-    // 正本は draw（積んだ行数をそのまま記録する）で、ヒットテストとスクロール計算は
-    // sidebar_rows と同じく「最後に描いた値」を読む
+    // サイドバー上部の固定行数（ccdesk 版行・claude 版行・区切り線・+ new session・
+    // 区切り線・⊞ group・集計行）。正本は draw（積んだ行数をそのまま記録する）で、
+    // ヒットテストとスクロール計算は sidebar_rows と同じく「最後に描いた値」を読む
     pub(crate) sidebar_header_rows: usize,
     // サイドバーのスクロール位置（先頭に表示する行 index。draw でクランプ）
     pub(crate) sidebar_scroll: usize,
@@ -122,10 +137,12 @@ pub(crate) struct App {
     pub(crate) footer_shared: Arc<Mutex<FooterInfo>>,
     pub(crate) footer_dirty: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) footer_refresh: Arc<std::sync::atomic::AtomicBool>,
-    // claude update 実行中（ボタン連打防止と "updating…" 表示）
+    // claude update 実行中（行の連打防止と "updating…" 表示）
     pub(crate) claude_updating: Arc<std::sync::atomic::AtomicBool>,
+    // ccdesk 自身の更新の進行状態（版行の表示と多重起動防止の正本）
+    pub(crate) ccdesk_update: Arc<Mutex<SelfUpdate>>,
     // ccdesk 自身の新しいリリース（起動時 1 回のチェック）。
-    // 新しい版があるときだけ Some = サイドバーの更新告知行を出す
+    // 新しい版があるときだけ Some = 版行に ⟳ と update が出る
     pub(crate) ccdesk_latest: Option<String>,
     pub(crate) ccdesk_latest_shared: Arc<Mutex<Option<String>>>,
     pub(crate) ccdesk_latest_dirty: Arc<std::sync::atomic::AtomicBool>,
@@ -413,6 +430,26 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 .clone();
             force_draw = true;
         }
+        // ccdesk 自身の更新の失敗を下部バーへ出す。成功は版行の "restart" が伝えるので
+        // ここでは扱わない（Idle へ戻すので、失敗した更新はもう一度押せる）
+        let failure = {
+            let mut state = app
+                .ccdesk_update
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*state {
+                SelfUpdate::Failed(msg) => {
+                    let msg = msg.clone();
+                    *state = SelfUpdate::Idle;
+                    Some(msg)
+                }
+                _ => None,
+            }
+        };
+        if let Some(msg) = failure {
+            set_notice(app, msg);
+            force_draw = true;
+        }
         // ccdesk 自身の新しいリリース（起動時チェック）を取り込む
         if app
             .ccdesk_latest_dirty
@@ -563,6 +600,8 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                                     open_short(app, &short);
                                     app.set_focus(Focus::Terminal);
                                 }
+                                Some(RowAction::UpdateCcdesk) => start_ccdesk_update(app),
+                                Some(RowAction::UpdateClaude) => start_claude_update(app),
                                 None => {}
                             }
                         }
@@ -795,17 +834,6 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
 
     if mouse.column < app.sidebar_width {
         let sl = sidebar_layout(app);
-        // フッターの更新ボタン行クリック（アカウント行の 1 つ上。描画時のみ有効）
-        if sl.footer_visible
-            && sl.update_row_visible
-            && mouse.row == sl.account_y.saturating_sub(1)
-        {
-            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                start_claude_update(app);
-            }
-            app.hovered_row = None;
-            return Ok(false);
-        }
         // ホイールでサイドバーをスクロール（クランプは draw 側で行う）
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -818,17 +846,14 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             }
             _ => {}
         }
-        // 上枠線ぶんを引き、固定ヘッダーより下はスクロールぶんも補正して行 index へ。
-        // 表示窓（capacity）の外＝フッター帯や下枠のクリックは、スクロールで隠れた
-        // 行のアクションを誤発火しないよう不感帯にする
-        let r = mouse.row.saturating_sub(1) as usize;
-        let row = if mouse.row == 0 || r >= sl.capacity {
-            usize::MAX // 枠線・フッター帯 → どの行にも対応しない
-        } else if r < app.sidebar_header_rows {
-            r
-        } else {
-            r + app.sidebar_scroll
-        };
+        // 画面 y → 行 index（列は見ないので行のどこを押しても当たる）。
+        // 計算は描画側と同じ ui::row_at を共有する
+        let row = row_at(
+            mouse.row,
+            sl.capacity,
+            app.sidebar_header_rows,
+            app.sidebar_scroll,
+        );
         let action = app.sidebar_rows.get(row).cloned().flatten();
         // hover: クリック可能な行の上にいるときだけハイライト
         app.hovered_row = action.as_ref().map(|_| row);
@@ -875,6 +900,9 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                     open_short(app, &short);
                     app.set_focus(Focus::Terminal);
                 }
+                // 更新行はその場で実行するだけ（右ペインを切り替えない）
+                Some(RowAction::UpdateCcdesk) => start_ccdesk_update(app),
+                Some(RowAction::UpdateClaude) => start_claude_update(app),
                 None => {}
             }
         }
@@ -1154,9 +1182,43 @@ fn move_selection(app: &mut App, dir: i32) {
     }
 }
 
+/// ccdesk 自身の更新を実行する（`ccdesk update` と同じ [`crate::update::install`]）。
+///
+/// **走ったまま差し替えられる。** Windows は実行中の exe を上書きできないが改名は
+/// できるので、update.rs の 3 段改名（`.new` へ置く → 現行を `.old` へ退避 →
+/// `.new` を本体へ）がそのまま成立する。反映は次回起動なので、成功後は版行が
+/// "restart" を出し続ける（`SelfUpdate::Done` はこのセッション中戻らない）。
+/// 数 MB のダウンロードと SHA-256 検証が入るため別スレッドで行う
+fn start_ccdesk_update(app: &mut App) {
+    let Some(tag) = app.ccdesk_latest.clone() else {
+        return; // 新しい版を知らないうちは何もしない（行もクリック不可）
+    };
+    {
+        let mut state = app
+            .ccdesk_update
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 実行中の多重起動と、済んだ更新の再実行を防ぐ
+        if matches!(*state, SelfUpdate::Running | SelfUpdate::Done) {
+            return;
+        }
+        *state = SelfUpdate::Running;
+    }
+    let shared = app.ccdesk_update.clone();
+    std::thread::spawn(move || {
+        let outcome = match crate::update::install(&tag) {
+            Ok(_) => SelfUpdate::Done,
+            Err(e) => SelfUpdate::Failed(format!("ccdesk update 失敗: {e}")),
+        };
+        *shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = outcome;
+    });
+}
+
 /// claude 本体の更新を実行する（公式 `claude update`）。
 /// 公式仕様: 更新は次回起動時から有効で、実行中セッションは現行版のまま動き続ける。
-/// 完了後はフッターを再取得し、最新化されれば更新ボタン行は消える
+/// 完了後はフッターを再取得し、最新化されれば版行は最新表示へ戻る
 fn start_claude_update(app: &mut App) {
     if app
         .claude_updating
