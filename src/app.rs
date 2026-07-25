@@ -45,23 +45,69 @@ pub(crate) enum RowAction {
     Open(String),  // short id: ウィンドウが開いていれば切替、無ければ claude attach
 }
 
-/// モーダルの種類
+/// メニュー枠が食う桁数: 左右の枠線 2 + 項目行の先頭空白 1（描画が `" {label}"` を出す）
+const POPUP_CHROME: u16 = 3;
+/// メニュー幅の下限。stop/delete・grouping 切替の見た目を従来（14 桁）から動かさないため
+const POPUP_MIN_WIDTH: u16 = 14;
+
+/// ポップアップに並べるアカウント 1 件。表示名と識別子を分けて持つ:
+/// 表示名（`ooba · 1→10, Inc.` 等）は組織違い・別 email で重複し得るので、
+/// 対象の特定はラベル一致ではなく「選択 index → id」で行う
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AccountItem {
+    pub(crate) label: String,
+    pub(crate) id: String,
+}
+
+/// モーダルの種類。**メニューの中身（項目・幅・項目の意味）はこの型が答える**。
+/// [`Popup`] は「どこに開いたか・どれを選んでいるか」だけを持つので、
+/// 種類を足すときの変更は [`PopupKind::entries`] と [`PopupKind::action`] の
+/// 2 つの match に閉じる（幅は項目から導くので触らない）
+#[derive(Debug, PartialEq)]
 pub(crate) enum PopupKind {
     Session { short: String, stopped: bool },
     Group,
+    /// アカウント一覧。開いた時点の写しを持つ（一覧の供給はデータ層の責務で、
+    /// メニューは受け取った並びをそのまま出す）。保管 0 件でも
+    /// `register current` だけのメニューとして成立する
+    // 構築側（フッターのアカウント行クリック）はアカウント切替の作業が入れる
+    #[allow(dead_code)]
+    Account { accounts: Vec<AccountItem> },
+    /// アカウント 1 件への操作（Account から遷移する 2 階層目）
+    AccountActions { account: AccountItem },
+    /// プロジェクト単位の操作
+    // 構築側（プロジェクト見出しクリック）はプロジェクト永続化の作業が入れる
+    #[allow(dead_code)]
+    Project { cwd: String },
 }
 
-/// ☰ / group 行クリックで開くコンテキストメニュー
-pub(crate) struct Popup {
-    pub(crate) kind: PopupKind,
-    pub(crate) anchor_y: u16, // 開いた元の画面行
-    pub(crate) selected: usize,
+/// 項目を選んだときに起きること。**選択 index から作る**ので、表示名が同じ項目が
+/// 並んでも対象を取り違えない（ラベル文字列から対象を復元しない）。
+/// 副作用は持たず、実行は [`run_popup_action`] だけが行う
+#[derive(Debug, PartialEq)]
+enum PopupAction {
+    Stop(String),
+    Delete(String),
+    SetGrouping(Grouping),
+    /// 2 階層目のメニューへ遷移する
+    Open(PopupKind),
+    /// 現在ログイン中のアカウントを保管に加える
+    RegisterCurrent,
+    /// 保管アカウントへ切り替える（[`AccountItem::id`]）
+    SwitchAccount(String),
+    /// 保管アカウントを一覧から外す（[`AccountItem::id`]）
+    UnregisterAccount(String),
+    /// 指定フォルダで新規セッション
+    NewSessionIn(String),
+    /// プロジェクトを一覧から外す
+    RemoveProject(String),
 }
 
-impl Popup {
-    /// (表示名, 実行可能か)
+impl PopupKind {
+    /// (表示名, 実行可能か)。並びは [`PopupKind::action`] の index 解釈と対になるので、
+    /// 項目を足すときは両方を同じ順で直す
     pub(crate) fn entries(&self, grouping: Grouping) -> Vec<(String, bool)> {
-        match &self.kind {
+        match self {
             // delete は稼働中でも選べる（実行側が stop → rm の 2 段で処理する）
             PopupKind::Session { stopped, .. } => vec![
                 ("stop".to_string(), !stopped),
@@ -74,8 +120,80 @@ impl Popup {
                     (format!("{}directory", mark(Grouping::Directory)), true),
                 ]
             }
+            // 保管一覧が先、`register current` が末尾（0 件でもこの 1 項目は残る）
+            PopupKind::Account { accounts } => accounts
+                .iter()
+                .map(|a| (a.label.clone(), true))
+                .chain(std::iter::once(("register current".to_string(), true)))
+                .collect(),
+            PopupKind::AccountActions { .. } => vec![
+                ("switch".to_string(), true),
+                ("unregister".to_string(), true),
+            ],
+            PopupKind::Project { .. } => vec![
+                ("new session".to_string(), true),
+                ("remove project".to_string(), true),
+            ],
         }
     }
+
+    /// メニュー幅。**項目の表示幅から決める**ので、アカウント表示名や email のような
+    /// 動的な項目でも切れない。種類ごとに固定値を置くと項目を足した時点で嘘になるため、
+    /// 幅の知識はここ 1 箇所だけに持たせる。端末へ収める責任は `popup_rect` 側
+    pub(crate) fn width(&self, grouping: Grouping) -> u16 {
+        use unicode_width::UnicodeWidthStr;
+        let widest = self
+            .entries(grouping)
+            .iter()
+            .map(|(label, _)| label.width().min(u16::MAX as usize) as u16)
+            .max()
+            .unwrap_or(0);
+        widest.saturating_add(POPUP_CHROME).max(POPUP_MIN_WIDTH)
+    }
+
+    /// 選択 index の項目が意味する動作（範囲外・意味を持たない index は None）。
+    /// 動的な項目は index で対象（アカウント）を引く
+    fn action(&self, index: usize) -> Option<PopupAction> {
+        match self {
+            PopupKind::Session { short, .. } => match index {
+                0 => Some(PopupAction::Stop(short.clone())),
+                1 => Some(PopupAction::Delete(short.clone())),
+                _ => None,
+            },
+            PopupKind::Group => match index {
+                0 => Some(PopupAction::SetGrouping(Grouping::State)),
+                1 => Some(PopupAction::SetGrouping(Grouping::Directory)),
+                _ => None,
+            },
+            PopupKind::Account { accounts } => match accounts.get(index) {
+                // 一覧の行 → そのアカウントの 2 階層目
+                Some(account) => Some(PopupAction::Open(PopupKind::AccountActions {
+                    account: account.clone(),
+                })),
+                // 一覧の 1 つ後ろが末尾項目
+                None if index == accounts.len() => Some(PopupAction::RegisterCurrent),
+                None => None,
+            },
+            PopupKind::AccountActions { account } => match index {
+                0 => Some(PopupAction::SwitchAccount(account.id.clone())),
+                1 => Some(PopupAction::UnregisterAccount(account.id.clone())),
+                _ => None,
+            },
+            PopupKind::Project { cwd } => match index {
+                0 => Some(PopupAction::NewSessionIn(cwd.clone())),
+                1 => Some(PopupAction::RemoveProject(cwd.clone())),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// ☰ / group 行クリックで開くコンテキストメニューの開き状態。
+/// 2 階層目は**階層を積まずに開き直す**（Esc・外クリックは常に全閉。戻り先を持たない）
+pub(crate) struct Popup {
+    pub(crate) kind: PopupKind,
+    pub(crate) anchor_y: u16, // 開いた元の画面行（矩形はこの 1 つ下に出る）
+    pub(crate) selected: usize,
 }
 
 /// 右ペインの表示内容
@@ -506,25 +624,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 if app.focus == Focus::Sidebar {
                     // モーダル表示中はモーダルがキーを受ける
                     if app.popup.is_some() {
-                        let grouping = app.grouping;
-                        let popup = app.popup.as_mut().unwrap();
-                        match key.code {
-                            KeyCode::Esc => app.popup = None,
-                            KeyCode::Up => popup.selected = popup.selected.saturating_sub(1),
-                            KeyCode::Down => {
-                                popup.selected =
-                                    (popup.selected + 1).min(popup.entries(grouping).len() - 1);
-                            }
-                            KeyCode::Enter => {
-                                let entries = popup.entries(grouping);
-                                let (label, enabled) = entries[popup.selected].clone();
-                                if enabled {
-                                    let popup = app.popup.take().unwrap();
-                                    run_popup_action(app, &popup, &label);
-                                }
-                            }
-                            _ => {}
-                        }
+                        handle_popup_key(app, key.code);
                         continue;
                     }
                     match key.code {
@@ -756,6 +856,16 @@ pub(crate) fn clamp_sidebar(app: &mut App) {
 
 /// マウス処理。true を返したら終了。
 fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
+    // モーダル表示中はモーダルが全クリックを受ける。**幅変更のつかみ代より先に**
+    // 判定するのが要点で、内容から幅を決めるメニューは境界線の列に被り得るため、
+    // 被った列の項目クリックがサイドバー幅変更に化けてはいけない
+    // （ドラッグ中だけは掴んだ操作を優先する = 下のドラッグ分岐へ落とす）
+    if app.popup.is_some() && !app.dragging {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            handle_popup_click(app, mouse.column, mouse.row);
+        }
+        return Ok(false);
+    }
     // 境界線ドラッグ（サイドバー右枠線と右ペイン左枠線の 2 列をつかみ代にする）
     let border_zone =
         mouse.column >= app.sidebar_width.saturating_sub(1) && mouse.column <= app.sidebar_width;
@@ -783,14 +893,6 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         }
         _ if app.dragging => return Ok(false),
         _ => {}
-    }
-
-    // モーダル表示中はモーダルが全クリックを受ける
-    if app.popup.is_some() {
-        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            handle_popup_click(app, mouse.column, mouse.row);
-        }
-        return Ok(false);
     }
 
     if mouse.column < app.sidebar_width {
@@ -973,12 +1075,38 @@ fn short_stopped(app: &App, short: &str) -> bool {
     !app.agents.iter().any(|a| a.id == short && a.has_pid)
 }
 
+/// モーダル表示中のキー操作（Esc = 全閉 / ↑↓ = 選択 / Enter = 実行）
+fn handle_popup_key(app: &mut App, code: KeyCode) {
+    let grouping = app.grouping;
+    match code {
+        // 階層を積まないので戻り先は無い。どの階層でも 1 度で全部閉じる
+        KeyCode::Esc => app.popup = None,
+        KeyCode::Up => {
+            if let Some(popup) = app.popup.as_mut() {
+                popup.selected = popup.selected.saturating_sub(1);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(popup) = app.popup.as_mut() {
+                let last = popup.kind.entries(grouping).len().saturating_sub(1);
+                popup.selected = (popup.selected + 1).min(last);
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(index) = app.popup.as_ref().map(|p| p.selected) {
+                activate_popup(app, index);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// モーダル内クリック
 fn handle_popup_click(app: &mut App, col: u16, row: u16) {
     let Some(popup) = &app.popup else { return };
     let rect = popup_rect(app, popup);
     if !rect.contains(Position::new(col, row)) {
-        app.popup = None; // 外クリックで閉じる
+        app.popup = None; // 外クリックで閉じる（階層を持たないので全閉）
         return;
     }
     // 枠線上のクリックは何もしない（上枠が先頭項目 "stop" に化けて誤発火しない）
@@ -989,33 +1117,55 @@ fn handle_popup_click(app: &mut App, col: u16, row: u16) {
     {
         return;
     }
-    let idx = (row - rect.y - 1) as usize;
-    let entries = popup.entries(app.grouping);
-    if idx < entries.len() && entries[idx].1 {
-        let label = entries[idx].0.clone();
-        let popup = app.popup.take().unwrap();
-        run_popup_action(app, &popup, &label);
-    }
+    activate_popup(app, (row - rect.y - 1) as usize);
 }
 
-/// メニュー項目の実行
-fn run_popup_action(app: &mut App, popup: &Popup, label: &str) {
-    match &popup.kind {
-        PopupKind::Session { short, .. } => match label {
-            "stop" => menu_stop(app, short),
-            "delete" => menu_delete(app, short),
-            _ => {}
-        },
-        PopupKind::Group => {
-            let next = if label.contains("state") {
-                Grouping::State
-            } else {
-                Grouping::Directory
-            };
+/// 選択項目の実行（Enter / クリック共通）。実行できない項目・範囲外の index は無視する
+fn activate_popup(app: &mut App, index: usize) {
+    let Some(popup) = app.popup.as_ref() else {
+        return;
+    };
+    let entries = popup.kind.entries(app.grouping);
+    if !entries.get(index).is_some_and(|(_, enabled)| *enabled) {
+        return;
+    }
+    let Some(action) = popup.kind.action(index) else {
+        return;
+    };
+    // 2 階層目は 1 階層目の選択行から生えて見えるようにする。矩形は anchor_y の
+    // 1 つ下に出るので、渡すのは「選択行 - 1」= 枠の上端 + index
+    let anchor_y = popup_rect(app, popup).y + index as u16;
+    app.popup = None;
+    run_popup_action(app, action, anchor_y);
+}
+
+/// メニュー項目の実行。**副作用はここだけ**に集め、「どの項目が何を意味するか」の
+/// 判定は [`PopupKind::action`]（純関数）に置く
+fn run_popup_action(app: &mut App, action: PopupAction, anchor_y: u16) {
+    match action {
+        PopupAction::Stop(short) => menu_stop(app, &short),
+        PopupAction::Delete(short) => menu_delete(app, &short),
+        PopupAction::SetGrouping(next) => {
             if app.grouping != next {
                 toggle_grouping(app);
             }
         }
+        // 開き直し（積まない）。anchor は親の選択行なので親から生えて見える
+        PopupAction::Open(kind) => {
+            app.popup = Some(Popup {
+                kind,
+                anchor_y,
+                selected: 0,
+            });
+        }
+        // プロジェクト見出しの + と同じ動作（同じ知識を 2 つ持たない）
+        PopupAction::NewSessionIn(cwd) => dispatch_session(app, cwd, String::new()),
+        // ここから下はメニュー基盤だけ先に用意した項目。実処理はアカウント切替・
+        // プロジェクト永続化の作業がこの arm を埋める
+        PopupAction::RegisterCurrent
+        | PopupAction::SwitchAccount(_)
+        | PopupAction::UnregisterAccount(_)
+        | PopupAction::RemoveProject(_) => {}
     }
 }
 
@@ -1230,4 +1380,520 @@ pub(crate) fn open_short(app: &mut App, short: &str) {
     };
     let cwd = job.cwd.clone();
     attach_by_id(app, short, &label, &cwd);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::DemoSource;
+    use unicode_width::UnicodeWidthStr;
+
+    const TERM: (u16, u16) = (120, 40);
+
+    /// ポップアップ判定に必要な最小の App。PTY セッションは持たず、供給元は撮影用
+    /// （ディスクもネットワークも触らない）にして開発者の設定を書き換えない
+    fn test_app(sidebar_width: u16, term_size: (u16, u16)) -> App {
+        App {
+            sessions: Vec::new(),
+            active: 0,
+            agents: Vec::new(),
+            agents_shared: Arc::new(Mutex::new(Vec::new())),
+            agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            jobs: Vec::new(),
+            last_scan: std::time::Instant::now(),
+            last_live_scan: std::time::Instant::now(),
+            rescan_hot_until: None,
+            sidebar_width,
+            dragging: false,
+            last_drag_resize: std::time::Instant::now(),
+            term_size,
+            sidebar_rows: Vec::new(),
+            sidebar_header_rows: 0,
+            sidebar_scroll: 0,
+            sidebar_follow_sel: false,
+            hovered_row: None,
+            selected_row: 0,
+            dispatch_cwd: String::new(),
+            right_view: RightView::Sessions,
+            footer: FooterInfo::default(),
+            footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
+            footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ccdesk_latest: None,
+            ccdesk_latest_shared: Arc::new(Mutex::new(None)),
+            ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            usage_display: false,
+            usage: None,
+            last_usage_read: std::time::Instant::now(),
+            pending_delete: None,
+            spawn_rx: None,
+            notice: None,
+            grouping: Grouping::State,
+            popup: None,
+            // サイドバー側にしておく（set_focus が PTY へ通知を出さない）
+            focus: Focus::Sidebar,
+            source: Box::new(DemoSource),
+        }
+    }
+
+    fn open(app: &mut App, kind: PopupKind, anchor_y: u16) {
+        app.popup = Some(Popup {
+            kind,
+            anchor_y,
+            selected: 0,
+        });
+    }
+
+    fn labels(kind: &PopupKind, grouping: Grouping) -> Vec<String> {
+        kind.entries(grouping)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect()
+    }
+
+    fn click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn account(label: &str, id: &str) -> AccountItem {
+        AccountItem {
+            label: label.to_string(),
+            id: id.to_string(),
+        }
+    }
+
+    fn session(short: &str, stopped: bool) -> PopupKind {
+        PopupKind::Session {
+            short: short.to_string(),
+            stopped,
+        }
+    }
+
+    /// 稼働中は stop・delete の両方が選べ、停止済みは stop だけ選べない（従来どおり）
+    #[test]
+    fn session_menu_disables_stop_only_when_the_session_is_stopped() {
+        assert_eq!(
+            session("s1", false).entries(Grouping::State),
+            [("stop".to_string(), true), ("delete".to_string(), true)]
+        );
+        assert_eq!(
+            session("s1", true).entries(Grouping::State),
+            [("stop".to_string(), false), ("delete".to_string(), true)]
+        );
+    }
+
+    /// stop / delete は行 index から引く（ラベル文字列で分岐しない）
+    #[test]
+    fn session_menu_maps_each_row_index_to_its_action() {
+        let kind = session("abc123", false);
+        assert_eq!(
+            kind.action(0),
+            Some(PopupAction::Stop("abc123".to_string()))
+        );
+        assert_eq!(
+            kind.action(1),
+            Some(PopupAction::Delete("abc123".to_string()))
+        );
+        assert_eq!(kind.action(2), None, "項目の無い index は何も起こさない");
+    }
+
+    /// grouping メニューは現在の選択に ● を付け、各行はその grouping を指す
+    #[test]
+    fn group_menu_marks_the_current_grouping_and_maps_each_row_to_it() {
+        assert_eq!(
+            labels(&PopupKind::Group, Grouping::State),
+            ["● state", "  directory"]
+        );
+        assert_eq!(
+            labels(&PopupKind::Group, Grouping::Directory),
+            ["  state", "● directory"]
+        );
+        assert_eq!(
+            PopupKind::Group.action(0),
+            Some(PopupAction::SetGrouping(Grouping::State))
+        );
+        assert_eq!(
+            PopupKind::Group.action(1),
+            Some(PopupAction::SetGrouping(Grouping::Directory))
+        );
+        assert_eq!(PopupKind::Group.action(2), None);
+    }
+
+    /// セッション行の ☰ クリックで stop / delete のメニューが開く（従来の入口）
+    #[test]
+    fn clicking_the_hamburger_opens_the_session_menu() {
+        let mut app = test_app(34, TERM);
+        app.sidebar_rows = vec![Some(RowAction::Open("abc123".to_string()))];
+        app.sidebar_header_rows = 1;
+        handle_mouse(&mut app, &click(0, 1)).unwrap();
+        let popup = app.popup.as_ref().expect("メニューが開いていない");
+        // agents が空 = プロセス無しなので停止済み扱い
+        assert_eq!(popup.kind, session("abc123", true));
+        assert_eq!(labels(&popup.kind, app.grouping), ["stop", "delete"]);
+        assert_eq!(popup.anchor_y, 1, "クリックした行の下に出る");
+    }
+
+    /// ⊞ group 行クリック → メニュー → 別の行を選ぶと grouping が切り替わる。
+    /// クリック判定は描画と同じ popup_rect の座標で行う
+    #[test]
+    fn clicking_the_group_row_and_picking_a_row_switches_grouping() {
+        let mut app = test_app(34, TERM);
+        app.sidebar_rows = vec![Some(RowAction::ToggleGroup)];
+        app.sidebar_header_rows = 1;
+        handle_mouse(&mut app, &click(5, 1)).unwrap();
+        assert_eq!(
+            app.popup.as_ref().map(|p| &p.kind),
+            Some(&PopupKind::Group),
+            "grouping メニューが開いていない"
+        );
+        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+        handle_mouse(&mut app, &click(rect.x + 1, rect.y + 2)).unwrap(); // 2 行目 = directory
+        assert_eq!(app.grouping, Grouping::Directory);
+        assert!(app.popup.is_none(), "実行後は閉じる");
+    }
+
+    /// 選択中の grouping をもう一度選んでも切り替わらない（トグルにならない）
+    #[test]
+    fn picking_the_current_grouping_leaves_it_unchanged() {
+        let mut app = test_app(34, TERM);
+        open(&mut app, PopupKind::Group, 3);
+        activate_popup(&mut app, 0); // ● state
+        assert_eq!(app.grouping, Grouping::State);
+        assert!(app.popup.is_none());
+    }
+
+    /// 保管 0 件でも register current だけのメニューとして成立し、
+    /// 保管があれば一覧が先・register current が末尾に並ぶ
+    #[test]
+    fn account_menu_lists_stored_accounts_before_register_current() {
+        let empty = PopupKind::Account {
+            accounts: Vec::new(),
+        };
+        assert_eq!(labels(&empty, Grouping::State), ["register current"]);
+        let two = PopupKind::Account {
+            accounts: vec![
+                account("ooba · 1→10, Inc.", "id-a"),
+                account("you@example.com", "id-b"),
+            ],
+        };
+        assert_eq!(
+            labels(&two, Grouping::State),
+            ["ooba · 1→10, Inc.", "you@example.com", "register current"]
+        );
+    }
+
+    /// 表示名が同じ項目が並んでも、選んだ行の対象（id）が選ばれる。
+    /// ラベル文字列から対象を復元する実装では区別できない組み合わせ
+    #[test]
+    fn account_menu_picks_the_row_target_even_when_labels_are_identical() {
+        let kind = PopupKind::Account {
+            accounts: vec![account("ooba", "id-personal"), account("ooba", "id-work")],
+        };
+        assert_eq!(
+            labels(&kind, Grouping::State),
+            ["ooba", "ooba", "register current"]
+        );
+        assert_eq!(
+            kind.action(0),
+            Some(PopupAction::Open(PopupKind::AccountActions {
+                account: account("ooba", "id-personal"),
+            }))
+        );
+        assert_eq!(
+            kind.action(1),
+            Some(PopupAction::Open(PopupKind::AccountActions {
+                account: account("ooba", "id-work"),
+            }))
+        );
+        assert_eq!(kind.action(2), Some(PopupAction::RegisterCurrent));
+        assert_eq!(kind.action(3), None);
+    }
+
+    /// 2 階層目は対象アカウントの id を各動作へ持ち込む
+    #[test]
+    fn account_actions_menu_carries_the_account_id_into_each_action() {
+        let kind = PopupKind::AccountActions {
+            account: account("ooba", "id-work"),
+        };
+        assert_eq!(labels(&kind, Grouping::State), ["switch", "unregister"]);
+        assert_eq!(
+            kind.action(0),
+            Some(PopupAction::SwitchAccount("id-work".to_string()))
+        );
+        assert_eq!(
+            kind.action(1),
+            Some(PopupAction::UnregisterAccount("id-work".to_string()))
+        );
+        assert_eq!(kind.action(2), None);
+    }
+
+    /// プロジェクトメニューは対象フォルダを各動作へ持ち込む
+    #[test]
+    fn project_menu_carries_its_folder_into_each_action() {
+        let kind = PopupKind::Project {
+            cwd: "C:\\dev\\shop-app".to_string(),
+        };
+        assert_eq!(
+            labels(&kind, Grouping::State),
+            ["new session", "remove project"]
+        );
+        assert_eq!(
+            kind.action(0),
+            Some(PopupAction::NewSessionIn("C:\\dev\\shop-app".to_string()))
+        );
+        assert_eq!(
+            kind.action(1),
+            Some(PopupAction::RemoveProject("C:\\dev\\shop-app".to_string()))
+        );
+        assert_eq!(kind.action(2), None);
+    }
+
+    /// 一覧の項目を Enter で選ぶと 2 階層目が開き、矩形は 1 階層目の選択行に来る
+    #[test]
+    fn selecting_an_account_opens_the_second_level_at_the_selected_row() {
+        let mut app = test_app(34, TERM);
+        open(
+            &mut app,
+            PopupKind::Account {
+                accounts: vec![account("ooba", "id-a"), account("you@example.com", "id-b")],
+            },
+            5,
+        );
+        handle_popup_key(&mut app, KeyCode::Down); // 2 行目（id-b）を選ぶ
+        let parent = popup_rect(&app, app.popup.as_ref().unwrap());
+        let selected_row = parent.y + 1 + 1; // 上枠 + 選択 index
+        handle_popup_key(&mut app, KeyCode::Enter);
+        let popup = app.popup.as_ref().expect("2 階層目が開いていない");
+        assert_eq!(
+            popup.kind,
+            PopupKind::AccountActions {
+                account: account("you@example.com", "id-b"),
+            }
+        );
+        assert_eq!(popup.selected, 0, "2 階層目の選択は先頭から");
+        assert_eq!(
+            popup_rect(&app, popup).y,
+            selected_row,
+            "2 階層目が親の選択行に寄っていない"
+        );
+    }
+
+    /// Esc は階層を戻らず全部閉じる（戻り先を持たない）。外クリックも同じ
+    #[test]
+    fn esc_and_outside_click_close_every_popup_level() {
+        let mut app = test_app(34, TERM);
+        let accounts = || PopupKind::Account {
+            accounts: vec![account("ooba", "id-a")],
+        };
+        open(&mut app, accounts(), 5);
+        handle_popup_key(&mut app, KeyCode::Enter); // 1 階層目 → 2 階層目
+        assert!(
+            matches!(
+                app.popup.as_ref().map(|p| &p.kind),
+                Some(PopupKind::AccountActions { .. })
+            ),
+            "2 階層目が開いていない"
+        );
+        handle_popup_key(&mut app, KeyCode::Esc);
+        assert!(app.popup.is_none(), "Esc で一覧に戻っている");
+
+        open(&mut app, accounts(), 5);
+        handle_popup_key(&mut app, KeyCode::Enter);
+        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+        handle_mouse(&mut app, &click(rect.right() + 2, rect.bottom() + 2)).unwrap();
+        assert!(app.popup.is_none(), "外クリックで一覧に戻っている");
+    }
+
+    /// ↑↓ は項目数の範囲で止まる（端で溢れない）
+    #[test]
+    fn arrow_keys_clamp_the_selection_to_the_entry_range() {
+        let mut app = test_app(34, TERM);
+        open(
+            &mut app,
+            PopupKind::Account {
+                accounts: vec![account("ooba", "id-a")],
+            },
+            3,
+        );
+        for _ in 0..5 {
+            handle_popup_key(&mut app, KeyCode::Down);
+        }
+        // 一覧 1 件 + register current の 2 項目
+        assert_eq!(app.popup.as_ref().unwrap().selected, 1);
+        for _ in 0..5 {
+            handle_popup_key(&mut app, KeyCode::Up);
+        }
+        assert_eq!(app.popup.as_ref().unwrap().selected, 0);
+    }
+
+    /// 実行できない項目（停止済みの stop）は Enter でも動かず、メニューも閉じない
+    #[test]
+    fn disabled_item_is_not_executed() {
+        let mut app = test_app(34, TERM);
+        open(&mut app, session("s1", true), 3);
+        handle_popup_key(&mut app, KeyCode::Enter);
+        assert!(
+            app.popup.is_some(),
+            "実行できない項目でメニューが閉じている"
+        );
+    }
+
+    /// 枠線クリックは項目を発火しない（上枠が先頭項目に化けない）
+    #[test]
+    fn clicking_the_menu_border_does_not_run_an_item() {
+        let mut app = test_app(34, TERM);
+        open(&mut app, PopupKind::Group, 3);
+        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+        for (col, row) in [
+            (rect.x, rect.y + 1),
+            (rect.x + 1, rect.y),
+            (rect.x + 1, rect.bottom() - 1),
+            (rect.right() - 1, rect.y + 1),
+        ] {
+            handle_mouse(&mut app, &click(col, row)).unwrap();
+            assert!(
+                app.popup.is_some(),
+                "枠 ({col},{row}) のクリックで閉じている"
+            );
+            assert_eq!(
+                app.grouping,
+                Grouping::State,
+                "枠 ({col},{row}) のクリックで項目が発火した"
+            );
+        }
+    }
+
+    /// stop/delete・grouping 切替の幅は従来（14 桁）から動かさない
+    #[test]
+    fn menu_width_keeps_the_static_menus_at_the_previous_size() {
+        assert_eq!(session("s1", false).width(Grouping::State), 14);
+        assert_eq!(PopupKind::Group.width(Grouping::State), 14);
+        assert_eq!(PopupKind::Group.width(Grouping::Directory), 14);
+    }
+
+    /// 幅は最長項目の表示幅から決まる（email やアカウント表示名が切れない）。
+    /// 桁数は文字数ではなく表示幅で数える（全角は 2 桁）
+    #[test]
+    fn menu_width_adapts_to_the_longest_entry() {
+        let long = "very.long.address@example.co.jp";
+        let kind = PopupKind::Account {
+            accounts: vec![account("ooba", "id-a"), account(long, "id-b")],
+        };
+        assert_eq!(
+            kind.width(Grouping::State),
+            long.width() as u16 + POPUP_CHROME
+        );
+        assert!(kind.width(Grouping::State) > PopupKind::Group.width(Grouping::State));
+
+        let wide_label = "大場 · 1→10, Inc.";
+        let wide = PopupKind::Account {
+            accounts: vec![account(wide_label, "id-c")],
+        };
+        assert_eq!(
+            wide.width(Grouping::State),
+            wide_label.width() as u16 + POPUP_CHROME
+        );
+        assert!(
+            wide_label.width() > wide_label.chars().count(),
+            "全角の前提が崩れている"
+        );
+    }
+
+    /// 内容から幅を決めるので、狭いサイドバーでは右ペインに被る。
+    /// 被ることは許容するが、端末の外へは出さない
+    #[test]
+    fn wide_menu_overlaps_the_right_pane_but_keeps_its_left_edge() {
+        let mut app = test_app(12, TERM);
+        open(
+            &mut app,
+            PopupKind::Account {
+                accounts: vec![account("very.long.address@example.co.jp", "id-a")],
+            },
+            3,
+        );
+        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+        assert_eq!(rect.x, 1, "収まる限り左端はサイドバー内の x=1");
+        assert!(
+            rect.right() > app.sidebar_width,
+            "サイドバーに収まってしまっている"
+        );
+        assert!(rect.right() <= TERM.0);
+    }
+
+    /// どのサイドバー幅・端末サイズ・anchor でも矩形は端末内に収まり、潰れない。
+    /// 幅は内容で決まるため「サイドバーより広い」「端末より広い」が起こり得る
+    #[test]
+    fn popup_rect_stays_inside_the_terminal_for_any_sidebar_width() {
+        let kinds = || {
+            vec![
+                session("s1", false),
+                PopupKind::Group,
+                PopupKind::Account {
+                    accounts: (0..30)
+                        .map(|i| {
+                            account(
+                                &format!("very.long.address.number.{i}@example.co.jp"),
+                                &format!("id-{i}"),
+                            )
+                        })
+                        .collect(),
+                },
+            ]
+        };
+        for (term_w, term_h) in [(120u16, 40u16), (80, 24), (52, 8), (14, 5), (1, 1)] {
+            for sidebar_width in [12u16, 26, 34, term_w] {
+                for anchor_y in [0u16, 1, 5, u16::MAX] {
+                    for kind in kinds() {
+                        let mut app = test_app(sidebar_width, (term_w, term_h));
+                        open(&mut app, kind, anchor_y);
+                        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+                        assert!(
+                            rect.right() <= term_w.max(1) && rect.bottom() <= term_h.max(1),
+                            "端末 {term_w}x{term_h} / sidebar {sidebar_width} / anchor {anchor_y} で矩形 {rect:?} が外へ出る"
+                        );
+                        assert!(
+                            rect.width >= 1 && rect.height >= 1,
+                            "矩形 {rect:?} が潰れている"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// サイドバー幅より広いメニューは幅変更のつかみ代（境界線の列）に被る。
+    /// その列のクリックは項目の実行で、幅変更ドラッグにはならない
+    #[test]
+    fn clicking_a_menu_row_over_the_resize_border_does_not_start_a_drag() {
+        let mut app = test_app(12, TERM);
+        open(
+            &mut app,
+            PopupKind::Account {
+                accounts: vec![account("very.long.address@example.co.jp", "id-a")],
+            },
+            3,
+        );
+        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+        assert!(
+            rect.right() > app.sidebar_width,
+            "境界線に被っている前提が崩れている"
+        );
+        let border_col = app.sidebar_width;
+        handle_mouse(&mut app, &click(border_col, rect.y + 1)).unwrap();
+        assert!(!app.dragging, "幅変更ドラッグが始まっている");
+        assert_eq!(app.sidebar_width, 12, "サイドバー幅が動いている");
+        assert!(
+            matches!(
+                app.popup.as_ref().map(|p| &p.kind),
+                Some(PopupKind::AccountActions { .. })
+            ),
+            "被った列の項目が実行されていない"
+        );
+    }
 }
