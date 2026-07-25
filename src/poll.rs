@@ -90,6 +90,17 @@ pub(crate) fn demo_jobs() -> Vec<BgJob> {
         .collect()
 }
 
+/// スクリーンショット撮影用の架空フッター（--demo）。実アカウントを出さない。
+/// demo ではフッターのポーラーを起動しないので、これが最終値になる
+/// （`latest` が None なので更新ボタン行は出ず、`current` は描画に現れない）
+pub(crate) fn demo_footer() -> FooterInfo {
+    FooterInfo {
+        account: AccountStatus::LoggedIn("you · Acme, Inc.".to_string()),
+        current: String::new(),
+        latest: None,
+    }
+}
+
 /// 使用率（5h/7d 枠）の表示用データ。statusline フックが書いた
 /// ~/.ccdesk/usage.json（公式 statusline JSON の rate_limits 由来）を読む
 #[derive(Clone, Copy, PartialEq)]
@@ -159,9 +170,8 @@ pub(crate) struct FooterInfo {
 ///
 /// 組織名は「実在の Team/Enterprise 組織のときだけ」出す。個人アカウントでも
 /// orgName は空にならず `"<email>'s Organization"` という email 由来の自動生成名が
-/// 返るため（実測値）、email と同じ情報しか持たないそれは出さない。
-/// 判定材料は組織名の形（email 由来か）と `subscriptionType`（個人プランか）の
-/// 2 つ。詳細は [`is_personal_org`]。
+/// 返るため（実測値）、email と同じ情報しか持たないそれは出さない。落とすのは
+/// 「組織名自体が自動生成の形をしている」ときだけ。詳細は [`is_personal_org`]。
 ///
 /// 判定は終了コードを見ない: 未ログインは **exit 1 + 正当な JSON**（実測）なので、
 /// 「JSON が読めたか」「loggedIn があるか」だけで決める
@@ -177,7 +187,10 @@ fn parse_account(auth_json: &str, profile: Option<(&str, &str)>) -> AccountStatu
     let str_of = |key: &str| v.get(key).and_then(|s| s.as_str()).filter(|s| !s.is_empty());
     let email = str_of("email").unwrap_or_default();
     let name = profile
-        .filter(|(profile_email, _)| *profile_email == email) // 古いプロフィールは使わない
+        // 古いプロフィールは使わない。email が空同士の「一致」も認めない
+        // （email を返さない認証方式 + emailAddress が空の `.claude.json` で、
+        //   無関係な displayName を採用してしまう）
+        .filter(|(profile_email, _)| !email.is_empty() && *profile_email == email)
         .map(|(_, display_name)| display_name)
         .filter(|s| !s.is_empty())
         .or_else(|| email.split('@').next().filter(|s| !s.is_empty()));
@@ -194,32 +207,45 @@ fn parse_account(auth_json: &str, profile: Option<(&str, &str)>) -> AccountStatu
     AccountStatus::LoggedIn(label)
 }
 
-/// 個人アカウントに自動で付く組織名か。次の **どちらか**が成り立てば落とす:
+/// 個人アカウントに自動で付く組織名か。
+///
+/// **不変条件: 組織名それ自体が email 以上の情報を持たないときだけ落とす。**
+/// どちらの規則も「自動生成名の形をしているか」を必ず経由するので、`Acme, Inc.`
+/// のような実在の名前はどの入力でも隠れない。誤りの向きとして、余計な組織名を
+/// 1 行出すより情報を消す方が悪い。
+///
+/// 次の **どちらか**が成り立てば落とす:
 ///
 /// 1. **email 前方一致**: 実測では個人アカウントの orgName は
-///    `"<email>'s Organization"`。接尾辞の表記揺れに耐えるため前方一致で判定する。
+///    `"<email>'s Organization"`。接尾辞の表記揺れに耐えるため前方一致で判定する
+///    （大小文字は無視する。email と orgName の表記差で漏らさないため）。
 ///    組織名が利用者本人の email で始まるなら、既に出している email 以上の
 ///    情報を持たないので出す価値が無い
-/// 2. **`subscriptionType` が既知の個人プラン**: 個人プランに実在の
-///    Team/Enterprise 組織は無いので、組織名の形に依らず落とせる
-///    （email 由来でない自動生成名になった場合も 1 の網から漏らさない）
+/// 2. **自動生成名の形 + 既知の個人プラン**: `"…'s Organization"` のように
+///    自動生成名の形をしていて、かつ `subscriptionType` が既知の個人プラン。
+///    個人プランに実在の Team/Enterprise 組織は無いので、email 由来でない
+///    自動生成名（表示名由来・大小文字違い）も落とせる
 ///
-/// 2 は「既知の個人プラン値の**ホワイトリスト**」であって、team 系の値を並べた
+/// 2 の個人プランは「既知の値の**ホワイトリスト**」であって、team 系の値を並べた
 /// ブラックリストではない。ブラックリストにすると、未知の値（将来のプラン名や
-/// 別表記）を個人扱いして **実在の Team/Enterprise 組織名を隠してしまう**——
-/// 誤りの向きとして、余計な組織名を 1 行出すより情報を消す方が悪い。
-/// 手元にあるのは個人 Max のアカウントだけで、Team/Enterprise の
-/// `subscriptionType` の値は**実機で未確認**なので推測で書かない。よって未知・
-/// 不在の値は 1 の判定だけに委ね、それ単独では組織名を落とさない。
-///
-/// email も個人プラン値も取れない出力では判定できないので false（= 出す）に倒す
+/// 別表記）を個人扱いすることになる。手元にあるのは個人 Max のアカウントだけで、
+/// Team/Enterprise の `subscriptionType` の値は**実機で未確認**なので推測で
+/// 書かない。加えて `subscriptionType` が選択中の組織由来か利用者由来かも
+/// 未確認なので、プラン単独では落とさず組織名の形も必ず見る
 fn is_personal_org(org: &str, email: &str, subscription_type: Option<&str>) -> bool {
     /// 個人プランの `subscriptionType`。`"max"` は実測値、`"free"` / `"pro"` は
     /// 公表されている個人プラン名。Team/Enterprise の値は未確認なので載せない
     const PERSONAL_PLANS: [&str; 3] = ["free", "pro", "max"];
 
-    let email_derived = !email.is_empty() && org.starts_with(email);
-    let personal_plan = subscription_type.is_some_and(|t| PERSONAL_PLANS.contains(&t));
+    let email_derived = !email.is_empty()
+        && org
+            .to_ascii_lowercase()
+            .starts_with(&email.to_ascii_lowercase());
+    // 自動生成名の形（実測は "<email>'s Organization"）。email 由来でない
+    // 変種を規則 2 で拾うための条件
+    let auto_shaped = org.contains("'s Organization") || org.ends_with("Organization");
+    let personal_plan =
+        auto_shaped && subscription_type.is_some_and(|t| PERSONAL_PLANS.contains(&t));
     email_derived || personal_plan
 }
 
@@ -238,6 +264,9 @@ fn out(cmd: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&o.stdout).to_string())
 }
 
+/// ファイルの (mtime, サイズ)。読めない・存在しないときは None
+type AuthFp = Option<(std::time::SystemTime, u64)>;
+
 /// ログイン状態が変わったことを示す安価な signal: 認証情報ファイルの (mtime, サイズ)。
 /// ログイン・ログアウト・トークン更新で書き換わるので、これを見て初めて
 /// `claude auth status --json`（1 回 ~350ms のプロセス起動）を叩く。
@@ -245,38 +274,69 @@ fn out(cmd: &str, args: &[&str]) -> Option<String> {
 /// `.claude.json` は 100KB 超で claude の通常動作でも常時書き換わるため signal に
 /// 使えない。認証情報が OS の資格情報マネージャ側にある環境ではこの関数は常に
 /// None を返すので、その場合は周期フォールバックだけが効く
-fn auth_fingerprint() -> Option<(std::time::SystemTime, u64)> {
+fn auth_fingerprint() -> AuthFp {
     file_fingerprint(ccdesk::claude_dir()?.join(".credentials.json"))
 }
 
 /// ファイルの (mtime, サイズ)。存在しない・読めないときは None。
 /// 「消えた」も None への変化として検出できる
-fn file_fingerprint(path: impl AsRef<std::path::Path>) -> Option<(std::time::SystemTime, u64)> {
+fn file_fingerprint(path: impl AsRef<std::path::Path>) -> AuthFp {
     let md = std::fs::metadata(path).ok()?;
     Some((md.modified().ok()?, md.len()))
 }
 
-/// アカウント行の取得。表示名は `.claude.json` から best-effort で補完する
-/// （`ccdesk doctor` も同じ経路で「今どう表示されるか」を出す）
-pub(crate) fn fetch_account() -> AccountStatus {
-    // (emailAddress, displayName) を組で取る。email は「このプロフィールが今の
-    // アカウントのものか」の照合に使う（parse_account 参照）
-    let profile: Option<(String, String)> = ccdesk::claude_json_path()
+/// `.claude.json` の `oauthAccount` から (emailAddress, displayName) を読む。
+/// email は「このプロフィールが今のアカウントのものか」の照合に使う
+/// （[`parse_account`] 参照）。
+///
+/// このファイルは 100KB 超で全 claude セッションが常時書き換えるため、読み取りは
+/// 普通に失敗しうる（書き換え途中のパース失敗、Windows では共有モードの都合で
+/// open 自体の失敗）
+fn read_profile() -> Option<(String, String)> {
+    let v = ccdesk::claude_json_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| {
-            let s = |key: &str| {
-                v.pointer(&format!("/oauthAccount/{key}"))
-                    .and_then(|x| x.as_str())
-                    .map(str::to_string)
-            };
-            Some((s("emailAddress")?, s("displayName")?))
-        });
-    let profile = profile.as_ref().map(|(e, d)| (e.as_str(), d.as_str()));
-    match out("claude", &["auth", "status", "--json"]) {
-        Some(json) => parse_account(&json, profile),
-        None => AccountStatus::Unknown,
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())?;
+    let s = |key: &str| {
+        v.pointer(&format!("/oauthAccount/{key}"))
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+    };
+    Some((s("emailAddress")?, s("displayName")?))
+}
+
+/// アカウント行の取得。最後に読めたプロフィールを持ち越す。
+///
+/// `.claude.json` の一時的な読み取り失敗でプロフィールが落ちると、表示名は email
+/// ローカル部へ退化する（`alice` → `taro`）。これは `Unknown` ではなく `LoggedIn`
+/// なので「Unknown では上書きしない」規則では守れず、ラベルが 2 周期のあいだ
+/// 目に見えて揺れる。前回読めた値を使い回して防ぐ。
+/// 採否の判断は [`parse_account`] の email 照合に委ねるので、別アカウントへ
+/// 再ログインした後に古いプロフィールが使われることはない
+#[derive(Default)]
+struct AccountFetcher {
+    last_profile: Option<(String, String)>,
+}
+
+impl AccountFetcher {
+    fn fetch(&mut self) -> AccountStatus {
+        if let Some(profile) = read_profile() {
+            self.last_profile = Some(profile);
+        }
+        let profile = self
+            .last_profile
+            .as_ref()
+            .map(|(email, display_name)| (email.as_str(), display_name.as_str()));
+        match out("claude", &["auth", "status", "--json"]) {
+            Some(json) => parse_account(&json, profile),
+            None => AccountStatus::Unknown,
+        }
     }
+}
+
+/// アカウント行の 1 回取得（`ccdesk doctor` 用。ポーラーと同じ経路で
+/// 「今どう表示されるか」を出す）
+pub(crate) fn fetch_account() -> AccountStatus {
+    AccountFetcher::default().fetch()
 }
 
 /// 現行バージョンと、それより新しい配布版があれば その版番号。
@@ -307,6 +367,69 @@ const ACCOUNT_FALLBACK_SECS: u64 = 60;
 /// バージョンチェックの周期（秒）。外部ネットワークへ出るので頻繁には回さない
 const VERSION_INTERVAL_SECS: u64 = 3600;
 
+/// 取得した値を表示へ反映するか。反映しないなら None。
+///
+/// - `Unknown`（取得失敗）は既存表示を上書きしない。一時的な失敗でアカウント行が
+///   消えたり "not logged in" に化けたりしないため
+/// - `LoggedOut` は上書きする（ログアウトを反映しないと嘘の表示になる）
+/// - 同値なら None（無駄な再描画をしない）
+fn next_account(shown: &AccountStatus, fetched: AccountStatus) -> Option<AccountStatus> {
+    if fetched == AccountStatus::Unknown || *shown == fetched {
+        return None;
+    }
+    Some(fetched)
+}
+
+/// 再取得の契機があるか。`changed` は監視対象の変化（認証ファイルの書き換え）、
+/// `forced` は明示要求（`claude update` 完了時など）。どちらも無ければ周期待ち
+fn refetch_due(age: u64, interval: u64, changed: bool, forced: bool) -> bool {
+    age >= interval || changed || forced
+}
+
+/// アカウントポーリングの持ち越し状態
+struct AccountPollState {
+    /// 前回 **取得の前に** 観測した認証ファイルの fingerprint
+    last_fp: AuthFp,
+    /// 最後の取得からの経過秒
+    age: u64,
+}
+
+impl AccountPollState {
+    /// 起動直後は 1 度取得する（認証ファイルが無い環境では fingerprint が
+    /// 変化せず、周期フォールバックまでアカウント行が出ないため）
+    fn new() -> Self {
+        Self {
+            last_fp: None,
+            age: u64::MAX / 2,
+        }
+    }
+}
+
+/// アカウント 1 周分の判定。表示を差し替えるなら新しい値を返す。
+/// IO を引数（`read_fp` / `fetch`）で受けるので単体テストできる。
+///
+/// **fingerprint は取得の前に読んで `last_fp` に残す。** 取得後に読み直すと、
+/// 取得中（子プロセスが認証情報を読んだ後）に入ったログインが「もう反映済み」に
+/// 見えて次の周で拾えず、古い表示が周期フォールバック（60s）まで残る。
+/// `claude auth status` 自身は認証ファイルを書き換えない（実行前後で mtime・
+/// サイズが同一と実測）ので、取得起因の空振りは起きない
+fn account_step(
+    state: &mut AccountPollState,
+    shown: &AccountStatus,
+    forced: bool,
+    read_fp: impl Fn() -> AuthFp,
+    fetch: impl FnOnce() -> AccountStatus,
+) -> Option<AccountStatus> {
+    let fp = read_fp();
+    let auth_changed = fp != state.last_fp;
+    state.last_fp = fp;
+    if !refetch_due(state.age, ACCOUNT_FALLBACK_SECS, auth_changed, forced) {
+        return None;
+    }
+    state.age = 0;
+    next_account(shown, fetch())
+}
+
 /// フッター情報のバックグラウンド取得。
 /// アカウントとバージョンは変化の速さが違うので別々の周期で回す:
 /// - アカウント: 認証ファイルの変化で即時 + 60s フォールバック
@@ -318,43 +441,41 @@ pub(crate) fn spawn_footer_poller(
     refresh: Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        let mut account_age = u64::MAX / 2; // 初回は即取得
-        let mut version_age = u64::MAX / 2;
-        let mut last_fp = auth_fingerprint();
+        let mut account = AccountPollState::new();
+        let mut fetcher = AccountFetcher::default();
+        // 共有側へ最後に書いたアカウント。書き手はこのスレッドだけなので、
+        // 毎秒ロックを取らずに手元の写しと比べられる
+        let mut shown = AccountStatus::default();
+        let mut version_age = u64::MAX / 2; // 初回は即取得
         loop {
             let forced = refresh.swap(false, std::sync::atomic::Ordering::Relaxed);
-            let fp = auth_fingerprint();
-            let auth_changed = fp != last_fp;
-            last_fp = fp;
             let mut updated = false;
 
-            if account_age >= ACCOUNT_FALLBACK_SECS || auth_changed || forced {
-                account_age = 0;
-                let account = fetch_account();
-                // 取得に失敗した（Unknown）ときは既存表示を残す。一時的な失敗で
-                // アカウント行が消えたり "not logged in" に化けたりしないため
-                let mut guard = shared
+            if let Some(next) = account_step(&mut account, &shown, forced, auth_fingerprint, || {
+                fetcher.fetch()
+            }) {
+                shown = next.clone();
+                shared
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if account != AccountStatus::Unknown && guard.account != account {
-                    guard.account = account;
-                    updated = true;
-                }
-                drop(guard);
-                // 取得中に状態が変わっていたら次のループで拾い直す
-                last_fp = auth_fingerprint();
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .account = next;
+                updated = true;
             }
 
-            if version_age >= VERSION_INTERVAL_SECS || forced {
+            if refetch_due(version_age, VERSION_INTERVAL_SECS, false, forced) {
                 version_age = 0;
                 let (current, latest) = fetch_version();
-                let mut guard = shared
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if guard.current != current || guard.latest != latest {
-                    guard.current = current;
-                    guard.latest = latest;
-                    updated = true;
+                // 取得に失敗した（current が空）ときは書かない。1 回の失敗で
+                // バージョン表記と更新ボタン行が 1 時間消えるのを防ぐ
+                if !current.is_empty() {
+                    let mut guard = shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if guard.current != current || guard.latest != latest {
+                        guard.current = current;
+                        guard.latest = latest;
+                        updated = true;
+                    }
                 }
             }
 
@@ -362,7 +483,7 @@ pub(crate) fn spawn_footer_poller(
                 dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             std::thread::sleep(Duration::from_secs(1));
-            account_age += 1;
+            account.age += 1;
             version_age += 1;
         }
     });
@@ -512,6 +633,11 @@ mod tests {
         v.to_string()
     }
 
+    /// テスト用の fingerprint。値そのものに意味は無く「変わったか」だけを見る
+    fn fp_of(size: u64) -> AuthFp {
+        Some((std::time::UNIX_EPOCH, size))
+    }
+
     /// スコープを抜けるときに必ずファイルを消す番人。アサート失敗で
     /// パニックしても Drop は走るので、一時ファイルを残さない
     struct TempFile(std::path::PathBuf);
@@ -563,6 +689,16 @@ mod tests {
         }
     }
 
+    /// 規則 1 は大小文字を無視する。email と orgName の表記差で
+    /// 自動生成名を漏らさない
+    #[test]
+    fn suppresses_email_derived_org_name_ignoring_case() {
+        assert_eq!(
+            parse_account(&auth_json("TARO@EXAMPLE.COM's Organization", None), None),
+            AccountStatus::LoggedIn("taro".into())
+        );
+    }
+
     /// 実在の組織名は出す。プランが分からない出力（`subscriptionType` 不在）では
     /// 規則 1 しか効かず、email 由来でない組織名は情報として残す
     #[test]
@@ -573,20 +709,39 @@ mod tests {
         );
     }
 
-    /// 規則 2: 既知の個人プランなら、組織名が email 由来に見えなくても落とす
-    /// （個人アカウントに実在の Team/Enterprise 組織は無い）
+    /// 不変条件: 個人プランでも、組織名自体が情報を持つなら隠さない。
+    /// `subscriptionType` が選択中の組織由来か利用者由来かは未確認なので、
+    /// プランだけを根拠に実在の組織名を消してはいけない
     #[test]
-    fn suppresses_real_looking_org_name_on_personal_plan() {
+    fn keeps_real_org_name_on_personal_plan() {
         for plan in ["free", "pro", "max"] {
             assert_eq!(
                 parse_account(&auth_json("Acme, Inc.", Some(plan)), None),
-                AccountStatus::LoggedIn("taro".into()),
+                AccountStatus::LoggedIn("taro · Acme, Inc.".into()),
                 "plan: {plan:?}"
             );
         }
     }
 
-    /// ホワイトリストの要: 未知の `subscriptionType` は単独では落とさない。
+    /// 規則 2: 自動生成名の形 + 既知の個人プランなら、email 由来でなくても落とす
+    /// （表示名由来の変種を規則 1 の網から漏らさない）
+    #[test]
+    fn suppresses_auto_shaped_org_name_on_personal_plan() {
+        for plan in ["free", "pro", "max"] {
+            assert_eq!(
+                parse_account(&auth_json("Alice's Organization", Some(plan)), None),
+                AccountStatus::LoggedIn("taro".into()),
+                "plan: {plan:?}"
+            );
+        }
+        // 規則 2 は 2 条件が揃って初めて効く。プランが分からなければ落とさない
+        assert_eq!(
+            parse_account(&auth_json("Alice's Organization", None), None),
+            AccountStatus::LoggedIn("taro · Alice's Organization".into())
+        );
+    }
+
+    /// ホワイトリストの要: 未知の `subscriptionType` は落とす根拠にしない。
     /// 落としてしまうと実在の Team/Enterprise 組織名を隠すことになる
     /// （Team/Enterprise 側の値は実機で未確認なので、未知として扱われる）
     #[test]
@@ -624,6 +779,19 @@ mod tests {
         );
     }
 
+    /// email を返さない認証方式 + emailAddress が空のプロフィール。
+    /// 空同士を「一致」と見なして無関係な displayName を採用してはいけない
+    #[test]
+    fn ignores_profile_when_email_is_empty() {
+        assert_eq!(
+            parse_account(
+                r#"{"loggedIn": true, "authMethod": "claude.ai"}"#,
+                Some(("", "alice"))
+            ),
+            AccountStatus::LoggedIn("claude.ai".into())
+        );
+    }
+
     #[test]
     fn treats_logged_out_output_as_logged_out() {
         assert_eq!(
@@ -644,10 +812,13 @@ mod tests {
         }
     }
 
+    /// 空の orgName は「無い」ものとして扱う（`"taro · "` にしない）。
+    /// プラン不在の出力を使う: 個人プランの出力だと組織名が別の規則でも落ちるため、
+    /// 空文字フィルタが効いているかを固定できない
     #[test]
     fn falls_back_to_email_local_part_when_org_name_is_empty() {
         assert_eq!(
-            parse_account(&PERSONAL.replace(PERSONAL_ORG, ""), None),
+            parse_account(&auth_json("", None), None),
             AccountStatus::LoggedIn("taro".into())
         );
     }
@@ -694,6 +865,88 @@ mod tests {
         assert_eq!(
             parse_account(r#"{"loggedIn": true}"#, None),
             AccountStatus::LoggedIn("logged in".into())
+        );
+    }
+
+    /// 取得失敗（Unknown）で既存表示を消さない。一時的な失敗でアカウント行が
+    /// 消えたり "not logged in" に化けたりしないため
+    #[test]
+    fn unknown_does_not_overwrite_known_account() {
+        let shown = AccountStatus::LoggedIn("taro".into());
+        assert_eq!(next_account(&shown, AccountStatus::Unknown), None);
+    }
+
+    /// 起動直後の失敗も同じ扱い（Unknown のまま = 行を出さない）
+    #[test]
+    fn unknown_on_the_first_cycle_leaves_state_unknown() {
+        assert_eq!(
+            next_account(&AccountStatus::Unknown, AccountStatus::Unknown),
+            None
+        );
+    }
+
+    /// ログアウトは反映しないと嘘の表示になるので上書きする
+    #[test]
+    fn logged_out_overwrites_known_account() {
+        let shown = AccountStatus::LoggedIn("taro".into());
+        assert_eq!(
+            next_account(&shown, AccountStatus::LoggedOut),
+            Some(AccountStatus::LoggedOut)
+        );
+    }
+
+    /// 同値なら再描画しない
+    #[test]
+    fn identical_account_produces_no_update() {
+        let shown = AccountStatus::LoggedIn("taro".into());
+        assert_eq!(next_account(&shown, shown.clone()), None);
+    }
+
+    #[test]
+    fn refetch_is_due_on_age_change_or_force() {
+        const FALLBACK: u64 = ACCOUNT_FALLBACK_SECS;
+        assert!(
+            refetch_due(FALLBACK, FALLBACK, false, false),
+            "周期フォールバック"
+        );
+        assert!(refetch_due(0, FALLBACK, true, false), "認証ファイルの変化");
+        assert!(refetch_due(0, FALLBACK, false, true), "明示要求");
+        assert!(
+            !refetch_due(FALLBACK - 1, FALLBACK, false, false),
+            "契機が無い"
+        );
+    }
+
+    /// 取得中（子プロセスが認証情報を読んだ後）にログインが入るケース。
+    /// fingerprint を取得の **前に** 記録するので、次の周で変化として拾える。
+    /// 取得後に読み直すと「もう反映済み」に見えて古い表示が 60s 残る
+    #[test]
+    fn login_during_fetch_is_picked_up_on_the_next_cycle() {
+        let fp = std::cell::Cell::new(fp_of(1));
+        let mut state = AccountPollState::new();
+        let old = AccountStatus::LoggedIn("taro".into());
+        let new = AccountStatus::LoggedIn("hanako".into());
+
+        // 1 周目: 取得中に認証ファイルが書き換わる。子プロセスは変更前の
+        // 認証情報を読んでいるので、古いアカウントが返る
+        let first = account_step(
+            &mut state,
+            &AccountStatus::Unknown,
+            false,
+            || fp.get(),
+            || {
+                fp.set(fp_of(2));
+                old.clone()
+            },
+        );
+        assert_eq!(first, Some(old.clone()));
+
+        // 2 周目: age は 0 に戻っているので、fingerprint の変化だけが契機になる
+        let second = account_step(&mut state, &old, false, || fp.get(), || new.clone());
+        assert_eq!(
+            second,
+            Some(new),
+            "取得中に入ったログインを次の周で拾えていない"
         );
     }
 }
