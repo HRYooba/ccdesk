@@ -147,7 +147,17 @@ pub(crate) enum BrowseRow {
 /// 新規セッション画面（フォルダブラウザ + プロンプト入力）
 pub(crate) struct NewState {
     pub(crate) cur_dir: String,
-    /// 起動ボタン + ".." + サブディレクトリ（隠しフォルダ含む）
+    /// 一覧に効いている前方一致フィルタ（Folder 欄の打鍵途中の断片。小文字化済み。
+    /// 空 = 絞り込み無し）。
+    ///
+    /// `entries` は `(cur_dir, filter)` から決まるので、この 2 つが一覧の唯一の入力に
+    /// なる。フィルタを状態として持たないと「一覧が絞り込みで縮んでいる」ことを
+    /// 判別できず、Folder 欄が `cur_dir` と一致した時点で一覧の作り直しが
+    /// 要るのかどうかが分からない
+    filter: String,
+    /// `(cur_dir, filter)` から作った表示行。起動ボタン + ".." + サブディレクトリ
+    /// （隠しフォルダ含む）を、フィルタが空でなければ前方一致で絞ったもの。
+    /// 作り直しは [`NewState::rebuild`] だけが行う
     pub(crate) entries: Vec<BrowseRow>,
     pub(crate) dir_idx: usize,
     pub(crate) scroll: usize, // 表示ウィンドウ先頭（draw で更新）
@@ -172,6 +182,7 @@ impl NewState {
         path.set_text(dir);
         Self {
             cur_dir: dir.to_string(),
+            filter: String::new(),
             entries: Self::list_entries(dir),
             dir_idx: 0,
             scroll: 0,
@@ -184,10 +195,55 @@ impl NewState {
     }
 
     pub(crate) fn set_dir(&mut self, dir: String) {
+        self.rebuild(dir, String::new());
+        let cur = self.cur_dir.clone();
+        self.path.set_text(&cur);
+    }
+
+    /// `(dir, filter)` から一覧を作り直す。`entries` に触るのはここだけ。
+    /// `filter` が空でなければサブフォルダを前方一致で絞る（起動ボタンは常設なので
+    /// 残し、".." は絞り込み中は落とす）
+    fn rebuild(&mut self, dir: String, filter: String) {
         self.cur_dir = dir;
-        self.path.set_text(&self.cur_dir);
+        self.filter = filter;
         self.entries = Self::list_entries(&self.cur_dir);
-        self.reset_selection(0);
+        if !self.filter.is_empty() {
+            let frag = self.filter.clone();
+            self.entries.retain(|row| match row {
+                BrowseRow::Launch => true, // 起動ボタンはフィルタで消さない
+                BrowseRow::Parent => false,
+                BrowseRow::Dir(n) => n.to_lowercase().starts_with(&frag),
+            });
+        }
+        // 断片を打鍵中は最初の一致フォルダを選ぶ。index 0 は常設の起動ボタン
+        // なので 0 のままにすると、絞り込んだ直後の → / Enter が何も起こらない
+        let idx = if self.filter.is_empty() {
+            0
+        } else {
+            self.entries
+                .iter()
+                .position(|row| matches!(row, BrowseRow::Dir(_)))
+                .unwrap_or(0)
+        };
+        self.reset_selection(idx);
+    }
+
+    /// 一覧の入力 `(dir, filter)` が変わったときだけ作り直す。
+    /// 変わっていなければ選択・スクロールを保つ（Folder 欄での ←→ など、
+    /// 一覧に影響しない打鍵で選択を既定へ飛ばさない）
+    fn rebuild_if_changed(&mut self, dir: String, filter: String) {
+        if dir != self.cur_dir || filter != self.filter {
+            self.rebuild(dir, filter);
+        }
+    }
+
+    /// Folder 欄の編集を取り消して現在のフォルダへ戻す（Esc）。テキストだけ戻すと
+    /// 「有効なディレクトリを表示しているのに一覧は絞り込み後」の食い違いが残るので、
+    /// 一覧の絞り込みもここで解除する
+    pub(crate) fn cancel_path_edit(&mut self) {
+        let cur = self.cur_dir.clone();
+        self.path.set_text(&cur);
+        self.rebuild_if_changed(cur, String::new());
     }
 
     /// 一覧を作り直したときの選択リセット。`selection_from_rebuild` の立て忘れを
@@ -324,21 +380,22 @@ impl NewState {
     }
 
     /// Folder 欄の変化に一覧をリアルタイム追従させる（テキスト・カーソルは触らない）。
-    /// - 全体が実在パス → そのフォルダの一覧
+    /// - 全体が実在パス → そのフォルダの一覧（絞り込み無し）
     /// - 入力途中 → 最後の区切りまでを親フォルダとして開き、残りの断片で前方一致フィルタ
     /// - どちらでもなく末尾に実在パスが埋まっている（D&D がキー入力として既存テキストへ
     ///   挿入されたケース）→ パスごと置き換える
+    ///
+    /// やることはテキストから一覧の入力 `(dir, filter)` を決めることだけで、
+    /// 作り直すかどうかの判断は [`NewState::rebuild_if_changed`] に任せる。
+    /// 判断材料をフォルダだけにすると、Folder 欄が `cur_dir` と一致した時点で
+    /// 「絞り込み中だから作り直しが要る」ケースを取りこぼす
     pub(crate) fn refresh_from_input(&mut self) {
         let t = self.path.text.trim().trim_matches('"').to_string();
         if t.is_empty() {
             return;
         }
         if std::path::Path::new(&t).is_dir() {
-            if t != self.cur_dir {
-                self.cur_dir = t;
-                self.entries = Self::list_entries(&self.cur_dir);
-                self.reset_selection(0);
-            }
+            self.rebuild_if_changed(t, String::new());
             return;
         }
         if let Some(sep) = t.rfind(['\\', '/']) {
@@ -353,25 +410,7 @@ impl NewState {
                 trimmed
             };
             if std::path::Path::new(parent).is_dir() {
-                let frag = frag.to_lowercase();
-                self.cur_dir = parent.to_string();
-                self.entries = Self::list_entries(parent);
-                self.entries.retain(|row| match row {
-                    BrowseRow::Launch => true, // 起動ボタンはフィルタで消さない
-                    BrowseRow::Parent => frag.is_empty(),
-                    BrowseRow::Dir(n) => n.to_lowercase().starts_with(&frag),
-                });
-                // 断片を打鍵中は最初の一致フォルダを選ぶ。index 0 は常設の起動ボタン
-                // なので 0 のままにすると、絞り込んだ直後の → / Enter が何も起こらない
-                let idx = if frag.is_empty() {
-                    0
-                } else {
-                    self.entries
-                        .iter()
-                        .position(|row| matches!(row, BrowseRow::Dir(_)))
-                        .unwrap_or(0)
-                };
-                self.reset_selection(idx);
+                self.rebuild_if_changed(parent.to_string(), frag.to_lowercase());
                 return;
             }
         }
@@ -405,9 +444,8 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
         KeyCode::Esc => {
             match state.focus {
                 NewFocus::Path => {
-                    // 編集を破棄して現在のフォルダに戻す
-                    let cur = state.cur_dir.clone();
-                    state.path.set_text(&cur);
+                    // 編集を破棄して現在のフォルダに戻す（一覧の絞り込みも解除する）
+                    state.cancel_path_edit();
                     state.focus = NewFocus::Prompt;
                 }
                 _ if !app.sessions.is_empty() => {
@@ -1183,6 +1221,138 @@ mod tests {
             text.contains("no matching folders"),
             "0 件の理由が描画されていない: {text:?}"
         );
+    }
+
+    /// 絞り込み中に Folder 欄が `cur_dir` と完全一致まで戻ったら、一覧も
+    /// `cur_dir` 直下の全フォルダへ戻る（Issue #1）。
+    /// 旧実装は `t != cur_dir` だけを再構築の条件にしていたため、
+    /// 「一覧が絞り込みで縮んでいる」状態を区別できず一覧が古いまま残っていた
+    #[test]
+    fn clears_the_filter_when_input_returns_to_cur_dir() {
+        let tmp = TempDir::new("filter-back-to-cur-dir");
+        let root = tmp.path().to_string_lossy().to_string();
+        let mut state = NewState::browse(&root);
+
+        // 一致フォルダの無い断片で絞り込む: cur_dir は root のまま、一覧は起動ボタンだけ
+        state.path.set_text(&format!("{root}\\zzz"));
+        state.refresh_from_input();
+        assert_eq!(state.cur_dir, root);
+        assert_eq!(state.entries, vec![BrowseRow::Launch]);
+
+        // テキストが cur_dir と完全一致まで戻った = 絞り込み解除
+        state.path.set_text(&root);
+        state.refresh_from_input();
+        assert_eq!(
+            state.entries,
+            vec![
+                BrowseRow::Launch,
+                BrowseRow::Parent,
+                BrowseRow::Dir("sub_a".into()),
+                BrowseRow::Dir("sub_b".into()),
+            ],
+            "cur_dir と一致しているのに一覧が絞り込み後のまま"
+        );
+        assert!(!state.no_folder_rows());
+    }
+
+    /// Issue #1 の再現手順そのまま: `X\zzz` の `\zzz` を Delete で 1 文字ずつ消す。
+    /// 途中のテキスト（`Xzzz` 等）がどの分岐に入るかに依らず、`X` へ戻った時点で
+    /// X 直下のサブフォルダ一覧が出ていること
+    #[test]
+    fn restores_listing_while_deleting_the_fragment_char_by_char() {
+        let tmp = TempDir::new("filter-delete-keys");
+        let root = tmp.path().to_string_lossy().to_string();
+        let mut state = NewState::browse(&root);
+
+        state.path.set_text(&format!("{root}\\zzz"));
+        state.refresh_from_input();
+        // カーソルを X の直後（= 区切り文字の手前）へ置き、"\zzz" を Delete で消す
+        state.path.cursor = root.chars().count();
+        for _ in 0..4 {
+            state.path.delete();
+            state.refresh_from_input();
+        }
+
+        assert_eq!(state.path.text, root);
+        assert_eq!(state.cur_dir, root);
+        assert_eq!(
+            state.entries,
+            vec![
+                BrowseRow::Launch,
+                BrowseRow::Parent,
+                BrowseRow::Dir("sub_a".into()),
+                BrowseRow::Dir("sub_b".into()),
+            ]
+        );
+    }
+
+    /// 一覧は常に `(cur_dir, filter)` の関数であること。この不変条件が保たれている限り
+    /// 「テキストは有効なディレクトリなのに一覧が絞り込み後のまま」は起こり得ない
+    #[test]
+    fn entries_always_match_cur_dir_and_filter() {
+        let tmp = TempDir::new("filter-invariant");
+        let root = tmp.path().to_string_lossy().to_string();
+        let mut state = NewState::browse(&root);
+
+        // 打鍵の各段階（絞り込み → 0 件 → 解除 → 別フォルダ）で不変条件を見る
+        for text in [
+            format!("{root}\\sub"),
+            format!("{root}\\sub_a"),
+            format!("{root}\\zzz"),
+            root.clone(),
+            format!("{root}\\"),
+            format!("{root}\\sub_b"),
+        ] {
+            state.path.set_text(&text);
+            state.refresh_from_input();
+            let mut expected = NewState::list_entries(&state.cur_dir);
+            if !state.filter.is_empty() {
+                let frag = state.filter.clone();
+                expected.retain(|row| match row {
+                    BrowseRow::Launch => true,
+                    BrowseRow::Parent => false,
+                    BrowseRow::Dir(n) => n.to_lowercase().starts_with(&frag),
+                });
+            }
+            assert_eq!(
+                state.entries, expected,
+                "text {text:?} で一覧が (cur_dir {:?}, filter {:?}) と不整合",
+                state.cur_dir, state.filter
+            );
+        }
+    }
+
+    /// Esc（Folder 欄の編集取り消し）はテキストと一覧の両方を現在のフォルダへ戻す。
+    /// テキストだけ戻すと一覧が絞り込み後のまま残る
+    #[test]
+    fn cancel_path_edit_restores_text_and_listing() {
+        let tmp = TempDir::new("cancel-path-edit");
+        let root = tmp.path().to_string_lossy().to_string();
+        let mut state = NewState::browse(&root);
+
+        state.path.set_text(&format!("{root}\\zzz"));
+        state.refresh_from_input();
+        assert!(state.no_folder_rows());
+
+        state.cancel_path_edit();
+        assert_eq!(state.path.text, root);
+        assert_eq!(state.cur_dir, root);
+        assert!(!state.no_folder_rows(), "Esc 後も一覧が絞り込み後のまま");
+    }
+
+    /// 一覧の入力 `(cur_dir, filter)` が変わらない打鍵（Folder 欄での ←→ 等）では
+    /// 一覧を作り直さず、選択を既定へ飛ばさない
+    #[test]
+    fn keeps_selection_when_list_input_is_unchanged() {
+        let tmp = TempDir::new("no-op-refresh");
+        let root = tmp.path().to_string_lossy().to_string();
+        let mut state = NewState::browse(&root);
+
+        state.select(3); // sub_b
+        state.path.cursor = 0; // ← / Home 相当（テキストは変わらない）
+        state.refresh_from_input();
+        assert_eq!(state.dir_idx, 3);
+        assert!(!state.selection_from_rebuild);
     }
 
     #[test]
