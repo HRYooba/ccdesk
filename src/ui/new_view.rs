@@ -319,7 +319,16 @@ impl NewState {
                     BrowseRow::Parent => frag.is_empty(),
                     BrowseRow::Dir(n) => n.to_lowercase().starts_with(&frag),
                 });
-                self.dir_idx = 0;
+                // 断片を打鍵中は最初の一致フォルダを選ぶ。index 0 は常設の起動ボタン
+                // なので 0 のままにすると、絞り込んだ直後の → / Enter が何も起こらない
+                self.dir_idx = if frag.is_empty() {
+                    0
+                } else {
+                    self.entries
+                        .iter()
+                        .position(|row| matches!(row, BrowseRow::Dir(_)))
+                        .unwrap_or(0)
+                };
                 self.scroll = 0;
                 return;
             }
@@ -332,8 +341,11 @@ impl NewState {
 
 /// 新規セッション画面のキー処理。
 /// フィールド制: Tab で Prompt → Path → Browser と巡回し、キーはフォーカス中のフィールドにだけ効く。
-/// 起動は 2 手段: Prompt での Enter と、一覧先頭の起動ボタン行（Enter またはクリック 1 回）。
-/// Browser の Enter は「選択行の実行」なので、フォルダ行では移動になる
+/// 起動は 2 手段: Prompt での Enter と、一覧先頭の起動ボタン行での Enter。
+/// Browser の Enter は「選択行の実行」なので、フォルダ行では移動になる。
+/// 起動ボタン行の Enter は 1 打鍵で起動する（明示的な操作なので確認を挟まない）。
+/// マウスは同じ扱いにしない: 誤クリックで起動しないよう、クリックはフォルダ行と同じ
+/// 「選択 → 再クリックで実行」の 2 段階（app::handle_mouse 側）
 pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Result<()> {
     let RightView::New(state) = &mut app.right_view else {
         return Ok(());
@@ -584,8 +596,14 @@ pub(crate) fn draw_new_view(frame: &mut Frame, area: Rect, state: &mut NewState,
             BrowseRow::Parent => "..".to_string(),
             BrowseRow::Dir(name) => name.clone(),
         };
-        // 起動ボタンはアクション色。起動処理中は dim にして連打が無効なことを見せる
-        let base = if is_launch && !starting {
+        // 起動ボタンはアクション色。起動処理中（starting）は dim にして連打が無効な
+        // ことを見せる。starting 判定を先に置くのは、起動時に focus が Browser へ
+        // 移る = browser_focused が真になり、後段だと MUTED_FG に負けて dim が
+        // 一度も効かないため。dim にするのは起動ボタン行だけ: 多重ディスパッチで
+        // 止まるのは起動だけで、フォルダ行の移動（↑↓ →← / クリック）は生きている
+        let base = if is_launch && starting {
+            ui().dim
+        } else if is_launch {
             C_OK
         } else if browser_focused {
             MUTED_FG
@@ -709,14 +727,23 @@ mod tests {
 
     impl TempDir {
         /// sub_a / sub_b を持つ一時ディレクトリを作る。
-        /// パスにプロセス ID を含めるため、別チェックアウトでの並行実行と衝突しない
+        /// パスはプロセス ID + 連番で一意にする: プロセス ID で別チェックアウトとの
+        /// 並行実行を、連番で同一プロセス内の並行テストスレッド同士を分ける
+        /// （tag の手書き重複に一意性を賭けない）
         fn new(tag: &str) -> Self {
-            let root = std::env::temp_dir()
-                .join(format!("ccdesk-new-view-{}-{tag}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(root.join("sub_a")).unwrap();
-            std::fs::create_dir_all(root.join("sub_b")).unwrap();
-            Self(root)
+            static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "ccdesk-new-view-{}-{tag}-{seq}",
+                std::process::id()
+            ));
+            // ディレクトリ作成より先にガードを組み立てる。作成中に panic しても
+            // ガードが所有しているので Drop で作りかけのディレクトリを片付けられる
+            let guard = Self(root);
+            let _ = std::fs::remove_dir_all(guard.path());
+            std::fs::create_dir_all(guard.path().join("sub_a")).unwrap();
+            std::fs::create_dir_all(guard.path().join("sub_b")).unwrap();
+            guard
         }
 
         fn path(&self) -> &std::path::Path {
@@ -793,6 +820,35 @@ mod tests {
         state.go_up();
         let parent = root.parent().unwrap().to_string_lossy().to_string();
         assert_eq!(state.cur_dir, parent);
+    }
+
+    #[test]
+    fn selects_first_match_when_filtering_so_descend_works() {
+        let tmp = TempDir::new("filter-select");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        // "…/sub" まで打鍵 = 断片フィルタ（sub_a / sub_b が一致）。選択は常設の
+        // 起動ボタン（index 0）ではなく最初の一致フォルダに載る。載っていないと
+        // 絞り込んだ直後の → / Enter が空振りする
+        state.path.set_text(&root.join("sub").to_string_lossy());
+        state.refresh_from_input();
+        assert_eq!(state.entries[state.dir_idx], BrowseRow::Dir("sub_a".into()));
+        assert!(!state.selected_is_launch());
+        // その選択のまま潜れる（↓ を 1 回押させない）
+        state.descend();
+        assert_eq!(state.cur_dir, root.join("sub_a").to_string_lossy());
+    }
+
+    #[test]
+    fn keeps_selection_in_range_when_filter_has_no_dir_row() {
+        let tmp = TempDir::new("filter-select-none");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        // 一致フォルダが無い断片。選ぶ先が無いので起動ボタン（index 0）へ落とす
+        state.path.set_text(&root.join("zzz").to_string_lossy());
+        state.refresh_from_input();
+        assert_eq!(state.dir_idx, 0);
+        assert!(state.selected_is_launch());
     }
 
     #[test]

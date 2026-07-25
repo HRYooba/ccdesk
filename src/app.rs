@@ -822,17 +822,23 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                         && mouse.row < layout.list_top + layout.list_height
                     {
                         // フォルダ一覧エリア（空白部分も含む）→ 一覧フォーカス。
-                        // 実在する行の上なら選択も動かし、選択済みの再クリックは潜る
+                        // 実在する行の上なら選択も動かし、選択済み行の再クリックで実行する
                         let row_in = (mouse.row - layout.list_top) as usize;
                         if row_in < state.shown {
                             let idx = state.scroll + row_in;
                             let reclick = state.focus == NewFocus::Browser && state.dir_idx == idx;
                             state.dir_idx = idx;
                             state.focus = NewFocus::Browser;
-                            if state.selected_is_launch() {
-                                launch = true; // ボタンなので 1 クリックで起動
-                            } else if reclick {
-                                state.descend(); // 選択済みを再クリック = 潜る
+                            // 起動ボタン行もフォルダ行と同じ 2 段階（選択 → 再クリック）にする。
+                            // 1 クリックで起動すると、プロンプト入力中に一覧へフォーカスを
+                            // 移すだけのクリックが書きかけのプロンプトでセッションを起動して
+                            // しまう（supervisor 管理なので取り消せない）
+                            if reclick {
+                                if state.selected_is_launch() {
+                                    launch = true;
+                                } else {
+                                    state.descend(); // 選択済みを再クリック = 潜る
+                                }
                             }
                         } else {
                             state.focus = NewFocus::Browser;
