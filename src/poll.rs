@@ -160,6 +160,8 @@ pub(crate) struct FooterInfo {
 /// 組織名は「実在の Team/Enterprise 組織のときだけ」出す。個人アカウントでも
 /// orgName は空にならず `"<email>'s Organization"` という email 由来の自動生成名が
 /// 返るため（実測値）、email と同じ情報しか持たないそれは出さない。
+/// 判定材料は組織名の形（email 由来か）と `subscriptionType`（個人プランか）の
+/// 2 つ。詳細は [`is_personal_org`]。
 ///
 /// 判定は終了コードを見ない: 未ログインは **exit 1 + 正当な JSON**（実測）なので、
 /// 「JSON が読めたか」「loggedIn があるか」だけで決める
@@ -179,7 +181,8 @@ fn parse_account(auth_json: &str, profile: Option<(&str, &str)>) -> AccountStatu
         .map(|(_, display_name)| display_name)
         .filter(|s| !s.is_empty())
         .or_else(|| email.split('@').next().filter(|s| !s.is_empty()));
-    let org = str_of("orgName").filter(|org| !is_personal_org(org, email));
+    let subscription_type = str_of("subscriptionType");
+    let org = str_of("orgName").filter(|org| !is_personal_org(org, email, subscription_type));
     // 名前も組織も取れない（email を返さない認証方式）ときも空行にはしない。
     // 空ラベルは Unknown（未取得）と区別が付かず、ログイン済みなのに何も出ない
     let label = match (name, org) {
@@ -191,15 +194,33 @@ fn parse_account(auth_json: &str, profile: Option<(&str, &str)>) -> AccountStatu
     AccountStatus::LoggedIn(label)
 }
 
-/// 個人アカウントに自動で付く組織名か。実測では `"<email>'s Organization"`。
-/// 接尾辞の表記揺れに耐えるため email の前方一致で判定する: 組織名が利用者本人の
-/// email で始まるなら、既に出している email 以上の情報を持たないので出す価値が無い。
+/// 個人アカウントに自動で付く組織名か。次の **どちらか**が成り立てば落とす:
 ///
-/// email が取れない出力では判定できないので false（= 出す）に倒す。
-/// なお `.claude.json` の `oauthAccount.organizationType`（実測 `"claude_max"`）でも
-/// 判別できそうだが、Team/Enterprise 側の値を実機で確認できていないため使わない
-fn is_personal_org(org: &str, email: &str) -> bool {
-    !email.is_empty() && org.starts_with(email)
+/// 1. **email 前方一致**: 実測では個人アカウントの orgName は
+///    `"<email>'s Organization"`。接尾辞の表記揺れに耐えるため前方一致で判定する。
+///    組織名が利用者本人の email で始まるなら、既に出している email 以上の
+///    情報を持たないので出す価値が無い
+/// 2. **`subscriptionType` が既知の個人プラン**: 個人プランに実在の
+///    Team/Enterprise 組織は無いので、組織名の形に依らず落とせる
+///    （email 由来でない自動生成名になった場合も 1 の網から漏らさない）
+///
+/// 2 は「既知の個人プラン値の**ホワイトリスト**」であって、team 系の値を並べた
+/// ブラックリストではない。ブラックリストにすると、未知の値（将来のプラン名や
+/// 別表記）を個人扱いして **実在の Team/Enterprise 組織名を隠してしまう**——
+/// 誤りの向きとして、余計な組織名を 1 行出すより情報を消す方が悪い。
+/// 手元にあるのは個人 Max のアカウントだけで、Team/Enterprise の
+/// `subscriptionType` の値は**実機で未確認**なので推測で書かない。よって未知・
+/// 不在の値は 1 の判定だけに委ね、それ単独では組織名を落とさない。
+///
+/// email も個人プラン値も取れない出力では判定できないので false（= 出す）に倒す
+fn is_personal_org(org: &str, email: &str, subscription_type: Option<&str>) -> bool {
+    /// 個人プランの `subscriptionType`。`"max"` は実測値、`"free"` / `"pro"` は
+    /// 公表されている個人プラン名。Team/Enterprise の値は未確認なので載せない
+    const PERSONAL_PLANS: [&str; 3] = ["free", "pro", "max"];
+
+    let email_derived = !email.is_empty() && org.starts_with(email);
+    let personal_plan = subscription_type.is_some_and(|t| PERSONAL_PLANS.contains(&t));
+    email_derived || personal_plan
 }
 
 /// 子プロセスの stdout を取る。不正な出力は各パーサ側で弾く。
@@ -458,7 +479,11 @@ mod tests {
     /// PERSONAL の email（プロフィール照合のテストで使う）
     const EMAIL: &str = "taro@example.com";
 
-    /// 実測した個人アカウントの出力（email 以外の値も実物と同じ形）
+    /// PERSONAL の自動生成組織名（差し替えの土台）
+    const PERSONAL_ORG: &str = "taro@example.com's Organization";
+
+    /// 実測した個人アカウントの出力（email・orgId は架空の値に差し替え済み。
+    /// フィールドの並びと種類は実物と同じ）
     const PERSONAL: &str = r#"{
         "loggedIn": true,
         "authMethod": "claude.ai",
@@ -469,42 +494,114 @@ mod tests {
         "subscriptionType": "max"
     }"#;
 
+    /// PERSONAL と同じ形で orgName / subscriptionType だけを差し替えた出力を作る。
+    /// `subscription` が None なら `subscriptionType` フィールド自体を落とす
+    /// （＝プランが分からない出力。組織名の形だけで判定させるケース）
+    fn auth_json(org: &str, subscription: Option<&str>) -> String {
+        let mut v = serde_json::json!({
+            "loggedIn": true,
+            "authMethod": "claude.ai",
+            "apiProvider": "firstParty",
+            "email": EMAIL,
+            "orgId": "00000000-0000-0000-0000-000000000000",
+            "orgName": org,
+        });
+        if let Some(subscription) = subscription {
+            v["subscriptionType"] = subscription.into();
+        }
+        v.to_string()
+    }
+
+    /// スコープを抜けるときに必ずファイルを消す番人。アサート失敗で
+    /// パニックしても Drop は走るので、一時ファイルを残さない
+    struct TempFile(std::path::PathBuf);
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    impl TempFile {
+        /// 並列実行・別チェックアウトの同時実行と衝突しないよう、
+        /// テスト名とプロセス ID でパスを一意にする
+        fn new(test_name: &str) -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "ccdesk-{test_name}-{}.json",
+                std::process::id()
+            )))
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
     #[test]
-    fn 個人アカウントの自動生成組織名は出さない() {
+    fn suppresses_auto_generated_org_name() {
         assert_eq!(
             parse_account(PERSONAL, None),
             AccountStatus::LoggedIn("taro".into())
         );
     }
 
+    /// email 前方一致（規則 1）だけで落とせることの固定。`subscriptionType` を
+    /// 落とした出力＝プラン不明でも、組織名が email 由来なら出さない
     #[test]
-    fn 自動生成組織名の表記揺れも出さない() {
-        // 接尾辞が変わっても email 前方一致で落とす
+    fn suppresses_email_derived_org_name_without_subscription_type() {
+        // 接尾辞の表記が変わっても email 前方一致で落とす
         for org in [
-            "taro@example.com's Organization",
+            PERSONAL_ORG,
             "taro@example.com のオーガナイゼーション",
             "taro@example.com",
         ] {
-            let json = PERSONAL.replace("taro@example.com's Organization", org);
             assert_eq!(
-                parse_account(&json, None),
+                parse_account(&auth_json(org, None), None),
                 AccountStatus::LoggedIn("taro".into()),
                 "org: {org:?}"
             );
         }
     }
 
+    /// 実在の組織名は出す。プランが分からない出力（`subscriptionType` 不在）では
+    /// 規則 1 しか効かず、email 由来でない組織名は情報として残す
     #[test]
-    fn 実在の組織名は出す() {
-        let json = PERSONAL.replace("taro@example.com's Organization", "Acme, Inc.");
+    fn keeps_real_org_name() {
         assert_eq!(
-            parse_account(&json, None),
+            parse_account(&auth_json("Acme, Inc.", None), None),
             AccountStatus::LoggedIn("taro · Acme, Inc.".into())
         );
     }
 
+    /// 規則 2: 既知の個人プランなら、組織名が email 由来に見えなくても落とす
+    /// （個人アカウントに実在の Team/Enterprise 組織は無い）
     #[test]
-    fn 表示名があればemailローカル部より優先する() {
+    fn suppresses_real_looking_org_name_on_personal_plan() {
+        for plan in ["free", "pro", "max"] {
+            assert_eq!(
+                parse_account(&auth_json("Acme, Inc.", Some(plan)), None),
+                AccountStatus::LoggedIn("taro".into()),
+                "plan: {plan:?}"
+            );
+        }
+    }
+
+    /// ホワイトリストの要: 未知の `subscriptionType` は単独では落とさない。
+    /// 落としてしまうと実在の Team/Enterprise 組織名を隠すことになる
+    /// （Team/Enterprise 側の値は実機で未確認なので、未知として扱われる）
+    #[test]
+    fn keeps_real_org_name_for_unknown_subscription_type() {
+        for plan in ["team", "enterprise", "", "MAX"] {
+            assert_eq!(
+                parse_account(&auth_json("Acme, Inc.", Some(plan)), None),
+                AccountStatus::LoggedIn("taro · Acme, Inc.".into()),
+                "plan: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefers_display_name_over_email_local_part() {
         assert_eq!(
             parse_account(PERSONAL, Some((EMAIL, "alice"))),
             AccountStatus::LoggedIn("alice".into())
@@ -519,7 +616,7 @@ mod tests {
     /// 別アカウントへ再ログインした直後、`.claude.json` のプロフィールは前の
     /// アカウントのまま残る窓がある。照合しないと「名前が変わらない」ままになる
     #[test]
-    fn 別アカウントの古い表示名は採用しない() {
+    fn ignores_stale_display_name_from_another_account() {
         assert_eq!(
             parse_account(PERSONAL, Some(("hanako@example.com", "hanako"))),
             AccountStatus::LoggedIn("taro".into()),
@@ -528,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn 未ログインは未ログインとして扱う() {
+    fn treats_logged_out_output_as_logged_out() {
         assert_eq!(
             parse_account(r#"{"loggedIn": false}"#, None),
             AccountStatus::LoggedOut
@@ -536,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn 取得失敗を未ログインと誤判定しない() {
+    fn treats_unparsable_output_as_unknown() {
         // CLI が何も出さなかった / JSON でない / loggedIn が無い
         for bad in ["", "not json", "{}", r#"{"email":"a@b.c"}"#] {
             assert_eq!(
@@ -548,10 +645,9 @@ mod tests {
     }
 
     #[test]
-    fn 組織名が空でもemailだけは出す() {
-        let json = PERSONAL.replace("taro@example.com's Organization", "");
+    fn falls_back_to_email_local_part_when_org_name_is_empty() {
         assert_eq!(
-            parse_account(&json, None),
+            parse_account(&PERSONAL.replace(PERSONAL_ORG, ""), None),
             AccountStatus::LoggedIn("taro".into())
         );
     }
@@ -559,26 +655,26 @@ mod tests {
     /// 認証ファイルの変化検知。ログイン・ログアウトを即時反映する土台なので、
     /// 「書き換え」と「消滅」の両方が変化として見えることを固定する
     #[test]
-    fn 認証ファイルの書き換えと消滅を変化として検出する() {
-        let path = std::env::temp_dir().join("ccdesk-fp-test.json");
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(file_fingerprint(&path), None, "無いファイルは None");
+    fn detects_credential_file_rewrite_and_removal() {
+        let temp = TempFile::new("detects_credential_file_rewrite_and_removal");
+        let path = temp.path();
+        assert_eq!(file_fingerprint(path), None, "無いファイルは None");
 
-        std::fs::write(&path, "a").unwrap();
-        let first = file_fingerprint(&path);
+        std::fs::write(path, "a").unwrap();
+        let first = file_fingerprint(path);
         assert!(first.is_some());
 
         // 長さが変わればサイズで検出できる（mtime の粒度に依存しない）
-        std::fs::write(&path, "abcd").unwrap();
-        assert_ne!(file_fingerprint(&path), first, "書き換えを検出できていない");
+        std::fs::write(path, "abcd").unwrap();
+        assert_ne!(file_fingerprint(path), first, "書き換えを検出できていない");
 
         // ログアウトでファイルが消えるケース
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(file_fingerprint(&path), None, "消滅を検出できていない");
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(file_fingerprint(path), None, "消滅を検出できていない");
     }
 
     #[test]
-    fn emailが取れないときは組織名を落とさない() {
+    fn keeps_org_name_when_email_is_missing() {
         // email 不在では自動生成組織名かを判定できないので、情報を消さない側に倒す。
         // 名前は照合できないので使わず、組織名だけを出す
         let json = r#"{"loggedIn": true, "orgName": "Acme, Inc."}"#;
@@ -590,7 +686,7 @@ mod tests {
 
     /// ログイン済みなのに空ラベルになると Unknown（未取得）と区別が付かない
     #[test]
-    fn 名前も組織も取れなくても空にはしない() {
+    fn never_produces_an_empty_label() {
         assert_eq!(
             parse_account(r#"{"loggedIn": true, "authMethod": "claude.ai"}"#, None),
             AccountStatus::LoggedIn("claude.ai".into())
