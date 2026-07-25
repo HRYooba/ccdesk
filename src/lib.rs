@@ -429,7 +429,13 @@ fn kv_load_list(path: Option<std::path::PathBuf>, key: &str) -> Vec<String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Vec::new();
     };
-    v.get(key)
+    value_strings(v.get(key))
+}
+
+/// JSON 値を文字列配列として読む（配列でない / 要素が文字列でない分は捨てる）。
+/// 読みとマージの両方がここを通るので、寛容さの範囲が 2 通りにならない
+fn value_strings(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -441,8 +447,15 @@ fn kv_load_list(path: Option<std::path::PathBuf>, key: &str) -> Vec<String> {
 }
 
 /// キー 1 つの read-modify-write。**書き込みの作法（プロセス内ロック・オブジェクト以外の
-/// 上書き・tmp → rename）をここ 1 箇所に持つ**ので、値が文字列でも配列でも同じ保証になる
-fn kv_put(path: Option<std::path::PathBuf>, key: &str, value: serde_json::Value) {
+/// 上書き・tmp → rename）をここ 1 箇所に持つ**ので、値が文字列でも配列でも同じ保証になる。
+///
+/// `edit` は**同じロックの下でディスク上の今の値**を受け取る（読みと書きの間に
+/// 別の書き込みを挟ませないため）＝ 呼び手は「今の値の上に載せる」判断ができる
+fn kv_edit(
+    path: Option<std::path::PathBuf>,
+    key: &str,
+    edit: impl FnOnce(Option<&serde_json::Value>) -> serde_json::Value,
+) {
     let Some(path) = path else { return };
     let _guard = KV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut v = std::fs::read_to_string(&path)
@@ -452,7 +465,7 @@ fn kv_put(path: Option<std::path::PathBuf>, key: &str, value: serde_json::Value)
     if !v.is_object() {
         v = serde_json::json!({});
     }
-    v[key] = value;
+    v[key] = edit(v.get(key));
     // 読み手が書きかけの JSON を見ないよう tmp → rename で置く
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, serde_json::to_string_pretty(&v).unwrap_or_default()).is_ok() {
@@ -461,20 +474,22 @@ fn kv_put(path: Option<std::path::PathBuf>, key: &str, value: serde_json::Value)
 }
 
 fn kv_save(path: Option<std::path::PathBuf>, key: &str, value: &str) {
-    kv_put(path, key, serde_json::Value::String(value.to_string()));
+    kv_edit(path, key, |_| serde_json::Value::String(value.to_string()));
 }
 
-fn kv_save_list(path: Option<std::path::PathBuf>, key: &str, values: &[String]) {
-    kv_put(
-        path,
-        key,
+fn kv_update_list(
+    path: Option<std::path::PathBuf>,
+    key: &str,
+    merge: impl FnOnce(Vec<String>) -> Vec<String>,
+) {
+    kv_edit(path, key, |current| {
         serde_json::Value::Array(
-            values
-                .iter()
-                .map(|v| serde_json::Value::String(v.clone()))
+            merge(value_strings(current))
+                .into_iter()
+                .map(serde_json::Value::String)
                 .collect(),
-        ),
-    );
+        )
+    });
 }
 
 pub fn load_setting(key: &str) -> Option<String> {
@@ -499,8 +514,16 @@ pub fn load_state_list(key: &str) -> Vec<String> {
     kv_load_list(state_path(), key)
 }
 
-pub fn save_state_list(key: &str, values: &[String]) {
-    kv_save_list(state_path(), key, values);
+/// 配列の状態を**ディスク上の今の値から**作り直す。`merge` はディスクの一覧を受けて
+/// 保存する一覧を返す。
+///
+/// **全量で上書きする書き方を持たない**のが要点: ccdesk は複数起動でき state.json は
+/// 共有なので、メモリ上の写しをそのまま書くと、その間に別のインスタンスが足した
+/// 要素が消える（[`kv_edit`] は他のキーは保つが、同じキーへの同時編集は保たない）。
+/// 単値（サイドバー幅など）も後勝ちだが、あちらは設定でこちらはユーザーのデータなので
+/// 黙って捨ててはいけない。マージの意味論は呼び手（保存する値の持ち主）が決める
+pub fn update_state_list(key: &str, merge: impl FnOnce(Vec<String>) -> Vec<String>) {
+    kv_update_list(state_path(), key, merge);
 }
 
 /// 2 つのパスが同じフォルダを指すか。**「同じフォルダか」の判断はここ 1 箇所だけ**に置く
@@ -608,13 +631,16 @@ mod tests {
     fn state_writes_keep_other_keys_and_round_trip() {
         let path = temp_json("round-trip", Some("{\"projects\": \"legacy\"}"));
         let some = |p: &std::path::PathBuf| Some(p.clone());
+        let write = |p: &std::path::PathBuf, values: &[String]| {
+            kv_update_list(some(p), "projects", |_| values.to_vec());
+        };
         kv_save(some(&path), "sidebar_width", "33");
         let projects = vec!["C:\\dev\\a".to_string(), "C:\\dev\\b".to_string()];
-        kv_save_list(some(&path), "projects", &projects);
+        write(&path, &projects);
         assert_eq!(kv_load(some(&path), "sidebar_width").as_deref(), Some("33"));
         assert_eq!(kv_load_list(some(&path), "projects"), projects);
         // 空配列も「0 件」として保存できる（キーごと消す実装だと未保存と区別できない）
-        kv_save_list(some(&path), "projects", &[]);
+        write(&path, &[]);
         assert!(kv_load_list(some(&path), "projects").is_empty());
         assert_eq!(
             kv_load(some(&path), "sidebar_width").as_deref(),
@@ -623,8 +649,37 @@ mod tests {
         );
         // オブジェクトでないファイルは作り直す（壊れた state.json で保存が死なない）
         let broken = temp_json("write-over-broken", Some("[1,2,3]"));
-        kv_save_list(some(&broken), "projects", &projects);
-        assert_eq!(kv_load_list(some(&broken), "projects"), projects);
+        write(&broken, &projects);
+        assert_eq!(kv_load_list(broken.clone().into(), "projects"), projects);
+    }
+
+    /// 配列の書きは**ディスク上の今の値を受け取ってから**新しい値を作る
+    /// （別のインスタンスが書いた要素の上に載せられる ＝ マージの前提）。
+    /// 想定外の形（旧形式の単値・配列でない）が入っていても空の一覧として渡す
+    #[test]
+    fn list_writes_see_the_value_on_disk_first() {
+        let path = temp_json("merge-base", Some("{\"projects\": [\"C:\\\\dev\\\\disk\"]}"));
+        let some = || Some(path.clone());
+        let mut seen = Vec::new();
+        kv_update_list(some(), "projects", |disk| {
+            seen = disk.clone();
+            let mut next = disk;
+            next.push("C:\\dev\\mine".to_string());
+            next
+        });
+        assert_eq!(seen, ["C:\\dev\\disk"], "ディスク上の値が渡っていない");
+        assert_eq!(
+            kv_load_list(some(), "projects"),
+            ["C:\\dev\\disk", "C:\\dev\\mine"]
+        );
+        // 配列でない値は「保存が無い」扱い（読みと同じ寛容さ）
+        let legacy = temp_json("merge-legacy", Some("{\"projects\": \"legacy\"}"));
+        let mut seen_legacy = vec!["dirty".to_string()];
+        kv_update_list(Some(legacy.clone()), "projects", |disk| {
+            seen_legacy = disk;
+            Vec::new()
+        });
+        assert!(seen_legacy.is_empty(), "旧形式の単値が一覧として渡っている");
     }
 
     /// フォルダの同一判定。**大小と末尾の区切りは無視する**（登録リスト・claude が記録した

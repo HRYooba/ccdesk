@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::anyhow;
 
 use ccdesk::{
-    load_setting, load_state, load_state_list, save_setting, save_state, save_state_list,
-    scan_jobs, BgJob,
+    load_setting, load_state, load_state_list, same_dir, save_setting, save_state,
+    scan_jobs, update_state_list, BgJob,
 };
 
 use crate::accounts::{Account, AccountStore};
@@ -106,8 +106,10 @@ pub(crate) enum WindowItem<'a> {
     SidebarWidth(u16),
     LastFolder(&'a str),
     Grouping(Grouping),
-    /// 登録プロジェクトの一覧。**差分ではなく全量で渡す**（正本は App 側の一覧で、
-    /// 「今の全量」を書き切る形にしておけば追加と削除で保存経路が分かれない）
+    /// 登録プロジェクトの一覧。**差分ではなく全量で渡す**（App から見た正本は
+    /// メモリ上の一覧で、「今の全量」を渡す形にしておけば追加と削除で保存経路が
+    /// 分かれない）。ディスクへ載せるときの突き合わせは live 側の責務
+    /// （[`merge_projects`] ＝ 複数インスタンスで登録を消し合わない）
     Projects(&'a [String]),
 }
 
@@ -190,16 +192,78 @@ fn apply_account_action(store: &AccountStore, action: AccountAction<'_>) -> anyh
     }
 }
 
+/// 登録プロジェクトの保存内容を、**ディスク上の一覧と突き合わせて**決める。
+///
+/// **なぜマージするか**: ccdesk は複数起動でき state.json は共有なので、メモリ上の
+/// 写しをそのまま書くと、その間に別のインスタンスが登録したフォルダが消える
+/// （A 起動 → B 起動 → B が登録 → A が何か登録して自分の写しを書く、で B の登録が
+/// 落ちる）。サイドバー幅のようなスカラーも後勝ちだが、こちらは設定ではなく
+/// **ユーザーのデータ**なので黙って捨てられない。
+///
+/// **意味論**（最近使った順 = LRU の扱いをどう決めたか）:
+/// - 同一性は [`same_dir`]（表記違いは同じフォルダ。判定は lib 1 箇所のまま）
+/// - `baseline` は「ディスクはこうなっている」とこのインスタンスが最後に判断した
+///   一覧。`next` との差が**このインスタンスの操作**なので、足した / 外したを
+///   区別できる（全量の写しだけでは「外したから無い」と「知らないから無い」が
+///   同じ形になり、マージのしようがない）
+/// - `baseline` に居て `next` に居ないフォルダは**このインスタンスが外した**ので、
+///   ディスクに残っていても落とす（remove project が他インスタンスの書き込みで
+///   復活しない）
+/// - どちらにも居ない ＝ ディスクにしか居ないフォルダは他インスタンスの登録。
+///   **`next` の後ろへ足す**: 自分が baseline を取った後に書かれた登録なので、
+///   自分が知っている登録より新しいと見なすのが妥当で、上限で追い出されるのも
+///   自分の古い登録が先になる（他インスタンスの登録を消さないための修正なのに、
+///   前に足して真っ先に追い出したら意味が無い）
+/// - 上限は最後にかける（追い出しは先頭 ＝ 最も長く使っていない側から）
+///
+/// 単独起動なら `disk` は `baseline` と一致するので、結果は `next` そのもの
+/// （＝ マージが入っても通常の 1 プロセス動作は何も変わらない）
+fn merge_projects(disk: &[String], baseline: &[String], next: &[String]) -> Vec<String> {
+    let mut merged: Vec<String> = next.to_vec();
+    for entry in disk {
+        // baseline に居る ＝ このインスタンスが外したフォルダなので足さない。
+        // merged に居る ＝ 既に入っている（ディスク側の自己重複もここで落ちる）
+        if merged.iter().chain(baseline).any(|p| same_dir(p, entry)) {
+            continue;
+        }
+        merged.push(entry.clone());
+    }
+    let excess = merged.len().saturating_sub(PROJECTS_LIMIT);
+    merged.drain(..excess);
+    merged
+}
+
 /// 実データ。~/.claude と ~/.ccdesk を読み、ポーラーで claude CLI と
 /// 公式配布エンドポイントを叩く
 pub(crate) struct LiveSource {
     /// 使用率表示の opt-in（config.json の usage_display = "on"）
     usage_display: bool,
+    /// 「ディスク上の登録プロジェクトはこうなっている」とこのインスタンスが最後に
+    /// 判断した一覧。**書き込みのマージの基準**（[`merge_projects`]）で、
+    /// 起動時の読み込みと、自分が書いた内容で更新する
+    projects_baseline: Mutex<Vec<String>>,
 }
 
 impl LiveSource {
     pub(crate) fn new(usage_display: bool) -> Self {
-        Self { usage_display }
+        Self {
+            usage_display,
+            projects_baseline: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 登録プロジェクトの保存。**書く前にディスクを読み直してマージする**
+    /// （意味論は [`merge_projects`]）
+    fn store_projects(&self, next: &[String]) {
+        let mut baseline = self
+            .projects_baseline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        update_state_list("projects", |disk| merge_projects(&disk, &baseline, next));
+        // 次のマージの基準は**このインスタンスが書いた内容**（マージ結果ではない）:
+        // マージ結果を基準にすると、App 側の一覧に無い他インスタンスの登録が
+        // 次の書き込みで「このインスタンスが外した」と読めて消えてしまう
+        *baseline = next.to_vec();
     }
 }
 
@@ -218,6 +282,19 @@ impl DataSource for LiveSource {
     }
 
     fn window_state(&self) -> WindowState {
+        // **存在しないディレクトリも落とさない**（dispatch_cwd の is_dir と対照的）:
+        // リムーバブルドライブ・ネットワークドライブ・未マウントの作業領域は
+        // 「今この瞬間見えない」だけで、消えたわけではない。ここで黙って隠すと
+        // ドライブを挿し直したときに見出しが復活する理由が読めないし、
+        // 登録を外す操作（remove project）も出せなくなる。
+        // 見えないフォルダで new session を選んだ場合は `claude --bg` が
+        // 失敗して下部バーに出るので、間違いは操作した時点で伝わる
+        let projects = load_state_list("projects");
+        // **読んだ内容が以降の書き込みでマージする基準になる**（[`merge_projects`]）
+        *self
+            .projects_baseline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = projects.clone();
         WindowState {
             // 旧版は config.json に保存していたため、state.json に無ければそちらへフォールバック
             sidebar_width: load_state("sidebar_width")
@@ -239,14 +316,7 @@ impl DataSource for LiveSource {
                 Some("directory") => Grouping::Directory,
                 _ => Grouping::State,
             },
-            // **存在しないディレクトリも落とさない**（dispatch_cwd の is_dir と対照的）:
-            // リムーバブルドライブ・ネットワークドライブ・未マウントの作業領域は
-            // 「今この瞬間見えない」だけで、消えたわけではない。ここで黙って隠すと
-            // ドライブを挿し直したときに見出しが復活する理由が読めないし、
-            // 登録を外す操作（remove project）も出せなくなる。
-            // 見えないフォルダで new session を選んだ場合は `claude --bg` が
-            // 失敗して下部バーに出るので、間違いは操作した時点で伝わる
-            projects: load_state_list("projects"),
+            projects,
         }
     }
 
@@ -263,7 +333,8 @@ impl DataSource for LiveSource {
                     Grouping::State => "state",
                 },
             ),
-            WindowItem::Projects(projects) => save_state_list("projects", projects),
+            // 全量を渡されるが**そのまま上書きしない**（[`Self::store_projects`]）
+            WindowItem::Projects(projects) => self.store_projects(projects),
         }
     }
 
@@ -508,6 +579,75 @@ mod tests {
             load_state_list("projects"),
             before,
             "demo が projects を書き換えている"
+        );
+    }
+
+    /// テスト内でパス一覧を組む短縮
+    fn paths(list: &[&str]) -> Vec<String> {
+        list.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// **2 つのインスタンスの登録が両方残る（この不具合の直接のリグレッションテスト）。**
+    /// A 起動 → B 起動 → B が別フォルダを登録 → A が自分の登録を足して写しを書く、で
+    /// B の登録が消えていた。ディスクにしか居ないフォルダは他インスタンスの登録なので、
+    /// 最近使った順の末尾（自分の登録の後ろ）へ回して残す
+    #[test]
+    fn merging_projects_keeps_registrations_from_another_instance() {
+        let baseline = paths(&["C:\\dev\\shared"]); // 両方が起動時に読んだ内容
+        let disk = paths(&["C:\\dev\\shared", "C:\\dev\\from-b"]); // B の登録後
+        let next = paths(&["C:\\dev\\shared", "C:\\dev\\from-a"]); // A のメモリ上の一覧
+        assert_eq!(
+            merge_projects(&disk, &baseline, &next),
+            ["C:\\dev\\shared", "C:\\dev\\from-a", "C:\\dev\\from-b"],
+            "他インスタンスの登録が消えている"
+        );
+        // 表記違いは同じフォルダなので二重にしない（同一判定は same_dir 1 箇所）
+        let disk = paths(&["c:/dev/shared/", "C:\\DEV\\from-a"]);
+        assert_eq!(
+            merge_projects(&disk, &baseline, &next),
+            next,
+            "表記違いのフォルダが二重に積まれている"
+        );
+    }
+
+    /// 単独起動なら結果はメモリ上の写しそのもの（マージが通常動作を変えない）。
+    /// ディスクが読めなかった場合（空で渡る）も同じ
+    #[test]
+    fn merging_projects_is_a_no_op_for_a_single_instance() {
+        let next = paths(&["C:\\dev\\a", "C:\\dev\\b"]);
+        assert_eq!(merge_projects(&next, &next, &next), next);
+        assert_eq!(merge_projects(&[], &next, &next), next);
+    }
+
+    /// **外した登録は他インスタンスの書き込みで復活しない。** baseline に居て next に
+    /// 居ないフォルダは「このインスタンスが remove project した」ので、ディスクに
+    /// 残っていても落とす（全量の写しだけでは「外した」と「知らない」が区別できない ＝
+    /// マージの基準が要る理由そのもの）
+    #[test]
+    fn merging_projects_honors_a_removal_by_this_instance() {
+        let baseline = paths(&["C:\\dev\\keep", "C:\\dev\\dropped"]);
+        let disk = paths(&["C:\\dev\\keep", "C:\\dev\\dropped"]);
+        let next = paths(&["C:\\dev\\keep"]);
+        assert_eq!(merge_projects(&disk, &baseline, &next), ["C:\\dev\\keep"]);
+        // 表記違いで残っていても復活しない
+        let disk = paths(&["C:\\dev\\keep", "c:/dev/dropped/"]);
+        assert_eq!(merge_projects(&disk, &baseline, &next), ["C:\\dev\\keep"]);
+    }
+
+    /// 上限はマージの後にかける。追い出しは先頭（最も長く使っていない側）からで、
+    /// 他インスタンスの登録は末尾に居るので残る
+    #[test]
+    fn merging_projects_applies_the_limit_last() {
+        let baseline = paths(&[]);
+        let next: Vec<String> = (0..PROJECTS_LIMIT).map(|i| format!("C:\\dev\\p{i}")).collect();
+        let disk = paths(&["C:\\dev\\from-b"]);
+        let merged = merge_projects(&disk, &baseline, &next);
+        assert_eq!(merged.len(), PROJECTS_LIMIT, "上限を超えて積まれている");
+        assert_eq!(merged.first().map(String::as_str), Some("C:\\dev\\p1"));
+        assert_eq!(
+            merged.last().map(String::as_str),
+            Some("C:\\dev\\from-b"),
+            "他インスタンスの登録が追い出されている"
         );
     }
 
