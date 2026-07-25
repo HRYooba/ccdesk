@@ -660,7 +660,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         // アカウント行（表示名 · 組織名）。未ログインは要対応なので注意色、
         // 未取得（起動直後・CLI 失敗）は誤情報を出さないため空行にする
         let (account, account_style) = match &app.footer.account {
-            AccountStatus::LoggedIn(label) => (label.as_str(), Style::default().fg(ui().dim)),
+            // 出すのはラベルだけ（email は同一性の保持用で、行には出さない）
+            AccountStatus::LoggedIn(account) => {
+                (account.label.as_str(), Style::default().fg(ui().dim))
+            }
             AccountStatus::LoggedOut => ("not logged in", Style::default().fg(C_ATTENTION)),
             AccountStatus::Unknown => ("", Style::default().fg(ui().dim)),
         };

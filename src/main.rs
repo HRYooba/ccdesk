@@ -12,6 +12,7 @@ use crossterm::event::{
 };
 use ccdesk::{load_setting, log_error};
 
+mod accounts;
 mod app;
 mod cli;
 mod keys;

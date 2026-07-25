@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use ccdesk::{load_setting, load_state, save_setting, save_state, scan_jobs, BgJob};
 
+use crate::accounts::Account;
 use crate::poll::{
     read_usage, spawn_agents_poller, spawn_ccdesk_version_check, spawn_footer_poller,
     AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo,
@@ -259,7 +260,7 @@ fn demo_jobs() -> Vec<BgJob> {
 /// （`latest` が None なので更新ボタン行は出ず、`current` は描画に現れない）
 fn demo_footer() -> FooterInfo {
     FooterInfo {
-        account: AccountStatus::LoggedIn("you · Acme, Inc.".to_string()),
+        account: AccountStatus::LoggedIn(Account::new("you@example.com", "you · Acme, Inc.")),
         current: String::new(),
         latest: None,
     }
@@ -301,7 +302,7 @@ mod tests {
 
         assert_eq!(
             DemoSource.footer().account,
-            AccountStatus::LoggedIn("you · Acme, Inc.".to_string())
+            AccountStatus::LoggedIn(Account::new("you@example.com", "you · Acme, Inc."))
         );
         assert!(DemoSource.footer().latest.is_none(), "更新行は出さない");
 

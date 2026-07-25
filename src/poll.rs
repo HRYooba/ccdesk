@@ -6,6 +6,7 @@ use ratatui::style::Color;
 
 use ccdesk::{claude_settings_channel, version_newer};
 
+use crate::accounts::{Account, AccountStore};
 use crate::theme::{ui, C_ATTENTION, C_FAIL, C_OK, C_WORKING};
 
 /// `claude agents --json --all` の 1 エントリ（公式のスクリプト向けライブデータ。
@@ -103,8 +104,12 @@ pub(crate) enum AccountStatus {
     Unknown,
     /// `loggedIn: false`。ログインを促す
     LoggedOut,
-    /// 表示用ラベル（"alice" または "alice · Acme, Inc."）
-    LoggedIn(String),
+    /// ログイン中のアカウント。同一性（email）と表示ラベルの両方を持つ。
+    ///
+    /// **ラベルだけでは足りない。** 複数アカウントの保管はキーに安定した識別子を
+    /// 要求するが、ラベルは組織名の抑制（[`is_personal_org`]）で変わるので不適。
+    /// ラベルで同一性を判定すると、表示ロジックと同一性判定に同じ知識が二重化する
+    LoggedIn(Account),
 }
 
 /// サイドバー下部に出すアカウント・バージョン情報。
@@ -113,7 +118,7 @@ pub(crate) enum AccountStatus {
 /// メタデータ（registry.npmjs.org/@anthropic-ai/claude-code/latest）から取る
 #[derive(Clone, Default)]
 pub(crate) struct FooterInfo {
-    pub(crate) account: AccountStatus, // "alice · Acme, Inc."（表示名 + 組織名）
+    pub(crate) account: AccountStatus, // ログイン状態 + アカウント（email とラベル）
     pub(crate) current: String,        // claude の現行バージョン
     pub(crate) latest: Option<String>, // 新しい版があるときだけ Some
 }
@@ -186,7 +191,10 @@ fn parse_account(auth_json: &str, profile: Option<(&str, &str)>) -> AccountStatu
         (None, Some(org)) => org.to_string(),
         (None, None) => str_of("authMethod").unwrap_or("logged in").to_string(),
     };
-    AccountStatus::LoggedIn(label)
+    // email は表示に使わない（サイドバーに出るのはラベル）が、アカウントの
+    // 同一性として持ち回す。email を返さない認証方式では空になり、その場合は
+    // 保管できない（[`crate::accounts::AccountStore::register`]）
+    AccountStatus::LoggedIn(Account::new(email, label))
 }
 
 /// 個人アカウントに自動で付く組織名か。
@@ -323,6 +331,25 @@ impl AccountFetcher {
 /// 「今どう表示されるか」を出す）
 pub(crate) fn fetch_account() -> AccountStatus {
     AccountFetcher::default().fetch()
+}
+
+/// 追従更新の呼び出し口。**登録済みアカウントの保管を現行の認証情報に追従させる**
+/// （claude はトークン更新で refreshToken を使い捨てにするため、放置すると保管が
+/// 腐って切替で復元できなくなる。詳細は
+/// [`crate::accounts::AccountStore::sync_active`]）。
+///
+/// 契機は既存の signal（[`auth_fingerprint`] の変化 + 周期フォールバック）に乗せる。
+/// **新しいポーリングは足さない。** 未登録アカウントには何もしないので、
+/// 「明示登録するまでコピーしない」規則はストア側で守られる
+fn sync_stored_account(account: &Account) {
+    let Some(store) = AccountStore::detect() else {
+        return;
+    };
+    // 失敗しても表示は続ける（保管の追従はアカウント行の表示より優先度が低い）。
+    // ログにはパスとエラーだけが出る（トークンは載せない）
+    if let Err(e) = store.sync_active(account) {
+        ccdesk::log_error(&format!("account store sync failed: {e}"));
+    }
 }
 
 /// 現行バージョンと、それより新しい配布版があれば その版番号。
@@ -467,7 +494,13 @@ pub(crate) fn spawn_footer_poller(
             let mut updated = false;
 
             if let Some(next) = account_step(&mut account, &shown, forced, auth_fingerprint, || {
-                fetcher.fetch()
+                let fetched = fetcher.fetch();
+                // 追従更新は「取得できた度」に見る。トークン更新はラベルを変えない
+                // ので、表示の差分（account_step の戻り値）では拾えない
+                if let AccountStatus::LoggedIn(account) = &fetched {
+                    sync_stored_account(account);
+                }
+                fetched
             }) {
                 shown = next.clone();
                 shared
@@ -653,6 +686,46 @@ mod tests {
         Some((std::time::UNIX_EPOCH, size))
     }
 
+    /// 期待値の組み立て。ラベル生成規則のテストは PERSONAL の email を使う
+    fn logged_in(label: &str) -> AccountStatus {
+        logged_in_as(EMAIL, label)
+    }
+
+    /// email を明示する版（email を返さない認証方式のケース用）
+    fn logged_in_as(email: &str, label: &str) -> AccountStatus {
+        AccountStatus::LoggedIn(Account::new(email, label))
+    }
+
+    /// 保管のキーになる email を落とさないこと。**ラベルとは独立**なので、
+    /// 表示名で上書きされても・組織名が抑制されても email は素の値のまま残る
+    /// （ラベルで同一性を判定すると表示ロジックと知識が二重化する）
+    #[test]
+    fn keeps_the_email_as_the_stable_identity() {
+        let AccountStatus::LoggedIn(account) = parse_account(PERSONAL, Some((EMAIL, "alice")))
+        else {
+            panic!("ログイン済みとして解釈されていない");
+        };
+        assert_eq!(account.email, EMAIL);
+        assert_eq!(account.label, "alice", "ラベルの生成規則が変わっている");
+
+        // 組織名が出るケースでも email はそのまま
+        let AccountStatus::LoggedIn(account) = parse_account(&auth_json("Acme, Inc.", None), None)
+        else {
+            panic!("ログイン済みとして解釈されていない");
+        };
+        assert_eq!(account.email, EMAIL);
+    }
+
+    /// email を返さない認証方式では email は空（＝保管できないアカウント）。
+    /// ラベルで代用しないことの固定
+    #[test]
+    fn leaves_the_email_empty_when_the_auth_method_has_none() {
+        assert_eq!(
+            parse_account(r#"{"loggedIn": true, "authMethod": "claude.ai"}"#, None),
+            logged_in_as("", "claude.ai")
+        );
+    }
+
     /// スコープを抜けるときに必ずファイルを消す番人。アサート失敗で
     /// パニックしても Drop は走るので、一時ファイルを残さない
     struct TempFile(std::path::PathBuf);
@@ -682,7 +755,7 @@ mod tests {
     fn suppresses_auto_generated_org_name() {
         assert_eq!(
             parse_account(PERSONAL, None),
-            AccountStatus::LoggedIn("taro".into())
+            logged_in("taro")
         );
     }
 
@@ -698,7 +771,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse_account(&auth_json(org, None), None),
-                AccountStatus::LoggedIn("taro".into()),
+                logged_in("taro"),
                 "org: {org:?}"
             );
         }
@@ -710,7 +783,7 @@ mod tests {
     fn suppresses_email_derived_org_name_ignoring_case() {
         assert_eq!(
             parse_account(&auth_json("TARO@EXAMPLE.COM's Organization", None), None),
-            AccountStatus::LoggedIn("taro".into())
+            logged_in("taro")
         );
     }
 
@@ -720,7 +793,7 @@ mod tests {
     fn keeps_real_org_name() {
         assert_eq!(
             parse_account(&auth_json("Acme, Inc.", None), None),
-            AccountStatus::LoggedIn("taro · Acme, Inc.".into())
+            logged_in("taro · Acme, Inc.")
         );
     }
 
@@ -732,7 +805,7 @@ mod tests {
         for plan in ["free", "pro", "max"] {
             assert_eq!(
                 parse_account(&auth_json("Acme, Inc.", Some(plan)), None),
-                AccountStatus::LoggedIn("taro · Acme, Inc.".into()),
+                logged_in("taro · Acme, Inc."),
                 "plan: {plan:?}"
             );
         }
@@ -745,14 +818,14 @@ mod tests {
         for plan in ["free", "pro", "max"] {
             assert_eq!(
                 parse_account(&auth_json("Alice's Organization", Some(plan)), None),
-                AccountStatus::LoggedIn("taro".into()),
+                logged_in("taro"),
                 "plan: {plan:?}"
             );
         }
         // 規則 2 は 2 条件が揃って初めて効く。プランが分からなければ落とさない
         assert_eq!(
             parse_account(&auth_json("Alice's Organization", None), None),
-            AccountStatus::LoggedIn("taro · Alice's Organization".into())
+            logged_in("taro · Alice's Organization")
         );
     }
 
@@ -763,7 +836,7 @@ mod tests {
         for plan in ["free", "pro", "max"] {
             assert_eq!(
                 parse_account(&auth_json("Contoso Organization", Some(plan)), None),
-                AccountStatus::LoggedIn("taro · Contoso Organization".into()),
+                logged_in("taro · Contoso Organization"),
                 "plan: {plan:?}"
             );
         }
@@ -777,7 +850,7 @@ mod tests {
         for plan in ["team", "enterprise", "", "MAX"] {
             assert_eq!(
                 parse_account(&auth_json("Acme, Inc.", Some(plan)), None),
-                AccountStatus::LoggedIn("taro · Acme, Inc.".into()),
+                logged_in("taro · Acme, Inc."),
                 "plan: {plan:?}"
             );
         }
@@ -787,12 +860,12 @@ mod tests {
     fn prefers_display_name_over_email_local_part() {
         assert_eq!(
             parse_account(PERSONAL, Some((EMAIL, "alice"))),
-            AccountStatus::LoggedIn("alice".into())
+            logged_in("alice")
         );
         // 空の表示名は無いものとして扱う
         assert_eq!(
             parse_account(PERSONAL, Some((EMAIL, ""))),
-            AccountStatus::LoggedIn("taro".into())
+            logged_in("taro")
         );
     }
 
@@ -802,7 +875,7 @@ mod tests {
     fn ignores_stale_display_name_from_another_account() {
         assert_eq!(
             parse_account(PERSONAL, Some(("hanako@example.com", "hanako"))),
-            AccountStatus::LoggedIn("taro".into()),
+            logged_in("taro"),
             "email が一致しないプロフィールを使ってしまっている"
         );
     }
@@ -816,7 +889,7 @@ mod tests {
                 r#"{"loggedIn": true, "authMethod": "claude.ai"}"#,
                 Some(("", "alice"))
             ),
-            AccountStatus::LoggedIn("claude.ai".into())
+            logged_in_as("", "claude.ai")
         );
     }
 
@@ -847,7 +920,7 @@ mod tests {
     fn falls_back_to_email_local_part_when_org_name_is_empty() {
         assert_eq!(
             parse_account(&auth_json("", None), None),
-            AccountStatus::LoggedIn("taro".into())
+            logged_in("taro")
         );
     }
 
@@ -879,7 +952,7 @@ mod tests {
         let json = r#"{"loggedIn": true, "orgName": "Acme, Inc."}"#;
         assert_eq!(
             parse_account(json, Some(("taro@example.com", "taro"))),
-            AccountStatus::LoggedIn("Acme, Inc.".into())
+            logged_in_as("", "Acme, Inc.")
         );
     }
 
@@ -888,11 +961,11 @@ mod tests {
     fn never_produces_an_empty_label() {
         assert_eq!(
             parse_account(r#"{"loggedIn": true, "authMethod": "claude.ai"}"#, None),
-            AccountStatus::LoggedIn("claude.ai".into())
+            logged_in_as("", "claude.ai")
         );
         assert_eq!(
             parse_account(r#"{"loggedIn": true}"#, None),
-            AccountStatus::LoggedIn("logged in".into())
+            logged_in_as("", "logged in")
         );
     }
 
@@ -900,7 +973,7 @@ mod tests {
     /// 消えたり "not logged in" に化けたりしないため
     #[test]
     fn unknown_does_not_overwrite_known_account() {
-        let shown = AccountStatus::LoggedIn("taro".into());
+        let shown = logged_in("taro");
         assert_eq!(next_account(&shown, AccountStatus::Unknown), None);
     }
 
@@ -916,7 +989,7 @@ mod tests {
     /// ログアウトは反映しないと嘘の表示になるので上書きする
     #[test]
     fn logged_out_overwrites_known_account() {
-        let shown = AccountStatus::LoggedIn("taro".into());
+        let shown = logged_in("taro");
         assert_eq!(
             next_account(&shown, AccountStatus::LoggedOut),
             Some(AccountStatus::LoggedOut)
@@ -926,7 +999,7 @@ mod tests {
     /// 同値なら再描画しない
     #[test]
     fn identical_account_produces_no_update() {
-        let shown = AccountStatus::LoggedIn("taro".into());
+        let shown = logged_in("taro");
         assert_eq!(next_account(&shown, shown.clone()), None);
     }
 
@@ -951,7 +1024,7 @@ mod tests {
     #[test]
     fn failed_fetch_retries_before_the_fallback_interval() {
         let mut state = AccountPollState::new();
-        let account = AccountStatus::LoggedIn("taro".into());
+        let account = logged_in("taro");
 
         // 1 周目: 起動直後の取得が失敗（claude の起動に失敗した等）
         assert_eq!(
@@ -992,8 +1065,8 @@ mod tests {
     fn login_during_fetch_is_picked_up_on_the_next_cycle() {
         let fp = std::cell::Cell::new(fp_of(1));
         let mut state = AccountPollState::new();
-        let old = AccountStatus::LoggedIn("taro".into());
-        let new = AccountStatus::LoggedIn("hanako".into());
+        let old = logged_in("taro");
+        let new = logged_in_as("hanako@example.com", "hanako");
 
         // 1 周目: 取得中に認証ファイルが書き換わる。子プロセスは変更前の
         // 認証情報を読んでいるので、古いアカウントが返る

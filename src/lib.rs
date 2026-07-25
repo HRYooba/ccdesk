@@ -361,6 +361,12 @@ pub fn usage_cache_path() -> Option<std::path::PathBuf> {
     Some(ccdesk_dir()?.join("usage.json"))
 }
 
+/// 複数アカウントの保管先 ~/.ccdesk/accounts.json。
+/// **トークンを含む**ので、ログやエラーメッセージに中身を出さないこと
+pub fn accounts_store_path() -> Option<std::path::PathBuf> {
+    Some(ccdesk_dir()?.join("accounts.json"))
+}
+
 /// エラーの集約先 ~/.ccdesk/error.log へ時刻付きで追記する。
 /// panic（TUI は画面ごと消えて読めない）と実行時エラー（attach 失敗等）の両方が集まる
 pub fn log_error(msg: &str) {
