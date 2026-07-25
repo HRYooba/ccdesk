@@ -30,3 +30,6 @@ jobs:
 
       - name: Clippy (deny warnings)
         run: cargo clippy --release --all-targets --locked -- -D warnings
+
+      - name: Test (release)
+        run: cargo test --release --locked

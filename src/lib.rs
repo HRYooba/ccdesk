@@ -169,6 +169,38 @@ pub fn claude_dir() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(std::env::var_os("USERPROFILE")?).join(".claude"))
 }
 
+/// claude の更新チャネル。settings.json の autoUpdatesChannel（公式に文書化された
+/// 設定。"latest"(既定) / "stable"）を読む。CLAUDE_CONFIG_DIR にも追従する
+pub fn claude_settings_channel() -> String {
+    claude_dir()
+        .map(|d| d.join("settings.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.get("autoUpdatesChannel")
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+        })
+        .filter(|c| c == "stable")
+        .unwrap_or_else(|| "latest".to_string())
+}
+
+/// バージョン文字列 "2.1.218" の数値比較（比較不能なら等価扱い）
+pub fn version_newer(latest: &str, current: &str) -> bool {
+    let parse = |s: &str| -> Vec<u64> {
+        s.split('.')
+            .map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0)
+            })
+            .collect()
+    };
+    parse(latest) > parse(current)
+}
+
 /// ~/.claude.json（CLAUDE_CONFIG_DIR 設定時はその配下）
 pub fn claude_json_path() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {

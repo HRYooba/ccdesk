@@ -7,7 +7,8 @@ use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 
 use crate::app::{start_new_session, App, RightView};
-use crate::theme::{ui, C_WORKING, FOCUS_BORDER, MUTED_FG};
+use crate::theme::{ui, C_OK, C_WORKING, FOCUS_BORDER, MUTED_FG};
+use crate::ui::{pane_fallback_pos, FrameCursor};
 
 /// カーソル付きテキストフィールド（挿入・削除・←→・Home/End・クリック位置反映、全角幅対応）
 #[derive(Default)]
@@ -126,20 +127,43 @@ impl TextField {
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum NewFocus {
     Prompt,  // 下部のプロンプト入力（初期フォーカス。Enter で起動）
-    Browser, // フォルダ一覧（↑↓/→/← で移動。Enter は潜るだけ）
+    Browser, // フォルダ一覧（↑↓ で行移動・→← で潜る/上がる。Enter は選択行の実行）
     Path,    // Folder 行のテキストフィールド
+}
+
+/// フォルダ一覧の行。先頭の Launch は「今開いているフォルダで起動する」ボタン行。
+/// 行の意味を型で持つことで、`entry == ".."` の文字列比較と
+/// 「index 0 は必ず ..」という暗黙の前提を無くす
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum BrowseRow {
+    /// 現在のフォルダで起動（`..` の上に常設。フィルタでも消えない）
+    Launch,
+    /// 親フォルダへ
+    Parent,
+    /// サブフォルダ（名前）
+    Dir(String),
 }
 
 /// 新規セッション画面（フォルダブラウザ + プロンプト入力）
 pub(crate) struct NewState {
     pub(crate) cur_dir: String,
-    pub(crate) entries: Vec<String>, // ".." + サブディレクトリ（隠しフォルダ含む）
+    /// 起動ボタン + ".." + サブディレクトリ（隠しフォルダ含む）
+    pub(crate) entries: Vec<BrowseRow>,
     pub(crate) dir_idx: usize,
     pub(crate) scroll: usize, // 表示ウィンドウ先頭（draw で更新）
     pub(crate) shown: usize,  // 直近 draw で表示した行数（マウス判定用）
     pub(crate) path: TextField,
     pub(crate) prompt: TextField,
     pub(crate) focus: NewFocus,
+    /// 今の選択行が「一覧の作り直しで既定へ戻った結果」か（＝利用者が選んだ行ではない）。
+    ///
+    /// クリックの 2 段階（選択 → 再クリックで実行）を守るために要る。一覧を作り直すと
+    /// `dir_idx` は 0 = 起動ボタン行に戻るが `focus` は Browser のまま残るので、これが
+    /// 無いと「フォルダ行を再クリックして潜った直後の起動ボタン 1 クリック」が
+    /// 再クリック扱いになり、書きかけのプロンプトでセッションが起動してしまう
+    /// （supervisor 管理なので取り消せない）。作り直しで立て、明示的な選択移動
+    /// （↑↓・ホイール・選択を動かすクリック）で倒す
+    pub(crate) selection_from_rebuild: bool,
 }
 
 impl NewState {
@@ -155,6 +179,7 @@ impl NewState {
             path,
             prompt: TextField::default(),
             focus: NewFocus::Prompt,
+            selection_from_rebuild: true,
         }
     }
 
@@ -162,8 +187,40 @@ impl NewState {
         self.cur_dir = dir;
         self.path.set_text(&self.cur_dir);
         self.entries = Self::list_entries(&self.cur_dir);
-        self.dir_idx = 0;
+        self.reset_selection(0);
+    }
+
+    /// 一覧を作り直したときの選択リセット。`selection_from_rebuild` の立て忘れを
+    /// 防ぐため、作り直し側の `dir_idx` 代入はすべてここを通す
+    fn reset_selection(&mut self, idx: usize) {
+        self.dir_idx = idx;
         self.scroll = 0;
+        self.selection_from_rebuild = true;
+    }
+
+    /// 利用者の明示操作で選択行を動かす（↑↓・ホイール・選択を動かすクリック）。
+    /// ここを通った選択だけが「再クリックで実行」の対象になる
+    pub(crate) fn select(&mut self, idx: usize) {
+        self.dir_idx = idx;
+        self.selection_from_rebuild = false;
+    }
+
+    /// 1 行上へ
+    pub(crate) fn select_prev(&mut self) {
+        self.select(self.dir_idx.saturating_sub(1));
+    }
+
+    /// 1 行下へ（末尾で止まる）
+    pub(crate) fn select_next(&mut self) {
+        self.select((self.dir_idx + 1).min(self.entries.len().saturating_sub(1)));
+    }
+
+    /// `idx` 行のクリックがその行のアクション（起動 / 潜る）を実行してよいか。
+    /// 実行するのは「利用者が選んだ行を、一覧にフォーカスしたまま再クリックした」
+    /// ときだけ。一覧の作り直しで既定へ戻った選択は対象外
+    /// （[`NewState::selection_from_rebuild`] 参照）
+    pub(crate) fn click_activates(&self, idx: usize) -> bool {
+        self.focus == NewFocus::Browser && self.dir_idx == idx && !self.selection_from_rebuild
     }
 
     /// Folder フィールドの内容を確定: 存在するディレクトリならそこへ移動して true
@@ -212,8 +269,8 @@ impl NewState {
         dir_of(t[i - 1..].trim().trim_matches('"'))
     }
 
-    fn list_entries(dir: &str) -> Vec<String> {
-        let mut out = vec!["..".to_string()];
+    fn list_entries(dir: &str) -> Vec<BrowseRow> {
+        let mut out = vec![BrowseRow::Launch, BrowseRow::Parent];
         if let Ok(read) = std::fs::read_dir(dir) {
             let mut subdirs: Vec<String> = read
                 .flatten()
@@ -221,32 +278,49 @@ impl NewState {
                 .map(|e| e.file_name().to_string_lossy().to_string())
                 .collect();
             subdirs.sort_by_key(|n| n.to_lowercase());
-            out.extend(subdirs);
+            out.extend(subdirs.into_iter().map(BrowseRow::Dir));
         }
         out
     }
 
+    /// 選択行が指すフォルダへ移動する。起動ボタン行は移動対象ではない
     pub(crate) fn descend(&mut self) {
-        let Some(entry) = self.entries.get(self.dir_idx) else {
-            return;
-        };
-        let next = if entry == ".." {
-            match std::path::Path::new(&self.cur_dir).parent() {
+        let next = match self.entries.get(self.dir_idx) {
+            Some(BrowseRow::Parent) => match std::path::Path::new(&self.cur_dir).parent() {
                 Some(p) => p.to_string_lossy().to_string(),
-                None => return,
-            }
-        } else {
-            std::path::Path::new(&self.cur_dir)
-                .join(entry)
+                None => return, // ドライブ直下
+            },
+            Some(BrowseRow::Dir(name)) => std::path::Path::new(&self.cur_dir)
+                .join(name)
                 .to_string_lossy()
-                .to_string()
+                .to_string(),
+            Some(BrowseRow::Launch) | None => return,
         };
         self.set_dir(next);
     }
 
+    /// 親フォルダへ。一覧の index 前提を持たないので、フィルタで `..` 行が
+    /// 消えている状態でも正しく上がれる
     fn go_up(&mut self) {
-        self.dir_idx = 0; // ".."
-        self.descend();
+        let Some(parent) = std::path::Path::new(&self.cur_dir).parent() else {
+            return; // ドライブ直下
+        };
+        let parent = parent.to_string_lossy().to_string();
+        self.set_dir(parent);
+    }
+
+    /// 一覧にフォルダ行（`..` / サブフォルダ）が 1 つも無いか。
+    /// 起動ボタンは常設なので `entries.is_empty()` では判定できない
+    pub(crate) fn no_folder_rows(&self) -> bool {
+        !self
+            .entries
+            .iter()
+            .any(|row| matches!(row, BrowseRow::Parent | BrowseRow::Dir(_)))
+    }
+
+    /// 選択行が起動ボタンか（クリック 1 回で起動するかの判定に使う）
+    pub(crate) fn selected_is_launch(&self) -> bool {
+        matches!(self.entries.get(self.dir_idx), Some(BrowseRow::Launch))
     }
 
     /// Folder 欄の変化に一覧をリアルタイム追従させる（テキスト・カーソルは触らない）。
@@ -263,8 +337,7 @@ impl NewState {
             if t != self.cur_dir {
                 self.cur_dir = t;
                 self.entries = Self::list_entries(&self.cur_dir);
-                self.dir_idx = 0;
-                self.scroll = 0;
+                self.reset_selection(0);
             }
             return;
         }
@@ -283,15 +356,22 @@ impl NewState {
                 let frag = frag.to_lowercase();
                 self.cur_dir = parent.to_string();
                 self.entries = Self::list_entries(parent);
-                self.entries.retain(|n| {
-                    if n == ".." {
-                        frag.is_empty()
-                    } else {
-                        n.to_lowercase().starts_with(&frag)
-                    }
+                self.entries.retain(|row| match row {
+                    BrowseRow::Launch => true, // 起動ボタンはフィルタで消さない
+                    BrowseRow::Parent => frag.is_empty(),
+                    BrowseRow::Dir(n) => n.to_lowercase().starts_with(&frag),
                 });
-                self.dir_idx = 0;
-                self.scroll = 0;
+                // 断片を打鍵中は最初の一致フォルダを選ぶ。index 0 は常設の起動ボタン
+                // なので 0 のままにすると、絞り込んだ直後の → / Enter が何も起こらない
+                let idx = if frag.is_empty() {
+                    0
+                } else {
+                    self.entries
+                        .iter()
+                        .position(|row| matches!(row, BrowseRow::Dir(_)))
+                        .unwrap_or(0)
+                };
+                self.reset_selection(idx);
                 return;
             }
         }
@@ -302,8 +382,12 @@ impl NewState {
 }
 
 /// 新規セッション画面のキー処理。
-/// フィールド制: Tab で Prompt ⇔ Browser を切替え、キーはフォーカス中のフィールドにだけ効く。
-/// 起動は Prompt での Enter のみ（Browser の Enter は移動専用）
+/// フィールド制: Tab で Prompt → Path → Browser と巡回し、キーはフォーカス中のフィールドにだけ効く。
+/// 起動は 2 手段: Prompt での Enter と、一覧先頭の起動ボタン行での Enter。
+/// Browser の Enter は「選択行の実行」なので、フォルダ行では移動になる。
+/// 起動ボタン行の Enter は 1 打鍵で起動する（明示的な操作なので確認を挟まない）。
+/// マウスは同じ扱いにしない: 誤クリックで起動しないよう、クリックはフォルダ行と同じ
+/// 「選択 → 再クリックで実行」の 2 段階（判定は [`NewState::click_activates`]）
 pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Result<()> {
     let RightView::New(state) = &mut app.right_view else {
         return Ok(());
@@ -352,13 +436,16 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
             }
         }
         NewFocus::Browser => match key.code {
-            KeyCode::Up => state.dir_idx = state.dir_idx.saturating_sub(1),
-            KeyCode::Down => {
-                state.dir_idx =
-                    (state.dir_idx + 1).min(state.entries.len().saturating_sub(1));
+            KeyCode::Up => state.select_prev(),
+            KeyCode::Down => state.select_next(),
+            // Enter = 選択行の実行。起動ボタン行なら起動、フォルダ行なら → と同じく移動
+            KeyCode::Enter => {
+                if state.selected_is_launch() {
+                    start_new_session(app)?;
+                } else {
+                    state.descend();
+                }
             }
-            // Enter = 現在のフォルダで起動（潜るのは →）
-            KeyCode::Enter => start_new_session(app)?,
             KeyCode::Right => state.descend(),
             KeyCode::Left => state.go_up(),
             _ => {}
@@ -445,11 +532,102 @@ impl NewLayout {
             ok: inner.height > Self::HEAD_ROWS + Self::FOOT_ROWS && inner.width >= 10,
         }
     }
+
+    /// PROMPT 入力枠の内側（Borders::ALL の 1px 内側）。入力行の描画とカーソル位置で
+    /// 同じ値を共有するため、Block::inner の再計算をここへ集約する
+    pub(crate) fn prompt_inner(&self) -> Rect {
+        Rect {
+            x: self.prompt_box.x.saturating_add(1),
+            y: self.prompt_box.y.saturating_add(1),
+            width: self.prompt_box.width.saturating_sub(2),
+            height: self.prompt_box.height.saturating_sub(2),
+        }
+    }
+}
+
+/// New 画面のカーソル位置と可視性。Frame を必要としない純関数なので描画から
+/// 切り離してテストできる。pane = 右ペイン矩形（枠を含む）。
+///
+/// フォーカス外・一覧操作中も「隠すだけ」で位置は必ず返す（位置を返さないと物理
+/// カーソルがサイドバーに置き去りになる。FrameCursor 参照）。戻り値の位置は
+/// pane がどんなサイズでも pane 矩形の内側に収まる
+pub(crate) fn new_view_cursor(
+    pane: Rect,
+    focus: NewFocus,
+    path_cursor_x: u16,
+    prompt_cursor_x: u16,
+    focused: bool,
+) -> FrameCursor {
+    let layout = NewLayout::compute(pane);
+    if !layout.ok {
+        // フォームが収まらない（inner が潰れている場合も含む）。inner 基準のクランプは
+        // 使えないので共通の退避先へ寄せる
+        return FrameCursor::hidden_at(pane_fallback_pos(pane));
+    }
+    // ここに来た時点で layout.ok なので inner.width >= 10 が保証され、
+    // inner（幅 >= 10）も prompt_inner（幅 >= 4）も幅 0 になり得ない
+    // （= right() - 1 のクランプは inner の外を指さない）。
+    // cursor_x は入力テキストの表示幅なので加算は飽和させる
+    // （素の + だと極端に長い入力で debug ビルドが panic する）
+    let inner = layout.inner;
+    let prompt_inner = layout.prompt_inner();
+    let (pos, in_field) = match focus {
+        NewFocus::Path => (
+            Position::new(
+                layout
+                    .path_text_x
+                    .saturating_add(path_cursor_x)
+                    .min(inner.right() - 1),
+                layout.path_y,
+            ),
+            true,
+        ),
+        NewFocus::Prompt => (
+            Position::new(
+                layout
+                    .input_text_x
+                    .saturating_add(prompt_cursor_x)
+                    .min(prompt_inner.right() - 1),
+                layout.input_y,
+            ),
+            true,
+        ),
+        NewFocus::Browser => (Position::new(layout.input_text_x, layout.input_y), false),
+    };
+    if focused && in_field {
+        FrameCursor::shown_at(pos)
+    } else {
+        FrameCursor::hidden_at(pos)
+    }
+}
+
+/// 一覧に描ける行数。0 件メッセージ（"no matching folders"）を出す場合は
+/// その 1 行を必ず確保する。
+///
+/// `no_folder_rows` が真なら一覧は起動ボタン 1 行だけなので、`list_height >= 2` では
+/// 両方が収まり従来どおり。問題は `list_height == 1`（`layout.ok` が許す下限）で、
+/// メッセージを行の後ろへ足すと ratatui の Paragraph に切られて「なぜ一覧が空か」が
+/// 見えなくなる。そのときはメッセージを優先する: 起動ボタンは PROMPT 欄の Enter と
+/// 同じ `cur_dir` での起動なので、失うのは重複した導線だけ。一方メッセージは
+/// 他のどこにも出ない情報
+fn list_rows_for_message(no_folder_rows: bool, list_height: u16) -> usize {
+    let height = list_height as usize;
+    if no_folder_rows {
+        height.saturating_sub(1)
+    } else {
+        height
+    }
 }
 
 /// 新規セッション画面の描画（フォルダブラウザ + 初回チャット入力）。
 /// starting = `claude --bg` 実行中（別スレッド）: プロンプト欄に進行中表示を出す
-pub(crate) fn draw_new_view(frame: &mut Frame, area: Rect, state: &mut NewState, focused: bool, starting: bool) {
+pub(crate) fn draw_new_view(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut NewState,
+    focused: bool,
+    starting: bool,
+) -> FrameCursor {
     let border = if focused {
         Style::default().fg(FOCUS_BORDER)
     } else {
@@ -463,13 +641,22 @@ pub(crate) fn draw_new_view(frame: &mut Frame, area: Rect, state: &mut NewState,
 
     // 描画とマウス判定で同一のジオメトリを使う（フォーム型レイアウト）
     let layout = NewLayout::compute(area);
+    // カーソル位置は描画結果に依存しないので先に決める（!ok の早期 return と共有する）
+    let cursor = new_view_cursor(
+        area,
+        state.focus,
+        state.path.cursor_x(),
+        state.prompt.cursor_x(),
+        focused,
+    );
     if !layout.ok {
-        return;
+        return cursor;
     }
     let inner = layout.inner;
 
     // 一覧のスクロールウィンドウを更新（縦が足りなければ list_height 側が縮む）
-    let max_visible = layout.list_height as usize;
+    // 0 件メッセージは起動ボタン行より優先する（[`list_rows_for_message`] 参照）
+    let max_visible = list_rows_for_message(state.no_folder_rows(), layout.list_height);
     if state.dir_idx < state.scroll {
         state.scroll = state.dir_idx;
     } else if max_visible > 0 && state.dir_idx >= state.scroll + max_visible {
@@ -529,33 +716,56 @@ pub(crate) fn draw_new_view(frame: &mut Frame, area: Rect, state: &mut NewState,
         Rect::new(inner.x, layout.sep_y, inner.width, 1),
     );
 
-    // フォルダ一覧（一覧インデント。フィルタ0件は状態を明示）
+    // フォルダ一覧（一覧インデント）。先頭は「このフォルダで起動」ボタン行。
+    // フィルタでフォルダ行が全部消えた場合はその状態も明示する（起動ボタンは残る）
     let list_indent = " ".repeat(margin + 1);
+    // 起動先をラベルに出す: Folder 欄を打鍵中は cur_dir が親フォルダへ巻き戻るため、
+    // 「どこで起動するのか」がテキスト欄の見た目と食い違うことがある
+    let launch_leaf = std::path::Path::new(&state.cur_dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| state.cur_dir.clone());
     let mut list_lines: Vec<Line> = Vec::new();
-    if shown == 0 {
-        list_lines.push(
-            Line::from(format!("{list_indent}no matching folders"))
-                .style(Style::default().fg(ui().dim)),
-        );
-    } else {
-        for virt in state.scroll..state.scroll + shown {
-            let selected = virt == state.dir_idx;
-            let marker = if selected { "▸ " } else { "  " };
-            let mut style = Style::default().fg(if browser_focused {
-                MUTED_FG
-            } else {
-                ui().dim
-            });
-            if selected {
-                style = style.add_modifier(Modifier::BOLD);
-                if browser_focused {
-                    style = style.fg(ui().emph).bg(ui().hl_bg);
+    for virt in state.scroll..state.scroll + shown {
+        let selected = virt == state.dir_idx;
+        let marker = if selected { "▸ " } else { "  " };
+        let is_launch = state.entries[virt] == BrowseRow::Launch;
+        let label = match &state.entries[virt] {
+            BrowseRow::Launch => format!("+ start in {launch_leaf}"),
+            BrowseRow::Parent => "..".to_string(),
+            BrowseRow::Dir(name) => name.clone(),
+        };
+        // 起動ボタンはアクション色。起動処理中（starting）は dim にして連打が無効な
+        // ことを見せる。starting 判定を先に置くのは、起動時に focus が Browser へ
+        // 移る = browser_focused が真になり、後段だと MUTED_FG に負けて dim が
+        // 一度も効かないため。dim にするのは起動ボタン行だけ: 多重ディスパッチで
+        // 止まるのは起動だけで、フォルダ行の移動（↑↓ →← / クリック）は生きている
+        let base = if is_launch && starting {
+            ui().dim
+        } else if is_launch {
+            C_OK
+        } else if browser_focused {
+            MUTED_FG
+        } else {
+            ui().dim
+        };
+        let mut style = Style::default().fg(base);
+        if selected {
+            style = style.add_modifier(Modifier::BOLD);
+            if browser_focused {
+                style = style.bg(ui().hl_bg);
+                if !is_launch {
+                    style = style.fg(ui().emph);
                 }
             }
-            list_lines.push(
-                Line::from(format!("{list_indent}{marker}{}", state.entries[virt])).style(style),
-            );
         }
+        list_lines.push(Line::from(format!("{list_indent}{marker}{label}")).style(style));
+    }
+    if state.no_folder_rows() {
+        list_lines.push(
+            Line::from(format!("{list_indent}  no matching folders"))
+                .style(Style::default().fg(ui().dim)),
+        );
     }
     frame.render_widget(
         ratatui::widgets::Paragraph::new(list_lines),
@@ -579,7 +789,7 @@ pub(crate) fn draw_new_view(frame: &mut Frame, area: Rect, state: &mut NewState,
     let prompt_block = Block::default()
         .borders(Borders::ALL)
         .border_style(box_border);
-    let prompt_inner = prompt_block.inner(layout.prompt_box);
+    let prompt_inner = layout.prompt_inner();
     frame.render_widget(prompt_block, layout.prompt_box);
     // 入力行（starting 表示も枠内に出す）
     let marker_style = if prompt_focused {
@@ -611,32 +821,380 @@ pub(crate) fn draw_new_view(frame: &mut Frame, area: Rect, state: &mut NewState,
         Rect::new(prompt_inner.x, layout.input_y, prompt_inner.width, 1),
     );
 
-    // ペイン内ヒント（下部バーの "new session:" セグメントはここへ移設して重複を避ける）
+    // ペイン内ヒント（下部バーの "new session:" セグメントはここへ移設して重複を避ける）。
+    // Enter の意味はフォーカスで変わる（Browser では選択行の実行）ので出し分ける
+    let hint = match state.focus {
+        NewFocus::Prompt => "Tab: next field · Enter: start",
+        NewFocus::Path => "Tab: next field · Enter: apply path",
+        NewFocus::Browser => "Tab: next field · ↑↓ select · Enter: run row · ←→ move",
+    };
     frame.render_widget(
         ratatui::widgets::Paragraph::new(
-            Line::from(format!("{pad}Tab: next field · Enter: start"))
-                .style(Style::default().fg(ui().dim)),
+            Line::from(format!("{pad}{hint}")).style(Style::default().fg(ui().dim)),
         ),
         Rect::new(inner.x, layout.hint_y, inner.width, 1),
     );
 
-    if focused {
-        match state.focus {
-            NewFocus::Path => {
-                let cursor_x = layout.path_text_x + state.path.cursor_x();
-                frame.set_cursor_position(Position::new(
-                    cursor_x.min(inner.right().saturating_sub(1)),
-                    layout.path_y,
-                ));
-            }
-            NewFocus::Prompt => {
-                let cursor_x = layout.input_text_x + state.prompt.cursor_x();
-                frame.set_cursor_position(Position::new(
-                    cursor_x.min(prompt_inner.right().saturating_sub(1)),
-                    layout.input_y,
-                ));
-            }
-            NewFocus::Browser => {} // 一覧操作中はカーソル非表示
+    cursor
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// pos が矩形の内側にあるか（幅・高さ 0 の矩形は「内側なし」なので常に false）
+    fn contains(rect: Rect, pos: Position) -> bool {
+        pos.x >= rect.x && pos.x < rect.right() && pos.y >= rect.y && pos.y < rect.bottom()
+    }
+
+    const FOCUSES: [NewFocus; 3] = [NewFocus::Prompt, NewFocus::Path, NewFocus::Browser];
+
+    /// 十分な広さのペインなら、どのフィールドにフォーカスしていても位置はペイン内
+    #[test]
+    fn cursor_stays_in_pane_for_every_focus() {
+        let pane = Rect::new(34, 0, 80, 30);
+        for focus in FOCUSES {
+            let cursor = new_view_cursor(pane, focus, 0, 0, true);
+            assert!(
+                contains(pane, cursor.pos),
+                "focus 切替で pos {:?} がペイン外",
+                cursor.pos
+            );
         }
+    }
+
+    /// 長い入力（= 大きな cursor_x）でも枠の外へ出ない。狭いペインでも同じ。
+    /// u16::MAX は加算の飽和も兼ねて見る（素の + だと debug ビルドで panic する）
+    #[test]
+    fn cursor_stays_in_pane_for_long_field_text() {
+        for width in [10u16, 12, 20, 80] {
+            let pane = Rect::new(34, 0, width, 30);
+            for cursor_x in [500u16, u16::MAX - 1, u16::MAX] {
+                for focus in FOCUSES {
+                    let cursor = new_view_cursor(pane, focus, cursor_x, cursor_x, true);
+                    assert!(
+                        contains(pane, cursor.pos),
+                        "幅 {width} / cursor_x {cursor_x} で pos {:?} がペイン外",
+                        cursor.pos
+                    );
+                }
+            }
+        }
+    }
+
+    /// フォームが収まらない高さ（layout.ok == false）でも位置はペイン内
+    #[test]
+    fn cursor_stays_in_pane_when_layout_does_not_fit() {
+        let pane = Rect::new(34, 0, 80, 6); // HEAD_ROWS + FOOT_ROWS に足りない
+        assert!(!NewLayout::compute(pane).ok);
+        for focus in FOCUSES {
+            let cursor = new_view_cursor(pane, focus, 0, 0, true);
+            assert_eq!(cursor.pos, Position::new(pane.x, pane.y));
+            assert!(contains(pane, cursor.pos));
+        }
+    }
+
+    /// 退化サイズでもペイン外へ出ない（Finding 3 の回帰テスト）。
+    /// 幅・高さのどちらかが 0 のペインには「内側」が存在しないので、
+    /// その場合だけはペイン原点に落ちることを確認する
+    #[test]
+    fn cursor_stays_in_pane_for_degenerate_pane_sizes() {
+        for w in [0u16, 1, 2, 3, 9, 10] {
+            for h in [0u16, 1, 2, 11, 12] {
+                let pane = Rect::new(34, 5, w, h);
+                for focus in FOCUSES {
+                    let cursor = new_view_cursor(pane, focus, 42, 42, true);
+                    if w == 0 || h == 0 {
+                        assert_eq!(
+                            cursor.pos,
+                            Position::new(pane.x, pane.y),
+                            "{w}x{h} でペイン原点に落ちていない"
+                        );
+                    } else {
+                        assert!(
+                            contains(pane, cursor.pos),
+                            "{w}x{h} で pos {:?} がペイン外",
+                            cursor.pos
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 可視になるのは「ペインにフォーカスがあり、かつテキストフィールド上」のときだけ。
+    /// 隠すときも位置は必ず入っている（IME のアンカーを迷子にしない）
+    #[test]
+    fn cursor_visible_only_when_pane_focused_and_field_active() {
+        let pane = Rect::new(34, 0, 80, 30);
+        assert!(new_view_cursor(pane, NewFocus::Prompt, 0, 0, true).visible);
+        assert!(new_view_cursor(pane, NewFocus::Path, 0, 0, true).visible);
+        // 一覧操作中は入力欄に居ないので隠す
+        assert!(!new_view_cursor(pane, NewFocus::Browser, 0, 0, true).visible);
+        // ペイン自体が非フォーカス（サイドバーにフォーカス）なら常に隠す
+        for focus in FOCUSES {
+            let cursor = new_view_cursor(pane, focus, 0, 0, false);
+            assert!(!cursor.visible);
+            assert!(contains(pane, cursor.pos), "非表示でも位置は確定させる");
+        }
+    }
+
+    /// テスト用の一時ディレクトリ。drop で必ず再帰削除するので、
+    /// アサーション失敗（= panic）で抜けても後片付けが漏れない
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        /// sub_a / sub_b を持つ一時ディレクトリを作る。
+        /// パスはプロセス ID + 連番で一意にする: プロセス ID で別チェックアウトとの
+        /// 並行実行を、連番で同一プロセス内の並行テストスレッド同士を分ける
+        /// （tag の手書き重複に一意性を賭けない）
+        fn new(tag: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "ccdesk-new-view-{}-{tag}-{seq}",
+                std::process::id()
+            ));
+            // ディレクトリ作成より先にガードを組み立てる。作成中に panic しても
+            // ガードが所有しているので Drop で作りかけのディレクトリを片付けられる
+            let guard = Self(root);
+            let _ = std::fs::remove_dir_all(guard.path());
+            std::fs::create_dir_all(guard.path().join("sub_a")).unwrap();
+            std::fs::create_dir_all(guard.path().join("sub_b")).unwrap();
+            guard
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn lists_launch_row_and_parent_first() {
+        let tmp = TempDir::new("list");
+        let root = tmp.path();
+        let state = NewState::browse(&root.to_string_lossy());
+        assert_eq!(
+            state.entries,
+            vec![
+                BrowseRow::Launch,
+                BrowseRow::Parent,
+                BrowseRow::Dir("sub_a".into()),
+                BrowseRow::Dir("sub_b".into()),
+            ]
+        );
+        // 初期選択は起動ボタン。Enter の意味（現在のフォルダで起動）と一致する
+        assert!(state.selected_is_launch());
+    }
+
+    #[test]
+    fn does_not_descend_on_launch_row() {
+        let tmp = TempDir::new("no-descend");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        // 初期選択は起動ボタン行。→ / Enter でフォルダが変わってはいけない
+        state.descend();
+        assert_eq!(state.cur_dir, root.to_string_lossy());
+    }
+
+    #[test]
+    fn descends_into_subdir_and_back_to_parent() {
+        let tmp = TempDir::new("move");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        state.dir_idx = 2; // sub_a
+        state.descend();
+        assert_eq!(state.cur_dir, root.join("sub_a").to_string_lossy());
+        state.dir_idx = 1; // ..
+        state.descend();
+        assert_eq!(state.cur_dir, root.to_string_lossy());
+    }
+
+    #[test]
+    fn goes_up_even_when_parent_row_is_filtered_out() {
+        let tmp = TempDir::new("go-up");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        // "…/sub" まで打鍵 = 断片フィルタ。".." 行は落ち、起動ボタンは残る
+        state.path.set_text(&root.join("sub").to_string_lossy());
+        state.refresh_from_input();
+        assert_eq!(
+            state.entries,
+            vec![
+                BrowseRow::Launch,
+                BrowseRow::Dir("sub_a".into()),
+                BrowseRow::Dir("sub_b".into()),
+            ]
+        );
+        // go_up は一覧の index を見ず cur_dir の親を直接引くので、".." 行が
+        // 消えていても正しく上がれる。旧実装は「index 0 = ..」前提で
+        // entries[0] を実行していたため、ここで sub_a へ潜ってしまっていた
+        state.go_up();
+        let parent = root.parent().unwrap().to_string_lossy().to_string();
+        assert_eq!(state.cur_dir, parent);
+    }
+
+    #[test]
+    fn selects_first_match_when_filtering_so_descend_works() {
+        let tmp = TempDir::new("filter-select");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        // "…/sub" まで打鍵 = 断片フィルタ（sub_a / sub_b が一致）。選択は常設の
+        // 起動ボタン（index 0）ではなく最初の一致フォルダに載る。載っていないと
+        // 絞り込んだ直後の → / Enter が空振りする
+        state.path.set_text(&root.join("sub").to_string_lossy());
+        state.refresh_from_input();
+        assert_eq!(state.entries[state.dir_idx], BrowseRow::Dir("sub_a".into()));
+        assert!(!state.selected_is_launch());
+        // その選択のまま潜れる（↓ を 1 回押させない）
+        state.descend();
+        assert_eq!(state.cur_dir, root.join("sub_a").to_string_lossy());
+    }
+
+    #[test]
+    fn keeps_selection_in_range_when_filter_has_no_dir_row() {
+        let tmp = TempDir::new("filter-select-none");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        // 一致フォルダが無い断片。選ぶ先が無いので起動ボタン（index 0）へ落とす
+        state.path.set_text(&root.join("zzz").to_string_lossy());
+        state.refresh_from_input();
+        assert_eq!(state.dir_idx, 0);
+        assert!(state.selected_is_launch());
+    }
+
+    /// 一覧を作り直した直後の選択（既定の起動ボタン行）はクリック 1 回で実行しない。
+    /// 「フォルダ行を再クリックして潜る → その位置で起動ボタンを 1 回クリック」で
+    /// 書きかけのプロンプトのままセッションが起動してしまうのを防ぐ
+    #[test]
+    fn rebuilt_selection_needs_an_explicit_click_before_activating() {
+        let tmp = TempDir::new("click-guard");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        state.focus = NewFocus::Browser;
+        // 初期表示の選択も「利用者が選んだ行」ではない
+        assert!(state.selected_is_launch());
+        assert!(!state.click_activates(0));
+
+        // フォルダ行のクリックで選択が動く → 再クリックで潜れる
+        state.select(2);
+        assert_eq!(state.entries[state.dir_idx], BrowseRow::Dir("sub_a".into()));
+        assert!(state.click_activates(2));
+        state.descend();
+
+        // 潜った先では dir_idx が 0 = 起動ボタンへ戻るが focus は Browser のまま。
+        // ここが 1 クリックで起動すると取り消せない誤発火になる
+        assert_eq!(state.cur_dir, root.join("sub_a").to_string_lossy());
+        assert!(state.selected_is_launch());
+        assert!(
+            !state.click_activates(0),
+            "作り直し直後の起動ボタンが 1 クリックで起動する"
+        );
+
+        // 起動ボタン行を明示的にクリック（1 回目）した後は次のクリックで起動する
+        state.select(0);
+        assert!(state.click_activates(0));
+    }
+
+    /// 一覧の作り直しはすべて選択を無効化する（set_dir / refresh_from_input の両分岐）。
+    /// 明示的な選択移動（↑↓・ホイール・選択を動かすクリック）だけが有効化する
+    #[test]
+    fn every_list_rebuild_invalidates_the_selection() {
+        let tmp = TempDir::new("click-guard-rebuild");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+
+        // 断片フィルタでの作り直し
+        state.select(2);
+        assert!(!state.selection_from_rebuild);
+        state.path.set_text(&root.join("sub").to_string_lossy());
+        state.refresh_from_input();
+        assert!(state.selection_from_rebuild, "フィルタでの作り直し");
+        assert!(!state.click_activates(state.dir_idx));
+
+        // 実在パス全体を入れた作り直し
+        state.select(1);
+        state.path.set_text(&root.join("sub_b").to_string_lossy());
+        state.refresh_from_input();
+        assert!(state.selection_from_rebuild, "パス確定での作り直し");
+
+        // set_dir（→ / Enter での移動もここを通る）
+        state.select(0);
+        state.set_dir(root.to_string_lossy().to_string());
+        assert!(state.selection_from_rebuild, "set_dir");
+
+        // 明示操作で倒れる
+        state.select_next();
+        assert!(!state.selection_from_rebuild, "↓ / ホイール下");
+        state.select_prev();
+        assert!(!state.selection_from_rebuild, "↑ / ホイール上");
+    }
+
+    /// 0 件メッセージ用の 1 行を確保する。list_height == 1（layout.ok の下限）では
+    /// 起動ボタン行より優先する
+    #[test]
+    fn reserves_a_line_for_the_no_match_message() {
+        assert_eq!(list_rows_for_message(false, 1), 1);
+        assert_eq!(list_rows_for_message(false, 5), 5);
+        assert_eq!(
+            list_rows_for_message(true, 1),
+            0,
+            "1 行しか無いならメッセージを優先する"
+        );
+        assert_eq!(list_rows_for_message(true, 5), 4);
+        assert_eq!(list_rows_for_message(true, 0), 0);
+    }
+
+    /// 一覧が 1 行しか取れない高さでも「なぜ空なのか」が画面に出る。
+    /// メッセージを行の後ろへ足していた実装では Paragraph に切られて消えていた
+    #[test]
+    fn renders_no_match_message_in_the_shortest_pane() {
+        let tmp = TempDir::new("short-pane");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        // 一致するサブフォルダが無い断片 = 起動ボタン行だけが残る
+        state.path.set_text(&root.join("zzz").to_string_lossy());
+        state.refresh_from_input();
+        assert!(state.no_folder_rows());
+
+        // 一覧に 1 行だけ割ける最小の高さ
+        let pane = Rect::new(0, 0, 40, 14);
+        assert_eq!(NewLayout::compute(pane).list_height, 1);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(pane.width, pane.height))
+                .unwrap();
+        terminal
+            .draw(|frame| {
+                draw_new_view(frame, pane, &mut state, true, false);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..pane.height)
+            .flat_map(|y| (0..pane.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buffer.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect();
+        assert!(
+            text.contains("no matching folders"),
+            "0 件の理由が描画されていない: {text:?}"
+        );
+    }
+
+    #[test]
+    fn detects_zero_folder_rows_when_filter_matches_nothing() {
+        let tmp = TempDir::new("empty");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        // 一致するサブフォルダが無い断片。起動ボタンだけが残る
+        state.path.set_text(&root.join("zzz").to_string_lossy());
+        state.refresh_from_input();
+        assert_eq!(state.entries, vec![BrowseRow::Launch]);
+        // entries は空でないので、0 件判定は no_folder_rows() でしか出せない
+        assert!(state.no_folder_rows());
     }
 }

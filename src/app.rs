@@ -11,9 +11,7 @@ use ratatui::layout::{Position, Rect};
 use ccdesk::{log_error, save_setting, save_state, scan_jobs, BgJob};
 
 use crate::keys::{encode_key, forward_mouse};
-use crate::poll::{
-    demo_jobs, read_usage, AgentInfo, FooterInfo, Grouping, UsageInfo,
-};
+use crate::poll::{demo_jobs, read_usage, AgentInfo, FooterInfo, Grouping, UsageInfo};
 use crate::session::Session;
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
 use crate::ui::{draw, popup_rect, sidebar_layout};
@@ -238,6 +236,84 @@ fn write_inject_settings() -> Option<std::path::PathBuf> {
     Some(path)
 }
 
+/// 同期出力（DECSET 2026）のスコープガード。Drop で閉じるため、draw のクロージャが
+/// panic して巻き戻した場合も開いたままにならない。閉じ忘れると mode 2026 に
+/// タイムアウトを持たない端末では画面が固まり、panic メッセージも表示されないまま
+/// 操作不能になる。
+///
+/// 既知の制限（挙動は変えない）: crossterm 0.29 の Begin/EndSynchronizedUpdate は
+/// `is_ansi_code_supported()` を true 決め打ちで実装しているため、VT 処理の無い
+/// レガシー Windows コンソールでは他コマンドが winapi 経路を通る一方この 2 つだけ
+/// 生 ANSI を書き、`[?2026h` が文字として表示され得る。ccdesk は ConPTY を
+/// 前提とするため許容する。
+///
+/// カーソルの `Show` はここでは出さない。panic 時は ratatui の hook が
+/// alt screen を離脱し、その後の巻き戻しで Terminal の Drop が
+/// （hidden_cursor が立っていれば）`?25h` を出すので、通常画面に戻った後に
+/// 復帰する順序が既に成立している。ここで二重に出す必要はない
+struct SyncOutput;
+
+impl SyncOutput {
+    fn begin() -> Self {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::BeginSynchronizedUpdate
+        );
+        Self
+    }
+}
+
+impl Drop for SyncOutput {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EndSynchronizedUpdate
+        );
+    }
+}
+
+/// 1 フレームぶんの出力。同期出力（DECSET 2026）で包み、終端カーソルを必ず確定させる。
+///
+/// ratatui は 1 フレームを「差分 + 非表示/表示 + MoveTo」の複数 flush に分けて書く。
+/// 途中状態を端末に観測させないため全体を同期出力で囲む（非対応端末は無視するだけ）。
+/// 見せるフレームだけ ratatui に位置を渡し、隠すフレームは位置を渡さず（= None）
+/// 自前の MoveTo でカーソルをペイン内へ駐車させる。この非対称が要点で、理由は 2 つ:
+///
+/// 1. 終了後にカーソルが隠れたまま残るのを防ぐ。ratatui は自前の hidden_cursor
+///    フラグを持ち、Terminal の Drop ではそれが立っているときだけ `?25h` を出す。
+///    フラグが立つのは位置 None（= 内部で hide_cursor を通る）のときだけなので、
+///    位置を常に渡して生の `cursor::Hide` で隠すとフラグが永久に false のまま
+///    「実際は隠れているのに ratatui は表示中だと思っている」状態になり、
+///    alt screen 離脱で DECTCEM を復元しない端末では終了後のシェルにカーソルが戻らない。
+/// 2. 毎フレームの `?25h` を出さない。位置ありの draw は毎回 show_cursor を呼ぶため、
+///    隠すフレームでも Show → MoveTo → Hide を送ることになり、DECTCEM の実装が
+///    素直でない端末ではこれがちらつきになる。None ならそもそも Show を出さない。
+///
+/// 元の IME バグ（位置を渡さないと MoveTo が出ず、物理カーソルが差分の最終セル
+/// = サイドバーに残る）は自前の MoveTo で駐車させるので再発しない。差分描画側の
+/// MoveTo 省略判定（last_pos）は Backend::draw のメソッドローカルで毎回リセット
+/// されるため、後から MoveTo を出しても次フレームの差分とは干渉しない。
+/// 生 stdout と CrosstermBackend<Stdout> は同一のグローバル stdout を共有するので
+/// 書き込み順序も保証される
+fn draw_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
+    let _sync = SyncOutput::begin();
+    // 隠すフレームでカーソルを駐車させたい位置（Some = 非表示フレーム）
+    let mut park: Option<ratatui::layout::Position> = None;
+    let drawn = terminal.draw(|frame| {
+        let cursor = draw(frame, app);
+        if cursor.visible {
+            frame.set_cursor_position(cursor.pos);
+        } else {
+            park = Some(cursor.pos);
+        }
+    });
+    drawn?;
+    if let Some(pos) = park {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::MoveTo(pos.x, pos.y));
+    }
+    Ok(())
+}
+
 pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
     let mut last_draw = std::time::Instant::now();
     let mut force_draw = true;
@@ -323,10 +399,6 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            if app.demo {
-                app.footer.account = "you · Acme, Inc.".to_string();
-                app.footer.latest = None;
-            }
             force_draw = true;
         }
         // agents --json のライブ状態を取り込む（rename・state 変化の即時反映）
@@ -374,7 +446,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             .iter()
             .any(|s| s.dirty.swap(false, std::sync::atomic::Ordering::Relaxed));
         if force_draw || pty_dirty || last_draw.elapsed() > Duration::from_millis(250) {
-            terminal.draw(|frame| draw(frame, app))?;
+            draw_frame(terminal, app)?;
             last_draw = std::time::Instant::now();
             force_draw = false;
         }
@@ -788,6 +860,8 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         }
         // New 画面: クリックでフォルダ選択・プロンプト欄フォーカス
         if let RightView::New(state) = &mut app.right_view {
+            // 起動ボタン行のクリックは state の借用を抜けてからディスパッチする
+            let mut launch = false;
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     // 描画と同じジオメトリでヒットテスト（右ペイン矩形を chunks[1] と同一に再構成）
@@ -820,15 +894,25 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                         && mouse.row < layout.list_top + layout.list_height
                     {
                         // フォルダ一覧エリア（空白部分も含む）→ 一覧フォーカス。
-                        // 実在する行の上なら選択も動かし、選択済みの再クリックは潜る
+                        // 実在する行の上なら選択も動かし、選択済み行の再クリックで実行する
                         let row_in = (mouse.row - layout.list_top) as usize;
                         if row_in < state.shown {
                             let idx = state.scroll + row_in;
-                            if state.focus == NewFocus::Browser && state.dir_idx == idx {
-                                state.descend(); // 選択済みを再クリック = 潜る
-                            } else {
-                                state.dir_idx = idx;
-                                state.focus = NewFocus::Browser;
+                            // 起動ボタン行もフォルダ行と同じ 2 段階（選択 → 再クリック）にする。
+                            // 1 クリックで起動すると、プロンプト入力中に一覧へフォーカスを
+                            // 移すだけのクリックが書きかけのプロンプトでセッションを起動して
+                            // しまう（supervisor 管理なので取り消せない）。
+                            // 判定はクリックで選択を動かす前に取る（動かした後では
+                            // 常に dir_idx == idx になり 2 段階が崩れる）
+                            let reclick = state.click_activates(idx);
+                            state.select(idx);
+                            state.focus = NewFocus::Browser;
+                            if reclick {
+                                if state.selected_is_launch() {
+                                    launch = true;
+                                } else {
+                                    state.descend(); // 選択済みを再クリック = 潜る
+                                }
                             }
                         } else {
                             state.focus = NewFocus::Browser;
@@ -837,14 +921,16 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                 }
                 MouseEventKind::ScrollUp => {
                     state.focus = NewFocus::Browser;
-                    state.dir_idx = state.dir_idx.saturating_sub(1);
+                    state.select_prev();
                 }
                 MouseEventKind::ScrollDown => {
                     state.focus = NewFocus::Browser;
-                    state.dir_idx =
-                        (state.dir_idx + 1).min(state.entries.len().saturating_sub(1));
+                    state.select_next();
                 }
                 _ => {}
+            }
+            if launch {
+                start_new_session(app)?;
             }
             return Ok(false);
         }

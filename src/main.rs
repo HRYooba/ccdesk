@@ -22,7 +22,9 @@ mod ui;
 
 use app::{clamp_sidebar, instant_ago, open_short, run, App, Focus, RightView, JOBS_LIMIT};
 use cli::{print_usage, run_doctor, show_logs, statusline_hook, update_self};
-use poll::{demo_jobs, spawn_agents_poller, spawn_footer_poller, FooterInfo, Grouping};
+use poll::{
+    demo_footer, demo_jobs, spawn_agents_poller, spawn_footer_poller, FooterInfo, Grouping,
+};
 use theme::HOST_COLORS;
 
 fn main() -> anyhow::Result<()> {
@@ -127,7 +129,7 @@ fn main() -> anyhow::Result<()> {
         selected_row: 0,
         dispatch_cwd: cwd1.clone(),
         right_view: RightView::Sessions,
-        footer: FooterInfo::default(),
+        footer: if demo { demo_footer() } else { FooterInfo::default() },
         footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
         footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -149,11 +151,15 @@ fn main() -> anyhow::Result<()> {
     };
     clamp_sidebar(&mut app); // 保存値が現在の端末幅を超えていたら丸める
     spawn_agents_poller(app.agents_shared.clone(), app.agents_dirty.clone());
-    spawn_footer_poller(
-        app.footer_shared.clone(),
-        app.footer_dirty.clone(),
-        app.footer_refresh.clone(),
-    );
+    // demo は撮影用の固定値をそのまま出すので、
+    // フッターのポーリング自体を回さない
+    if !demo {
+        spawn_footer_poller(
+            app.footer_shared.clone(),
+            app.footer_dirty.clone(),
+            app.footer_refresh.clone(),
+        );
+    }
     // 前回開いていた画面を復元: セッションを見ていたなら再 attach、それ以外は new session 画面
     match load_state("last_view") {
         Some(short) if !demo && short != "new" && app.jobs.iter().any(|j| j.short == short) => {
@@ -178,5 +184,10 @@ fn main() -> anyhow::Result<()> {
         DisableBracketedPaste
     );
     ratatui::restore();
+    // ratatui::restore() は raw mode 解除 + alt screen 離脱だけで DECTCEM を戻さない。
+    // カーソルの表示状態を戻すのは Terminal の Drop（hidden_cursor が立っているときだけ
+    // `?25h` を出す）。alt screen を出た後に出さないと通常画面に効かない端末があるため、
+    // restore() の後で明示的に drop する（この順序は意味を持つので暗黙の drop に任せない）
+    drop(terminal);
     result
 }

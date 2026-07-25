@@ -10,7 +10,7 @@ use std::time::Duration;
 use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, Focus, Popup, RightView, RowAction, SIDEBAR_HEADER_ROWS};
-use crate::poll::{classify, Bucket, Group, Grouping, StateView};
+use crate::poll::{classify, AccountStatus, Bucket, Group, Grouping, StateView};
 use crate::session::SessionStatus;
 use crate::theme::{
     ui, usage_color, C_ATTENTION, C_FAIL, C_WORKING, FOCUS_BORDER, MUTED_FG,
@@ -83,7 +83,31 @@ fn fmt_age(secs: u64) -> String {
     }
 }
 
-pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
+/// 1 フレーム終端のカーソル状態。**位置は可視性に関係なく必ず返す**。
+///
+/// ratatui は位置が None だとカーソル非表示コマンドしか出さず MoveTo を出さない。
+/// 一方で差分描画は「変更セルごとに MoveTo」なので、位置を渡さないフレームでは
+/// 物理カーソルが最終変更セルに置き去りになる。日本語変換中は右ペインに差分が出ず
+/// サイドバー（スピナー 400ms・経過時間 1s）だけが変わるため、その置き去り先は
+/// サイドバー内になる。Windows の IME 変換窓はコンソールカーソル位置に
+/// アンカーされるので、これが「変換中に一瞬サイドバーへ飛ぶ」症状になる。
+pub(crate) struct FrameCursor {
+    pub(crate) pos: Position,
+    pub(crate) visible: bool,
+}
+
+impl FrameCursor {
+    pub(crate) fn shown_at(pos: Position) -> Self {
+        Self { pos, visible: true }
+    }
+
+    /// 見せないが位置は確定させる（IME のアンカーを迷子にしない）
+    pub(crate) fn hidden_at(pos: Position) -> Self {
+        Self { pos, visible: false }
+    }
+}
+
+pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // 最下行は横断のキーヒントバー
     let vert = Layout::default()
         .direction(Direction::Vertical)
@@ -590,11 +614,15 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             ),
             Rect::new(fx, sep_y, fw, 1),
         );
-        // アカウント行（表示名 · 組織名）
+        // アカウント行（表示名 · 組織名）。未ログインは要対応なので注意色、
+        // 未取得（起動直後・CLI 失敗）は誤情報を出さないため空行にする
+        let (account, account_style) = match &app.footer.account {
+            AccountStatus::LoggedIn(label) => (label.as_str(), Style::default().fg(ui().dim)),
+            AccountStatus::LoggedOut => ("not logged in", Style::default().fg(C_ATTENTION)),
+            AccountStatus::Unknown => ("", Style::default().fg(ui().dim)),
+        };
         frame.render_widget(
-            ratatui::widgets::Paragraph::new(
-                Line::from(clip(&app.footer.account)).style(Style::default().fg(ui().dim)),
-            ),
+            ratatui::widgets::Paragraph::new(Line::from(clip(account)).style(account_style)),
             Rect::new(fx, account_y, fw, 1),
         );
         if update_row_visible {
@@ -656,8 +684,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     let terminal_focused = app.focus == Focus::Terminal;
     let starting = app.spawn_rx.is_some();
     if let RightView::New(state) = &mut app.right_view {
-        draw_new_view(frame, chunks[1], state, terminal_focused, starting);
-        return;
+        return draw_new_view(frame, chunks[1], state, terminal_focused, starting);
     }
     if app.sessions.is_empty() {
         frame.render_widget(
@@ -667,7 +694,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                 .border_style(Style::default().fg(ui().dim)),
             chunks[1],
         );
-        return;
+        return FrameCursor::hidden_at(pane_fallback_pos(chunks[1]));
     }
     let session = &app.sessions[app.active];
     let parser = session.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -688,11 +715,106 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         .block(block);
     frame.render_widget(widget, chunks[1]);
 
-    // カーソル位置を反映（フォーカス外は隠す。ペイン外へはみ出す座標はクランプ）
+    // カーソル位置を反映。フォーカス外・子が非表示指定のときも「隠すだけ」で
+    // 位置は必ず確定させる（描かないとサイドバーに置き去りになる。FrameCursor 参照）。
+    // ペイン外へはみ出す座標はペイン内へクランプする
+    let (crow, ccol) = screen.cursor_position();
+    let pos = terminal_cursor_pos(chunks[1], inner, crow, ccol);
     if app.focus == Focus::Terminal && !screen.hide_cursor() {
-        let (crow, ccol) = screen.cursor_position();
-        if ccol < inner.width && crow < inner.height {
-            frame.set_cursor_position(Position::new(inner.x + ccol, inner.y + crow));
+        FrameCursor::shown_at(pos)
+    } else {
+        FrameCursor::hidden_at(pos)
+    }
+}
+
+/// カーソルの安全な退避先。「見せるものが無い / クランプの前提が崩れた」経路は
+/// すべてここへ寄せる（セッション 0 件・inner が潰れている・New 画面のフォームが
+/// 収まらない）。位置を返さないと物理カーソルがサイドバーに置き去りになるので、
+/// 何も指せないフレームでもペイン矩形の原点だけは必ず返す。
+/// pane は Layout::split の結果なので、原点は常に端末の内側にある
+pub(crate) fn pane_fallback_pos(pane: Rect) -> Position {
+    Position::new(pane.x, pane.y)
+}
+
+/// ターミナルペインのカーソル位置。子（vt100）の (row, col) を pane 内の絶対座標へ移す。
+/// Frame を必要としない純関数なので描画から切り離してテストできる。
+///
+/// inner が潰れている（幅または高さ 0）ときは width-1 クランプが枠の列＝inner の外を
+/// 指し、端末幅を超える MoveTo にもなり得る。右ペインは Constraint::Min(1) なので
+/// サイドバーを広げ切ると幅 1 = inner 幅 0 が起こり得るため、その場合は退避先を使う
+fn terminal_cursor_pos(pane: Rect, inner: Rect, crow: u16, ccol: u16) -> Position {
+    if inner.width == 0 || inner.height == 0 {
+        return pane_fallback_pos(pane);
+    }
+    Position::new(
+        inner.x + ccol.min(inner.width - 1),
+        inner.y + crow.min(inner.height - 1),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// pos が矩形の内側にあるか（幅・高さ 0 の矩形は「内側なし」なので常に false）
+    fn contains(rect: Rect, pos: Position) -> bool {
+        pos.x >= rect.x && pos.x < rect.right() && pos.y >= rect.y && pos.y < rect.bottom()
+    }
+
+    /// Borders::ALL の Block::inner と同じ 1px 縮小
+    fn shrink(rect: Rect) -> Rect {
+        Rect {
+            x: rect.x + 1,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(2),
+            height: rect.height.saturating_sub(2),
+        }
+    }
+
+    /// 通常サイズでは子の (row, col) がそのまま inner 内の絶対座標へ移る
+    #[test]
+    fn terminal_cursor_maps_child_position_into_inner() {
+        let pane = Rect::new(34, 0, 60, 20);
+        let inner = shrink(pane);
+        let pos = terminal_cursor_pos(pane, inner, 3, 7);
+        assert_eq!(pos, Position::new(42, 4));
+        assert!(contains(inner, pos));
+    }
+
+    /// inner をはみ出す座標は最終行・最終列へクランプされる
+    #[test]
+    fn terminal_cursor_clamps_out_of_range_child_position() {
+        let pane = Rect::new(0, 0, 10, 5);
+        let inner = shrink(pane);
+        let pos = terminal_cursor_pos(pane, inner, 99, 99);
+        assert_eq!(pos, Position::new(8, 3));
+        assert!(contains(inner, pos));
+    }
+
+    /// 退避先はどんなペインでもその内側（幅・高さがある限り）。
+    /// draw のセッション 0 件経路が返すのはこの位置そのもの
+    #[test]
+    fn pane_fallback_is_inside_pane() {
+        for (x, y, w, h) in [(34u16, 0u16, 60u16, 20u16), (0, 0, 1, 1), (34, 5, 3, 12)] {
+            let pane = Rect::new(x, y, w, h);
+            let pos = pane_fallback_pos(pane);
+            assert_eq!(pos, Position::new(x, y));
+            assert!(contains(pane, pos), "pane {pane:?} で pos {pos:?} が外");
+        }
+    }
+
+    /// inner が潰れてもペイン矩形の外（枠の列や端末外）へ出ない。
+    /// 右ペインは Constraint::Min(1) なので幅 1 = inner 幅 0 が起こり得る
+    #[test]
+    fn terminal_cursor_stays_in_pane_for_degenerate_inner() {
+        for (w, h) in [(1u16, 20u16), (2, 20), (3, 20), (20, 1), (20, 2), (1, 1)] {
+            let pane = Rect::new(34, 0, w, h);
+            let inner = shrink(pane);
+            let pos = terminal_cursor_pos(pane, inner, 5, 5);
+            assert!(
+                contains(pane, pos),
+                "pane {pane:?} / inner {inner:?} で pos {pos:?} がペイン外"
+            );
         }
     }
 }
