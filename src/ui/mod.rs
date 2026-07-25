@@ -417,6 +417,16 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 " ↑↓ select · Enter open · Ctrl+S group · Ctrl+X stop→delete",
             ));
         }
+        // `claude --bg` の実行中（~1 秒）であることを出す。**見出しメニューの
+        // new session は右ペインの表示を変えない**ので、ここに出さないと無反応に見える。
+        // 判定は `spawn_rx` 1 つ（起動中かどうかの正本を増やさない）。
+        // New 画面は入力欄に自前の starting 表示を持つので、そこでは二重に出さない
+        if app.spawn_rx.is_some() && !matches!(app.right_view, RightView::New(_)) {
+            hint_spans.push(Span::styled(
+                "  starting session…",
+                Style::default().fg(C_WORKING),
+            ));
+        }
         // 右端: 5h/7d 使用率とリセット時刻（opt-in。statusline フック由来の公式データ）。
         // 古いデータ（10 分超更新なし）は消さず、全体を dim に落として区別する
         let mut usage_spans: Vec<Span> = Vec::new();
@@ -1651,5 +1661,34 @@ mod tests {
             !stored.contains(WARN_MARK) && stored.contains("you · Acme, Inc."),
             "保管済みなのに警告が残っている: {stored:?}"
         );
+    }
+
+    /// 端末を 1 フレーム描いて、指定行の文字列を返す
+    fn drawn_row(app: &mut App, y: u16) -> String {
+        let (w, h) = app.term_size;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("端末が作れない");
+        terminal.draw(|frame| {
+            draw(frame, app);
+        })
+        .expect("描画に失敗");
+        let buffer = terminal.backend().buffer();
+        (0..w).map(|x| buffer[(x, y)].symbol()).collect()
+    }
+
+    /// **起動処理中であることを下部バーへ出す。** 見出しメニューの new session は
+    /// 右ペインの表示を変えないので、ここに出さないと ~1 秒間まったく無反応に見える。
+    /// 判定は `spawn_rx` 1 つ（起動中の正本を増やさない）
+    #[test]
+    fn the_bottom_bar_shows_that_a_session_is_starting() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = App {
+            term_size: (120, 30),
+            spawn_rx: Some(rx),
+            ..Default::default()
+        };
+        // 下部バーは最下行
+        let bar = drawn_row(&mut app, 29);
+        assert!(bar.contains("starting session…"), "起動中の表示が無い: {bar:?}");
     }
 }

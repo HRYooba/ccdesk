@@ -1013,13 +1013,24 @@ fn selected_row_y(app: &App) -> u16 {
 /// （見出しメニューの new session は空プロンプトで直接ここに来る）
 fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
     if app.spawn_rx.is_some() {
-        return; // 起動処理中の多重ディスパッチを防ぐ
+        // 起動処理中の多重ディスパッチを防ぐ。**黙って捨てない**のが要点で、
+        // 見出しメニューの new session は右ペインの表示を変えないため、
+        // 落としたことを伝えないと「押しても何も起きないメニュー」に見える
+        set_notice(app, "セッション起動中 — 完了してからもう一度".to_string());
+        return;
     }
     // そのフォルダで作業を始めた ＝ プロジェクト。**登録をここに置くのが要点**で、
     // new session 画面の起動ボタンと見出しメニューの new session はどちらも
     // この関数へ収束するため、経路が増えても登録漏れが起きない
     register_project(app, &cwd);
     app.dispatch_cwd = cwd.clone();
+    // 起動したら打ち先はそのセッションなので、フォーカスを端末へ移す。
+    // **登録と同じ理由でここに置く**（起動の経路が増えてもフォーカス漏れが起きない）。
+    // 完了後の attach 側に置けないのは、[`App::show_session`] が
+    // 「フォーカスは動かさない」契約で、セッション切替と共用のため。
+    // 起動完了までの ~1 秒はまだ前のセッションがキーを受ける ＝ 打つには早い状態なので、
+    // 下部バーの "starting session…"（`spawn_rx` を見て出る）でそれを見せる
+    app.set_focus(Focus::Terminal);
     // 撮影用データは本物のセッションを起こさない（架空の一覧に実セッションが混ざらない）。
     // フォルダの登録と初期値の更新までは済んでいるので、供給元が違っても状態の育ち方は同じ
     if !app.source.spawns_sessions() {
@@ -2931,6 +2942,38 @@ mod tests {
         assert!(app.popup.is_none(), "実行後もメニューが開いている");
         assert_eq!(app.projects, ["C:\\dev\\api"]);
         assert_eq!(app.dispatch_cwd, "C:\\dev\\api");
+    }
+
+    /// **見出しメニューの new session はフォーカスを端末へ移す。** 起動したのに
+    /// キーがサイドバーへ行き続けると、↑↓ で選択が動き Ctrl+X で止まる ＝
+    /// クリックか Alt+→ を押すまでタイプできない。attach 側
+    /// （[`App::show_session`]）はフォーカスを動かさない契約なので、
+    /// ディスパッチの時点で移す（New 画面の起動ボタンと同じ挙動）
+    #[test]
+    fn picking_new_session_from_the_project_menu_moves_focus_to_the_terminal() {
+        let mut app = test_app(34, TERM);
+        open(&mut app, project("C:\\dev\\api", false), 5);
+        handle_popup_key(&mut app, KeyCode::Enter); // 先頭 = new session
+        assert!(
+            app.focus == Focus::Terminal,
+            "起動したのにキー入力がサイドバーに残る"
+        );
+    }
+
+    /// 起動処理中の 2 度目のディスパッチは**黙って捨てない**。選んでも画面が
+    /// 変わらない操作なので、落としたことを下部バーで伝える
+    #[test]
+    fn a_second_dispatch_while_one_is_in_flight_is_reported() {
+        let mut app = test_app(34, TERM);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.spawn_rx = Some(rx); // 起動処理中
+        open(&mut app, project("C:\\dev\\api", false), 5);
+        handle_popup_key(&mut app, KeyCode::Enter);
+        assert!(app.notice.is_some(), "無反応になっている");
+        assert!(
+            app.projects.is_empty() && app.dispatch_cwd.is_empty(),
+            "捨てたディスパッチが状態を変えている"
+        );
     }
 
     /// 登録・解除は撮影用の供給元では永続化されない ＝ **テストが開発者の
