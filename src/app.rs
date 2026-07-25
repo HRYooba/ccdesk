@@ -284,6 +284,76 @@ pub(crate) struct App {
     pub(crate) focus: Focus,
 }
 
+/// テストの土台になる中立な `App`。各テストは関心のあるフィールドだけを
+/// `App { .., ..Default::default() }` で上書きする。
+///
+/// **置き場所が要点で、`mod tests` ではなく構造体定義の直後に置いてある。**
+/// フィールド列挙をテスト側に持つと、`App` にフィールドを足した変更と、
+/// 全フィールドを列挙するテストヘルパを足した変更が別ブランチで並んだとき、
+/// テキスト衝突が起きないまま**テストビルドだけが壊れたマージ**が生まれる（実際に
+/// 起きた: `ccdesk_update` の追加とヘルパの追加で E0063）。定義の隣なら、
+/// フィールドを足す変更が同じ場所の編集になるので取り違えようがない。
+///
+/// ここは「同じ知識を 2 箇所に持たせない」より
+/// **「1 つの変更が 1 箇所に閉じる（局所性）」を優先した**判断:
+/// 中立値の列挙自体は `main` の本番組み立てと重複するが、それを消すには
+/// `source` に偽の供給元を既定値として持たせる必要があり、本番の構造を
+/// テストのために歪めることになる。だから重複は残し、代わりに
+/// 「足す場所が 1 箇所に見える」ことを取った。
+///
+/// `#[cfg(test)]` なのは、`source` の既定値が [`DemoSource`]（ファイルも
+/// ネットワークも触らない）で、本番でこれを既定にしてはいけないため
+#[cfg(test)]
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            sessions: Vec::new(),
+            active: 0,
+            agents: Vec::new(),
+            agents_shared: Arc::new(Mutex::new(Vec::new())),
+            agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            jobs: Vec::new(),
+            last_scan: std::time::Instant::now(),
+            last_live_scan: std::time::Instant::now(),
+            rescan_hot_until: None,
+            sidebar_width: 34,
+            dragging: false,
+            last_drag_resize: std::time::Instant::now(),
+            term_size: (120, 30),
+            sidebar_rows: Vec::new(),
+            sidebar_header_rows: 0,
+            sidebar_scroll: 0,
+            sidebar_follow_sel: false,
+            hovered_row: None,
+            selected_row: 0,
+            dispatch_cwd: String::new(),
+            right_view: RightView::Sessions,
+            footer: FooterInfo::default(),
+            footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
+            footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
+            ccdesk_latest: None,
+            ccdesk_latest_shared: Arc::new(Mutex::new(None)),
+            ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            usage_display: false,
+            usage: None,
+            last_usage_read: std::time::Instant::now(),
+            // 撮影用の供給元は state.json / config.json を書かないので、
+            // テストが開発者の設定を踏まない
+            source: Box::new(crate::source::DemoSource),
+            pending_delete: None,
+            spawn_rx: None,
+            notice: None,
+            grouping: Grouping::State,
+            popup: None,
+            // サイドバー側にしておく（set_focus が PTY へ通知を出さない）
+            focus: Focus::Sidebar,
+        }
+    }
+}
+
 /// `claude --bg` ディスパッチ（別スレッド）の結果
 pub(crate) struct SpawnOutcome {
     pub(crate) id: Option<String>,
@@ -1447,55 +1517,18 @@ pub(crate) fn open_short(app: &mut App, short: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::DemoSource;
     use unicode_width::UnicodeWidthStr;
 
     const TERM: (u16, u16) = (120, 40);
 
-    /// ポップアップ判定に必要な最小の App。PTY セッションは持たず、供給元は撮影用
-    /// （ディスクもネットワークも触らない）にして開発者の設定を書き換えない
+    /// ポップアップ・ヒットテスト判定に必要な最小の App。
+    /// 中立値は `App` の [`Default`]（構造体定義の直後）が持つので、ここは
+    /// このヘルパが決める 2 つだけを上書きする（フィールドを列挙し直さない）
     fn test_app(sidebar_width: u16, term_size: (u16, u16)) -> App {
         App {
-            sessions: Vec::new(),
-            active: 0,
-            agents: Vec::new(),
-            agents_shared: Arc::new(Mutex::new(Vec::new())),
-            agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            jobs: Vec::new(),
-            last_scan: std::time::Instant::now(),
-            last_live_scan: std::time::Instant::now(),
-            rescan_hot_until: None,
             sidebar_width,
-            dragging: false,
-            last_drag_resize: std::time::Instant::now(),
             term_size,
-            sidebar_rows: Vec::new(),
-            sidebar_header_rows: 0,
-            sidebar_scroll: 0,
-            sidebar_follow_sel: false,
-            hovered_row: None,
-            selected_row: 0,
-            dispatch_cwd: String::new(),
-            right_view: RightView::Sessions,
-            footer: FooterInfo::default(),
-            footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
-            footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            ccdesk_latest: None,
-            ccdesk_latest_shared: Arc::new(Mutex::new(None)),
-            ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            usage_display: false,
-            usage: None,
-            last_usage_read: std::time::Instant::now(),
-            pending_delete: None,
-            spawn_rx: None,
-            notice: None,
-            grouping: Grouping::State,
-            popup: None,
-            // サイドバー側にしておく（set_focus が PTY へ通知を出さない）
-            focus: Focus::Sidebar,
-            source: Box::new(DemoSource),
+            ..Default::default()
         }
     }
 
@@ -1957,5 +1990,123 @@ mod tests {
             ),
             "被った列の項目が実行されていない"
         );
+    }
+
+    /// ヘッダーの版行 2 本 + 区切り線 + `+ new session` を積んだサイドバー。
+    /// 版行のヒットテストを見るテストの土台
+    fn app_with_version_rows(sidebar_width: u16) -> App {
+        let mut app = test_app(sidebar_width, TERM);
+        app.sidebar_rows = vec![
+            Some(RowAction::UpdateCcdesk),
+            Some(RowAction::UpdateClaude),
+            None, // 区切り線
+            Some(RowAction::New),
+        ];
+        app.sidebar_header_rows = 4;
+        app
+    }
+
+    /// 版行は**行全体が当たる**。列 0（`☰` の桁）から内容の最右列まで、どこを
+    /// 押しても同じ行に解決する（更新行に ☰ メニューは無いので列 0 も行に当たる）。
+    ///
+    /// 更新の実行そのものは副作用（ダウンロード / `claude update` 起動）なので、
+    /// 判定の到達点は「クリックがどの行に解決したか」で見る。ディスパッチが読むのと
+    /// 同じ `row` / `action` の組なので、これが一致していれば実行先も一致する
+    #[test]
+    fn clicking_anywhere_on_a_version_row_resolves_to_its_update_action() {
+        let mut app = app_with_version_rows(34);
+        // 内容の桁は x=1..=sidebar_width-2（左右の枠を除く内側）
+        let rightmost = app.sidebar_width - 2;
+        for (y, row, expected) in [
+            (1u16, 0usize, RowAction::UpdateCcdesk),
+            (2, 1, RowAction::UpdateClaude),
+        ] {
+            for col in [0, 1, 2, 5, rightmost - 1, rightmost] {
+                handle_mouse(&mut app, &click(col, y)).unwrap();
+                assert_eq!(app.hovered_row, Some(row), "y={y} col={col}");
+                assert_eq!(app.selected_row, row, "y={y} col={col}");
+                assert_eq!(
+                    app.sidebar_rows[row].as_ref(),
+                    Some(&expected),
+                    "y={y} col={col}"
+                );
+                assert!(app.popup.is_none(), "更新行でメニューが開いた y={y} col={col}");
+                assert!(!app.dragging, "幅変更ドラッグが始まった y={y} col={col}");
+            }
+        }
+        assert_eq!(app.sidebar_width, 34, "サイドバー幅が動いている");
+    }
+
+    /// 版行の右端に置く動詞（`update` / `restart`）は内容の最右列で終わるので、
+    /// **幅変更のつかみ代（境界線の 2 列）には掛からない**。1 桁でも外すと
+    /// 動詞のクリックがサイドバー幅変更に化ける
+    #[test]
+    fn the_verb_at_the_right_edge_of_a_version_row_is_not_the_resize_grip() {
+        let mut app = app_with_version_rows(34);
+        // ui::version_row が右端寄せする先は内側幅 = sidebar_width - 2 桁ぶん。
+        // その最終桁の画面 x は 1 + (内側幅 - 1) = sidebar_width - 2
+        let verb_end = app.sidebar_width - 2;
+        handle_mouse(&mut app, &click(verb_end, 1)).unwrap();
+        assert!(!app.dragging, "動詞の最終桁が幅変更のつかみ代になっている");
+        assert_eq!(app.selected_row, 0, "動詞のクリックが行に当たっていない");
+        // つかみ代はその 1 つ外（右枠の列）から始まる = 境界がここにあることの固定
+        let mut app = app_with_version_rows(34);
+        handle_mouse(&mut app, &click(verb_end + 1, 1)).unwrap();
+        assert!(app.dragging, "境界線の列が幅変更にならない");
+    }
+
+    /// メニュー表示中の版行クリックは**メニューが受ける**（誤爆しない）。
+    /// popup 判定が行のヒットテストより先にあることの固定
+    #[test]
+    fn an_open_menu_swallows_clicks_aimed_at_the_version_rows() {
+        let mut app = app_with_version_rows(34);
+        app.selected_row = 3; // `+ new session`。動いたら分かる位置に置く
+        open(&mut app, PopupKind::Group, 3);
+        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+        assert!(rect.y > 2, "メニューが版行に被っていて外クリックにならない");
+        handle_mouse(&mut app, &click(5, 1)).unwrap();
+        assert_eq!(app.selected_row, 3, "版行が選択されてしまっている");
+        assert!(app.hovered_row.is_none(), "版行がホバー扱いになっている");
+        assert!(app.popup.is_none(), "メニュー外クリックで閉じていない");
+        assert_eq!(state_name(&app), "Idle", "更新が走ってしまっている");
+    }
+
+    /// 更新の進行状態の名前（中身の文面ではなく「どの状態か」だけを見たい）
+    fn state_name(app: &App) -> &'static str {
+        match &*app
+            .ccdesk_update
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            SelfUpdate::Idle => "Idle",
+            SelfUpdate::Running => "Running",
+            SelfUpdate::Done => "Done",
+            SelfUpdate::Failed(_) => "Failed",
+        }
+    }
+
+    /// 更新の入口のガード。**副作用（ダウンロード）が起きない経路だけを通す**:
+    /// 新しい版を知らないとき / 実行中 / 再起動待ちは、押しても何も始まらない。
+    /// `Idle` + タグありは本物のダウンロードが走るので、ここでは通さない
+    #[test]
+    fn the_ccdesk_update_entry_point_refuses_to_start_twice() {
+        // 新しい版を知らない = 行もクリック不可なので、呼ばれても始まらない
+        let mut app = test_app(34, TERM);
+        start_ccdesk_update(&mut app);
+        assert_eq!(state_name(&app), "Idle");
+        // 実行中・再起動待ちは、タグを知っていても再実行しない
+        for (state, name) in [(SelfUpdate::Running, "Running"), (SelfUpdate::Done, "Done")] {
+            let mut app = test_app(34, TERM);
+            app.ccdesk_latest = Some("v9.9.9".to_string());
+            *app.ccdesk_update
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+            start_ccdesk_update(&mut app);
+            assert_eq!(
+                state_name(&app),
+                name,
+                "済んだ / 走っている更新を再実行している"
+            );
+        }
     }
 }
