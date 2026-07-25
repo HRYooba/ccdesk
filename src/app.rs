@@ -8,22 +8,24 @@ use crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 
-use ccdesk::{log_error, save_setting, save_state, scan_jobs, BgJob};
+use ccdesk::{log_error, save_setting, save_state, BgJob};
 
 use crate::keys::{encode_key, forward_mouse};
-use crate::poll::{demo_jobs, read_usage, AgentInfo, FooterInfo, Grouping, UsageInfo};
+use crate::poll::{AgentInfo, FooterInfo, Grouping, UsageInfo};
 use crate::session::Session;
+use crate::source::{DataSource, PollSinks};
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
 use crate::ui::{draw, popup_rect, sidebar_layout};
 
 const MIN_SIDEBAR: u16 = 12;
 const MIN_PANE: u16 = 40;
 
-pub(crate) const JOBS_LIMIT: usize = 50;
 // state.json は name(/rename)・needs・summary の正本なので短周期で読む
 // （数十ファイルの小さな read。描画は dirty 時のみなので負荷は無視できる）
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const LIVE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+/// 使用率の読み取り周期（statusline フックが書くキャッシュを見に行く間隔）
+const USAGE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// ペインフォーカス。キー入力はフォーカス中のペインにだけ流す
 #[derive(Clone, Copy, PartialEq)]
@@ -127,12 +129,15 @@ pub(crate) struct App {
     pub(crate) ccdesk_latest: Option<String>,
     pub(crate) ccdesk_latest_shared: Arc<Mutex<Option<String>>>,
     pub(crate) ccdesk_latest_dirty: Arc<std::sync::atomic::AtomicBool>,
-    // 使用率表示（opt-in: config.json の usage_display = "on"）
+    // 使用率表示（opt-in: config.json の usage_display = "on"）。
+    // 表示するかどうかの判断は供給元（DataSource::usage）が持つので、ここは
+    // dispatch 時に statusline フックを注入するかの判断だけに使う
     pub(crate) usage_display: bool,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) last_usage_read: std::time::Instant,
-    // スクリーンショット撮影用の架空データ描画（--demo）
-    pub(crate) demo: bool,
+    // 画面に出す値の供給元（実データ / 撮影用の固定データ）。起動時に 1 度だけ選ばれ、
+    // 以降ここを通る限り「今 demo か」を問う必要が無い
+    pub(crate) source: Box<dyn DataSource>,
     // Ctrl+X の 2 度押し削除（short id と 1 回目 stop の時刻。2 秒以内の再押下 = rm）
     pub(crate) pending_delete: Option<(String, std::time::Instant)>,
     // `claude --bg` は ~1s かかるため別スレッドで実行し、完了を channel で受ける
@@ -174,6 +179,20 @@ impl App {
     pub(crate) fn open_new_view(&mut self) {
         self.right_view = RightView::New(NewState::browse(&self.dispatch_cwd));
         save_state("last_view", "new"); // 次回起動時に同じ画面を復元する
+    }
+
+    /// ポーラーの書き込み先をまとめて渡す。どのポーラーを起こすかは供給元が決めるので、
+    /// 呼び出し側は demo かどうかを知らない
+    pub(crate) fn poll_sinks(&self) -> PollSinks {
+        PollSinks {
+            agents: self.agents_shared.clone(),
+            agents_dirty: self.agents_dirty.clone(),
+            footer: self.footer_shared.clone(),
+            footer_dirty: self.footer_dirty.clone(),
+            footer_refresh: self.footer_refresh.clone(),
+            ccdesk_latest: self.ccdesk_latest_shared.clone(),
+            ccdesk_latest_dirty: self.ccdesk_latest_dirty.clone(),
+        }
     }
 
     /// フォーカス変更（PTY への focus in/out 通知つき）。
@@ -340,11 +359,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             app.last_scan.elapsed() > SCAN_INTERVAL
         };
         if scan_due {
-            app.jobs = if app.demo {
-                demo_jobs() // 撮影用: 実セッションを一切表示しない
-            } else {
-                scan_jobs(JOBS_LIMIT)
-            };
+            app.jobs = app.source.jobs();
             app.last_scan = std::time::Instant::now();
             if !hot {
                 app.rescan_hot_until = None;
@@ -375,20 +390,11 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 }
             }
         }
-        // 使用率キャッシュ（statusline フックが書く）を 5 秒毎に読む
-        if app.demo {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            app.usage = Some(UsageInfo {
-                five: Some((34.0, now + 2 * 3600 + 40 * 60)),
-                seven: Some((58.0, now + 3 * 86400 + 5 * 3600)),
-                stale: false,
-            });
-        } else if app.usage_display && app.last_usage_read.elapsed() > Duration::from_secs(5) {
+        // 使用率を 5 秒毎に取り込む（実データなら statusline フックが書いた
+        // キャッシュ、撮影用なら固定値。どちらを読むかは供給元が決める）
+        if app.last_usage_read.elapsed() > USAGE_INTERVAL {
             app.last_usage_read = std::time::Instant::now();
-            let usage = read_usage();
+            let usage = app.source.usage();
             if usage != app.usage {
                 app.usage = usage;
                 force_draw = true;

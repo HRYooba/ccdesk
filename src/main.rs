@@ -10,23 +10,22 @@ use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture,
 };
-use ccdesk::{load_setting, load_state, log_error, scan_jobs};
+use ccdesk::{load_setting, load_state, log_error};
 
 mod app;
 mod cli;
 mod keys;
 mod poll;
 mod session;
+mod source;
 mod theme;
 mod ui;
 mod update;
 
-use app::{clamp_sidebar, instant_ago, open_short, run, App, Focus, RightView, JOBS_LIMIT};
+use app::{clamp_sidebar, instant_ago, open_short, run, App, Focus, RightView};
 use cli::{print_usage, run_doctor, show_logs, statusline_hook, update_self};
-use poll::{
-    demo_footer, demo_jobs, spawn_agents_poller, spawn_ccdesk_version_check, spawn_footer_poller,
-    FooterInfo, Grouping,
-};
+use poll::{FooterInfo, Grouping};
+use source::{DataSource, DemoSource, LiveSource};
 use theme::HOST_COLORS;
 
 fn main() -> anyhow::Result<()> {
@@ -60,6 +59,20 @@ fn main() -> anyhow::Result<()> {
     // 間は消せないので、次回起動のここが唯一の機会（失敗は無視する）。
     // TUI 初期化より前に済ませて画面に影響させない
     update::cleanup_old_exe();
+
+    // 使用率表示の opt-in。使用率そのものを読むかは供給元が判断し、
+    // ここでは dispatch 時の statusline フック注入の可否として使う
+    let usage_display = load_setting("usage_display").as_deref() == Some("on");
+    // demo / 実データの選択はこの 1 箇所だけ。以降のコードは供給元を通すので
+    // 「今 demo か」を問う分岐を持たない（＝分岐の書き漏らしで実データが漏れない）
+    let source: Box<dyn DataSource> = if demo {
+        Box::new(DemoSource)
+    } else {
+        Box::new(LiveSource::new(usage_display))
+    };
+    // セッション一覧とフッターは供給元から受け取る
+    let jobs = source.jobs();
+    let footer = source.footer();
 
     // new session の初期フォルダは前回使ったものを復元（無ければ起動ディレクトリ）
     let cwd1 = if demo {
@@ -117,7 +130,7 @@ fn main() -> anyhow::Result<()> {
         agents: Vec::new(),
         agents_shared: Arc::new(Mutex::new(Vec::new())),
         agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        jobs: if demo { demo_jobs() } else { scan_jobs(JOBS_LIMIT) },
+        jobs,
         last_scan: std::time::Instant::now(),
         last_live_scan: std::time::Instant::now(),
         rescan_hot_until: None,
@@ -136,9 +149,9 @@ fn main() -> anyhow::Result<()> {
         sidebar_follow_sel: false,
         hovered_row: None,
         selected_row: 0,
-        dispatch_cwd: cwd1.clone(),
+        dispatch_cwd: cwd1,
         right_view: RightView::Sessions,
-        footer: if demo { demo_footer() } else { FooterInfo::default() },
+        footer,
         footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
         footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -146,10 +159,9 @@ fn main() -> anyhow::Result<()> {
         ccdesk_latest: None,
         ccdesk_latest_shared: Arc::new(Mutex::new(None)),
         ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        usage_display: load_setting("usage_display").as_deref() == Some("on"),
+        usage_display,
         usage: None,
         last_usage_read: instant_ago(Duration::from_secs(60)),
-        demo,
         pending_delete: None,
         spawn_rx: None,
         notice: None,
@@ -160,23 +172,12 @@ fn main() -> anyhow::Result<()> {
         },
         popup: None,
         focus: Focus::Terminal,
+        source,
     };
     clamp_sidebar(&mut app); // 保存値が現在の端末幅を超えていたら丸める
-    spawn_agents_poller(app.agents_shared.clone(), app.agents_dirty.clone());
-    // demo は撮影用の固定値をそのまま出すので、
-    // フッターのポーリング自体を回さない
-    if !demo {
-        spawn_footer_poller(
-            app.footer_shared.clone(),
-            app.footer_dirty.clone(),
-            app.footer_refresh.clone(),
-        );
-        // ccdesk 自身の版チェックは起動時 1 回だけ（周期ポーリングしない）
-        spawn_ccdesk_version_check(
-            app.ccdesk_latest_shared.clone(),
-            app.ccdesk_latest_dirty.clone(),
-        );
-    }
+    // バックグラウンド取得の起動。撮影用の供給元は 1 本も起こさないので、
+    // ここに `if !demo` は要らない
+    app.source.spawn_pollers(app.poll_sinks());
     // 前回開いていた画面を復元: セッションを見ていたなら再 attach、それ以外は new session 画面
     match load_state("last_view") {
         Some(short) if !demo && short != "new" && app.jobs.iter().any(|j| j.short == short) => {
