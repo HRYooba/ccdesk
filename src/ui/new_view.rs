@@ -126,7 +126,7 @@ impl TextField {
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum NewFocus {
     Prompt,  // 下部のプロンプト入力（初期フォーカス。Enter で起動）
-    Browser, // フォルダ一覧（↑↓ で行移動・→← で潜る/上がる。Enter は現在のフォルダで起動）
+    Browser, // フォルダ一覧（↑↓ で行移動・→← で潜る/上がる。Enter は選択行の実行）
     Path,    // Folder 行のテキストフィールド
 }
 
@@ -332,8 +332,8 @@ impl NewState {
 
 /// 新規セッション画面のキー処理。
 /// フィールド制: Tab で Prompt → Path → Browser と巡回し、キーはフォーカス中のフィールドにだけ効く。
-/// 起動は Prompt / Browser の Enter（どちらも「今開いているフォルダ + プロンプト」で起動）。
-/// Browser では一覧先頭の起動ボタン行がその手段を可視化している（クリックは 1 回で起動）
+/// 起動は 2 手段: Prompt での Enter と、一覧先頭の起動ボタン行（Enter またはクリック 1 回）。
+/// Browser の Enter は「選択行の実行」なので、フォルダ行では移動になる
 pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Result<()> {
     let RightView::New(state) = &mut app.right_view else {
         return Ok(());
@@ -387,8 +387,14 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
                 state.dir_idx =
                     (state.dir_idx + 1).min(state.entries.len().saturating_sub(1));
             }
-            // Enter = 現在のフォルダで起動（潜るのは →）
-            KeyCode::Enter => start_new_session(app)?,
+            // Enter = 選択行の実行。起動ボタン行なら起動、フォルダ行なら → と同じく移動
+            KeyCode::Enter => {
+                if state.selected_is_launch() {
+                    start_new_session(app)?;
+                } else {
+                    state.descend();
+                }
+            }
             KeyCode::Right => state.descend(),
             KeyCode::Left => state.go_up(),
             _ => {}
@@ -658,11 +664,16 @@ pub(crate) fn draw_new_view(frame: &mut Frame, area: Rect, state: &mut NewState,
         Rect::new(prompt_inner.x, layout.input_y, prompt_inner.width, 1),
     );
 
-    // ペイン内ヒント（下部バーの "new session:" セグメントはここへ移設して重複を避ける）
+    // ペイン内ヒント（下部バーの "new session:" セグメントはここへ移設して重複を避ける）。
+    // Enter の意味はフォーカスで変わる（Browser では選択行の実行）ので出し分ける
+    let hint = match state.focus {
+        NewFocus::Prompt => "Tab: next field · Enter: start",
+        NewFocus::Path => "Tab: next field · Enter: apply path",
+        NewFocus::Browser => "Tab: next field · ↑↓ select · Enter: run row · ←→ move",
+    };
     frame.render_widget(
         ratatui::widgets::Paragraph::new(
-            Line::from(format!("{pad}Tab: next field · Enter: start"))
-                .style(Style::default().fg(ui().dim)),
+            Line::from(format!("{pad}{hint}")).style(Style::default().fg(ui().dim)),
         ),
         Rect::new(inner.x, layout.hint_y, inner.width, 1),
     );
