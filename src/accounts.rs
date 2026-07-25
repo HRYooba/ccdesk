@@ -468,7 +468,7 @@ fn write_json_atomically(path: &Path, value: &Value) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const EMAIL_A: &str = "taro@example.com";
@@ -476,13 +476,17 @@ mod tests {
 
     /// テスト専用の擬似ホーム。**実ユーザーの `~/.claude` / `~/.ccdesk` を
     /// 絶対に触らない**ための境界で、パスは全て [`Paths`] 経由で注入する。
-    /// Drop で丸ごと消すので、アサート失敗でパニックしても残らない
-    struct TempHome(PathBuf);
+    /// Drop で丸ごと消すので、アサート失敗でパニックしても残らない。
+    ///
+    /// **他モジュールのテストからも使う**（[`crate::source`] の
+    /// 「UI の動作 → ドメイン API」の対応表テスト）。フィクスチャを複製すると
+    /// 「実ホームを触らない」境界の知識が 2 箇所に分かれるので、ここ 1 つに保つ
+    pub(crate) struct TempHome(PathBuf);
 
     impl TempHome {
         /// パスはテスト名 + pid + 連番で一意にする（並列実行・別チェックアウトの
         /// 同時実行と衝突させない。Drop がディレクトリごと消すので共有は事故になる）
-        fn new(test: &str) -> Self {
+        pub(crate) fn new(test: &str) -> Self {
             static SEQ: AtomicUsize = AtomicUsize::new(0);
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
             let root = std::env::temp_dir().join(format!(
@@ -495,7 +499,7 @@ mod tests {
         }
 
         /// 実運用と同じ導出（`lock_path_for`）を通す
-        fn paths(&self) -> Paths {
+        pub(crate) fn paths(&self) -> Paths {
             let claude = self.0.join(".claude");
             Paths {
                 store: self.0.join(".ccdesk").join("accounts.json"),
@@ -505,7 +509,7 @@ mod tests {
             }
         }
 
-        fn store(&self) -> AccountStore {
+        pub(crate) fn store(&self) -> AccountStore {
             AccountStore::new(self.paths())
         }
 
@@ -516,7 +520,7 @@ mod tests {
             store
         }
 
-        fn write_credentials(&self, value: &Value) {
+        pub(crate) fn write_credentials(&self, value: &Value) {
             std::fs::write(
                 self.paths().credentials,
                 serde_json::to_string_pretty(value).unwrap(),
@@ -524,7 +528,7 @@ mod tests {
             .unwrap();
         }
 
-        fn read_credentials(&self) -> Value {
+        pub(crate) fn read_credentials(&self) -> Value {
             read_json(&self.paths().credentials).expect("認証情報ファイルが読めない")
         }
     }
@@ -537,7 +541,7 @@ mod tests {
 
     /// 実測した認証情報ファイルの形（トークンは架空。トップレベルに
     /// `mcpOAuth` が同居し、`claudeAiOauth` に email は入らない）
-    fn credentials_doc(access: &str, refresh: &str) -> Value {
+    pub(crate) fn credentials_doc(access: &str, refresh: &str) -> Value {
         json!({
             "mcpOAuth": {
                 "linear-server": { "accessToken": "mcp-token", "expiresAt": 1_800_000_000_u64 }
@@ -546,7 +550,7 @@ mod tests {
         })
     }
 
-    fn oauth(access: &str, refresh: &str) -> Value {
+    pub(crate) fn oauth(access: &str, refresh: &str) -> Value {
         json!({
             "accessToken": access,
             "refreshToken": refresh,

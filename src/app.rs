@@ -10,10 +10,11 @@ use ratatui::layout::{Position, Rect};
 
 use ccdesk::{log_error, BgJob};
 
+use crate::accounts::Account;
 use crate::keys::{encode_key, forward_mouse};
-use crate::poll::{AgentInfo, FooterInfo, Grouping, UsageInfo};
+use crate::poll::{AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo};
 use crate::session::Session;
-use crate::source::{DataSource, PollSinks, WindowItem};
+use crate::source::{AccountAction, DataSource, PollSinks, WindowItem};
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
 use crate::ui::{draw, popup_rect, row_at, sidebar_layout};
 
@@ -68,7 +69,14 @@ const POPUP_MIN_WIDTH: u16 = 14;
 
 /// ポップアップに並べるアカウント 1 件。表示名と識別子を分けて持つ:
 /// 表示名（`ooba · 1→10, Inc.` 等）は組織違い・別 email で重複し得るので、
-/// 対象の特定はラベル一致ではなく「選択 index → id」で行う
+/// 対象の特定はラベル一致ではなく「選択 index → id」で行う。
+///
+/// **[`crate::accounts::Account`] と統合せず、[`account_items`] の写像 1 行で繋ぐ。**
+/// 形は似ているが持っている値の意味が違う: `label` はアクティブ印（`● `）を
+/// 前置した**メニューに出す文字列そのもの**で、`Account::label` は
+/// `accounts.json` に保管され追従更新で書き戻される**ドメインの値**。統合すると
+/// 印を付けた文字列が保管へ流れ込む経路ができる（保管したラベルに `● ` が付き、
+/// 次に開いたときは印が二重になる）。層が違うものを 1 つの型にしない
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AccountItem {
     pub(crate) label: String,
@@ -86,9 +94,13 @@ pub(crate) enum PopupKind {
     /// アカウント一覧。開いた時点の写しを持つ（一覧の供給はデータ層の責務で、
     /// メニューは受け取った並びをそのまま出す）。保管 0 件でも
     /// `register current` だけのメニューとして成立する
-    // 構築側（フッターのアカウント行クリック）はアカウント切替の作業が入れる
-    #[allow(dead_code)]
-    Account { accounts: Vec<AccountItem> },
+    Account {
+        accounts: Vec<AccountItem>,
+        /// 開いた時点で稼働していたセッション数。切替の影響範囲の注記に使う
+        /// （[`switch_notice`]）。写しにしてあるのは他の項目と同じ理由で、
+        /// メニューは開いた時点のスナップショットを出すため
+        sessions: usize,
+    },
     /// アカウント 1 件への操作（Account から遷移する 2 階層目）
     AccountActions { account: AccountItem },
     /// プロジェクト単位の操作
@@ -136,11 +148,13 @@ impl PopupKind {
                     (format!("{}directory", mark(Grouping::Directory)), true),
                 ]
             }
-            // 保管一覧が先、`register current` が末尾（0 件でもこの 1 項目は残る）
-            PopupKind::Account { accounts } => accounts
+            // 保管一覧が先、`register current` が末尾（0 件でもこの 1 項目は残る）。
+            // 切替の影響範囲の注記はさらにその後ろ（実行できない情報行）
+            PopupKind::Account { accounts, sessions } => accounts
                 .iter()
                 .map(|a| (a.label.clone(), true))
                 .chain(std::iter::once(("register current".to_string(), true)))
+                .chain(switch_notice(*sessions).map(|text| (text, false)))
                 .collect(),
             PopupKind::AccountActions { .. } => vec![
                 ("switch".to_string(), true),
@@ -181,7 +195,9 @@ impl PopupKind {
                 1 => Some(PopupAction::SetGrouping(Grouping::Directory)),
                 _ => None,
             },
-            PopupKind::Account { accounts } => match accounts.get(index) {
+            // 注記行は index が一覧・`register current` の後ろなので、
+            // ここでは何にも当たらない（実行不可なので activate_popup にも来ない）
+            PopupKind::Account { accounts, .. } => match accounts.get(index) {
                 // 一覧の行 → そのアカウントの 2 階層目
                 Some(account) => Some(PopupAction::Open(PopupKind::AccountActions {
                     account: account.clone(),
@@ -201,6 +217,31 @@ impl PopupKind {
                 _ => None,
             },
         }
+    }
+}
+
+/// 切替が稼働中のセッションへ及ぶことの注記。**0 本なら出さない**（伝えることが無い）。
+///
+/// Windows の claude は `.credentials.json` を読み直すため、**稼働中のセッションも
+/// 次のメッセージから新しいアカウントになる**（claude-swap の記述。Anthropic の
+/// 公式仕様ではない）。5 本走っていれば 5 本とも会話の途中で移るので本数を出す。
+/// 確認ダイアログは過剰なので出さない。
+///
+/// **見せ方は「実行できない項目」を選んだ。** [`PopupKind::entries`] は
+/// 「選べる項目の列」を返す形なので情報行を入れる素直な手段が無く、候補は
+/// (a) 実行不可の項目として混ぜる (b) 2 階層目の `switch` のラベルへ埋める
+/// (c) メニューの描画経路を分ける の 3 つだった。(a) にしたのは、実行不可の項目が
+/// 既に存在し（停止済みセッションの `stop`。dim 表示で Enter・クリックとも
+/// 発火しない）**幅計算・クリック判定・キー操作の既存の仕組みがそのまま効く**ため。
+/// (b) は 1 つのラベルに動作名と影響範囲の 2 つの意味を持たせることになり、
+/// (c) は幅と当たり判定の知識が 2 箇所に増える。
+///
+/// 末尾に置くのは [`PopupKind::action`] の「index → 対象」の対応を崩さないため
+fn switch_notice(sessions: usize) -> Option<String> {
+    match sessions {
+        0 => None,
+        1 => Some("1 session will switch".to_string()),
+        n => Some(format!("{n} sessions will switch")),
     }
 }
 
@@ -255,6 +296,13 @@ pub(crate) struct App {
     pub(crate) footer_shared: Arc<Mutex<FooterInfo>>,
     pub(crate) footer_dirty: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) footer_refresh: Arc<std::sync::atomic::AtomicBool>,
+    // 保管済みアカウントの写し。**アカウント行の ⚠（[`active_unstored`]）と
+    // アカウントメニューの一覧が、どちらもこの 1 つの写しを見る**。
+    //
+    // ポーラーで追わずに写しで持つのは、保管の「メンバーシップ」が変わるのが
+    // この UI の登録・登録解除だけだから（追従更新はトークンを書き換えるが
+    // 一覧の顔ぶれは変えない）。取り直す契機は [`refresh_accounts`] に集める
+    pub(crate) accounts: Vec<Account>,
     // claude update 実行中（行の連打防止と "updating…" 表示）
     pub(crate) claude_updating: Arc<std::sync::atomic::AtomicBool>,
     // ccdesk 自身の更新の進行状態（版行の表示と多重起動防止の正本）
@@ -332,6 +380,8 @@ impl Default for App {
             footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
             footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // 保管 0 件 = どのアカウントもまだ保管していない中立な状態
+            accounts: Vec::new(),
             claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
             ccdesk_latest: None,
@@ -1018,6 +1068,17 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             }
             _ => {}
         }
+        // アカウント行（フッター下段）はサイドバー一覧の行ではないので、
+        // 一覧のヒットテスト（`row_at` はフッター帯を不感帯にする）ではなくここで受ける。
+        // **列は見ない = 行のどこを押しても当たる**（一覧の行と同じ規則）
+        if sl.footer_visible && mouse.row == sl.account_y {
+            app.hovered_row = None; // 一覧の行ではないのでホバー対象にもしない
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                app.set_focus(Focus::Sidebar);
+                open_account_popup(app, mouse.row);
+            }
+            return Ok(false);
+        }
         // 画面 y → 行 index（列は見ないので行のどこを押しても当たる）。
         // 計算は描画側と同じ ui::row_at を共有する
         let row = row_at(
@@ -1258,12 +1319,136 @@ fn run_popup_action(app: &mut App, action: PopupAction, anchor_y: u16) {
         }
         // プロジェクト見出しの + と同じ動作（同じ知識を 2 つ持たない）
         PopupAction::NewSessionIn(cwd) => dispatch_session(app, cwd, String::new()),
-        // ここから下はメニュー基盤だけ先に用意した項目。実処理はアカウント切替・
-        // プロジェクト永続化の作業がこの arm を埋める
-        PopupAction::RegisterCurrent
-        | PopupAction::SwitchAccount(_)
-        | PopupAction::UnregisterAccount(_)
-        | PopupAction::RemoveProject(_) => {}
+        // アカウント操作は 3 つとも供給元へ流す（実処理は [`crate::accounts`]、
+        // demo は実ファイルを触らない）。**実行後にメニューを開き直さない**:
+        // activate_popup が実行前に閉じており、一覧は開くたびに
+        // [`account_items`] が作り直すので、開いたまま更新する経路
+        // （＝一覧の組み立てを 2 箇所に持つ）を作らずに再取得が成立する
+        PopupAction::RegisterCurrent => register_current(app),
+        PopupAction::SwitchAccount(email) => switch_account(app, &email),
+        PopupAction::UnregisterAccount(email) => {
+            apply_account(app, AccountAction::Unregister(&email), "登録解除")
+        }
+        // メニュー基盤だけ先に用意した項目。実処理はプロジェクト永続化の作業が入れる
+        PopupAction::RemoveProject(_) => {}
+    }
+}
+
+/// 一覧でアクティブなアカウントに前置する印。`PopupKind::Group` が現在の grouping に
+/// 付けているものと同じ語彙（印なしの行は同じ桁数の空白で埋めて桁を揃える）
+const ACTIVE_MARK: &str = "● ";
+/// [`ACTIVE_MARK`] と同じ桁を確保する空白（印の有無で名前の桁が動かない）
+const NO_MARK: &str = "  ";
+
+/// 今ログイン中のアカウント（未取得・未ログインなら None）。
+/// **アカウント操作が `footer.account` を読む唯一の場所**にしてある
+fn active_account(app: &App) -> Option<&Account> {
+    match &app.footer.account {
+        AccountStatus::LoggedIn(account) => Some(account),
+        AccountStatus::LoggedOut | AccountStatus::Unknown => None,
+    }
+}
+
+/// アクティブなアカウントが保管されていないか（アカウント行の ⚠ の判定）。
+///
+/// **未取得・未ログインでは出さない**: ⚠ は「今のログインを失いかけている」
+/// 警告なので、失う対象が分からない状態で出すと何を直せばいいのか分からない。
+/// email を持たないアカウント（email を返さない認証方式）も出さない
+/// ＝ そもそも保管できないので、警告しても打つ手が無い
+pub(crate) fn active_unstored(app: &App) -> bool {
+    active_account(app).is_some_and(|active| {
+        !active.email.is_empty() && !app.accounts.iter().any(|a| a.email == active.email)
+    })
+}
+
+/// 保管一覧の写しを取り直す。⚠ とメニューの一覧が同じ写しを見るので、
+/// 取り直す契機（起動時・アカウント行を開いた時・保管を変更した後）はここに集める
+fn refresh_accounts(app: &mut App) {
+    app.accounts = app.source.accounts();
+}
+
+/// 保管一覧 → メニューの行。アクティブな 1 件にだけ [`ACTIVE_MARK`] を前置する。
+/// id は email（表示ラベルは組織名の抑制で変わるので同一性判定に使えない）
+fn account_items(app: &App) -> Vec<AccountItem> {
+    let active = active_account(app).map(|a| a.email.as_str()).unwrap_or("");
+    app.accounts
+        .iter()
+        .map(|account| AccountItem {
+            label: format!(
+                "{}{}",
+                if !account.email.is_empty() && account.email == active {
+                    ACTIVE_MARK
+                } else {
+                    NO_MARK
+                },
+                account.label
+            ),
+            id: account.email.clone(),
+        })
+        .collect()
+}
+
+/// 切替の影響を受けるセッション数 ＝ **プロセスが生きているセッション**
+/// （`agents --json` の pid 有無。停止中は次の起動時に新しいアカウントで始まるので
+/// 「会話の途中で移る」対象ではない）
+fn running_sessions(app: &App) -> usize {
+    app.agents.iter().filter(|a| a.has_pid).count()
+}
+
+/// アカウント行クリックで開く一覧。開く直前に写しを取り直すので、
+/// 別インスタンスや前回の操作で変わった保管もその場で反映される。
+///
+/// 矩形は他のメニューと同じ [`popup_rect`] が決める。アカウント行は画面の下端
+/// なので必ず上へ丸められ、**行自体に被って開く**。被りを許容するのは、行に出る
+/// 情報（アクティブなアカウントのラベル）がメニュー側のアクティブ印で代弁される
+/// ため（幅と同じ判断: 内容を切って読めなくするより被せる）
+fn open_account_popup(app: &mut App, anchor_y: u16) {
+    refresh_accounts(app);
+    app.popup = Some(Popup {
+        kind: PopupKind::Account {
+            accounts: account_items(app),
+            sessions: running_sessions(app),
+        },
+        anchor_y,
+        selected: 0,
+    });
+}
+
+/// `register current`: 今ログイン中のアカウントを保管へ加える
+fn register_current(app: &mut App) {
+    let Some(account) = active_account(app).cloned() else {
+        // 未取得・未ログインでは保管する対象が無い（押しても無反応に見せない）
+        set_notice(app, "ログイン中のアカウントが取得できていない".to_string());
+        return;
+    };
+    apply_account(app, AccountAction::Register(&account), "登録");
+}
+
+/// `switch`: 保管アカウントへ切り替える。
+/// **`active` は `footer.account` のアクティブアカウントをそのまま渡す**
+/// （出ていくアカウントのトークンを同じロック下で保管へ巻き取るために必須。
+/// 渡さないと、切替の直前に更新された使い捨ての refreshToken を落として
+/// そのアカウントへ戻れなくなる）
+fn switch_account(app: &mut App, email: &str) {
+    let active = active_account(app).cloned();
+    apply_account(
+        app,
+        AccountAction::Switch {
+            email,
+            active: active.as_ref(),
+        },
+        "切替",
+    );
+}
+
+/// 保管への変更を供給元へ流す。成功したら写しを取り直し（⚠ と一覧が即座に追従する）、
+/// 失敗は下部バーへ出す。**エラー文はそのまま載せてよい**: ドメイン側の失敗は
+/// パスとロックの事情だけを述べ、トークンを含まない
+fn apply_account(app: &mut App, action: AccountAction<'_>, what: &str) {
+    let result = app.source.apply_account(action);
+    match result {
+        Ok(()) => refresh_accounts(app),
+        Err(e) => set_notice(app, format!("アカウントの{what}に失敗: {e}")),
     }
 }
 
@@ -1519,6 +1704,8 @@ mod tests {
     use super::*;
     use unicode_width::UnicodeWidthStr;
 
+    use crate::source::WindowState;
+
     const TERM: (u16, u16) = (120, 40);
 
     /// ポップアップ・ヒットテスト判定に必要な最小の App。
@@ -1560,6 +1747,15 @@ mod tests {
         AccountItem {
             label: label.to_string(),
             id: id.to_string(),
+        }
+    }
+
+    /// アカウント一覧のメニュー。稼働セッションは 0 本 ＝ 切替の注記が出ない形
+    /// （注記そのものを見るテストだけが `sessions` を明示する）
+    fn account_menu(accounts: Vec<AccountItem>) -> PopupKind {
+        PopupKind::Account {
+            accounts,
+            sessions: 0,
         }
     }
 
@@ -1667,16 +1863,12 @@ mod tests {
     /// 保管があれば一覧が先・register current が末尾に並ぶ
     #[test]
     fn account_menu_lists_stored_accounts_before_register_current() {
-        let empty = PopupKind::Account {
-            accounts: Vec::new(),
-        };
+        let empty = account_menu(Vec::new());
         assert_eq!(labels(&empty, Grouping::State), ["register current"]);
-        let two = PopupKind::Account {
-            accounts: vec![
-                account("ooba · 1→10, Inc.", "id-a"),
-                account("you@example.com", "id-b"),
-            ],
-        };
+        let two = account_menu(vec![
+            account("ooba · 1→10, Inc.", "id-a"),
+            account("you@example.com", "id-b"),
+        ]);
         assert_eq!(
             labels(&two, Grouping::State),
             ["ooba · 1→10, Inc.", "you@example.com", "register current"]
@@ -1687,9 +1879,10 @@ mod tests {
     /// ラベル文字列から対象を復元する実装では区別できない組み合わせ
     #[test]
     fn account_menu_picks_the_row_target_even_when_labels_are_identical() {
-        let kind = PopupKind::Account {
-            accounts: vec![account("ooba", "id-personal"), account("ooba", "id-work")],
-        };
+        let kind = account_menu(vec![
+            account("ooba", "id-personal"),
+            account("ooba", "id-work"),
+        ]);
         assert_eq!(
             labels(&kind, Grouping::State),
             ["ooba", "ooba", "register current"]
@@ -1755,9 +1948,7 @@ mod tests {
         let mut app = test_app(34, TERM);
         open(
             &mut app,
-            PopupKind::Account {
-                accounts: vec![account("ooba", "id-a"), account("you@example.com", "id-b")],
-            },
+            account_menu(vec![account("ooba", "id-a"), account("you@example.com", "id-b")]),
             5,
         );
         handle_popup_key(&mut app, KeyCode::Down); // 2 行目（id-b）を選ぶ
@@ -1783,9 +1974,7 @@ mod tests {
     #[test]
     fn esc_and_outside_click_close_every_popup_level() {
         let mut app = test_app(34, TERM);
-        let accounts = || PopupKind::Account {
-            accounts: vec![account("ooba", "id-a")],
-        };
+        let accounts = || account_menu(vec![account("ooba", "id-a")]);
         open(&mut app, accounts(), 5);
         handle_popup_key(&mut app, KeyCode::Enter); // 1 階層目 → 2 階層目
         assert!(
@@ -1809,13 +1998,7 @@ mod tests {
     #[test]
     fn arrow_keys_clamp_the_selection_to_the_entry_range() {
         let mut app = test_app(34, TERM);
-        open(
-            &mut app,
-            PopupKind::Account {
-                accounts: vec![account("ooba", "id-a")],
-            },
-            3,
-        );
+        open(&mut app, account_menu(vec![account("ooba", "id-a")]), 3);
         for _ in 0..5 {
             handle_popup_key(&mut app, KeyCode::Down);
         }
@@ -1877,9 +2060,7 @@ mod tests {
     #[test]
     fn menu_width_adapts_to_the_longest_entry() {
         let long = "very.long.address@example.co.jp";
-        let kind = PopupKind::Account {
-            accounts: vec![account("ooba", "id-a"), account(long, "id-b")],
-        };
+        let kind = account_menu(vec![account("ooba", "id-a"), account(long, "id-b")]);
         assert_eq!(
             kind.width(Grouping::State),
             long.width() as u16 + POPUP_CHROME
@@ -1887,9 +2068,7 @@ mod tests {
         assert!(kind.width(Grouping::State) > PopupKind::Group.width(Grouping::State));
 
         let wide_label = "大場 · 1→10, Inc.";
-        let wide = PopupKind::Account {
-            accounts: vec![account(wide_label, "id-c")],
-        };
+        let wide = account_menu(vec![account(wide_label, "id-c")]);
         assert_eq!(
             wide.width(Grouping::State),
             wide_label.width() as u16 + POPUP_CHROME
@@ -1907,9 +2086,7 @@ mod tests {
         let mut app = test_app(12, TERM);
         open(
             &mut app,
-            PopupKind::Account {
-                accounts: vec![account("very.long.address@example.co.jp", "id-a")],
-            },
+            account_menu(vec![account("very.long.address@example.co.jp", "id-a")]),
             3,
         );
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
@@ -1929,8 +2106,8 @@ mod tests {
             vec![
                 session("s1", false),
                 PopupKind::Group,
-                PopupKind::Account {
-                    accounts: (0..30)
+                account_menu(
+                    (0..30)
                         .map(|i| {
                             account(
                                 &format!("very.long.address.number.{i}@example.co.jp"),
@@ -1938,7 +2115,7 @@ mod tests {
                             )
                         })
                         .collect(),
-                },
+                ),
             ]
         };
         for (term_w, term_h) in [(120u16, 40u16), (80, 24), (52, 8), (14, 5), (1, 1)] {
@@ -1969,9 +2146,7 @@ mod tests {
         let mut app = test_app(12, TERM);
         open(
             &mut app,
-            PopupKind::Account {
-                accounts: vec![account("very.long.address@example.co.jp", "id-a")],
-            },
+            account_menu(vec![account("very.long.address@example.co.jp", "id-a")]),
             3,
         );
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
@@ -2082,6 +2257,379 @@ mod tests {
             SelfUpdate::Running => "Running",
             SelfUpdate::Done => "Done",
             SelfUpdate::Failed(_) => "Failed",
+        }
+    }
+
+    /// 供給元へ渡ったアカウント操作の記録。**UI が組んだ引数そのもの**を見るので、
+    /// 実ユーザーの `~/.claude` / `~/.ccdesk` を触らずに配線を固定できる
+    /// （特に switch の `active`。落とすと出ていくアカウントへ戻れなくなる）
+    #[derive(Debug, PartialEq)]
+    enum Recorded {
+        Register(Account),
+        Switch {
+            email: String,
+            active: Option<Account>,
+        },
+        Unregister(String),
+    }
+
+    /// 保管一覧を固定値で返し、変更要求を記録するだけの供給元。
+    /// `fails` を立てると変更が失敗する（下部バーへの通知経路を見るため）
+    struct RecordingSource {
+        stored: Vec<Account>,
+        recorded: Arc<Mutex<Vec<Recorded>>>,
+        fails: bool,
+    }
+
+    impl DataSource for RecordingSource {
+        fn jobs(&self) -> Vec<BgJob> {
+            Vec::new()
+        }
+
+        fn footer(&self) -> FooterInfo {
+            FooterInfo::default()
+        }
+
+        fn usage(&self) -> Option<UsageInfo> {
+            None
+        }
+
+        fn window_state(&self) -> WindowState {
+            WindowState {
+                sidebar_width: 34,
+                last_view: None,
+                dispatch_cwd: String::new(),
+                grouping: Grouping::State,
+            }
+        }
+
+        fn save_window(&self, _item: WindowItem<'_>) {}
+
+        fn spawn_pollers(&self, _sinks: PollSinks) {}
+
+        fn accounts(&self) -> Vec<Account> {
+            self.stored.clone()
+        }
+
+        fn apply_account(&self, action: AccountAction<'_>) -> anyhow::Result<()> {
+            self.recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(match action {
+                    AccountAction::Register(account) => Recorded::Register(account.clone()),
+                    AccountAction::Switch { email, active } => Recorded::Switch {
+                        email: email.to_string(),
+                        active: active.cloned(),
+                    },
+                    AccountAction::Unregister(email) => Recorded::Unregister(email.to_string()),
+                });
+            if self.fails {
+                // 実際に返り得る失敗（ロック競合）と同じ形。トークンは含まない
+                return Err(anyhow::anyhow!("lock is held by another process"));
+            }
+            Ok(())
+        }
+    }
+
+    /// 記録用の供給元を挿した App。`active` が `footer.account`（アクティブな
+    /// アカウント）、`stored` が保管一覧で、写しは起動時と同じく供給元と揃えておく
+    fn recording_app(
+        active: Option<Account>,
+        stored: Vec<Account>,
+        fails: bool,
+    ) -> (App, Arc<Mutex<Vec<Recorded>>>) {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let app = App {
+            footer: FooterInfo {
+                account: match active {
+                    Some(account) => AccountStatus::LoggedIn(account),
+                    None => AccountStatus::Unknown,
+                },
+                ..FooterInfo::default()
+            },
+            accounts: stored.clone(),
+            source: Box::new(RecordingSource {
+                stored,
+                recorded: recorded.clone(),
+                fails,
+            }),
+            ..test_app(34, TERM)
+        };
+        (app, recorded)
+    }
+
+    /// アカウントメニューの中身（開いていなければ panic）
+    fn open_account_items(app: &App) -> &[AccountItem] {
+        match app.popup.as_ref().map(|p| &p.kind) {
+            Some(PopupKind::Account { accounts, .. }) => accounts,
+            other => panic!("アカウントメニューが開いていない: {other:?}"),
+        }
+    }
+
+    /// アカウント行は**行全体が当たる**。列 0（一覧行なら ☰ の桁）から内容の
+    /// 最右列まで、どこを押してもアカウントメニューが開く。
+    /// 当たり判定は描画と同じ [`sidebar_layout`] の `account_y`
+    #[test]
+    fn clicking_anywhere_on_the_account_row_opens_the_account_menu() {
+        let active = Account::new("a@example.com", "taro");
+        let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
+        let sl = sidebar_layout(&app);
+        assert!(sl.footer_visible, "フッターが出ていない前提が崩れている");
+        // 内容の桁は x=1..=sidebar_width-2（枠の内側）。列 0 も行に当たる
+        let rightmost = app.sidebar_width - 2;
+        for col in [0, 1, 2, 5, rightmost - 1, rightmost] {
+            app.popup = None;
+            handle_mouse(&mut app, &click(col, sl.account_y)).unwrap();
+            let popup = app
+                .popup
+                .as_ref()
+                .unwrap_or_else(|| panic!("col={col} でメニューが開いていない"));
+            assert!(
+                matches!(popup.kind, PopupKind::Account { .. }),
+                "col={col} で別のメニューが開いた"
+            );
+            assert_eq!(popup.anchor_y, sl.account_y, "col={col}");
+            assert!(!app.dragging, "col={col} で幅変更ドラッグが始まっている");
+        }
+        assert_eq!(app.sidebar_width, 34, "サイドバー幅が動いている");
+        // 一覧の行やヘッダーの選択は動かさない（アカウント行は sidebar_rows の外）
+        assert!(app.hovered_row.is_none());
+    }
+
+    /// 一覧は供給元の保管一覧（[`crate::accounts::AccountStore::list`]）から作られ、
+    /// **id は email**。表示ラベルは組織名の抑制で変わるので同一性に使えない
+    #[test]
+    fn the_account_menu_comes_from_the_stored_list_keyed_by_email() {
+        let active = Account::new("b@example.com", "hanako · Acme, Inc.");
+        let stored = vec![Account::new("a@example.com", "taro"), active.clone()];
+        let (mut app, _) = recording_app(Some(active), stored, false);
+        let sl = sidebar_layout(&app);
+        handle_mouse(&mut app, &click(3, sl.account_y)).unwrap();
+
+        let items = open_account_items(&app);
+        assert_eq!(
+            items.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["a@example.com", "b@example.com"],
+            "id が email になっていない"
+        );
+        // **アクティブな 1 件だけに ● が付き**、他は同じ桁数の空白で桁を揃える
+        assert_eq!(
+            items.iter().map(|a| a.label.as_str()).collect::<Vec<_>>(),
+            ["  taro", "● hanako · Acme, Inc."]
+        );
+        // 末尾は register current（保管 0 件でも残る項目）
+        assert_eq!(
+            labels(&app.popup.as_ref().unwrap().kind, app.grouping).last(),
+            Some(&"register current".to_string())
+        );
+    }
+
+    /// 保管された 2 件の表示ラベルが同じでも、クリックした行の email が対象になる。
+    /// ラベル文字列から対象を復元する実装では区別できない組み合わせ
+    #[test]
+    fn identical_labels_still_target_the_clicked_account() {
+        // アクティブはどちらでもない ＝ ● が付かず 2 行が完全に同じ文字列になる
+        let stored = vec![
+            Account::new("work@example.com", "ooba"),
+            Account::new("x-personal@example.com", "ooba"),
+        ];
+        let (mut app, recorded) =
+            recording_app(Some(Account::new("other@example.com", "other")), stored, false);
+        let sl = sidebar_layout(&app);
+        handle_mouse(&mut app, &click(3, sl.account_y)).unwrap();
+        assert_eq!(
+            open_account_items(&app)
+                .iter()
+                .map(|a| a.label.as_str())
+                .collect::<Vec<_>>(),
+            ["  ooba", "  ooba"],
+            "ラベルが同一という前提が崩れている"
+        );
+
+        // 2 行目（x-personal）を選んで 2 階層目 → switch
+        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+        handle_mouse(&mut app, &click(rect.x + 1, rect.y + 2)).unwrap();
+        assert_eq!(
+            app.popup.as_ref().map(|p| &p.kind),
+            Some(&PopupKind::AccountActions {
+                account: account("  ooba", "x-personal@example.com"),
+            })
+        );
+        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+        handle_mouse(&mut app, &click(rect.x + 1, rect.y + 1)).unwrap();
+        assert_eq!(
+            *recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            [Recorded::Switch {
+                email: "x-personal@example.com".to_string(),
+                active: Some(Account::new("other@example.com", "other")),
+            }],
+            "クリックした行と別のアカウントが対象になっている"
+        );
+    }
+
+    /// 3 つの動作がそれぞれ正しい引数でドメインへ届く。**switch の第 2 引数
+    /// `active` は `footer.account` のアクティブアカウント**で、これが無いと
+    /// 出ていくアカウントの使い捨て refreshToken を落として戻れなくなる
+    #[test]
+    fn account_actions_reach_the_store_with_the_arguments_from_the_footer() {
+        let active = Account::new("a@example.com", "taro");
+        let stored = vec![active.clone(), Account::new("b@example.com", "hanako")];
+        let (mut app, recorded) = recording_app(Some(active.clone()), stored, false);
+
+        run_popup_action(&mut app, PopupAction::RegisterCurrent, 0);
+        run_popup_action(
+            &mut app,
+            PopupAction::SwitchAccount("b@example.com".to_string()),
+            0,
+        );
+        run_popup_action(
+            &mut app,
+            PopupAction::UnregisterAccount("b@example.com".to_string()),
+            0,
+        );
+
+        assert_eq!(
+            *recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            [
+                Recorded::Register(active.clone()),
+                Recorded::Switch {
+                    email: "b@example.com".to_string(),
+                    active: Some(active),
+                },
+                Recorded::Unregister("b@example.com".to_string()),
+            ]
+        );
+        assert!(app.notice.is_none(), "成功したのに通知が出ている");
+    }
+
+    /// 同じアカウントへの switch は「切替先 = アクティブ」の組で渡る。これが
+    /// ドメイン側の no-op 条件そのもの（[`crate::accounts::AccountStore::switch_to`]
+    /// は現行トークンを古い写しで上書きしない）で、実物での確認は
+    /// `source::tests::switching_to_the_active_account_changes_nothing` が持つ
+    #[test]
+    fn switching_to_the_active_account_passes_it_as_both_target_and_active() {
+        let active = Account::new("a@example.com", "taro");
+        let (mut app, recorded) = recording_app(Some(active.clone()), vec![active.clone()], false);
+        run_popup_action(
+            &mut app,
+            PopupAction::SwitchAccount("a@example.com".to_string()),
+            0,
+        );
+        assert_eq!(
+            *recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            [Recorded::Switch {
+                email: "a@example.com".to_string(),
+                active: Some(active),
+            }]
+        );
+        assert!(app.notice.is_none(), "no-op が失敗として扱われている");
+    }
+
+    /// 保管する対象が無い（未取得・未ログイン）ときの `register current` は、
+    /// 何も送らずに理由を出す（押しても無反応に見せない）。
+    /// ここで書かれるのは診断ログ（`~/.ccdesk/error.log`）だけで、
+    /// 認証情報・保管ファイルには触らない
+    #[test]
+    fn register_current_without_a_known_account_says_why() {
+        let (mut app, recorded) = recording_app(None, Vec::new(), false);
+        run_popup_action(&mut app, PopupAction::RegisterCurrent, 0);
+        assert!(
+            recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "保管する対象が無いのに要求を出している"
+        );
+        assert!(app.notice.is_some(), "無反応になっている");
+    }
+
+    /// 切替が失敗したら下部バーへ出す（**ドメインのエラー文をそのまま載せる**:
+    /// パスとロックの事情だけでトークンを含まないため）。
+    /// 通知は診断ログ（`~/.ccdesk/error.log`）にも 1 行残る＝ここで触る実ファイルは
+    /// それだけで、認証情報・保管ファイルには触らない
+    #[test]
+    fn a_failed_account_action_is_reported_in_the_bottom_bar() {
+        let active = Account::new("a@example.com", "taro");
+        let (mut app, _) = recording_app(Some(active.clone()), vec![active], true);
+        run_popup_action(
+            &mut app,
+            PopupAction::SwitchAccount("b@example.com".to_string()),
+            0,
+        );
+        let (msg, _) = app.notice.as_ref().expect("失敗が伝わっていない");
+        assert!(msg.contains("切替"), "どの操作が失敗したか分からない: {msg:?}");
+        assert!(
+            msg.contains("lock is held by another process"),
+            "ドメインのエラー文が落ちている: {msg:?}"
+        );
+    }
+
+    /// 切替の影響範囲（稼働セッション数）は**選べない情報行**として末尾に出る。
+    /// 0 本なら出さず、1 本は単数形。実行しても何も起きない
+    #[test]
+    fn the_account_menu_notes_how_many_sessions_will_switch() {
+        assert_eq!(switch_notice(0), None);
+        assert_eq!(switch_notice(1).as_deref(), Some("1 session will switch"));
+        assert_eq!(switch_notice(5).as_deref(), Some("5 sessions will switch"));
+
+        let kind = PopupKind::Account {
+            accounts: vec![account("  ooba", "id-a")],
+            sessions: 3,
+        };
+        assert_eq!(
+            kind.entries(Grouping::State),
+            [
+                ("  ooba".to_string(), true),
+                ("register current".to_string(), true),
+                ("3 sessions will switch".to_string(), false),
+            ]
+        );
+        assert_eq!(kind.action(2), None, "注記行が動作を持っている");
+        // 選んでも実行されない（メニューも閉じない）
+        let mut app = test_app(34, TERM);
+        open(&mut app, kind, 3);
+        handle_popup_key(&mut app, KeyCode::Down);
+        handle_popup_key(&mut app, KeyCode::Down);
+        assert_eq!(app.popup.as_ref().unwrap().selected, 2);
+        handle_popup_key(&mut app, KeyCode::Enter);
+        assert!(app.popup.is_some(), "注記行の Enter でメニューが閉じている");
+    }
+
+    /// 注記の本数は**プロセスが生きているセッション**の数（`agents --json` の
+    /// pid 有無）。停止中は次の起動で新しいアカウントになるので数えない
+    #[test]
+    fn the_switch_note_counts_only_running_sessions() {
+        for (alive, expected) in [
+            (vec![], None),
+            (vec![true], Some("1 session will switch")),
+            (vec![true, false, true], Some("2 sessions will switch")),
+            (vec![false, false], None),
+        ] {
+            let active = Account::new("a@example.com", "taro");
+            let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
+            app.agents = alive
+                .iter()
+                .enumerate()
+                .map(|(i, has_pid)| AgentInfo {
+                    id: format!("s{i}"),
+                    has_pid: *has_pid,
+                    ..AgentInfo::default()
+                })
+                .collect();
+            let sl = sidebar_layout(&app);
+            handle_mouse(&mut app, &click(3, sl.account_y)).unwrap();
+            let entries = labels(&app.popup.as_ref().unwrap().kind, app.grouping);
+            let note = entries
+                .iter()
+                .find(|label| label.contains("will switch"))
+                .map(String::as_str);
+            assert_eq!(note, expected, "alive={alive:?}");
         }
     }
 

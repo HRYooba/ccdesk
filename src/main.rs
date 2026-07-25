@@ -76,6 +76,9 @@ fn main() -> anyhow::Result<()> {
     let jobs = source.jobs();
     let footer = source.footer();
     let window = source.window_state();
+    // 保管済みアカウントは起動時に 1 度読む（以降はアカウント行を開いた時と
+    // 保管を変更した後に取り直す。変えるのはこの UI だけなのでポーリングしない）
+    let accounts = source.accounts();
 
     // ホスト端末の実 fg/bg を OSC 10/11 で照会。
     // raw mode / alt screen に入る前に行う。非対応端末はヒューリスティックで
@@ -141,6 +144,7 @@ fn main() -> anyhow::Result<()> {
         footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
         footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        accounts,
         claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
         ccdesk_latest: None,

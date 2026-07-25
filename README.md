@@ -21,6 +21,22 @@ Agent View.
 - **Account line** in the sidebar footer, showing the signed-in Claude account, the same value
   `ccdesk doctor` prints. A login or logout that rewrites `~/.claude/.credentials.json` shows
   up in ~1 s; where credentials live outside that file, only the ~60 s refresh applies
+- **Account switching** — **clicking anywhere on the account line** opens a menu of the accounts
+  ccdesk has stored (`●` marks the one you are signed in as) plus `register current`, and picking
+  a stored account offers `switch` / `unregister`. Registering copies the current
+  `claudeAiOauth` credentials into `~/.ccdesk/accounts.json` under your account's email;
+  switching writes them back, leaving `mcpOAuth` and every other key in
+  `~/.claude/.credentials.json` untouched. Both take the same lock file claude Code uses for
+  token refresh, and the outgoing account's tokens are folded into the store under that lock,
+  so a rotated refresh token is never lost. Since Windows claude re-reads the credentials file,
+  **live sessions move to the new account from their next message** — the menu says how many
+  (`N sessions will switch`). Until the signed-in account is stored the line is prefixed with
+  `⚠`: that is the reminder to register before your next `/login`, because
+  `.credentials.json` only ever holds one account and the previous one is overwritten. Stored
+  refresh tokens are single-use, so an account you have used elsewhere in the meantime can go
+  stale; ccdesk does not probe for that ahead of time and the account line simply reports
+  `not logged in · run /login` once the switch lands. Export/import and automatic rotation are
+  deliberately out of scope
 - **Version rows** at the top of the sidebar — `ccdesk vX.Y.Z` and `claude vX.Y.Z` — each with a
   `⟳` marker column and a verb at the right edge. When a newer version exists the row reads
   `⟳ ccdesk vX.Y.Z          update` and **clicking anywhere on it runs the update**, showing
@@ -32,7 +48,8 @@ Agent View.
   per launch (no polling), and the download is verified by SHA-256 before anything is replaced
   (the same install path as `ccdesk update`). A native `claude` install also auto-updates in
   the background by default, so the claude row may clear itself without you doing anything
-- **Mouse-first**: click to switch/focus, ☰ menu for stop/delete, drag the border to resize
+- **Mouse-first**: click to switch/focus, ☰ menu for stop/delete, account line for account
+  switching, drag the border to resize
 - **Keyboard**: `Ctrl+X` stop→delete, `Ctrl+S` toggle grouping, `Alt+←/→` pane focus,
   `Ctrl+Q` quit — everything else passes through to claude untouched. On the new-session
   screen, `Tab` cycles fields and `Enter` runs the selected folder-list row
@@ -84,6 +101,9 @@ ccdesk --help     # show usage
 Settings (grouping, opt-ins) live in `~/.ccdesk/config.json`; window state
 (sidebar width, last screen, last folder) in `~/.ccdesk/state.json`.
 Errors and panics are appended to `~/.ccdesk/error.log`.
+Accounts you register from the account line are stored in
+`~/.ccdesk/accounts.json` — it holds their OAuth tokens, so treat it exactly
+like `~/.claude/.credentials.json` and never share or copy it elsewhere.
 
 ## Usage display (opt-in)
 

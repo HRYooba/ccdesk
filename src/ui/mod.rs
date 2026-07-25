@@ -9,7 +9,7 @@ use ratatui::Frame;
 use std::time::Duration;
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::{App, Focus, Popup, RightView, RowAction, SelfUpdate};
+use crate::app::{active_unstored, App, Focus, Popup, RightView, RowAction, SelfUpdate};
 use crate::poll::{classify, AccountStatus, Bucket, Group, Grouping, StateView};
 use crate::session::SessionStatus;
 use crate::theme::{
@@ -244,6 +244,44 @@ fn clip_to_width(s: &str, width: u16) -> String {
         used += w;
     }
     out
+}
+
+/// 未保管警告のマーカー。**表示幅は実測 1 桁**（U+26A0 / unicode-width 0.2.2 で `1`。
+/// 異体字セレクタを付けた `⚠️` は 2 桁になるので、素の 1 文字で持つ）。
+/// 既定のサイドバー幅（内側 32 桁）にアカウント行を収める前提がこの実測値に乗っている
+const WARN_MARK: &str = "⚠";
+
+/// 未ログインのときのアカウント行。**再ログインの手順まで出す。**
+///
+/// 保管したアカウントのリフレッシュトークンは使い捨てで、ccdesk が動いていない間に
+/// 別の場所でそのアカウントを使うと保管が無効になる。切替直後にこの状態へ落ちるのが
+/// その現れで、**事前検知はしない**（検知には ccdesk 自身がトークン更新
+/// エンドポイントを叩く必要があり、それは claude Code の client_id を借用する
+/// 行為なので意図的に避けている）。事後にこの行で気づけることが唯一の出口なので、
+/// 状態だけでなく打つ手も書く。文面は `ccdesk doctor` の案内と同じ語彙にそろえる
+const LOGGED_OUT_ROW: &str = "not logged in · run /login";
+
+/// アカウント行の文面とスタイル。Frame に触らない純関数なので、`⚠` の有無と
+/// 桁数をテストで固定できる。`unstored` は [`active_unstored`] の判定
+fn account_row(status: &AccountStatus, unstored: bool) -> (String, Style) {
+    match status {
+        // 未保管のときは `⚠` を前置し、色も dim から注意色へ上げる。dim のままだと
+        // 登録し忘れに気づけず、次の /login で前のアカウントの認証情報が
+        // 上書きされて失われる（`.credentials.json` は常に 1 アカウント分だけ）
+        AccountStatus::LoggedIn(account) if unstored => (
+            format!("{WARN_MARK} {}", account.label),
+            Style::default().fg(C_ATTENTION),
+        ),
+        // 出すのはラベルだけ（email は同一性の保持用で、行には出さない）
+        AccountStatus::LoggedIn(account) => {
+            (account.label.clone(), Style::default().fg(ui().dim))
+        }
+        AccountStatus::LoggedOut => {
+            (LOGGED_OUT_ROW.to_string(), Style::default().fg(C_ATTENTION))
+        }
+        // 未取得（起動直後・CLI 失敗）は誤情報を出さないため空行にする
+        AccountStatus::Unknown => (String::new(), Style::default().fg(ui().dim)),
+    }
 }
 
 /// モーダルの矩形。描画とクリック判定で同じ計算を共有する。
@@ -823,19 +861,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             ),
             Rect::new(fx, account_y - 1, fw, 1),
         );
-        // アカウント行（表示名 · 組織名）。未ログインは要対応なので注意色、
-        // 未取得（起動直後・CLI 失敗）は誤情報を出さないため空行にする
-        let (account, account_style) = match &app.footer.account {
-            // 出すのはラベルだけ（email は同一性の保持用で、行には出さない）
-            AccountStatus::LoggedIn(account) => {
-                (account.label.as_str(), Style::default().fg(ui().dim))
-            }
-            AccountStatus::LoggedOut => ("not logged in", Style::default().fg(C_ATTENTION)),
-            AccountStatus::Unknown => ("", Style::default().fg(ui().dim)),
-        };
+        // アカウント行（表示名 · 組織名）。文面の判断は account_row に閉じる。
+        // **この行はクリックできる**（アカウントメニューの入口。当たり判定は
+        // handle_mouse 側が同じ `sidebar_layout` の account_y で持つ）
+        let (account, account_style) = account_row(&app.footer.account, active_unstored(app));
         frame.render_widget(
             ratatui::widgets::Paragraph::new(
-                Line::from(clip_to_width(account, fw)).style(account_style),
+                Line::from(clip_to_width(&account, fw)).style(account_style),
             ),
             Rect::new(fx, account_y, fw, 1),
         );
@@ -1252,5 +1284,134 @@ mod tests {
                 "pane {pane:?} / inner {inner:?} で pos {pos:?} がペイン外"
             );
         }
+    }
+
+    /// 未保管警告 `⚠` の表示幅は **1 桁**。既定幅（内側 32 桁）にアカウント行を
+    /// 収める前提がこの実測値に乗っているので固定する（`⟳` も 1 桁だが `☰` は
+    /// 2 桁 ＝ 判定は文字ごとに違うので実測しないと分からない）
+    #[test]
+    fn the_warning_mark_is_one_column_wide() {
+        use unicode_width::UnicodeWidthStr;
+        assert_eq!(WARN_MARK.width(), 1, "⚠ が 1 桁でない");
+        assert_eq!(
+            WARN_MARK.chars().count(),
+            1,
+            "異体字セレクタが混ざっている（絵文字表示になると 2 桁になる）"
+        );
+    }
+
+    /// テスト内でアカウント行の文面だけを見るための短縮
+    fn row_text(status: &AccountStatus, unstored: bool) -> String {
+        account_row(status, unstored).0
+    }
+
+    /// **アクティブなアカウントが未保管のときだけ `⚠` を前置する。**
+    /// 保管済みなら付けない（常時出ていると警告の意味が無くなる）
+    #[test]
+    fn account_row_marks_only_an_unstored_active_account() {
+        use crate::accounts::Account;
+        let logged_in = AccountStatus::LoggedIn(Account::new("you@example.com", "you · Acme, Inc."));
+
+        assert_eq!(row_text(&logged_in, true), "⚠ you · Acme, Inc.");
+        assert_eq!(
+            row_text(&logged_in, false),
+            "you · Acme, Inc.",
+            "保管済みなのに警告が出ている"
+        );
+        // 未取得は空行のまま（誤情報を出さない）。未ログインは行そのものが警告なので
+        // ⚠ は前置しない ＝ ⚠ は「未保管」だけを意味する
+        assert_eq!(row_text(&AccountStatus::Unknown, true), "");
+        assert_eq!(row_text(&AccountStatus::LoggedOut, true), LOGGED_OUT_ROW);
+        assert!(!LOGGED_OUT_ROW.contains(WARN_MARK));
+    }
+
+    /// 未ログインの行は **再ログインの手順まで出す**。保管トークンの期限切れも
+    /// この状態で現れる（事前検知はしない方針なので、ここが唯一の気づきどころ）
+    #[test]
+    fn account_row_prompts_a_login_when_logged_out() {
+        let (text, style) = account_row(&AccountStatus::LoggedOut, false);
+        assert!(text.contains("not logged in"), "{text:?}");
+        assert!(text.contains("/login"), "再ログインの手順が無い: {text:?}");
+        assert_eq!(
+            style,
+            Style::default().fg(C_ATTENTION),
+            "要対応の行が注意色になっていない"
+        );
+    }
+
+    /// 既定のサイドバー幅（34 桁 = 内側 32 桁）でアカウント行が切られない。
+    /// `⚠ ` の 2 桁ぶんが増えても、現実的なラベルなら収まることの固定
+    #[test]
+    fn account_row_fits_the_default_sidebar_width() {
+        use crate::accounts::Account;
+        use unicode_width::UnicodeWidthStr;
+        // README・撮影データに出る実寸のラベルと、全角を含むラベル
+        for label in ["ooba · 1→10, Inc.", "you · Acme, Inc.", "大場 · 1→10, Inc."] {
+            let status = AccountStatus::LoggedIn(Account::new("you@example.com", label));
+            for unstored in [false, true] {
+                let text = row_text(&status, unstored);
+                assert_eq!(
+                    clip_to_width(&text, DEFAULT_INNER),
+                    text,
+                    "既定幅で切られる: {text:?}（{} 桁 / 内側 {DEFAULT_INNER} 桁）",
+                    text.width()
+                );
+            }
+        }
+        // 未ログインの案内も切ってはいけない（打つ手が読めなくなる）
+        assert_eq!(
+            clip_to_width(LOGGED_OUT_ROW, DEFAULT_INNER),
+            LOGGED_OUT_ROW,
+            "{} 桁 / 内側 {DEFAULT_INNER} 桁",
+            LOGGED_OUT_ROW.width()
+        );
+    }
+
+    /// 実際に 1 フレーム描いた結果でも `⚠` の出方が変わる。判定は
+    /// [`active_unstored`]（アクティブな email が保管の写しに居るか）なので、
+    /// 保管に加えた瞬間に消えることまで含めて固定する
+    #[test]
+    fn the_drawn_account_row_warns_until_the_active_account_is_stored() {
+        use crate::accounts::Account;
+        use crate::poll::FooterInfo;
+
+        let active = Account::new("you@example.com", "you · Acme, Inc.");
+        let drawn = |accounts: Vec<Account>| -> String {
+            let mut app = App {
+                term_size: (120, 30),
+                footer: FooterInfo {
+                    account: AccountStatus::LoggedIn(active.clone()),
+                    current: "2.1.220".to_string(),
+                    latest: None,
+                },
+                accounts,
+                ..Default::default()
+            };
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(frame, &mut app);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let y = sidebar_layout_of(29, 34).account_y;
+            (0..120).map(|x| buffer[(x, y)].symbol()).collect()
+        };
+
+        let unstored = drawn(Vec::new());
+        assert!(
+            unstored.contains(WARN_MARK) && unstored.contains("you · Acme, Inc."),
+            "未保管の警告が出ていない: {unstored:?}"
+        );
+        // 別アカウントだけが保管されていても、アクティブな 1 件が未保管なら警告する
+        let other = drawn(vec![Account::new("other@example.com", "other")]);
+        assert!(other.contains(WARN_MARK), "別 email の保管で消えている: {other:?}");
+        // アクティブなアカウントを保管したら消える
+        let stored = drawn(vec![active.clone()]);
+        assert!(
+            !stored.contains(WARN_MARK) && stored.contains("you · Acme, Inc."),
+            "保管済みなのに警告が残っている: {stored:?}"
+        );
     }
 }

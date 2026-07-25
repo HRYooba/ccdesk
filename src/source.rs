@@ -14,9 +14,11 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use anyhow::anyhow;
+
 use ccdesk::{load_setting, load_state, save_setting, save_state, scan_jobs, BgJob};
 
-use crate::accounts::Account;
+use crate::accounts::{Account, AccountStore};
 use crate::poll::{
     read_usage, spawn_agents_poller, spawn_ccdesk_version_check, spawn_footer_poller,
     AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo,
@@ -72,6 +74,24 @@ pub(crate) enum WindowItem<'a> {
     Grouping(Grouping),
 }
 
+/// アカウント保管への変更要求。[`WindowItem`] と同じ「1 つの enum を受ける
+/// メソッド」の形にしてあるのは理由も同じで、項目を増やすと live 側の match が
+/// 非網羅になる ＝ 撮影用の供給元で実ファイルを触ってしまう漏れが起きない
+pub(crate) enum AccountAction<'a> {
+    /// 今ログイン中のアカウントを保管へ加える
+    Register(&'a Account),
+    /// 保管アカウントへ切り替える
+    Switch {
+        /// 切替先（[`Account::email`]）
+        email: &'a str,
+        /// 今ログイン中のアカウント。**出ていく側のトークンを同じロック下で
+        /// 保管へ巻き取るために渡す**（[`AccountStore::switch_to`] 参照）
+        active: Option<&'a Account>,
+    },
+    /// 保管から外す（ログイン自体は外さない）
+    Unregister(&'a str),
+}
+
 /// バックグラウンド取得の書き込み先（ポーラーが書き、run ループが dirty で取り込む）
 pub(crate) struct PollSinks {
     pub(crate) agents: Arc<Mutex<Vec<AgentInfo>>>,
@@ -107,6 +127,24 @@ pub(crate) trait DataSource {
 
     /// バックグラウンド取得の開始。**demo は 1 本も起こさない**
     fn spawn_pollers(&self, sinks: PollSinks);
+
+    /// 保管済みアカウントの一覧（アカウント行のメニューに並べる中身と、
+    /// 「今のアカウントが保管されているか」＝ ⚠ の判定の両方がこれを見る）
+    fn accounts(&self) -> Vec<Account>;
+
+    /// 保管への変更（登録・切替・登録解除）。失敗は呼び出し側が下部バーへ出す
+    fn apply_account(&self, action: AccountAction<'_>) -> anyhow::Result<()>;
+}
+
+/// [`AccountAction`] とドメイン API の対応表。**ストアを引数で受ける**ので、
+/// 一時ディレクトリのストアに対してテストできる（実ユーザーの
+/// `~/.claude` / `~/.ccdesk` を触らずに「どの動作がどの API へ行くか」を固定する）
+fn apply_account_action(store: &AccountStore, action: AccountAction<'_>) -> anyhow::Result<()> {
+    match action {
+        AccountAction::Register(account) => store.register(account),
+        AccountAction::Switch { email, active } => store.switch_to(email, active),
+        AccountAction::Unregister(email) => store.unregister(email),
+    }
 }
 
 /// 実データ。~/.claude と ~/.ccdesk を読み、ポーラーで claude CLI と
@@ -183,6 +221,20 @@ impl DataSource for LiveSource {
         // ccdesk 自身の版チェックは起動時 1 回だけ（周期ポーリングしない）
         spawn_ccdesk_version_check(sinks.ccdesk_latest, sinks.ccdesk_latest_dirty);
     }
+
+    fn accounts(&self) -> Vec<Account> {
+        // ホームが取れない環境（[`AccountStore::detect`] が None）は保管 0 件と同じ扱い。
+        // 一覧が空でも `register current` だけのメニューとして成立する
+        AccountStore::detect()
+            .map(|store| store.list())
+            .unwrap_or_default()
+    }
+
+    fn apply_account(&self, action: AccountAction<'_>) -> anyhow::Result<()> {
+        let store = AccountStore::detect()
+            .ok_or_else(|| anyhow!("could not locate the home directory for the account store"))?;
+        apply_account_action(&store, action)
+    }
 }
 
 /// スクリーンショット撮影用の固定データ（`--demo`）。
@@ -222,6 +274,17 @@ impl DataSource for DemoSource {
     fn spawn_pollers(&self, _sinks: PollSinks) {
         // 固定値をそのまま出すので、claude CLI 起動・ネットワーク・
         // ファイル監視のスレッドは 1 本も起こさない
+    }
+
+    fn accounts(&self) -> Vec<Account> {
+        demo_accounts()
+    }
+
+    fn apply_account(&self, _action: AccountAction<'_>) -> anyhow::Result<()> {
+        // 撮影は `~/.ccdesk/accounts.json` も `~/.claude/.credentials.json` も
+        // 書かない（実アカウントのトークンを触らせない）。成功を返すのは、
+        // 失敗の通知が下部バーに出て撮影の見た目が変わるのを避けるため
+        Ok(())
     }
 }
 
@@ -266,6 +329,19 @@ fn demo_footer() -> FooterInfo {
         current: "2.1.220".to_string(),
         latest: None,
     }
+}
+
+/// 撮影用の架空の保管一覧。実 email・実ラベルを出さない。
+///
+/// **先頭は [`demo_footer`] のアクティブアカウントと同じ email**。こうしておくと
+/// アカウントメニューにアクティブ印（`●`）が付いた状態で撮れて、同時に
+/// 「アクティブなのに未保管」の警告（`⚠`）が出ない見た目になる。
+/// 並びは [`AccountStore::list`] と同じ email 昇順（撮り直しても順序が動かない）
+fn demo_accounts() -> Vec<Account> {
+    vec![
+        Account::new("you@example.com", "you · Acme, Inc."),
+        Account::new("you@personal.example", "you"),
+    ]
 }
 
 /// 撮影用の架空使用率。リセット時刻は「今から N 時間後」なので、
@@ -387,6 +463,131 @@ mod tests {
         assert!(
             inner - widest <= 2,
             "サイドバーが必要幅より広い（必要 {widest} 桁 / 内側 {inner} 桁）"
+        );
+    }
+
+    /// 撮影の保管一覧も固定。**アクティブアカウント（[`demo_footer`]）が
+    /// 一覧に居る**ので、アクティブ印が付き未保管警告は出ない見た目になる
+    #[test]
+    fn demo_accounts_are_fixed_and_contain_the_active_one() {
+        let accounts = DemoSource.accounts();
+        assert_eq!(
+            accounts,
+            vec![
+                Account::new("you@example.com", "you · Acme, Inc."),
+                Account::new("you@personal.example", "you"),
+            ]
+        );
+        let AccountStatus::LoggedIn(active) = DemoSource.footer().account else {
+            panic!("撮影用のフッターがログイン済みでない");
+        };
+        assert!(
+            accounts.iter().any(|a| a.email == active.email),
+            "アクティブアカウントが保管一覧に無い（撮影に ⚠ が写る）"
+        );
+        // 並びは AccountStore::list と同じ email 昇順（撮り直しで順序が動かない）
+        let mut sorted = accounts.clone();
+        sorted.sort_by(|a, b| a.email.cmp(&b.email));
+        assert_eq!(accounts, sorted);
+    }
+
+    /// **撮影はアカウントファイルを書かない。** 保管の変更要求を投げても
+    /// `~/.ccdesk/accounts.json` は作られない（実アカウントのトークンを触らせない）。
+    /// ここでは実パスの **存在だけ** を前後で比べる（読むだけで書き込まない）
+    #[test]
+    fn demo_does_not_write_the_account_store() {
+        let store = ccdesk::accounts_store_path();
+        let existed = store.as_ref().map(|p| p.exists());
+        let account = Account::new("you@example.com", "you · Acme, Inc.");
+        for action in [
+            AccountAction::Register(&account),
+            AccountAction::Switch {
+                email: "you@personal.example",
+                active: Some(&account),
+            },
+            AccountAction::Unregister("you@personal.example"),
+        ] {
+            DemoSource.apply_account(action).expect("撮影で失敗を出さない");
+        }
+        assert_eq!(
+            store.as_ref().map(|p| p.exists()),
+            existed,
+            "demo が保管ファイルを作っている"
+        );
+    }
+
+    /// UI の 3 つの動作がどのドメイン API へ行くかの対応表。**一時ディレクトリの
+    /// ストア**に対して実物を通すので、実ユーザーのファイルは触らない
+    #[test]
+    fn each_ui_action_reaches_its_domain_api() {
+        use crate::accounts::tests::{credentials_doc, oauth, TempHome};
+
+        let home = TempHome::new("each_ui_action_reaches_its_domain_api");
+        let store = home.store();
+        let taro = Account::new("taro@example.com", "taro");
+        let hanako = Account::new("hanako@example.com", "hanako");
+
+        // register: 現行の認証情報がそのアカウントとして保管される
+        home.write_credentials(&credentials_doc("access-t", "refresh-t"));
+        apply_account_action(&store, AccountAction::Register(&taro)).unwrap();
+        home.write_credentials(&credentials_doc("access-h", "refresh-h"));
+        apply_account_action(&store, AccountAction::Register(&hanako)).unwrap();
+        assert_eq!(store.list(), vec![hanako.clone(), taro.clone()]); // email 昇順
+
+        // switch: 保管した認証情報が現行ファイルへ戻り、出ていく側は巻き取られる
+        apply_account_action(
+            &store,
+            AccountAction::Switch {
+                email: &taro.email,
+                active: Some(&hanako),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            home.read_credentials()["claudeAiOauth"],
+            oauth("access-t", "refresh-t"),
+            "切替先の認証情報が復元されていない"
+        );
+
+        // unregister: 一覧から消えるが、ログイン（現行の認証情報）は残る
+        apply_account_action(&store, AccountAction::Unregister(&hanako.email)).unwrap();
+        assert_eq!(store.list(), vec![taro.clone()]);
+        assert_eq!(
+            home.read_credentials()["claudeAiOauth"],
+            oauth("access-t", "refresh-t"),
+            "登録解除がログインを外している"
+        );
+    }
+
+    /// 同じアカウントへの switch は**何もしない**。UI は「切替先 = アクティブ」の
+    /// 組をそのまま渡すので（`app::tests::switching_to_the_active_account_passes_it_as_both_target_and_active`）、
+    /// この経路で現行トークンが古い写しに巻き戻らないことを実物で確かめる
+    #[test]
+    fn switching_to_the_active_account_changes_nothing() {
+        use crate::accounts::tests::{credentials_doc, TempHome};
+
+        let home = TempHome::new("switching_to_the_active_account_changes_nothing");
+        let store = home.store();
+        let taro = Account::new("taro@example.com", "taro");
+        home.write_credentials(&credentials_doc("access-t", "refresh-t"));
+        apply_account_action(&store, AccountAction::Register(&taro)).unwrap();
+        // 保管より後にトークンが更新された状態（使い捨ての refreshToken が進む）
+        home.write_credentials(&credentials_doc("access-t2", "refresh-t2"));
+        let before = std::fs::read(home.paths().credentials).unwrap();
+
+        apply_account_action(
+            &store,
+            AccountAction::Switch {
+                email: &taro.email,
+                active: Some(&taro),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(home.paths().credentials).unwrap(),
+            before,
+            "現行の認証情報を古い写しで上書きしている（今のログインが壊れる）"
         );
     }
 }
