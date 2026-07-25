@@ -53,7 +53,7 @@ Each release also ships a `.sha256` file so you can verify the download.
 
 ```sh
 ccdesk            # launch the TUI
-ccdesk doctor     # diagnose the environment (claude CLI, config dir, terminal)
+ccdesk doctor     # diagnose the environment (claude CLI, account, config dir, terminal)
 ccdesk logs       # print the path and tail of the error log
 ccdesk update     # check for a new release and show how to update
 ccdesk --version  # print version

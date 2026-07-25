@@ -11,9 +11,7 @@ use ratatui::layout::{Position, Rect};
 use ccdesk::{log_error, save_setting, save_state, scan_jobs, BgJob};
 
 use crate::keys::{encode_key, forward_mouse};
-use crate::poll::{
-    demo_jobs, read_usage, AgentInfo, FooterInfo, Grouping, UsageInfo,
-};
+use crate::poll::{demo_jobs, read_usage, AgentInfo, FooterInfo, Grouping, UsageInfo};
 use crate::session::Session;
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
 use crate::ui::{draw, popup_rect, sidebar_layout};
@@ -401,10 +399,6 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            if app.demo {
-                app.footer.account = "you · Acme, Inc.".to_string();
-                app.footer.latest = None;
-            }
             force_draw = true;
         }
         // agents --json のライブ状態を取り込む（rename・state 変化の即時反映）
