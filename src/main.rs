@@ -23,7 +23,7 @@ mod theme;
 mod ui;
 mod update;
 
-use app::{clamp_sidebar, instant_ago, open_short, run, App, Focus, RightView};
+use app::{clamp_sidebar, instant_ago, open_short, run, App, Focus, RightView, SelfUpdate};
 use cli::{print_usage, run_doctor, show_logs, statusline_hook, update_self};
 use poll::FooterInfo;
 use source::{DataSource, DemoSource, LiveSource};
@@ -142,6 +142,7 @@ fn main() -> anyhow::Result<()> {
         footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
         ccdesk_latest: None,
         ccdesk_latest_shared: Arc::new(Mutex::new(None)),
         ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),

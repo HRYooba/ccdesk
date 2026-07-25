@@ -9,7 +9,7 @@ use ratatui::Frame;
 use std::time::Duration;
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::{App, Focus, Popup, RightView, RowAction};
+use crate::app::{App, Focus, Popup, RightView, RowAction, SelfUpdate};
 use crate::poll::{classify, AccountStatus, Bucket, Group, Grouping, StateView};
 use crate::session::SessionStatus;
 use crate::theme::{
@@ -37,31 +37,41 @@ pub(crate) struct SidebarLayout {
     pub(crate) capacity: usize,
     /// フッターを描くか（狭すぎる端末では描かない = クリックも受けない）
     pub(crate) footer_visible: bool,
-    /// フッターの claude 更新行（`⟳ update claude X → Y`）を出すか。
-    /// サイドバー先頭にある ccdesk 自身の更新告知（クリック不可）とは別物
-    pub(crate) update_row_visible: bool,
     /// アカウント行の画面 y（footer_visible のときだけ有効）
     pub(crate) account_y: u16,
 }
 
 pub(crate) fn sidebar_layout(app: &App) -> SidebarLayout {
     // 下部バー 1 行を除いたサイドバー矩形は draw の chunks[0] と一致する
-    let height = app.term_size.1.saturating_sub(1);
-    let updating = app
-        .claude_updating
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let update_row_visible = app.footer.latest.is_some() || updating;
-    let footer_visible = height >= 8 && app.sidebar_width > 4;
-    let footer_rows = if footer_visible {
-        2 + usize::from(update_row_visible)
-    } else {
-        0
-    };
+    sidebar_layout_of(app.term_size.1.saturating_sub(1), app.sidebar_width)
+}
+
+/// [`sidebar_layout`] の本体。更新行が上部の版行に集約されたことでフッターは
+/// 「区切り線 + アカウント行」の 2 行に固定され、ジオメトリはサイドバー矩形の
+/// 大きさだけで決まる純関数になった（App を組まずにテストできる）
+fn sidebar_layout_of(height: u16, sidebar_width: u16) -> SidebarLayout {
+    let footer_visible = height >= 8 && sidebar_width > 4;
+    let footer_rows = if footer_visible { 2 } else { 0 };
     SidebarLayout {
         capacity: (height as usize).saturating_sub(2 + footer_rows),
         footer_visible,
-        update_row_visible,
         account_y: height.saturating_sub(2),
+    }
+}
+
+/// サイドバー内クリックの行 index。枠の 1 行を引き、固定ヘッダーより下は
+/// スクロールぶんを足す。**列は見ない = 行のどこを押しても同じ行に当たる**。
+///
+/// 表示窓（`capacity`）の外＝フッター帯や下枠は `usize::MAX` を返して不感帯にする
+/// （スクロールで隠れた行のアクションを誤発火させない）
+pub(crate) fn row_at(mouse_row: u16, capacity: usize, header_rows: usize, scroll: usize) -> usize {
+    let r = mouse_row.saturating_sub(1) as usize;
+    if mouse_row == 0 || r >= capacity {
+        usize::MAX
+    } else if r < header_rows {
+        r
+    } else {
+        r + scroll
     }
 }
 
@@ -70,38 +80,189 @@ fn separator_text(inner_width: u16) -> String {
     "─".repeat(inner_width as usize)
 }
 
-/// 更新告知の文面。**クリックできない告知**なので、何をすれば更新できるかを
-/// 文面に入れる（実行手段は `ccdesk update` だけ）。
-///
-/// 幅の予算: サイドバー既定 34 桁 = 内側 32 桁。長い版番号で溢れても意図が残るよう
-/// 版番号を先に置く（List は右端で切るだけなので、後ろの語から失われる）
-fn update_notice(tag: &str) -> String {
-    format!("⟳ {tag} · run: ccdesk update")
+/// 更新マーカー。**表示幅は実測 1 桁**（U+27F3 / unicode-width 0.2.2 で `1`。
+/// East Asian Ambiguous で 2 桁を占める `☰` とは違う）。1 桁だと分かっているので、
+/// 更新が無い行はスペース 1 個で同じ桁を確保できる
+const UPDATE_MARK: &str = "⟳";
+
+/// バージョン行の更新状態。マーカー桁と右端の動詞はこれだけで決まる。
+/// ccdesk 側（[`SelfUpdate`]）と claude 側（`claude_updating` + `footer.latest`）で
+/// 進行状態の持ち方が違うので、表示の語彙をここに 1 つだけ置いて両方を寄せる
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UpdateState {
+    /// 最新。マーカー桁は空白で確保する（更新が出たときに行が横へずれると
+    /// 「増えたこと」に気づきにくい）
+    Current,
+    /// 新しい版がある = 行をクリックすれば更新できる
+    Available,
+    /// 更新の実行中
+    Running,
+    /// 差し替え済み。ccdesk も claude も反映は次回起動なので、
+    /// そのセッション中はずっと再起動を促す
+    Restart,
 }
 
-/// サイドバー最上部の固定行（ccdesk 自身の版 / 更新告知 / 区切り線）。
-///
-/// 版行と区切り線は常時、告知行は新しいリリースがあるときだけ。どの行も
-/// クリックできないので、呼び出し側は `sidebar_rows` へ `None` を積む
-/// （区切り線と同じ扱い）。Frame に触らない純関数なので行構成をテストで固定できる
-fn ccdesk_info_rows(latest: Option<&str>, inner_width: u16) -> Vec<(String, Style)> {
-    let dim = Style::default().fg(ui().dim);
-    let mut rows = vec![(format!("ccdesk v{}", env!("CARGO_PKG_VERSION")), dim)];
-    if let Some(tag) = latest {
-        // 告知は本文色。dim だと更新の存在に気づかない
-        rows.push((update_notice(tag), Style::default().fg(MUTED_FG)));
+impl UpdateState {
+    /// 右端に置く動詞。最新のときだけ空（やることが無い）。
+    ///
+    /// **新しい版の番号は出さない。** 新旧を並べた `⟳ claude v2.1.218 → v2.1.220` に
+    /// 動詞まで足すと実測 35 桁で、既定幅（内側 32 桁）に収まらない。現行版と
+    /// 「やること」のどちらも欠かせないので、落とすのは新版の番号にした
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Current => "",
+            Self::Available => "update",
+            Self::Running => "updating…",
+            Self::Restart => "restart",
+        }
     }
-    rows.push((separator_text(inner_width), dim));
-    rows
+
+    /// クリックで更新を始められるか（＝行にアクションを付けるか）。
+    /// 実行中と再起動待ちはもう押す意味が無いので、ハイライトも出さない
+    fn actionable(self) -> bool {
+        self == Self::Available
+    }
+
+    /// 行のスタイル。最新は dim（背景情報）、やることがある行は本文色にする
+    /// （dim だと更新の存在に気づかない）
+    fn style(self) -> Style {
+        match self {
+            Self::Current => Style::default().fg(ui().dim),
+            Self::Running => Style::default().fg(C_WORKING),
+            Self::Available | Self::Restart => Style::default().fg(MUTED_FG),
+        }
+    }
 }
 
-/// モーダルの矩形。描画とクリック判定で同じ計算を共有する
+/// バージョン行 1 本の文面。`<マーカー> <名前> v<版>` を左に、動詞を右端へ寄せる。
+///
+/// 版が未取得（起動直後・CLI 失敗）なら番号を出さない ＝ 誤情報を出さない
+fn version_row(name: &str, version: &str, state: UpdateState, inner_width: u16) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let mark = if state == UpdateState::Current {
+        " " // マーカー桁を空白で確保する（更新が出ても名前の桁が動かない）
+    } else {
+        UPDATE_MARK
+    };
+    let left = if version.is_empty() {
+        format!("{mark} {name}")
+    } else {
+        format!("{mark} {name} v{version}")
+    };
+    let verb = state.verb();
+    if verb.is_empty() {
+        return left;
+    }
+    // 右端寄せ。入り切らない幅でも動詞は落とさず、間隔を 1 桁まで詰める
+    // （List が右端で切るので、溢れたときに失われるのは動詞側になる）
+    let gap = (inner_width as usize)
+        .saturating_sub(left.width() + verb.width())
+        .max(1);
+    format!("{left}{}{verb}", " ".repeat(gap))
+}
+
+/// サイドバー最上部の固定行（ccdesk の版行 / claude の版行 / 区切り線）。
+///
+/// 2 つの更新をここへ集約する（下部フッターには置かない ＝ 同じことを 2 箇所に出さない）。
+/// **行数は更新の有無で変わらない**ので、固定ヘッダー行数もマーカー桁の位置も動かない。
+/// Frame に触らない純関数なので、4 状態の文面と当たり判定をテストで固定できる
+fn version_rows(
+    ccdesk: UpdateState,
+    claude_version: &str,
+    claude: UpdateState,
+    inner_width: u16,
+) -> Vec<(String, Style, Option<RowAction>)> {
+    vec![
+        (
+            version_row("ccdesk", env!("CARGO_PKG_VERSION"), ccdesk, inner_width),
+            ccdesk.style(),
+            ccdesk.actionable().then_some(RowAction::UpdateCcdesk),
+        ),
+        (
+            version_row("claude", claude_version, claude, inner_width),
+            claude.style(),
+            claude.actionable().then_some(RowAction::UpdateClaude),
+        ),
+        (
+            separator_text(inner_width),
+            Style::default().fg(ui().dim),
+            None,
+        ),
+    ]
+}
+
+/// ccdesk 自身の版行の状態。更新の進行状態が版チェックの結果より優先する
+fn ccdesk_update_state(app: &App) -> UpdateState {
+    match &*app
+        .ccdesk_update
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        SelfUpdate::Running => UpdateState::Running,
+        SelfUpdate::Done => UpdateState::Restart,
+        // Failed は run ループが下部バーへ出して Idle へ戻すので、行は再試行可のまま
+        SelfUpdate::Idle | SelfUpdate::Failed(_) => {
+            if app.ccdesk_latest.is_some() {
+                UpdateState::Available
+            } else {
+                UpdateState::Current
+            }
+        }
+    }
+}
+
+/// claude 本体の版行の状態。ccdesk 側と違って Restart を持たないのは、更新後に
+/// `claude --version` が新しい版を返して `footer.latest` が消える ＝ 行が自然に
+/// 最新表示へ戻るため。ネイティブインストールは既定で自動更新するので、
+/// 何もしなくてもこの行が消えることもある（公式仕様）
+fn claude_update_state(app: &App) -> UpdateState {
+    if app
+        .claude_updating
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        UpdateState::Running
+    } else if app.footer.latest.is_some() {
+        UpdateState::Available
+    } else {
+        UpdateState::Current
+    }
+}
+
+/// 表示幅で切る。**文字数で切ってはいけない**: アカウント名・組織名は任意の
+/// 文字列なので全角を含み得て、文字数で数えると桁が溢れて枠を壊す
+/// （`⟳` は実測 1 桁なので版行には影響しないが、切り方の知識を 1 つにしておく）
+fn clip_to_width(s: &str, width: u16) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > width as usize {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
+}
+
+/// モーダルの矩形。描画とクリック判定で同じ計算を共有する。
+///
+/// 幅は内容が決める（[`crate::app::PopupKind::width`]）ので、サイドバーより広い
+/// メニューは右ペインに被る。アカウント表示名や email を切って読めなくするより、
+/// 被せて全部読ませる方を選んだ。
+///
+/// ただし**端末の外へは出さない**: 矩形が画面外へ出ると ratatui の描画が壊れるので、
+/// 幅・高さを端末サイズで丸めてから位置を決める（項目数が端末の高さを超える場合は
+/// 入る分だけを描く）
 pub(crate) fn popup_rect(app: &App, popup: &Popup) -> Rect {
-    let entries = popup.entries(app.grouping);
-    let width = 14u16;
-    let height = entries.len() as u16 + 2;
-    let x = 1u16.min(app.sidebar_width.saturating_sub(width));
-    let y = (popup.anchor_y + 1).min(app.term_size.1.saturating_sub(height));
+    let entries = popup.kind.entries(app.grouping);
+    let (term_w, term_h) = (app.term_size.0.max(1), app.term_size.1.max(1));
+    let width = popup.kind.width(app.grouping).min(term_w);
+    let height = entries.len().saturating_add(2).min(term_h as usize) as u16;
+    // 左端はサイドバー内の x=1 固定。端末に収まらないときだけ左へ寄せる
+    let x = 1u16.min(term_w - width);
+    let y = popup.anchor_y.saturating_add(1).min(term_h - height);
     Rect::new(x, y, width, height)
 }
 
@@ -451,10 +612,20 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
 
     let inner_width = chunks[0].width.saturating_sub(2);
 
-    // 先頭: ccdesk 自身の版・更新告知・区切り線（いずれもクリック不可）
-    for (text, style) in ccdesk_info_rows(app.ccdesk_latest.as_deref(), inner_width) {
+    // 先頭: ccdesk / claude の版行と区切り線。更新があるときだけ行全体がクリック可
+    for (text, style, action) in version_rows(
+        ccdesk_update_state(app),
+        &app.footer.current,
+        claude_update_state(app),
+        inner_width,
+    ) {
+        let cur = rows.len();
+        let mut style = style;
+        if action.is_some() && (hovered == Some(cur) || selected == cur) {
+            style = style.bg(ui().hl_bg).fg(ui().emph);
+        }
         items.push(ListItem::new(Line::from(text).style(style)));
-        rows.push(None);
+        rows.push(action);
     }
 
     // 新規セッション
@@ -503,8 +674,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         .style(Style::default().fg(ui().dim)),
     ));
     rows.push(None);
-    // ここまでが固定ヘッダー。行数は更新告知の有無で変わるので、積んだ数をそのまま
-    // 正本にする（ヒットテストとスクロール計算が読む。定数と二重管理にしない）
+    // ここまでが固定ヘッダー。積んだ数をそのまま正本にする
+    // （ヒットテストとスクロール計算が読む。定数と二重管理にしない）
     let header_n = rows.len();
 
     match app.grouping {
@@ -576,13 +747,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         }
     }
 
-    // 下部のフッター（区切り線 + 更新ボタン行 + アカウント行）を差し引いた行数が表示窓。
+    // 下部のフッター（区切り線 + アカウント行）を差し引いた行数が表示窓。
     // 溢れる分はスクロールで届く（ホイール / ↑↓ の選択追従）。
     // ジオメトリはクリック判定と同じ sidebar_layout を使う
     let sl = sidebar_layout(app);
-    let updating = app
-        .claude_updating
-        .load(std::sync::atomic::Ordering::Relaxed);
     let capacity = sl.capacity;
     app.sidebar_rows = rows;
     app.sidebar_header_rows = header_n;
@@ -642,20 +810,18 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     ));
     frame.render_widget(list, chunks[0]);
 
-    // ---- サイドバー下部フッター: 区切り線 / 更新ボタン行（差分時のみ）/ アカウント行 ----
+    // ---- サイドバー下部フッター: 区切り線 / アカウント行 ----
+    // claude の更新行はここには無い（上部の版行に集約した）
     if sl.footer_visible {
-        let update_row_visible = sl.update_row_visible;
         let fx = chunks[0].x + 1;
         let fw = chunks[0].width - 2;
         let account_y = sl.account_y;
-        let sep_y = account_y - 1 - u16::from(update_row_visible);
-        let clip = |s: &str| -> String { s.chars().take(fw as usize).collect() };
         // 区切り線（Desktop 風にフッターを本文から分ける）
         frame.render_widget(
             ratatui::widgets::Paragraph::new(
                 Line::from("─".repeat(fw as usize)).style(Style::default().fg(ui().dim)),
             ),
-            Rect::new(fx, sep_y, fw, 1),
+            Rect::new(fx, account_y - 1, fw, 1),
         );
         // アカウント行（表示名 · 組織名）。未ログインは要対応なので注意色、
         // 未取得（起動直後・CLI 失敗）は誤情報を出さないため空行にする
@@ -668,34 +834,16 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             AccountStatus::Unknown => ("", Style::default().fg(ui().dim)),
         };
         frame.render_widget(
-            ratatui::widgets::Paragraph::new(Line::from(clip(account)).style(account_style)),
+            ratatui::widgets::Paragraph::new(
+                Line::from(clip_to_width(account, fw)).style(account_style),
+            ),
             Rect::new(fx, account_y, fw, 1),
         );
-        if update_row_visible {
-            let label = if updating {
-                "⟳ updating claude…".to_string()
-            } else {
-                format!(
-                    "⟳ update claude {} → {}",
-                    app.footer.current,
-                    app.footer.latest.as_deref().unwrap_or("")
-                )
-            };
-            let style = if updating {
-                Style::default().fg(C_WORKING)
-            } else {
-                Style::default().fg(MUTED_FG)
-            };
-            frame.render_widget(
-                ratatui::widgets::Paragraph::new(Line::from(clip(&label)).style(style)),
-                Rect::new(fx, account_y - 1, fw, 1),
-            );
-        }
     }
 
     // コンテキストメニュー（モーダル）。矩形はクリック判定と同じ popup_rect を使う
     if let Some(popup) = &app.popup {
-        let entries = popup.entries(app.grouping);
+        let entries = popup.kind.entries(app.grouping);
         let area = popup_rect(app, popup);
         frame.render_widget(ratatui::widgets::Clear, area);
         let lines: Vec<ListItem> = entries
@@ -849,45 +997,245 @@ mod tests {
         }
     }
 
-    /// 行構成: 版行と区切り線は常時、告知行は新しいリリースがあるときだけ。
-    /// 告知の有無で行数が 1 だけ変わる（この差が固定ヘッダー行数の増減になる）
+    /// 既定のサイドバー幅（34 桁）の内側。版行の幅の予算はこの桁数
+    const DEFAULT_INNER: u16 = 32;
+
+    /// 更新マーカーの表示幅は 1 桁。**この 1 という実測値に設計が乗っている**:
+    /// 更新が無い行はスペース 1 個でマーカー桁を確保しており、2 桁なら桁がずれる。
+    /// `☰` が 2 桁を占めるのと対照（unicode-width の判定は文字ごとに違う）
     #[test]
-    fn ccdesk_info_rows_add_only_the_notice_when_an_update_exists() {
-        let without = ccdesk_info_rows(None, 32);
-        let with = ccdesk_info_rows(Some("v9.9.9"), 32);
-        assert_eq!(without.len(), 2, "版行と区切り線だけのはず");
-        assert_eq!(with.len(), 3, "告知行が 1 行増えるだけのはず");
-        // 版行は先頭・区切り線は末尾で、告知はその間に入る（前後が動かない）
-        assert_eq!(with[0].0, without[0].0);
-        assert_eq!(with[2].0, without[1].0);
-        assert!(with[0].0.contains(env!("CARGO_PKG_VERSION")), "{:?}", with[0].0);
-        assert_eq!(with[2].0, separator_text(32));
+    fn the_update_marker_is_one_column_wide() {
+        use unicode_width::UnicodeWidthStr;
+        assert_eq!(UPDATE_MARK.width(), 1, "⟳ が 1 桁でない");
+        assert_eq!("☰".width(), 2, "☰ は 2 桁（⟳ と同じ扱いにはできない）");
     }
 
-    /// 告知はクリックできないので、文面だけで「新しい版がある」と
-    /// 「`ccdesk update` を実行すればよい」の両方が伝わること
+    /// 更新の有無で行構成が変わらない（固定ヘッダー行数もマーカー桁の位置も動かない）。
+    /// 版行 2 本 + 区切り線 1 本で必ず 3 行
     #[test]
-    fn update_notice_states_the_new_version_and_the_command() {
-        let notice = update_notice("v9.9.9");
-        assert!(notice.contains("v9.9.9"), "{notice:?}");
-        assert!(notice.contains("ccdesk update"), "{notice:?}");
-        // フッターの claude 更新行（⟳ update claude X → Y）と混同しない
-        assert!(!notice.contains("claude"), "{notice:?}");
+    fn version_rows_keep_a_fixed_shape_whether_or_not_updates_exist() {
+        for (ccdesk, claude) in [
+            (UpdateState::Current, UpdateState::Current),
+            (UpdateState::Available, UpdateState::Current),
+            (UpdateState::Running, UpdateState::Available),
+            (UpdateState::Restart, UpdateState::Running),
+        ] {
+            let rows = version_rows(ccdesk, "2.1.220", claude, DEFAULT_INNER);
+            assert_eq!(rows.len(), 3, "版行 2 本 + 区切り線 1 本のはず");
+            assert!(rows[0].0.contains(env!("CARGO_PKG_VERSION")), "{:?}", rows[0].0);
+            assert!(rows[1].0.contains("claude v2.1.220"), "{:?}", rows[1].0);
+            assert_eq!(rows[2].0, separator_text(DEFAULT_INNER));
+            assert!(rows[2].2.is_none(), "区切り線はクリック不可");
+        }
+        // 版が未取得なら番号を出さない（誤情報を出さない）
+        let rows = version_rows(UpdateState::Current, "", UpdateState::Current, DEFAULT_INNER);
+        assert!(rows[1].0.contains("claude"), "{:?}", rows[1].0);
+        assert!(!rows[1].0.contains(" v"), "版が無いのに v を出している: {:?}", rows[1].0);
+    }
+
+    /// 4 状態の文面。左端がマーカー桁、右端が動詞で、**新版の番号は出さない**
+    #[test]
+    fn version_row_spells_out_all_four_update_states() {
+        let row = |state| version_row("ccdesk", "0.5.0", state, DEFAULT_INNER);
+        // 最新: マーカー桁は空白、動詞なし
+        let current = row(UpdateState::Current);
+        assert_eq!(current, "  ccdesk v0.5.0");
+        // 更新あり / 実行中 / 再起動待ち: ⟳ + 右端の動詞
+        for (state, verb) in [
+            (UpdateState::Available, "update"),
+            (UpdateState::Running, "updating…"),
+            (UpdateState::Restart, "restart"),
+        ] {
+            let text = row(state);
+            assert!(text.starts_with(UPDATE_MARK), "{text:?}");
+            assert!(text.ends_with(verb), "{text:?} が {verb:?} で終わっていない");
+            assert!(text.contains("ccdesk v0.5.0"), "{text:?}");
+        }
+    }
+
+    /// **最新のときもマーカー桁を確保する。** 更新が出た瞬間に名前が横へずれると、
+    /// 行が変わったこと自体に気づきにくい
+    #[test]
+    fn version_row_keeps_the_name_column_fixed_across_states() {
+        use unicode_width::UnicodeWidthStr;
+        // 名前の前にある部分の表示幅（マーカー桁 + 区切りの空白）
+        let name_col = |text: &str| {
+            let at = text.find("ccdesk").expect("名前が無い");
+            text[..at].width()
+        };
+        let base = name_col(&version_row("ccdesk", "0.5.0", UpdateState::Current, DEFAULT_INNER));
+        assert_eq!(base, 2, "マーカー 1 桁 + 空白 1 桁のはず");
+        for state in [
+            UpdateState::Available,
+            UpdateState::Running,
+            UpdateState::Restart,
+        ] {
+            let text = version_row("ccdesk", "0.5.0", state, DEFAULT_INNER);
+            assert_eq!(name_col(&text), base, "{state:?} で名前の桁がずれた: {text:?}");
+        }
+    }
+
+    /// クリックできるのは「更新がある」行だけ。実行中・再起動待ちは押しても
+    /// 意味が無いのでアクションを付けない（ハイライトも出さない）
+    #[test]
+    fn version_rows_are_clickable_only_when_an_update_is_available() {
+        let actions = |ccdesk, claude| {
+            let rows = version_rows(ccdesk, "2.1.220", claude, DEFAULT_INNER);
+            (rows[0].2.clone(), rows[1].2.clone())
+        };
+        assert_eq!(
+            actions(UpdateState::Available, UpdateState::Available),
+            (Some(RowAction::UpdateCcdesk), Some(RowAction::UpdateClaude))
+        );
+        for state in [
+            UpdateState::Current,
+            UpdateState::Running,
+            UpdateState::Restart,
+        ] {
+            assert_eq!(actions(state, state), (None, None), "{state:?}");
+        }
     }
 
     /// 既定のサイドバー幅（34 桁 = 内側 32 桁）で切られない。
-    /// 溢れる場合も版番号が先に来るので意図は残る
+    /// 版番号は現実的な桁数まで（claude は 3 パート、ccdesk は本ビルドの版）
     #[test]
-    fn update_notice_fits_the_default_sidebar_width() {
-        for tag in ["v0.3.0", "v1.2.3", "v10.20.30"] {
-            let notice = update_notice(tag);
-            assert!(
-                notice.chars().count() <= 32,
-                "既定幅に収まらない: {notice:?} ({} 桁)",
-                notice.chars().count()
-            );
-            // 先頭が版番号側（切られても版が残る語順）
-            assert!(notice.starts_with(&format!("⟳ {tag}")), "{notice:?}");
+    fn version_rows_fit_the_default_sidebar_width() {
+        use unicode_width::UnicodeWidthStr;
+        for state in [
+            UpdateState::Current,
+            UpdateState::Available,
+            UpdateState::Running,
+            UpdateState::Restart,
+        ] {
+            for version in ["", "0.5.0", "2.1.220", "10.20.300"] {
+                for name in ["ccdesk", "claude"] {
+                    let text = version_row(name, version, state, DEFAULT_INNER);
+                    assert!(
+                        text.width() <= DEFAULT_INNER as usize,
+                        "既定幅に収まらない: {text:?}（{} 桁 / 内側 {DEFAULT_INNER} 桁）",
+                        text.width()
+                    );
+                }
+            }
+        }
+    }
+
+    /// 切り出しは表示幅で数える。アカウント名・組織名は任意の文字列なので、
+    /// 文字数で切ると全角ぶんだけ枠を越える
+    #[test]
+    fn clip_to_width_counts_display_columns_not_characters() {
+        use unicode_width::UnicodeWidthStr;
+        // 全角 5 文字 = 10 桁。7 桁で切れば 3 文字（6 桁）まで
+        let wide = "山田太郎田";
+        assert_eq!(clip_to_width(wide, 7), "山田太");
+        assert_eq!(clip_to_width(wide, 7).width(), 6);
+        // 半角はそのまま桁数で切れる
+        assert_eq!(clip_to_width("ooba · 1→10, Inc.", 6), "ooba ·");
+        // 幅ぴったり・幅超過なしのときは全部残る
+        assert_eq!(clip_to_width(wide, 10), wide);
+        assert_eq!(clip_to_width(wide, 99), wide);
+        assert_eq!(clip_to_width(wide, 0), "");
+    }
+
+    /// アカウント行に出るのは [`crate::accounts::Account`] の **ラベルだけ**。
+    /// email は保管のキー（同一性）として持ち回すだけで、行には出さない。
+    ///
+    /// ジオメトリだけを見る他のフッターテストと違い、ここは実際に 1 フレーム
+    /// 描いて中身を見る: 版行が上部へ移って 2 行固定になったフッターと、
+    /// アカウントが `String` から `Account` になった変更が噛み合っていることは、
+    /// 「その行に何が出たか」でしか固定できない。
+    /// 供給元は [`DemoSource`] 既定の `App`（ファイルもネットワークも触らない）
+    #[test]
+    fn account_row_renders_the_label_without_the_email() {
+        use crate::accounts::Account;
+        use crate::poll::FooterInfo;
+
+        let mut app = App {
+            term_size: (120, 30),
+            footer: FooterInfo {
+                account: AccountStatus::LoggedIn(Account::new(
+                    "you@example.com",
+                    "you · Acme, Inc.",
+                )),
+                current: "2.1.220".to_string(),
+                latest: None,
+            },
+            ..Default::default()
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(frame, &mut app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String {
+            (0..120).map(|x| buffer[(x, y)].symbol()).collect::<String>()
+        };
+        // 端末高さ 30 → サイドバー高さ 29（下部バー 1 行を除く）。y は画面座標
+        let sl = sidebar_layout_of(29, 34);
+
+        assert!(
+            row(sl.account_y).contains("you · Acme, Inc."),
+            "アカウント行にラベルが出ていない: {:?}",
+            row(sl.account_y)
+        );
+        assert!(
+            !row(sl.account_y).contains('@'),
+            "email を行に出している: {:?}",
+            row(sl.account_y)
+        );
+        assert!(
+            row(sl.account_y - 1).contains('─'),
+            "アカウント行の 1 つ上が区切り線になっていない: {:?}",
+            row(sl.account_y - 1)
+        );
+    }
+
+    /// フッターは「区切り線 + アカウント行」の 2 行に固定された
+    /// （claude の更新行は上部の版行へ移したので、更新の有無で高さが変わらない）
+    #[test]
+    fn sidebar_footer_is_the_separator_and_the_account_row() {
+        // 端末高さ 30 → サイドバー矩形の高さ 29（下部バー 1 行を除く）
+        let sl = sidebar_layout_of(29, 34);
+        assert!(sl.footer_visible);
+        // 内側は 27 行（上下の枠を除く）。フッター 2 行を引いた 25 行が一覧の表示窓
+        assert_eq!(sl.capacity, 25);
+        // アカウント行は内側の最終行、その 1 つ上が区切り線
+        assert_eq!(sl.account_y, 27);
+        // 表示窓は上枠の次（y = 1）から始まるので、区切り線の 1 つ上までで尽きる
+        assert_eq!(1 + sl.capacity, (sl.account_y - 1) as usize);
+        // 狭い端末ではフッターを描かない = クリックも受けない
+        for (h, w) in [(7u16, 34u16), (29, 4)] {
+            assert!(!sidebar_layout_of(h, w).footer_visible, "h={h} w={w}");
+        }
+    }
+
+    /// クリック判定はヘッダー先頭の版行に当たる。行 index は列を取らない
+    /// = **行のどこを押しても同じ行**（マーカーの桁だけが当たり判定ではない）。
+    /// 上枠とフッター帯は不感帯
+    #[test]
+    fn row_at_hits_the_version_rows_at_the_top_of_the_header() {
+        let sl = sidebar_layout_of(29, 34);
+        let header = version_rows(
+            UpdateState::Available,
+            "2.1.220",
+            UpdateState::Available,
+            DEFAULT_INNER,
+        );
+        // 版行はヘッダーの 0・1 行目（区切り線が 2 行目）
+        assert_eq!(header[0].2, Some(RowAction::UpdateCcdesk));
+        assert_eq!(header[1].2, Some(RowAction::UpdateClaude));
+        // 画面 y=1 が ccdesk 行、y=2 が claude 行（スクロール位置に関係なく固定）
+        for scroll in [0usize, 5, 99] {
+            assert_eq!(row_at(1, sl.capacity, 7, scroll), 0);
+            assert_eq!(row_at(2, sl.capacity, 7, scroll), 1);
+        }
+        // 上枠とフッター帯・下枠は不感帯
+        assert_eq!(row_at(0, sl.capacity, 7, 0), usize::MAX);
+        for y in [sl.account_y - 1, sl.account_y, sl.account_y + 1] {
+            assert_eq!(row_at(y, sl.capacity, 7, 0), usize::MAX, "y={y}");
         }
     }
 

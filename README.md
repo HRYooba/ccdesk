@@ -21,11 +21,17 @@ Agent View.
 - **Account line** in the sidebar footer, showing the signed-in Claude account, the same value
   `ccdesk doctor` prints. A login or logout that rewrites `~/.claude/.credentials.json` shows
   up in ~1 s; where credentials live outside that file, only the ~60 s refresh applies
-- **Version line and update notice** at the top of the sidebar: ccdesk's own version, plus a
-  `⟳ vX.Y.Z · run: ccdesk update` notice when a newer release exists. The check runs once per
-  launch (no polling); the notice is informational — updating is always `ccdesk update`, which
-  verifies the download by SHA-256 before replacing anything. The running process keeps the old
-  version and the new one applies on the next launch
+- **Version rows** at the top of the sidebar — `ccdesk vX.Y.Z` and `claude vX.Y.Z` — each with a
+  `⟳` marker column and a verb at the right edge. When a newer version exists the row reads
+  `⟳ ccdesk vX.Y.Z          update` and **clicking anywhere on it runs the update**, showing
+  `updating…` while it runs. The marker column stays reserved when you are up to date, so
+  nothing shifts sideways when an update appears. **Both updates apply on the next launch** —
+  the running ccdesk and any live claude session keep the version they started with; the ccdesk
+  row therefore switches to `restart` and stays there for the rest of the session, while the
+  claude row clears once `claude --version` reports the new build. ccdesk's own check runs once
+  per launch (no polling), and the download is verified by SHA-256 before anything is replaced
+  (the same install path as `ccdesk update`). A native `claude` install also auto-updates in
+  the background by default, so the claude row may clear itself without you doing anything
 - **Mouse-first**: click to switch/focus, ☰ menu for stop/delete, drag the border to resize
 - **Keyboard**: `Ctrl+X` stop→delete, `Ctrl+S` toggle grouping, `Alt+←/→` pane focus,
   `Ctrl+Q` quit — everything else passes through to claude untouched. On the new-session
