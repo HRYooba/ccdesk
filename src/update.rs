@@ -60,6 +60,12 @@ pub(crate) fn tag_is_newer(tag: &str) -> bool {
     ccdesk::version_newer(tag.trim_start_matches('v'), env!("CARGO_PKG_VERSION"))
 }
 
+/// このビルドより新しいリリースタグ。同版・古い・取得失敗なら None
+pub(crate) fn newer_tag() -> Option<String> {
+    let tag = latest_tag()?;
+    tag_is_newer(&tag).then_some(tag)
+}
+
 /// 直前の自己更新で退避した `<exe>.old` を消す。更新した当のプロセスが生きている
 /// 間はファイルが掴まれていて消せないので、次回起動時のこの 1 回が唯一の掃除機会。
 /// 「無い」「まだ掴まれている」はどちらも正常なので失敗は無視する

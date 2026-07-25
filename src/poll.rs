@@ -160,6 +160,43 @@ pub(crate) struct FooterInfo {
     pub(crate) latest: Option<String>, // 新しい版があるときだけ Some
 }
 
+/// ccdesk 自身の更新状態（サイドバー先頭の更新行の正本）。
+///
+/// 取得は **起動時 1 回だけ**。ccdesk のリリース頻度は低く、適用には再起動が
+/// 必要なので、1 起動につき 1 回で足りる（claude 側のバージョン監視＝
+/// [`spawn_footer_poller`] の 1 時間周期とは別物なので混ぜない）。
+/// 更新を実行した後は再取得せず、ローカルの状態遷移だけで表示を変える
+#[derive(Clone, Default, PartialEq)]
+pub(crate) enum SelfUpdate {
+    /// 未取得、または最新。どちらも「更新行を出さない」なので区別しない
+    #[default]
+    UpToDate,
+    /// このビルドより新しいリリースタグ。行をクリックすると更新が走る
+    Available(String),
+    /// 差し替え済み。次回起動から有効
+    Installed(String),
+    /// 更新に失敗（詳細は ~/.ccdesk/error.log）
+    Failed(String),
+}
+
+/// ccdesk 自身の更新チェック（起動時 1 回の使い捨てスレッド）。
+/// 通信に数百 ms かかるので起動をブロックしない。新しいリリースが無ければ
+/// 何も書かない（＝更新行は出ない）
+pub(crate) fn spawn_self_update_check(
+    shared: Arc<Mutex<SelfUpdate>>,
+    dirty: Arc<std::sync::atomic::AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let Some(tag) = crate::update::newer_tag() else {
+            return;
+        };
+        *shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SelfUpdate::Available(tag);
+        dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
 /// `claude auth status --json` の出力 → アカウント行。
 ///
 /// profile は `.claude.json` の `oauthAccount` の (emailAddress, displayName)。
