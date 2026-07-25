@@ -715,10 +715,18 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // 位置は必ず確定させる（描かないとサイドバーに置き去りになる。FrameCursor 参照）。
     // ペイン外へはみ出す座標はペイン内へクランプする
     let (crow, ccol) = screen.cursor_position();
-    let pos = Position::new(
-        inner.x + ccol.min(inner.width.saturating_sub(1)),
-        inner.y + crow.min(inner.height.saturating_sub(1)),
-    );
+    let pos = if inner.width == 0 || inner.height == 0 {
+        // 内側が潰れている場合（右ペインは Constraint::Min(1) なので、サイドバーを
+        // 広げ切ると幅 1 = inner 幅 0 になり得る）。この状態で width-1 クランプを
+        // 使うと inner.x = 枠の列を指し、端末幅を超える MoveTo にもなり得るため、
+        // 確実に画面内であるペイン矩形の原点へ退避する
+        Position::new(chunks[1].x, chunks[1].y)
+    } else {
+        Position::new(
+            inner.x + ccol.min(inner.width - 1),
+            inner.y + crow.min(inner.height - 1),
+        )
+    };
     if app.focus == Focus::Terminal && !screen.hide_cursor() {
         FrameCursor::shown_at(pos)
     } else {

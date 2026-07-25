@@ -471,6 +471,8 @@ pub(crate) fn draw_new_view(
     // 描画とマウス判定で同一のジオメトリを使う（フォーム型レイアウト）
     let layout = NewLayout::compute(area);
     if !layout.ok {
+        // フォームが収まらない（inner が潰れている場合も含む）。inner 基準のクランプは
+        // 使えないので、確実に画面内であるペイン矩形の原点へ退避する
         return FrameCursor::hidden_at(Position::new(area.x, area.y));
     }
     let inner = layout.inner;
@@ -628,7 +630,9 @@ pub(crate) fn draw_new_view(
     );
 
     // 入力欄の位置を返す。フォーカス外・一覧操作中は「隠すだけ」で位置は確定させる
-    // （位置を返さないと物理カーソルがサイドバーに置き去りになる。FrameCursor 参照）
+    // （位置を返さないと物理カーソルがサイドバーに置き去りになる。FrameCursor 参照）。
+    // ここに来た時点で layout.ok なので inner.width >= 10 が保証され、
+    // inner / prompt_inner はどちらも幅 0 になり得ない（= right()-1 クランプは安全）
     let (pos, in_field) = match state.focus {
         NewFocus::Path => (
             Position::new(

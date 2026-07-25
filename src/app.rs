@@ -238,28 +238,65 @@ fn write_inject_settings() -> Option<std::path::PathBuf> {
     Some(path)
 }
 
+/// 同期出力（DECSET 2026）のスコープガード。Drop で閉じるため、draw のクロージャが
+/// panic して巻き戻した場合も開いたままにならない。閉じ忘れると mode 2026 に
+/// タイムアウトを持たない端末では画面が固まり、panic メッセージも表示されないまま
+/// 操作不能になる。
+///
+/// 既知の制限（挙動は変えない）: crossterm 0.29 の Begin/EndSynchronizedUpdate は
+/// `is_ansi_code_supported()` を true 決め打ちで実装しているため、VT 処理の無い
+/// レガシー Windows コンソールでは他コマンドが winapi 経路を通る一方この 2 つだけ
+/// 生 ANSI を書き、`[?2026h` が文字として表示され得る。ccdesk は ConPTY を
+/// 前提とするため許容する
+struct SyncOutput;
+
+impl SyncOutput {
+    fn begin() -> Self {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::BeginSynchronizedUpdate
+        );
+        Self
+    }
+}
+
+impl Drop for SyncOutput {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EndSynchronizedUpdate
+        );
+    }
+}
+
 /// 1 フレームぶんの出力。同期出力（DECSET 2026）で包み、終端カーソルを必ず確定させる。
 ///
 /// ratatui は 1 フレームを「差分 + 非表示/表示 + MoveTo」の複数 flush に分けて書く。
 /// 途中状態を端末に観測させないため全体を同期出力で囲む（非対応端末は無視するだけ）。
-/// カーソル位置は可視性に関係なく常に渡し、隠したいときは draw の後で Hide する
-/// （位置を渡さないと MoveTo が出ず、物理カーソルが差分の最終セルに残る）
+/// カーソル位置は可視性に関係なく常に渡し、隠したいときは draw の後で隠す
+/// （位置を渡さないと MoveTo が出ず、物理カーソルが差分の最終セルに残る）。
+///
+/// 隠すのに生の `cursor::Hide` ではなく `Terminal::hide_cursor` を通すのが要点。
+/// ratatui は自前の hidden_cursor フラグを持ち、Terminal の Drop ではそれが立って
+/// いるときだけ `?25h` を出す。位置ありの draw は毎回 show_cursor を呼んでフラグを
+/// false に戻すため、生 ANSI で隠すと「実際は隠れているのにフラグは false」になり、
+/// alt screen 離脱で DECTCEM を復元しない端末では終了後のシェルにカーソルが戻らない。
+/// hide_cursor は draw が MoveTo を出した後に呼ぶので位置は確定済み
+/// （= IME のアンカーは維持され、元のバグは再発しない）
 fn draw_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
-    use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-
-    let mut out = std::io::stdout();
-    let _ = crossterm::execute!(out, BeginSynchronizedUpdate);
+    let _sync = SyncOutput::begin();
     let mut visible = true;
-    let drawn = terminal.draw(|frame| {
-        let cursor = draw(frame, app);
-        frame.set_cursor_position(cursor.pos);
-        visible = cursor.visible;
-    });
+    // map で CompletedFrame を落として terminal の借用を切る（下で hide_cursor を呼ぶため）
+    let drawn = terminal
+        .draw(|frame| {
+            let cursor = draw(frame, app);
+            frame.set_cursor_position(cursor.pos);
+            visible = cursor.visible;
+        })
+        .map(|_| ());
     if !visible {
-        let _ = crossterm::execute!(out, crossterm::cursor::Hide);
+        let _ = terminal.hide_cursor();
     }
-    // draw が失敗しても同期出力は必ず閉じる（閉じ忘れると画面が更新されなくなる）
-    let _ = crossterm::execute!(out, EndSynchronizedUpdate);
     drawn?;
     Ok(())
 }
