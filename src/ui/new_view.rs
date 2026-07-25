@@ -446,6 +446,65 @@ impl NewLayout {
             ok: inner.height > Self::HEAD_ROWS + Self::FOOT_ROWS && inner.width >= 10,
         }
     }
+
+    /// PROMPT 入力枠の内側（Borders::ALL の 1px 内側）。入力行の描画とカーソル位置で
+    /// 同じ値を共有するため、Block::inner の再計算をここへ集約する
+    pub(crate) fn prompt_inner(&self) -> Rect {
+        Rect {
+            x: self.prompt_box.x + 1,
+            y: self.prompt_box.y + 1,
+            width: self.prompt_box.width.saturating_sub(2),
+            height: self.prompt_box.height.saturating_sub(2),
+        }
+    }
+}
+
+/// New 画面のカーソル位置と可視性。Frame を必要としない純関数なので描画から
+/// 切り離してテストできる。pane = 右ペイン矩形（枠を含む）。
+///
+/// フォーカス外・一覧操作中も「隠すだけ」で位置は必ず返す（位置を返さないと物理
+/// カーソルがサイドバーに置き去りになる。FrameCursor 参照）。戻り値の位置は
+/// pane がどんなサイズでも pane 矩形の内側に収まる
+pub(crate) fn new_view_cursor(
+    pane: Rect,
+    focus: NewFocus,
+    path_cursor_x: u16,
+    prompt_cursor_x: u16,
+    focused: bool,
+) -> FrameCursor {
+    let layout = NewLayout::compute(pane);
+    if !layout.ok {
+        // フォームが収まらない（inner が潰れている場合も含む）。inner 基準のクランプは
+        // 使えないので、確実に画面内であるペイン矩形の原点へ退避する
+        return FrameCursor::hidden_at(Position::new(pane.x, pane.y));
+    }
+    // ここに来た時点で layout.ok なので inner.width >= 10 が保証され、
+    // inner（幅 >= 10）も prompt_inner（幅 >= 4）も幅 0 になり得ない
+    // （= right() - 1 のクランプは inner の外を指さない）
+    let inner = layout.inner;
+    let prompt_inner = layout.prompt_inner();
+    let (pos, in_field) = match focus {
+        NewFocus::Path => (
+            Position::new(
+                (layout.path_text_x + path_cursor_x).min(inner.right() - 1),
+                layout.path_y,
+            ),
+            true,
+        ),
+        NewFocus::Prompt => (
+            Position::new(
+                (layout.input_text_x + prompt_cursor_x).min(prompt_inner.right() - 1),
+                layout.input_y,
+            ),
+            true,
+        ),
+        NewFocus::Browser => (Position::new(layout.input_text_x, layout.input_y), false),
+    };
+    if focused && in_field {
+        FrameCursor::shown_at(pos)
+    } else {
+        FrameCursor::hidden_at(pos)
+    }
 }
 
 /// 新規セッション画面の描画（フォルダブラウザ + 初回チャット入力）。
@@ -470,10 +529,16 @@ pub(crate) fn draw_new_view(
 
     // 描画とマウス判定で同一のジオメトリを使う（フォーム型レイアウト）
     let layout = NewLayout::compute(area);
+    // カーソル位置は描画結果に依存しないので先に決める（!ok の早期 return と共有する）
+    let cursor = new_view_cursor(
+        area,
+        state.focus,
+        state.path.cursor_x(),
+        state.prompt.cursor_x(),
+        focused,
+    );
     if !layout.ok {
-        // フォームが収まらない（inner が潰れている場合も含む）。inner 基準のクランプは
-        // 使えないので、確実に画面内であるペイン矩形の原点へ退避する
-        return FrameCursor::hidden_at(Position::new(area.x, area.y));
+        return cursor;
     }
     let inner = layout.inner;
 
@@ -588,7 +653,7 @@ pub(crate) fn draw_new_view(
     let prompt_block = Block::default()
         .borders(Borders::ALL)
         .border_style(box_border);
-    let prompt_inner = prompt_block.inner(layout.prompt_box);
+    let prompt_inner = layout.prompt_inner();
     frame.render_widget(prompt_block, layout.prompt_box);
     // 入力行（starting 表示も枠内に出す）
     let marker_style = if prompt_focused {
@@ -629,31 +694,104 @@ pub(crate) fn draw_new_view(
         Rect::new(inner.x, layout.hint_y, inner.width, 1),
     );
 
-    // 入力欄の位置を返す。フォーカス外・一覧操作中は「隠すだけ」で位置は確定させる
-    // （位置を返さないと物理カーソルがサイドバーに置き去りになる。FrameCursor 参照）。
-    // ここに来た時点で layout.ok なので inner.width >= 10 が保証され、
-    // inner / prompt_inner はどちらも幅 0 になり得ない（= right()-1 クランプは安全）
-    let (pos, in_field) = match state.focus {
-        NewFocus::Path => (
-            Position::new(
-                (layout.path_text_x + state.path.cursor_x()).min(inner.right().saturating_sub(1)),
-                layout.path_y,
-            ),
-            true,
-        ),
-        NewFocus::Prompt => (
-            Position::new(
-                (layout.input_text_x + state.prompt.cursor_x())
-                    .min(prompt_inner.right().saturating_sub(1)),
-                layout.input_y,
-            ),
-            true,
-        ),
-        NewFocus::Browser => (Position::new(layout.input_text_x, layout.input_y), false),
-    };
-    if focused && in_field {
-        FrameCursor::shown_at(pos)
-    } else {
-        FrameCursor::hidden_at(pos)
+    cursor
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// pos が矩形の内側にあるか（幅・高さ 0 の矩形は「内側なし」なので常に false）
+    fn contains(rect: Rect, pos: Position) -> bool {
+        pos.x >= rect.x && pos.x < rect.right() && pos.y >= rect.y && pos.y < rect.bottom()
+    }
+
+    const FOCUSES: [NewFocus; 3] = [NewFocus::Prompt, NewFocus::Path, NewFocus::Browser];
+
+    /// 十分な広さのペインなら、どのフィールドにフォーカスしていても位置はペイン内
+    #[test]
+    fn cursor_stays_in_pane_for_every_focus() {
+        let pane = Rect::new(34, 0, 80, 30);
+        for focus in FOCUSES {
+            let cursor = new_view_cursor(pane, focus, 0, 0, true);
+            assert!(
+                contains(pane, cursor.pos),
+                "focus 切替で pos {:?} がペイン外",
+                cursor.pos
+            );
+        }
+    }
+
+    /// 長い入力（= 大きな cursor_x）でも枠の外へ出ない。狭いペインでも同じ
+    #[test]
+    fn cursor_stays_in_pane_for_long_field_text() {
+        for width in [10u16, 12, 20, 80] {
+            let pane = Rect::new(34, 0, width, 30);
+            for focus in FOCUSES {
+                let cursor = new_view_cursor(pane, focus, 500, 500, true);
+                assert!(
+                    contains(pane, cursor.pos),
+                    "幅 {width} / focus 変化で pos {:?} がペイン外",
+                    cursor.pos
+                );
+            }
+        }
+    }
+
+    /// フォームが収まらない高さ（layout.ok == false）でも位置はペイン内
+    #[test]
+    fn cursor_stays_in_pane_when_layout_does_not_fit() {
+        let pane = Rect::new(34, 0, 80, 6); // HEAD_ROWS + FOOT_ROWS に足りない
+        assert!(!NewLayout::compute(pane).ok);
+        for focus in FOCUSES {
+            let cursor = new_view_cursor(pane, focus, 0, 0, true);
+            assert_eq!(cursor.pos, Position::new(pane.x, pane.y));
+            assert!(contains(pane, cursor.pos));
+        }
+    }
+
+    /// 退化サイズでもペイン外へ出ない（Finding 3 の回帰テスト）。
+    /// 幅・高さのどちらかが 0 のペインには「内側」が存在しないので、
+    /// その場合だけはペイン原点に落ちることを確認する
+    #[test]
+    fn cursor_stays_in_pane_for_degenerate_pane_sizes() {
+        for w in [0u16, 1, 2, 3, 9, 10] {
+            for h in [0u16, 1, 2, 11, 12] {
+                let pane = Rect::new(34, 5, w, h);
+                for focus in FOCUSES {
+                    let cursor = new_view_cursor(pane, focus, 42, 42, true);
+                    if w == 0 || h == 0 {
+                        assert_eq!(
+                            cursor.pos,
+                            Position::new(pane.x, pane.y),
+                            "{w}x{h} でペイン原点に落ちていない"
+                        );
+                    } else {
+                        assert!(
+                            contains(pane, cursor.pos),
+                            "{w}x{h} で pos {:?} がペイン外",
+                            cursor.pos
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 可視になるのは「ペインにフォーカスがあり、かつテキストフィールド上」のときだけ。
+    /// 隠すときも位置は必ず入っている（IME のアンカーを迷子にしない）
+    #[test]
+    fn cursor_visible_only_when_pane_focused_and_field_active() {
+        let pane = Rect::new(34, 0, 80, 30);
+        assert!(new_view_cursor(pane, NewFocus::Prompt, 0, 0, true).visible);
+        assert!(new_view_cursor(pane, NewFocus::Path, 0, 0, true).visible);
+        // 一覧操作中は入力欄に居ないので隠す
+        assert!(!new_view_cursor(pane, NewFocus::Browser, 0, 0, true).visible);
+        // ペイン自体が非フォーカス（サイドバーにフォーカス）なら常に隠す
+        for focus in FOCUSES {
+            let cursor = new_view_cursor(pane, focus, 0, 0, false);
+            assert!(!cursor.visible);
+            assert!(contains(pane, cursor.pos), "非表示でも位置は確定させる");
+        }
     }
 }

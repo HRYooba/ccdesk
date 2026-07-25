@@ -715,21 +715,82 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // 位置は必ず確定させる（描かないとサイドバーに置き去りになる。FrameCursor 参照）。
     // ペイン外へはみ出す座標はペイン内へクランプする
     let (crow, ccol) = screen.cursor_position();
-    let pos = if inner.width == 0 || inner.height == 0 {
-        // 内側が潰れている場合（右ペインは Constraint::Min(1) なので、サイドバーを
-        // 広げ切ると幅 1 = inner 幅 0 になり得る）。この状態で width-1 クランプを
-        // 使うと inner.x = 枠の列を指し、端末幅を超える MoveTo にもなり得るため、
-        // 確実に画面内であるペイン矩形の原点へ退避する
-        Position::new(chunks[1].x, chunks[1].y)
-    } else {
-        Position::new(
-            inner.x + ccol.min(inner.width - 1),
-            inner.y + crow.min(inner.height - 1),
-        )
-    };
+    let pos = terminal_cursor_pos(chunks[1], inner, crow, ccol);
     if app.focus == Focus::Terminal && !screen.hide_cursor() {
         FrameCursor::shown_at(pos)
     } else {
         FrameCursor::hidden_at(pos)
+    }
+}
+
+/// ターミナルペインのカーソル位置。子（vt100）の (row, col) を pane 内の絶対座標へ移す。
+/// Frame を必要としない純関数なので描画から切り離してテストできる。
+///
+/// inner が潰れている（幅または高さ 0）ときは width-1 クランプが枠の列＝inner の外を
+/// 指し、端末幅を超える MoveTo にもなり得る。右ペインは Constraint::Min(1) なので
+/// サイドバーを広げ切ると幅 1 = inner 幅 0 が起こり得るため、その場合は確実に画面内で
+/// あるペイン矩形の原点へ退避する
+fn terminal_cursor_pos(pane: Rect, inner: Rect, crow: u16, ccol: u16) -> Position {
+    if inner.width == 0 || inner.height == 0 {
+        return Position::new(pane.x, pane.y);
+    }
+    Position::new(
+        inner.x + ccol.min(inner.width - 1),
+        inner.y + crow.min(inner.height - 1),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// pos が矩形の内側にあるか（幅・高さ 0 の矩形は「内側なし」なので常に false）
+    fn contains(rect: Rect, pos: Position) -> bool {
+        pos.x >= rect.x && pos.x < rect.right() && pos.y >= rect.y && pos.y < rect.bottom()
+    }
+
+    /// Borders::ALL の Block::inner と同じ 1px 縮小
+    fn shrink(rect: Rect) -> Rect {
+        Rect {
+            x: rect.x + 1,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(2),
+            height: rect.height.saturating_sub(2),
+        }
+    }
+
+    /// 通常サイズでは子の (row, col) がそのまま inner 内の絶対座標へ移る
+    #[test]
+    fn terminal_cursor_maps_child_position_into_inner() {
+        let pane = Rect::new(34, 0, 60, 20);
+        let inner = shrink(pane);
+        let pos = terminal_cursor_pos(pane, inner, 3, 7);
+        assert_eq!(pos, Position::new(42, 4));
+        assert!(contains(inner, pos));
+    }
+
+    /// inner をはみ出す座標は最終行・最終列へクランプされる
+    #[test]
+    fn terminal_cursor_clamps_out_of_range_child_position() {
+        let pane = Rect::new(0, 0, 10, 5);
+        let inner = shrink(pane);
+        let pos = terminal_cursor_pos(pane, inner, 99, 99);
+        assert_eq!(pos, Position::new(8, 3));
+        assert!(contains(inner, pos));
+    }
+
+    /// inner が潰れてもペイン矩形の外（枠の列や端末外）へ出ない。
+    /// 右ペインは Constraint::Min(1) なので幅 1 = inner 幅 0 が起こり得る
+    #[test]
+    fn terminal_cursor_stays_in_pane_for_degenerate_inner() {
+        for (w, h) in [(1u16, 20u16), (2, 20), (3, 20), (20, 1), (20, 2), (1, 1)] {
+            let pane = Rect::new(34, 0, w, h);
+            let inner = shrink(pane);
+            let pos = terminal_cursor_pos(pane, inner, 5, 5);
+            assert!(
+                contains(pane, pos),
+                "pane {pane:?} / inner {inner:?} で pos {pos:?} がペイン外"
+            );
+        }
     }
 }
