@@ -115,9 +115,41 @@ const LOCK_MAX_STEALS: u32 = 3;
 /// `~/.claude.lock` の下で行う）と衝突し、**差し替えた認証情報が旧アカウントの
 /// 更新済みトークンで上書きされる**。
 ///
+/// # 解放は所有権を確認してから行う
+///
+/// 取得した瞬間の mtime を所有権の印として持ち、[`Drop`] では **それが今も
+/// 一致するときだけ** `rmdir` する。無条件に消すと、自分のロックが stale 判定で
+/// 奪われた後（奪取は rmdir → mkdir なので mtime が変わる）に **奪った側＝claude の
+/// ロックを消してしまい**、トークン更新の最中に第三者が入れる状態を作る。
+/// それはこのロックがまさに防ごうとしている上書きそのもので、使い捨ての
+/// refreshToken が壊れるとログインは復旧不能になりうる。
+///
+/// 印に mtime を選んだ理由:
+/// - **claude 側（proper-lockfile）も同じ基準で所有権を見ている。** 取得時の mtime と
+///   現在の mtime が違えば "compromised" と判定する実装で、claude のバイナリにも
+///   その痕跡（`mtimePrecision` / `ECOMPROMISED` / `onCompromised` /
+///   `Unable to update lock within the stale threshold` の文字列）がある
+/// - **ロックディレクトリの中に印のファイルは置けない。** 奪う側は `rmdir` で
+///   消すが、非空ディレクトリの `rmdir` は `ENOTEMPTY` で失敗する（この定数も
+///   claude のバイナリにある）。中身を置くと claude が stale ロックを回収できず、
+///   トークン更新が永久に失敗しうる
+///
+/// mtime の分解能（NTFS は 100ns 刻み）より短い間隔で奪われると判別できないが、
+/// 奪取は「mtime が 10 秒より古い」ことが前提なので実運用では起きない。
+///
 /// **mtime を更新するスレッドは持たない。** ここでの保持は小さなファイル 2 本の
-/// 読み書き（ミリ秒）で、stale 閾値 10 秒に対して十分短いため、生存を示す必要が無い
-struct Lock(PathBuf);
+/// 読み書き（ミリ秒）で、stale 閾値 10 秒に対して十分短い。仮に環境要因
+/// （ウイルス対策のスキャン・スリープ復帰）で 10 秒を超えて奪われても、
+/// 上の所有権確認があるので他者のロックを消すことはなく、こちらの書き込みが
+/// 失敗するだけで済む（touch スレッドを足しても「奪われた後に消す」経路は
+/// 消えないので、守りとしては所有権確認の方が単純かつ確実）
+struct Lock {
+    path: PathBuf,
+    /// 取得した瞬間の mtime＝所有権の印。取れなかった（None）ときは所有を
+    /// 証明できないので解放しない（stale 化して誰かが奪うのに任せる。
+    /// 他者のロックを消す危険より、10 秒待たせる方が軽い）
+    mtime: Option<std::time::SystemTime>,
+}
 
 impl Lock {
     /// `wait` まで待って取る。`stale` より古いロックは奪う
@@ -126,7 +158,12 @@ impl Lock {
         let mut steals = 0;
         loop {
             match std::fs::create_dir(path) {
-                Ok(()) => return Ok(Self(path.to_path_buf())),
+                Ok(()) => {
+                    return Ok(Self {
+                        path: path.to_path_buf(),
+                        mtime: lock_mtime(path),
+                    })
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => {
                     return Err(anyhow!(
@@ -157,13 +194,22 @@ impl Lock {
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.0);
+        // 所有権の確認（[`Lock`] の解説を参照）。奪われている・確認できないなら
+        // 何もしない。ここで無条件に消すと他者のロックを外すことになる
+        if self.mtime.is_some() && lock_mtime(&self.path) == self.mtime {
+            let _ = std::fs::remove_dir(&self.path);
+        }
     }
+}
+
+/// ロックの mtime（所有権の印）。無い・読めないときは None
+fn lock_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 /// ロックの経過時間。mtime が未来のとき（時刻のずれ）は None＝stale ではない扱い
 fn lock_age(path: &Path) -> Option<Duration> {
-    std::fs::metadata(path).ok()?.modified().ok()?.elapsed().ok()
+    lock_mtime(path)?.elapsed().ok()
 }
 
 /// 保管ファイルの read-modify-write を直列化するプロセス内ロック。
@@ -325,6 +371,12 @@ impl AccountStore {
         if active.is_some_and(|a| !a.email.is_empty() && a.email == email) {
             return Ok(());
         }
+        // 保管の読みは **意図的にロックの外**。`~/.claude.lock` が守るのは claude と
+        // 共有する認証情報ファイルで、こちらの保管ファイルはその対象ではない
+        // （ロック下に入れると、claude の保持時間ぶん自分の読みも待つことになる）。
+        // 許容している穴: ccdesk を複数起動していると、読んだ後に別インスタンスが
+        // `unregister` する窓がある。書き込みは tmp + rename で原子的なので、
+        // 最悪でも「登録解除したはずのアカウントに切り替わる」だけでファイルは壊れない
         let stored = read_accounts(&self.paths.store)
             .get(email)
             .and_then(|entry| entry.get(CREDENTIALS_KEY))
@@ -939,6 +991,41 @@ mod tests {
         );
         drop(mine);
         holder.join().unwrap();
+    }
+
+    /// **奪われた後の Drop で他者のロックを消してはいけない。**
+    /// 消すと、claude がトークン更新の最中（`~/.claude.lock` の下で
+    /// 読む → ネットワーク更新 → 保存を行う）に第三者が入れる状態になり、
+    /// このロック機構が防ごうとしている上書きそのものが起きる
+    #[test]
+    fn drop_keeps_a_lock_that_another_holder_took_over() {
+        let home = TempHome::new("drop_keeps_a_lock_that_another_holder_took_over");
+        let path = home.paths().lock;
+        let mine = Lock::acquire(&path, Duration::ZERO, LOCK_STALE).unwrap();
+
+        // 自分のロックが stale 判定で奪われた状況（他者の rmdir → mkdir）を作る。
+        // 所有権の印は mtime なので、奪い直しが元と同じ刻（Windows のシステム
+        // クロックは ~15ms 刻み）に収まると判別できない。実運用では奪取は
+        // 取得から 10 秒以上経ってからしか起きないので衝突しないが、
+        // テストは同じ刻を踏み得るため mtime が変わるまで作り直す
+        let mtime_of = || std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mine_mtime = mtime_of();
+        for _ in 0..500 {
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            if mtime_of() != mine_mtime {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_ne!(mtime_of(), mine_mtime, "奪取を作れていない（前提が崩れている）");
+
+        drop(mine);
+
+        assert!(
+            path.exists(),
+            "奪われた後の Drop が他者のロックを消している（claude のトークン更新を無防備にする）"
+        );
     }
 
     /// stale 閾値より古いロックは奪う（保持者が死んで残った `.lock` で
