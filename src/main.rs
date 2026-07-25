@@ -163,6 +163,10 @@ fn main() -> anyhow::Result<()> {
         source,
     };
     clamp_sidebar(&mut app); // 保存値が現在の端末幅を超えていたら丸める
+    // 既にあるセッションのフォルダを登録へ埋め戻す（以前から使っているフォルダの
+    // 見出しが、最後のセッションを消した時点で消えないように）。jobs を読んだ後・
+    // 画面を組む前のこの位置に置く: 埋め戻しは初回の一覧に効く必要がある
+    app::backfill_projects(&mut app);
     // バックグラウンド取得の起動。撮影用の供給元は 1 本も起こさないので、
     // ここに `if !demo` は要らない
     app.source.spawn_pollers(app.poll_sinks());

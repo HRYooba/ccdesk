@@ -983,6 +983,43 @@ fn register_project(app: &mut App, cwd: &str) {
     app.source.save_window(WindowItem::Projects(&app.projects));
 }
 
+/// 起動時に、既にあるセッションの cwd を登録へ埋め戻す（初回読み込みで 1 度だけ）。
+///
+/// **既存ユーザーのための経路**: 登録は [`register_project`]（＝ ccdesk から
+/// セッションを作ったとき）だけで起きるので、以前から使っているフォルダは
+/// 「セッションの cwd」由来でしか見出しが出ない ＝ 最後のセッションを消した時点で
+/// 見出し（＝そのフォルダで新規を開く入口）が消える。ccdesk から次のセッションを
+/// 立てるまでその状態が続くので、起動時に埋めておく。
+///
+/// **上限を超えていても既存の登録は落とさない**のが [`register_project`] との違い:
+/// 登録はユーザーの操作の記録（state.json が唯一の正本）で、埋め戻しは入口を
+/// 増やすためのものなので、空きが尽きたらそこで止める。空きの取り合いになったら
+/// 新しいセッションのフォルダを優先する（`jobs` は mtime 降順 = 新しい順）
+pub(crate) fn backfill_projects(app: &mut App) {
+    let room = PROJECTS_LIMIT.saturating_sub(app.projects.len());
+    let mut fresh: Vec<String> = Vec::new();
+    for job in &app.jobs {
+        if fresh.len() >= room {
+            break;
+        }
+        // cwd の取れなかった行から空の見出しを作らない（register_project と同じ扱い）
+        if job.cwd.is_empty() {
+            continue;
+        }
+        if app.projects.iter().chain(fresh.iter()).any(|p| same_dir(p, &job.cwd)) {
+            continue;
+        }
+        fresh.push(job.cwd.clone());
+    }
+    if fresh.is_empty() {
+        return;
+    }
+    // 登録の並びは最近使った順（末尾が最新）なので、新しい順の jobs を逆に積む
+    fresh.reverse();
+    app.projects.extend(fresh);
+    app.source.save_window(WindowItem::Projects(&app.projects));
+}
+
 /// 登録プロジェクトから外す。セッションが残っているかの判断はメニュー側
 /// （[`PopupKind::entries`] が項目を無効にする）で済んでいるので、ここは削るだけ
 fn remove_project(app: &mut App, cwd: &str) {
@@ -3066,6 +3103,73 @@ mod tests {
             ccdesk::load_state_list("projects"),
             before,
             "テストが実ユーザーの state.json を書き換えている"
+        );
+    }
+
+    /// **既存ユーザー救済: 起動時に既存セッションの cwd を登録へ埋め戻す。**
+    /// 埋め戻しが無いと、ccdesk から新しくセッションを立てるまで登録は空のままで、
+    /// 最後のセッションを消した時点で見出し（＝入口）が消える
+    #[test]
+    fn startup_backfills_projects_from_existing_sessions() {
+        let mut app = test_app(34, TERM);
+        app.projects = vec!["C:\\dev\\registered".to_string()];
+        // jobs は新しい順（scan_jobs が mtime 降順で並べる）
+        app.jobs = vec![
+            job_in("s1", "C:\\dev\\api"),
+            // 同じフォルダ（大小・末尾の区切り違い）は 1 件だけ
+            job_in("s2", "c:\\dev\\api\\"),
+            // 既に登録済みのフォルダは増えない
+            job_in("s3", "C:\\dev\\registered"),
+            // cwd の取れなかった行から空の見出しを作らない
+            job_in("s4", ""),
+            job_in("s5", "C:\\dev\\old"),
+        ];
+        backfill_projects(&mut app);
+        // 既存の登録はそのまま。埋め戻しは古い側から積むので、末尾 = 最近使ったフォルダ
+        assert_eq!(
+            app.projects,
+            ["C:\\dev\\registered", "C:\\dev\\old", "C:\\dev\\api"]
+        );
+    }
+
+    /// **埋め戻しは既存の登録を押し出さない。** 上限を超える数の既存セッションが
+    /// あっても、ユーザーの登録（唯一の記録）は落とさず、入る分だけを足す
+    #[test]
+    fn backfilling_never_evicts_registered_projects() {
+        let mut app = test_app(34, TERM);
+        app.projects = (0..PROJECTS_LIMIT)
+            .map(|i| format!("C:\\dev\\p{i}"))
+            .collect();
+        app.jobs = (0..5)
+            .map(|i| job_in(&format!("s{i}"), &format!("C:\\jobs\\j{i}")))
+            .collect();
+        backfill_projects(&mut app);
+        assert_eq!(app.projects.len(), PROJECTS_LIMIT);
+        assert!(
+            app.projects.iter().all(|p| p.starts_with("C:\\dev\\p")),
+            "登録済みのフォルダが埋め戻しで押し出された: {:?}",
+            app.projects
+        );
+    }
+
+    /// 既存セッションが上限を超えるときは**新しいセッションのフォルダを優先する**
+    /// （jobs は新しい順。最近使ったものが残るという登録の並びと同じ規則）
+    #[test]
+    fn backfilling_prefers_the_newest_sessions_when_they_exceed_the_limit() {
+        let mut app = test_app(34, TERM);
+        app.jobs = (0..PROJECTS_LIMIT + 5)
+            .map(|i| job_in(&format!("s{i}"), &format!("C:\\dev\\j{i}")))
+            .collect();
+        backfill_projects(&mut app);
+        assert_eq!(app.projects.len(), PROJECTS_LIMIT, "上限を超えて積まれている");
+        assert_eq!(
+            app.projects.last().map(String::as_str),
+            Some("C:\\dev\\j0"),
+            "最新のセッションのフォルダが最近使った側に来ていない"
+        );
+        assert!(
+            !app.projects.iter().any(|p| p == &format!("C:\\dev\\j{PROJECTS_LIMIT}")),
+            "上限を超えた古いセッションのフォルダが入っている"
         );
     }
 
