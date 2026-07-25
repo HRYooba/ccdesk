@@ -18,11 +18,16 @@ Agent View.
 - **Official lifecycle** — new sessions dispatch via `claude --bg`, windows are
   `claude attach` clients; stop/delete use `claude stop` / `claude rm`
 - **Live status** from `claude agents --json` (rename, state changes reflect in ~2 s)
+- **Account line** in the sidebar footer, showing the signed-in Claude account, the same value
+  `ccdesk doctor` prints. A login or logout that rewrites `~/.claude/.credentials.json` shows
+  up in ~1 s; where credentials live outside that file, only the ~60 s refresh applies
 - **Mouse-first**: click to switch/focus, ☰ menu for stop/delete, drag the border to resize
 - **Keyboard**: `Ctrl+X` stop→delete, `Ctrl+S` toggle grouping, `Alt+←/→` pane focus,
-  `Ctrl+Q` quit — everything else passes through to claude untouched
+  `Ctrl+Q` quit — everything else passes through to claude untouched. On the new-session
+  screen, `Tab` cycles fields and `Enter` runs the selected folder-list row
 - **New-session screen** with a folder browser, editable path field (paste / drag & drop),
-  and a first-prompt input
+  and a first-prompt input. The list starts with a `+ start in <folder>` row, so you can
+  launch a session in the folder you are browsing without typing a prompt first
 
 ## Requirements
 
