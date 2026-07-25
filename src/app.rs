@@ -8,12 +8,12 @@ use crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 
-use ccdesk::{log_error, save_setting, save_state, BgJob};
+use ccdesk::{log_error, BgJob};
 
 use crate::keys::{encode_key, forward_mouse};
 use crate::poll::{AgentInfo, FooterInfo, Grouping, UsageInfo};
 use crate::session::Session;
-use crate::source::{DataSource, PollSinks};
+use crate::source::{DataSource, PollSinks, WindowItem};
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
 use crate::ui::{draw, popup_rect, sidebar_layout};
 
@@ -178,7 +178,8 @@ impl App {
 
     pub(crate) fn open_new_view(&mut self) {
         self.right_view = RightView::New(NewState::browse(&self.dispatch_cwd));
-        save_state("last_view", "new"); // 次回起動時に同じ画面を復元する
+        // 次回起動時に同じ画面を復元する
+        self.source.save_window(WindowItem::LastView("new"));
     }
 
     /// ポーラーの書き込み先をまとめて渡す。どのポーラーを起こすかは供給元が決めるので、
@@ -222,7 +223,7 @@ impl App {
         self.right_view = RightView::Sessions;
         // 次回起動時に同じセッションを復元する
         if let Some(short) = self.sessions.get(idx).and_then(|s| s.attach_id.clone()) {
-            save_state("last_view", &short);
+            self.source.save_window(WindowItem::LastView(&short));
         }
         if self.focus == Focus::Terminal
             && let Some(session) = self.sessions.get_mut(idx) {
@@ -373,7 +374,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                     if let Some(id) = &outcome.id {
                         // 起動に成功したフォルダだけを次回の new session 初期値にする。
                         // 保存は UI スレッドに寄せて state.json の書込み競合を避ける
-                        save_state("last_folder", &outcome.cwd);
+                        app.source.save_window(WindowItem::LastFolder(&outcome.cwd));
                         attach_by_id(app, id, &outcome.label, &outcome.cwd);
                     }
                     if let Some(err) = outcome.error {
@@ -776,7 +777,8 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         MouseEventKind::Up(MouseButton::Left) if app.dragging => {
             app.dragging = false;
             app.resize_sessions(); // 最終サイズを確定
-            save_state("sidebar_width", &app.sidebar_width.to_string());
+            app.source
+                .save_window(WindowItem::SidebarWidth(app.sidebar_width));
             return Ok(false);
         }
         _ if app.dragging => return Ok(false),
@@ -1018,19 +1020,13 @@ fn run_popup_action(app: &mut App, popup: &Popup, label: &str) {
 }
 
 /// グルーピング切替（UI クリック / Ctrl+S 共通）。選択は ~/.ccdesk/config.json に永続化
+/// （撮影用の供給元は保存しない ＝ 開発者の設定を踏まない）
 fn toggle_grouping(app: &mut App) {
     app.grouping = match app.grouping {
         Grouping::State => Grouping::Directory,
         Grouping::Directory => Grouping::State,
     };
-    save_setting(
-        "grouping",
-        if app.grouping == Grouping::Directory {
-            "directory"
-        } else {
-            "state"
-        },
-    );
+    app.source.save_window(WindowItem::Grouping(app.grouping));
 }
 
 /// stop/delete 後の反映を早める（数秒間 1 秒間隔で再スキャン）

@@ -14,15 +14,62 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use ccdesk::{scan_jobs, BgJob};
+use ccdesk::{load_setting, load_state, save_setting, save_state, scan_jobs, BgJob};
 
 use crate::poll::{
     read_usage, spawn_agents_poller, spawn_ccdesk_version_check, spawn_footer_poller,
-    AccountStatus, AgentInfo, FooterInfo, UsageInfo,
+    AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo,
 };
 
 /// サイドバーに載せるセッション数の上限（state.json の走査本数）
 pub(crate) const JOBS_LIMIT: usize = 50;
+
+/// 実データ側のサイドバー既定幅（保存値が無いとき）
+const DEFAULT_SIDEBAR_WIDTH: u16 = 34;
+
+/// 撮影用のサイドバー幅（桁）。**開発者の保存値は使わない**（撮影のたびに
+/// 幅が変わると同じ画像が撮れない。実測で 26 桁の保存値が拾われ、
+/// セッション名が全部切れた画像になっていた）。
+///
+/// 内側（枠の中）に収めたいものは 2 つ。桁数はセルの表示幅で数える
+/// （`☰` は East Asian Ambiguous で 2 桁を占めるため、文字数では足りない）:
+///
+/// 1. セッション行 `☰ ␣ <グリフ> ␣ <名前>␣␣<状態>`。前置きが 5 桁で、
+///    [`demo_jobs`] の最長は "add dark mode toggle"(20) + "Needs input"(11)
+///    ＝ 5 + 20 + 2 + 11 = 38 桁
+/// 2. 集計ヘッダー行 `1 awaiting input · 0 working · 5 completed` ＝ 42 桁。
+///    語の途中で切れると画像が壊れて見えるので、こちらが実際の下限になる
+///
+/// List は枠の内側（幅 - 2）で切るので 42 + 2 = 44 桁。右ペインを削らないよう
+/// これ以上は広げない。行末の要約・経過時間は元々溢れる前提（切っても意味が残る）。
+/// 根拠は `demo_sidebar_width_fits_the_sidebar_rows` が固定する
+const DEMO_SIDEBAR_WIDTH: u16 = 44;
+
+/// 撮影用の new session 画面の初期フォルダ（実フォルダを出さない）
+const DEMO_CWD: &str = "C:\\dev\\shop-app";
+
+/// 起動時に復元するウィンドウ状態。
+/// 「どんな画面で始まるか」は撮影の再現性に直接効くので、セッションデータと同じく
+/// 供給元から受け取る（demo は固定値、live は state.json / config.json）
+pub(crate) struct WindowState {
+    pub(crate) sidebar_width: u16,
+    /// 復元するセッションの short id。None = new session 画面から始める
+    pub(crate) last_view: Option<String>,
+    /// new session の初期フォルダ
+    pub(crate) dispatch_cwd: String,
+    pub(crate) grouping: Grouping,
+}
+
+/// 永続化するウィンドウ状態の 1 項目。
+/// live は state.json / config.json へ書き、demo は捨てる
+/// （撮影が開発者の設定を書き換えないため）。
+/// 項目を増やすと live 側の match が非網羅になるので、保存先の指定漏れは起きない
+pub(crate) enum WindowItem<'a> {
+    LastView(&'a str),
+    SidebarWidth(u16),
+    LastFolder(&'a str),
+    Grouping(Grouping),
+}
 
 /// バックグラウンド取得の書き込み先（ポーラーが書き、run ループが dirty で取り込む）
 pub(crate) struct PollSinks {
@@ -50,6 +97,12 @@ pub(crate) trait DataSource {
 
     /// 使用率（5h/7d 枠）。表示しないなら None
     fn usage(&self) -> Option<UsageInfo>;
+
+    /// 起動時に復元するウィンドウ状態
+    fn window_state(&self) -> WindowState;
+
+    /// ウィンドウ状態の保存（demo は書かない）
+    fn save_window(&self, item: WindowItem<'_>);
 
     /// バックグラウンド取得の開始。**demo は 1 本も起こさない**
     fn spawn_pollers(&self, sinks: PollSinks);
@@ -82,6 +135,47 @@ impl DataSource for LiveSource {
         self.usage_display.then(read_usage).flatten()
     }
 
+    fn window_state(&self) -> WindowState {
+        WindowState {
+            // 旧版は config.json に保存していたため、state.json に無ければそちらへフォールバック
+            sidebar_width: load_state("sidebar_width")
+                .or_else(|| load_setting("sidebar_width"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_SIDEBAR_WIDTH),
+            // "new" は new session 画面を意味する保存値（＝復元するセッションは無い）
+            last_view: load_state("last_view").filter(|view| view != "new"),
+            // 前回使ったフォルダを復元（無ければ起動ディレクトリ）
+            dispatch_cwd: load_state("last_folder")
+                .filter(|p| std::path::Path::new(p).is_dir())
+                .unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                }),
+            // デフォルトは公式 Agent View と同じ State 別グルーピング
+            grouping: match load_setting("grouping").as_deref() {
+                Some("directory") => Grouping::Directory,
+                _ => Grouping::State,
+            },
+        }
+    }
+
+    fn save_window(&self, item: WindowItem<'_>) {
+        match item {
+            WindowItem::LastView(view) => save_state("last_view", view),
+            WindowItem::SidebarWidth(width) => save_state("sidebar_width", &width.to_string()),
+            WindowItem::LastFolder(cwd) => save_state("last_folder", cwd),
+            // グルーピングだけはユーザー設定なので config.json 側
+            WindowItem::Grouping(grouping) => save_setting(
+                "grouping",
+                match grouping {
+                    Grouping::Directory => "directory",
+                    Grouping::State => "state",
+                },
+            ),
+        }
+    }
+
     fn spawn_pollers(&self, sinks: PollSinks) {
         spawn_agents_poller(sinks.agents, sinks.agents_dirty);
         spawn_footer_poller(sinks.footer, sinks.footer_dirty, sinks.footer_refresh);
@@ -92,8 +186,9 @@ impl DataSource for LiveSource {
 
 /// スクリーンショット撮影用の固定データ（`--demo`）。
 ///
-/// 実セッション・実アカウント・実使用率を **一切読まない**。
-/// ポーラーも起こさないので、ネットワークにもプロセス起動にも出ない
+/// 実セッション・実アカウント・実使用率・保存済みのウィンドウ状態を **一切読まない**。
+/// ファイルもネットワークも触らないので、~/.ccdesk が無い環境でも同じ画面になり、
+/// スクリプトから何度撮っても同じ画像が得られる
 pub(crate) struct DemoSource;
 
 impl DataSource for DemoSource {
@@ -107,6 +202,20 @@ impl DataSource for DemoSource {
 
     fn usage(&self) -> Option<UsageInfo> {
         Some(demo_usage())
+    }
+
+    fn window_state(&self) -> WindowState {
+        WindowState {
+            sidebar_width: DEMO_SIDEBAR_WIDTH,
+            last_view: None, // 撮影は必ず new session 画面から始める
+            dispatch_cwd: DEMO_CWD.to_string(),
+            grouping: Grouping::State,
+        }
+    }
+
+    fn save_window(&self, _item: WindowItem<'_>) {
+        // 撮影が開発者の state.json / config.json を書き換えない
+        // （サイドバー幅・最後に開いた画面・グルーピングを踏み潰さない）
     }
 
     fn spawn_pollers(&self, _sinks: PollSinks) {
@@ -173,6 +282,7 @@ fn demo_usage() -> UsageInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::poll::{classify, Bucket};
 
     /// 撮影データは固定。実セッション・実アカウント・実使用率が混ざらないことを、
     /// 中身そのもので固定する（描画側はこの値をそのまま出す）
@@ -199,5 +309,76 @@ mod tests {
         assert_eq!(usage.five.map(|(pct, _)| pct), Some(34.0));
         assert_eq!(usage.seven.map(|(pct, _)| pct), Some(58.0));
         assert!(!usage.stale);
+    }
+
+    /// 撮影用のウィンドウ状態はディスクを読まない。
+    /// この機体の state.json / config.json に何が入っていても固定値になる
+    /// （幅 26 桁が拾われて名前が切れた画像になる事故の再発防止）
+    #[test]
+    fn demo_window_state_does_not_come_from_disk() {
+        let window = DemoSource.window_state();
+        assert_eq!(window.sidebar_width, DEMO_SIDEBAR_WIDTH);
+        assert!(window.last_view.is_none(), "撮影は new session 画面から");
+        assert_eq!(window.dispatch_cwd, DEMO_CWD);
+        assert_eq!(window.grouping, Grouping::State);
+    }
+
+    /// 撮影は開発者の設定を書き換えない。保存要求を投げても state.json は変わらない
+    /// （万一漏れても実害が小さい値を渡す: 存在しない last_view は
+    ///  次回起動で new session 画面へフォールバックするだけ）
+    #[test]
+    fn demo_does_not_persist_window_state() {
+        let before = load_state("last_view");
+        DemoSource.save_window(WindowItem::LastView("demo-must-not-write"));
+        assert_eq!(
+            load_state("last_view"),
+            before,
+            "demo が state.json を書き換えている"
+        );
+    }
+
+    /// 撮影用サイドバー幅の根拠を固定する。demo データを増やしたらここで落ちる。
+    /// 幅は文字数ではなく表示幅で数える（`☰` は 2 桁を占める）
+    #[test]
+    fn demo_sidebar_width_fits_the_sidebar_rows() {
+        use unicode_width::UnicodeWidthStr;
+
+        // 集計ヘッダー行（ui::draw が組む文面）。demo データではこの 1 通りに定まる
+        const DEMO_HEADER: &str = "1 awaiting input · 0 working · 5 completed";
+
+        let inner = usize::from(DEMO_SIDEBAR_WIDTH - 2);
+        // 名前より前の固定部分 `☰ ␣ <グリフ> ␣`。demo は agents ポーラーを
+        // 起こさないので生存プロセスは無く、グリフは常に停止形（∙）
+        let prefix = "☰ ∙ ".width();
+        let mut widest = DEMO_HEADER.width();
+        let (mut awaiting, mut working, mut completed) = (0, 0, 0);
+        for job in demo_jobs() {
+            let view = classify(&job.state, job.tempo == "blocked", false);
+            match view.bucket {
+                Bucket::Awaiting => awaiting += 1,
+                Bucket::Working => working += 1,
+                Bucket::Completed => completed += 1,
+            }
+            let need = prefix + job.name.width() + 2 + view.label.width();
+            assert!(
+                need <= inner,
+                "{:?} + {:?} に {need} 桁必要（内側 {inner} 桁）",
+                job.name,
+                view.label
+            );
+            widest = widest.max(need);
+        }
+        // ヘッダー行の文面（= 上の DEMO_HEADER）が demo データと合っていること
+        assert_eq!((awaiting, working, completed), (1, 0, 5));
+        assert!(
+            DEMO_HEADER.width() <= inner,
+            "集計ヘッダー行が切れる（{} 桁 / 内側 {inner} 桁）",
+            DEMO_HEADER.width()
+        );
+        // 右ペインを削らないよう、必要以上に広げない（余りは 2 桁まで）
+        assert!(
+            inner - widest <= 2,
+            "サイドバーが必要幅より広い（必要 {widest} 桁 / 内側 {inner} 桁）"
+        );
     }
 }

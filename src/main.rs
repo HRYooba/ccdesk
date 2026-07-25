@@ -10,7 +10,7 @@ use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture,
 };
-use ccdesk::{load_setting, load_state, log_error};
+use ccdesk::{load_setting, log_error};
 
 mod app;
 mod cli;
@@ -24,7 +24,7 @@ mod update;
 
 use app::{clamp_sidebar, instant_ago, open_short, run, App, Focus, RightView};
 use cli::{print_usage, run_doctor, show_logs, statusline_hook, update_self};
-use poll::{FooterInfo, Grouping};
+use poll::FooterInfo;
 use source::{DataSource, DemoSource, LiveSource};
 use theme::HOST_COLORS;
 
@@ -70,22 +70,10 @@ fn main() -> anyhow::Result<()> {
     } else {
         Box::new(LiveSource::new(usage_display))
     };
-    // セッション一覧とフッターは供給元から受け取る
+    // セッション一覧・フッター・ウィンドウ状態はすべて供給元から受け取る
     let jobs = source.jobs();
     let footer = source.footer();
-
-    // new session の初期フォルダは前回使ったものを復元（無ければ起動ディレクトリ）
-    let cwd1 = if demo {
-        "C:\\dev\\shop-app".to_string()
-    } else {
-        load_state("last_folder")
-            .filter(|p| std::path::Path::new(p).is_dir())
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            })
-    };
+    let window = source.window_state();
 
     // ホスト端末の実 fg/bg を OSC 10/11 で照会。
     // raw mode / alt screen に入る前に行う。非対応端末はヒューリスティックで
@@ -134,11 +122,7 @@ fn main() -> anyhow::Result<()> {
         last_scan: std::time::Instant::now(),
         last_live_scan: std::time::Instant::now(),
         rescan_hot_until: None,
-        // 旧版は config.json に保存していたため、state.json に無ければそちらへフォールバック
-        sidebar_width: load_state("sidebar_width")
-            .or_else(|| load_setting("sidebar_width"))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(34),
+        sidebar_width: window.sidebar_width,
         dragging: false,
         last_drag_resize: std::time::Instant::now(),
         term_size: (area.width, area.height),
@@ -149,7 +133,7 @@ fn main() -> anyhow::Result<()> {
         sidebar_follow_sel: false,
         hovered_row: None,
         selected_row: 0,
-        dispatch_cwd: cwd1,
+        dispatch_cwd: window.dispatch_cwd,
         right_view: RightView::Sessions,
         footer,
         footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
@@ -165,11 +149,7 @@ fn main() -> anyhow::Result<()> {
         pending_delete: None,
         spawn_rx: None,
         notice: None,
-        // デフォルトは公式 Agent View と同じ State 別グルーピング
-        grouping: match load_setting("grouping").as_deref() {
-            Some("directory") => Grouping::Directory,
-            _ => Grouping::State,
-        },
+        grouping: window.grouping,
         popup: None,
         focus: Focus::Terminal,
         source,
@@ -179,8 +159,8 @@ fn main() -> anyhow::Result<()> {
     // ここに `if !demo` は要らない
     app.source.spawn_pollers(app.poll_sinks());
     // 前回開いていた画面を復元: セッションを見ていたなら再 attach、それ以外は new session 画面
-    match load_state("last_view") {
-        Some(short) if !demo && short != "new" && app.jobs.iter().any(|j| j.short == short) => {
+    match window.last_view {
+        Some(short) if app.jobs.iter().any(|j| j.short == short) => {
             open_short(&mut app, &short);
             if app.sessions.is_empty() {
                 app.open_new_view(); // attach 失敗時のフォールバック
