@@ -349,10 +349,18 @@ fn fetch_version() -> (String, Option<String>) {
         .and_then(|s| s.split_whitespace().next().map(str::to_string))
         .unwrap_or_default();
     let channel = claude_settings_channel();
+    // タイムアウトは必須: このスレッドはアカウント取得と共用なので、curl が
+    // 応答しないネットワーク（DNS シンクホール・blackhole されたプロキシ）で
+    // ぶら下がるとアカウント行の更新まで止まる。返るのは版番号 1 行だけなので
+    // 接続 3s・全体 8s あれば十分で、失敗しても次は 1 時間後に再試行する
     let latest = out(
         "curl",
         &[
             "-fsSL",
+            "--connect-timeout",
+            "3",
+            "--max-time",
+            "8",
             &format!("https://downloads.claude.ai/claude-code-releases/{channel}"),
         ],
     )
@@ -364,6 +372,10 @@ fn fetch_version() -> (String, Option<String>) {
 /// アカウントの周期フォールバック（秒）。認証ファイルを見られない環境や、
 /// ファイルを経由しない状態変化のための保険
 const ACCOUNT_FALLBACK_SECS: u64 = 60;
+/// 取得失敗後の再試行間隔（秒）。失敗（`Unknown`）は認証ファイルを書き換えないので、
+/// 通常のフォールバックで待つと 1 回の空振り（起動直後に `claude` の起動が
+/// 間に合わない等）でアカウント行が 60 秒間空のまま残る。失敗だけは短く再試行する
+const ACCOUNT_RETRY_SECS: u64 = 5;
 /// バージョンチェックの周期（秒）。外部ネットワークへ出るので頻繁には回さない
 const VERSION_INTERVAL_SECS: u64 = 3600;
 
@@ -392,6 +404,8 @@ struct AccountPollState {
     last_fp: AuthFp,
     /// 最後の取得からの経過秒
     age: u64,
+    /// 直前の取得が失敗（`Unknown`）だったか。次の待ち時間を選ぶのに使う
+    last_failed: bool,
 }
 
 impl AccountPollState {
@@ -401,6 +415,16 @@ impl AccountPollState {
         Self {
             last_fp: None,
             age: u64::MAX / 2,
+            last_failed: false,
+        }
+    }
+
+    /// 次の取得までの待ち時間。失敗直後だけ短くする（[`ACCOUNT_RETRY_SECS`]）
+    fn interval(&self) -> u64 {
+        if self.last_failed {
+            ACCOUNT_RETRY_SECS
+        } else {
+            ACCOUNT_FALLBACK_SECS
         }
     }
 }
@@ -423,17 +447,22 @@ fn account_step(
     let fp = read_fp();
     let auth_changed = fp != state.last_fp;
     state.last_fp = fp;
-    if !refetch_due(state.age, ACCOUNT_FALLBACK_SECS, auth_changed, forced) {
+    if !refetch_due(state.age, state.interval(), auth_changed, forced) {
         return None;
     }
     state.age = 0;
-    next_account(shown, fetch())
+    let fetched = fetch();
+    // 失敗はフォールバック全体（60s）を消費させない。認証ファイルは変わっていないので
+    // 次の契機が周期しか無く、そのままではアカウント行が空で固まる
+    state.last_failed = fetched == AccountStatus::Unknown;
+    next_account(shown, fetched)
 }
 
 /// フッター情報のバックグラウンド取得。
 /// アカウントとバージョンは変化の速さが違うので別々の周期で回す:
 /// - アカウント: 認証ファイルの変化で即時 + 60s フォールバック
-///   （ログイン・ログアウトを 1 時間待たずに反映するため）
+///   （ログイン・ログアウトを 1 時間待たずに反映するため。取得失敗の直後だけ
+///   5s で再試行する）
 /// - バージョン: 1 時間毎 + `claude update` 完了時の再取得要求
 pub(crate) fn spawn_footer_poller(
     shared: Arc<Mutex<FooterInfo>>,
@@ -914,6 +943,46 @@ mod tests {
         assert!(
             !refetch_due(FALLBACK - 1, FALLBACK, false, false),
             "契機が無い"
+        );
+    }
+
+    /// 取得失敗（`Unknown`）はフォールバック全体（60s）を消費しない。
+    /// 認証ファイルは変わらないので周期しか契機が無く、そのままでは
+    /// 起動直後の 1 回の空振りでアカウント行が 60 秒間空のまま残る
+    #[test]
+    fn failed_fetch_retries_before_the_fallback_interval() {
+        let mut state = AccountPollState::new();
+        let account = AccountStatus::LoggedIn("taro".into());
+
+        // 1 周目: 起動直後の取得が失敗（claude の起動に失敗した等）
+        assert_eq!(
+            account_step(
+                &mut state,
+                &AccountStatus::Unknown,
+                false,
+                || None,
+                || AccountStatus::Unknown
+            ),
+            None
+        );
+
+        // 失敗直後は短い間隔で再試行する（認証ファイルは変化していない）
+        state.age = ACCOUNT_RETRY_SECS;
+        assert_eq!(
+            account_step(&mut state, &AccountStatus::Unknown, false, || None, || {
+                account.clone()
+            }),
+            Some(account.clone()),
+            "失敗後の再試行がフォールバック（60s）まで来ていない"
+        );
+
+        // 成功した後は通常の周期に戻す（短周期で claude を叩き続けない）
+        state.age = ACCOUNT_RETRY_SECS;
+        assert_eq!(
+            account_step(&mut state, &account, false, || None, || panic!(
+                "成功後も短周期で再取得している"
+            )),
+            None
         );
     }
 
