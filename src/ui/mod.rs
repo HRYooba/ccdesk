@@ -690,7 +690,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 .border_style(Style::default().fg(ui().dim)),
             chunks[1],
         );
-        return FrameCursor::hidden_at(Position::new(chunks[1].x, chunks[1].y));
+        return FrameCursor::hidden_at(pane_fallback_pos(chunks[1]));
     }
     let session = &app.sessions[app.active];
     let parser = session.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -723,16 +723,24 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     }
 }
 
+/// カーソルの安全な退避先。「見せるものが無い / クランプの前提が崩れた」経路は
+/// すべてここへ寄せる（セッション 0 件・inner が潰れている・New 画面のフォームが
+/// 収まらない）。位置を返さないと物理カーソルがサイドバーに置き去りになるので、
+/// 何も指せないフレームでもペイン矩形の原点だけは必ず返す。
+/// pane は Layout::split の結果なので、原点は常に端末の内側にある
+pub(crate) fn pane_fallback_pos(pane: Rect) -> Position {
+    Position::new(pane.x, pane.y)
+}
+
 /// ターミナルペインのカーソル位置。子（vt100）の (row, col) を pane 内の絶対座標へ移す。
 /// Frame を必要としない純関数なので描画から切り離してテストできる。
 ///
 /// inner が潰れている（幅または高さ 0）ときは width-1 クランプが枠の列＝inner の外を
 /// 指し、端末幅を超える MoveTo にもなり得る。右ペインは Constraint::Min(1) なので
-/// サイドバーを広げ切ると幅 1 = inner 幅 0 が起こり得るため、その場合は確実に画面内で
-/// あるペイン矩形の原点へ退避する
+/// サイドバーを広げ切ると幅 1 = inner 幅 0 が起こり得るため、その場合は退避先を使う
 fn terminal_cursor_pos(pane: Rect, inner: Rect, crow: u16, ccol: u16) -> Position {
     if inner.width == 0 || inner.height == 0 {
-        return Position::new(pane.x, pane.y);
+        return pane_fallback_pos(pane);
     }
     Position::new(
         inner.x + ccol.min(inner.width - 1),
@@ -777,6 +785,18 @@ mod tests {
         let pos = terminal_cursor_pos(pane, inner, 99, 99);
         assert_eq!(pos, Position::new(8, 3));
         assert!(contains(inner, pos));
+    }
+
+    /// 退避先はどんなペインでもその内側（幅・高さがある限り）。
+    /// draw のセッション 0 件経路が返すのはこの位置そのもの
+    #[test]
+    fn pane_fallback_is_inside_pane() {
+        for (x, y, w, h) in [(34u16, 0u16, 60u16, 20u16), (0, 0, 1, 1), (34, 5, 3, 12)] {
+            let pane = Rect::new(x, y, w, h);
+            let pos = pane_fallback_pos(pane);
+            assert_eq!(pos, Position::new(x, y));
+            assert!(contains(pane, pos), "pane {pane:?} で pos {pos:?} が外");
+        }
     }
 
     /// inner が潰れてもペイン矩形の外（枠の列や端末外）へ出ない。

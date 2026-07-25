@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 use crate::app::{start_new_session, App, RightView};
 use crate::theme::{ui, C_WORKING, FOCUS_BORDER, MUTED_FG};
-use crate::ui::FrameCursor;
+use crate::ui::{pane_fallback_pos, FrameCursor};
 
 /// カーソル付きテキストフィールド（挿入・削除・←→・Home/End・クリック位置反映、全角幅対応）
 #[derive(Default)]
@@ -475,8 +475,8 @@ pub(crate) fn new_view_cursor(
     let layout = NewLayout::compute(pane);
     if !layout.ok {
         // フォームが収まらない（inner が潰れている場合も含む）。inner 基準のクランプは
-        // 使えないので、確実に画面内であるペイン矩形の原点へ退避する
-        return FrameCursor::hidden_at(Position::new(pane.x, pane.y));
+        // 使えないので共通の退避先へ寄せる
+        return FrameCursor::hidden_at(pane_fallback_pos(pane));
     }
     // ここに来た時点で layout.ok なので inner.width >= 10 が保証され、
     // inner（幅 >= 10）も prompt_inner（幅 >= 4）も幅 0 になり得ない
