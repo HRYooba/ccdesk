@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use ratatui::style::Color;
 
-use ccdesk::{claude_settings_channel, version_newer, BgJob};
+use ccdesk::{claude_settings_channel, version_newer};
 
 use crate::theme::{ui, C_ATTENTION, C_FAIL, C_OK, C_WORKING};
 
@@ -57,48 +57,6 @@ pub(crate) fn spawn_agents_poller(
             }
         std::thread::sleep(Duration::from_secs(2));
     });
-}
-
-/// スクリーンショット撮影用の架空データ（--demo）。
-/// セッション名・プロジェクト・アカウント・使用率を実データの代わりに描画する
-pub(crate) fn demo_jobs() -> Vec<BgJob> {
-    let rows: [(&str, &str, &str, &str, &str); 6] = [
-        ("demo01", "fix login form validation", "working", "", "refining error messages"),
-        ("demo02", "add dark mode toggle", "blocked", "blocked", "choose accent color?"),
-        ("demo03", "refactor api client", "working", "", "extracting retry logic"),
-        ("demo04", "write onboarding docs", "done", "", "docs published"),
-        ("demo05", "optimize image pipeline", "done", "", "2.3x faster builds"),
-        ("demo06", "migrate to vite", "stopped", "", ""),
-    ];
-    let projects = ["C:\\dev\\shop-app", "C:\\dev\\shop-app", "C:\\dev\\api", "C:\\dev\\docs", "C:\\dev\\api", "C:\\dev\\shop-app"];
-    rows.iter()
-        .zip(projects)
-        .map(|((short, name, state, tempo, detail), cwd)| BgJob {
-            short: short.to_string(),
-            cwd: cwd.to_string(),
-            state: state.to_string(),
-            tempo: tempo.to_string(),
-            name: name.to_string(),
-            needs: "which option should I take?".to_string(),
-            detail: detail.to_string(),
-            result: detail.to_string(),
-            children: Vec::new(),
-            mtime: std::time::SystemTime::now(),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        })
-        .collect()
-}
-
-/// スクリーンショット撮影用の架空フッター（--demo）。実アカウントを出さない。
-/// demo ではフッターのポーラーを起動しないので、これが最終値になる
-/// （`latest` が None なので更新ボタン行は出ず、`current` は描画に現れない）
-pub(crate) fn demo_footer() -> FooterInfo {
-    FooterInfo {
-        account: AccountStatus::LoggedIn("you · Acme, Inc.".to_string()),
-        current: String::new(),
-        latest: None,
-    }
 }
 
 /// 使用率（5h/7d 枠）の表示用データ。statusline フックが書いた
@@ -158,6 +116,30 @@ pub(crate) struct FooterInfo {
     pub(crate) account: AccountStatus, // "alice · Acme, Inc."（表示名 + 組織名）
     pub(crate) current: String,        // claude の現行バージョン
     pub(crate) latest: Option<String>, // 新しい版があるときだけ Some
+}
+
+/// ccdesk 自身の版チェック（起動時 1 回の使い捨てスレッド）。
+/// このビルドより新しいリリースタグがあれば共有状態へ書く（無ければ何も書かない
+/// ＝告知行は出ない）。値の形は claude 側の [`FooterInfo::latest`] と同じ
+/// 「新しい版があるときだけ Some」。
+///
+/// **周期ポーリングはしない。** ccdesk のリリース頻度は低く、適用には再起動が
+/// 必要なので 1 起動につき 1 回で足りる（claude のバージョン監視＝
+/// [`spawn_footer_poller`] の 1 時間周期とは別物なので混ぜない）。
+/// 通信に数百 ms かかるため起動はブロックしない
+pub(crate) fn spawn_ccdesk_version_check(
+    shared: Arc<Mutex<Option<String>>>,
+    dirty: Arc<std::sync::atomic::AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let Some(tag) = crate::update::newer_tag() else {
+            return;
+        };
+        *shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tag);
+        dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
 }
 
 /// `claude auth status --json` の出力 → アカウント行。
@@ -523,7 +505,7 @@ pub(crate) fn spawn_footer_poller(
 }
 
 /// 公式のグルーピング切替（Ctrl+S）。デフォルトは State 別
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Grouping {
     State,
     Directory,

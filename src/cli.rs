@@ -1,11 +1,7 @@
 //! CLI サブコマンド（doctor / logs / update / statusline-hook）。
 
-use ccdesk::version_newer;
-
 use crate::poll::{fetch_account, AccountStatus};
-
-/// update コマンドの取得元（配布は cargo install のみ）
-const REPO_URL: &str = "https://github.com/HRYooba/ccdesk";
+use crate::update;
 
 pub(crate) fn print_usage() {
     println!(
@@ -14,29 +10,21 @@ pub(crate) fn print_usage() {
          \x20 ccdesk            launch the TUI\n\
          \x20 ccdesk doctor     diagnose the environment (claude CLI, config dir, terminal)\n\
          \x20 ccdesk logs       print the path and tail of the error log\n\
-         \x20 ccdesk update     check for a new release and show how to update\n\
+         \x20 ccdesk update     download and install the latest release\n\
          \x20 ccdesk --version  print version",
         env!("CARGO_PKG_VERSION")
     );
 }
 
-/// 更新チェック。最新リリースタグと比較し、新しければ更新手段を案内する。
-/// 更新の実体は Releases / cargo に委ねる
+/// 自己更新。最新リリースの実行ファイルを取得し、SHA-256 を検証してから
+/// 現行の実行ファイルと差し替える（実体は [`crate::update`]）。
+/// 出力は ASCII に留める: Windows コンソールのコードページ次第で
+/// 非 ASCII が化けるため
 pub(crate) fn update_self() -> anyhow::Result<()> {
-    // 最新リリースタグを GitHub API から取得（curl は Windows 10+ 標準搭載）
-    let api = "https://api.github.com/repos/HRYooba/ccdesk/releases/latest";
-    let tag = std::process::Command::new("curl")
-        .args(["-fsSL", api])
-        .output()
-        .ok()
-        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
-        .and_then(|v| v.get("tag_name").and_then(|t| t.as_str()).map(str::to_string));
-    let Some(tag) = tag else {
+    let Some(tag) = update::latest_tag() else {
         anyhow::bail!("failed to fetch the latest release tag from GitHub");
     };
-    // フッターの更新判定と同じ version_newer で比較する（ローカルビルドが
-    // リリースより新しい場合に「新しい版がある」と誤案内しない）
-    if !version_newer(tag.trim_start_matches('v'), env!("CARGO_PKG_VERSION")) {
+    if !update::tag_is_newer(&tag) {
         println!(
             "ccdesk {} is up to date (latest release: {tag})",
             env!("CARGO_PKG_VERSION")
@@ -44,11 +32,19 @@ pub(crate) fn update_self() -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "new release available: {tag} (current: {})\n\n\
-         update with one of:\n\
-         \x20 cargo install --git {REPO_URL} --tag {tag} --force\n\
-         \x20 or download: {REPO_URL}/releases/latest",
+        "downloading ccdesk {tag} (current: {})...",
         env!("CARGO_PKG_VERSION")
+    );
+    // 失敗時はここで Err を返して非ゼロ終了する。検証を通らなければ
+    // インストール済みの実行ファイルには触れていない（update::install 参照）
+    let installed = update::install(&tag)?;
+    println!(
+        "installed ccdesk {tag} at {}\n\
+         this process keeps running {}; the new version applies on next launch\n\
+         the previous exe is parked at {} and is deleted at the next launch",
+        installed.exe.display(),
+        env!("CARGO_PKG_VERSION"),
+        installed.old.display()
     );
     Ok(())
 }

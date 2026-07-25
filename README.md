@@ -21,6 +21,11 @@ Agent View.
 - **Account line** in the sidebar footer, showing the signed-in Claude account, the same value
   `ccdesk doctor` prints. A login or logout that rewrites `~/.claude/.credentials.json` shows
   up in ~1 s; where credentials live outside that file, only the ~60 s refresh applies
+- **Version line and update notice** at the top of the sidebar: ccdesk's own version, plus a
+  `⟳ vX.Y.Z · run: ccdesk update` notice when a newer release exists. The check runs once per
+  launch (no polling); the notice is informational — updating is always `ccdesk update`, which
+  verifies the download by SHA-256 before replacing anything. The running process keeps the old
+  version and the new one applies on the next launch
 - **Mouse-first**: click to switch/focus, ☰ menu for stop/delete, drag the border to resize
 - **Keyboard**: `Ctrl+X` stop→delete, `Ctrl+S` toggle grouping, `Alt+←/→` pane focus,
   `Ctrl+Q` quit — everything else passes through to claude untouched. On the new-session
@@ -45,12 +50,17 @@ cargo install --git https://github.com/HRYooba/ccdesk
 
 ### From Releases (no Rust required)
 
-1. Download the latest `ccdesk-vX.Y.Z-x86_64-pc-windows-msvc.zip` from the
-   [Releases](https://github.com/HRYooba/ccdesk/releases) page.
-2. Unzip it and place `ccdesk.exe` somewhere on your `PATH`.
+1. Download `ccdesk-x86_64-pc-windows-msvc.exe` from the
+   [Releases](https://github.com/HRYooba/ccdesk/releases) page — a bare
+   executable, no archive to unpack.
+2. Rename it to `ccdesk.exe` (optional) and place it somewhere on your `PATH`.
 3. Run `ccdesk`.
 
-Each release also ships a `.sha256` file so you can verify the download.
+Each release also ships `ccdesk-x86_64-pc-windows-msvc.exe.sha256` in
+`sha256sum` format, so you can verify the download with
+`sha256sum -c ccdesk-x86_64-pc-windows-msvc.exe.sha256` (or compare
+`certutil -hashfile ccdesk-x86_64-pc-windows-msvc.exe SHA256` by eye).
+Asset names carry no version, so `ccdesk update` can build the URL itself.
 
 (Developers working from a clone: `cargo install --path .`)
 
@@ -60,7 +70,7 @@ Each release also ships a `.sha256` file so you can verify the download.
 ccdesk            # launch the TUI
 ccdesk doctor     # diagnose the environment (claude CLI, account, config dir, terminal)
 ccdesk logs       # print the path and tail of the error log
-ccdesk update     # check for a new release and show how to update
+ccdesk update     # download the latest release, verify its SHA-256, and install it
 ccdesk --version  # print version
 ccdesk --help     # show usage
 ```

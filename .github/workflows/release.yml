@@ -32,7 +32,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  # Build the Windows binary and attach it (zip + sha256) to the release.
+  # Build the Windows binary and attach it (raw .exe + sha256) to the release.
   upload-assets:
     needs: create-release
     runs-on: windows-latest
@@ -50,13 +50,32 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
-      - name: Build and upload binary
-        uses: taiki-e/upload-rust-binary-action@v1
-        with:
-          bin: ccdesk
-          target: x86_64-pc-windows-msvc
-          # Produces ccdesk-<tag>-x86_64-pc-windows-msvc.zip
-          archive: $bin-$tag-$target
-          zip: all
-          checksum: sha256
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        run: cargo build --release --locked
+
+      # taiki-e/upload-rust-binary-action をやめて明示ステップにした理由:
+      # アーカイブを作らなくなったのでアクションの仕事は「名前を付けて上げる」だけに
+      # なり、かつそのアクションの命名は $bin-$tag-$target 前提でタグを抜いた
+      # 固定名を作れない。`ccdesk update` は「バージョンを含まない固定名」を前提に
+      # タグからダウンロード URL を組み立てるため、ここは自前で名付ける
+      - name: Upload assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 資産名にバージョンを入れない（更新機能が URL を組み立てられるように）。
+          # 消費側の対応箇所: src/update.rs の ASSET_NAME
+          asset=ccdesk-x86_64-pc-windows-msvc.exe
+          cp target/release/ccdesk.exe "$asset"
+          # sha256sum は windows-latest ランナーの Git for Windows 同梱 coreutils に
+          # 依存している（shell: bash = Git Bash の /usr/bin/sha256sum。同じ配布の
+          # ローカル環境で確認しただけで、ランナー実機では未確認）。
+          # 出力書式は「先頭トークンがハッシュ、以降は問わない」が両側の契約。
+          # Windows の GNU coreutils は binary モードが既定なので実際に出るのは
+          # "<hex>␠*<ファイル名>"（text モードの "<hex>␠␠<ファイル名>" ではない）。
+          # 人間は `sha256sum -c ccdesk-...exe.sha256` で検証でき、`ccdesk update` は
+          # 先頭トークンだけを読む（src/update.rs の parse_sha256_file と対応。
+          # 区切りに依存しないので、モードが変わっても両側とも壊れない）
+          sha256sum "$asset" > "$asset.sha256"
+          cat "$asset.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$asset" "$asset.sha256" --clobber

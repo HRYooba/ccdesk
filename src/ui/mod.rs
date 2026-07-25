@@ -9,7 +9,7 @@ use ratatui::Frame;
 use std::time::Duration;
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::{App, Focus, Popup, RightView, RowAction, SIDEBAR_HEADER_ROWS};
+use crate::app::{App, Focus, Popup, RightView, RowAction};
 use crate::poll::{classify, AccountStatus, Bucket, Group, Grouping, StateView};
 use crate::session::SessionStatus;
 use crate::theme::{
@@ -37,7 +37,8 @@ pub(crate) struct SidebarLayout {
     pub(crate) capacity: usize,
     /// フッターを描くか（狭すぎる端末では描かない = クリックも受けない）
     pub(crate) footer_visible: bool,
-    /// 更新ボタン行を出すか
+    /// フッターの claude 更新行（`⟳ update claude X → Y`）を出すか。
+    /// サイドバー先頭にある ccdesk 自身の更新告知（クリック不可）とは別物
     pub(crate) update_row_visible: bool,
     /// アカウント行の画面 y（footer_visible のときだけ有効）
     pub(crate) account_y: u16,
@@ -62,6 +63,36 @@ pub(crate) fn sidebar_layout(app: &App) -> SidebarLayout {
         update_row_visible,
         account_y: height.saturating_sub(2),
     }
+}
+
+/// サイドバーを横断する区切り線のテキスト（枠の内側幅ぶん）
+fn separator_text(inner_width: u16) -> String {
+    "─".repeat(inner_width as usize)
+}
+
+/// 更新告知の文面。**クリックできない告知**なので、何をすれば更新できるかを
+/// 文面に入れる（実行手段は `ccdesk update` だけ）。
+///
+/// 幅の予算: サイドバー既定 34 桁 = 内側 32 桁。長い版番号で溢れても意図が残るよう
+/// 版番号を先に置く（List は右端で切るだけなので、後ろの語から失われる）
+fn update_notice(tag: &str) -> String {
+    format!("⟳ {tag} · run: ccdesk update")
+}
+
+/// サイドバー最上部の固定行（ccdesk 自身の版 / 更新告知 / 区切り線）。
+///
+/// 版行と区切り線は常時、告知行は新しいリリースがあるときだけ。どの行も
+/// クリックできないので、呼び出し側は `sidebar_rows` へ `None` を積む
+/// （区切り線と同じ扱い）。Frame に触らない純関数なので行構成をテストで固定できる
+fn ccdesk_info_rows(latest: Option<&str>, inner_width: u16) -> Vec<(String, Style)> {
+    let dim = Style::default().fg(ui().dim);
+    let mut rows = vec![(format!("ccdesk v{}", env!("CARGO_PKG_VERSION")), dim)];
+    if let Some(tag) = latest {
+        // 告知は本文色。dim だと更新の存在に気づかない
+        rows.push((update_notice(tag), Style::default().fg(MUTED_FG)));
+    }
+    rows.push((separator_text(inner_width), dim));
+    rows
 }
 
 /// モーダルの矩形。描画とクリック判定で同じ計算を共有する
@@ -418,7 +449,15 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             rows.push(Some(d.action.clone()));
         };
 
-    // 先頭: 新規セッション
+    let inner_width = chunks[0].width.saturating_sub(2);
+
+    // 先頭: ccdesk 自身の版・更新告知・区切り線（いずれもクリック不可）
+    for (text, style) in ccdesk_info_rows(app.ccdesk_latest.as_deref(), inner_width) {
+        items.push(ListItem::new(Line::from(text).style(style)));
+        rows.push(None);
+    }
+
+    // 新規セッション
     {
         let cur = rows.len();
         let highlighted = hovered == Some(cur) || selected == cur;
@@ -431,8 +470,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     }
     // 区切り線: new session（アクション）とセッション一覧領域を分ける（Desktop 風）
     items.push(ListItem::new(
-        Line::from("─".repeat(chunks[0].width.saturating_sub(2) as usize))
-            .style(Style::default().fg(ui().dim)),
+        Line::from(separator_text(inner_width)).style(Style::default().fg(ui().dim)),
     ));
     rows.push(None);
     // グルーピング切替（クリックで state ⇔ directory）
@@ -465,6 +503,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         .style(Style::default().fg(ui().dim)),
     ));
     rows.push(None);
+    // ここまでが固定ヘッダー。行数は更新告知の有無で変わるので、積んだ数をそのまま
+    // 正本にする（ヒットテストとスクロール計算が読む。定数と二重管理にしない）
+    let header_n = rows.len();
 
     match app.grouping {
         Grouping::State => {
@@ -544,6 +585,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         .load(std::sync::atomic::Ordering::Relaxed);
     let capacity = sl.capacity;
     app.sidebar_rows = rows;
+    app.sidebar_header_rows = header_n;
     // 行構成が変わって選択が浮いたら、最寄りのクリック可能行へ寄せる
     if app
         .sidebar_rows
@@ -560,7 +602,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
 
     // ヘッダー行は固定表示。スクロールはその下（セッション一覧）にだけ効く。
     // ↑↓ 直後だけ選択行へ追従し、常に範囲内へクランプ
-    let header_n = SIDEBAR_HEADER_ROWS.min(items.len());
     let tail_capacity = capacity.saturating_sub(header_n);
     if app.sidebar_follow_sel {
         app.sidebar_follow_sel = false;
@@ -573,9 +614,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             }
         }
     }
+    // items と rows は 1:1 で積むので items.len() >= header_n だが、
+    // 引き算の前提を式の中で閉じておく（行の積み方を変えても破綻させない）
     app.sidebar_scroll = app
         .sidebar_scroll
-        .min((items.len() - header_n).saturating_sub(tail_capacity));
+        .min(items.len().saturating_sub(header_n + tail_capacity));
 
     // フォーカス中のペインだけ枠を少し明るく
     let focus_style = Style::default().fg(FOCUS_BORDER);
@@ -800,6 +843,48 @@ mod tests {
             let pos = pane_fallback_pos(pane);
             assert_eq!(pos, Position::new(x, y));
             assert!(contains(pane, pos), "pane {pane:?} で pos {pos:?} が外");
+        }
+    }
+
+    /// 行構成: 版行と区切り線は常時、告知行は新しいリリースがあるときだけ。
+    /// 告知の有無で行数が 1 だけ変わる（この差が固定ヘッダー行数の増減になる）
+    #[test]
+    fn ccdesk_info_rows_add_only_the_notice_when_an_update_exists() {
+        let without = ccdesk_info_rows(None, 32);
+        let with = ccdesk_info_rows(Some("v9.9.9"), 32);
+        assert_eq!(without.len(), 2, "版行と区切り線だけのはず");
+        assert_eq!(with.len(), 3, "告知行が 1 行増えるだけのはず");
+        // 版行は先頭・区切り線は末尾で、告知はその間に入る（前後が動かない）
+        assert_eq!(with[0].0, without[0].0);
+        assert_eq!(with[2].0, without[1].0);
+        assert!(with[0].0.contains(env!("CARGO_PKG_VERSION")), "{:?}", with[0].0);
+        assert_eq!(with[2].0, separator_text(32));
+    }
+
+    /// 告知はクリックできないので、文面だけで「新しい版がある」と
+    /// 「`ccdesk update` を実行すればよい」の両方が伝わること
+    #[test]
+    fn update_notice_states_the_new_version_and_the_command() {
+        let notice = update_notice("v9.9.9");
+        assert!(notice.contains("v9.9.9"), "{notice:?}");
+        assert!(notice.contains("ccdesk update"), "{notice:?}");
+        // フッターの claude 更新行（⟳ update claude X → Y）と混同しない
+        assert!(!notice.contains("claude"), "{notice:?}");
+    }
+
+    /// 既定のサイドバー幅（34 桁 = 内側 32 桁）で切られない。
+    /// 溢れる場合も版番号が先に来るので意図は残る
+    #[test]
+    fn update_notice_fits_the_default_sidebar_width() {
+        for tag in ["v0.3.0", "v1.2.3", "v10.20.30"] {
+            let notice = update_notice(tag);
+            assert!(
+                notice.chars().count() <= 32,
+                "既定幅に収まらない: {notice:?} ({} 桁)",
+                notice.chars().count()
+            );
+            // 先頭が版番号側（切られても版が残る語順）
+            assert!(notice.starts_with(&format!("⟳ {tag}")), "{notice:?}");
         }
     }
 

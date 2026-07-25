@@ -8,26 +8,24 @@ use crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 
-use ccdesk::{log_error, save_setting, save_state, scan_jobs, BgJob};
+use ccdesk::{log_error, BgJob};
 
 use crate::keys::{encode_key, forward_mouse};
-use crate::poll::{demo_jobs, read_usage, AgentInfo, FooterInfo, Grouping, UsageInfo};
+use crate::poll::{AgentInfo, FooterInfo, Grouping, UsageInfo};
 use crate::session::Session;
+use crate::source::{DataSource, PollSinks, WindowItem};
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
 use crate::ui::{draw, popup_rect, sidebar_layout};
 
 const MIN_SIDEBAR: u16 = 12;
 const MIN_PANE: u16 = 40;
 
-/// サイドバー上部の固定行数（+ new session / 区切り線 / ⊞ group / 集計行）。
-/// スクロールはこの下のセッション一覧にだけ効く
-pub(crate) const SIDEBAR_HEADER_ROWS: usize = 4;
-
-pub(crate) const JOBS_LIMIT: usize = 50;
 // state.json は name(/rename)・needs・summary の正本なので短周期で読む
 // （数十ファイルの小さな read。描画は dirty 時のみなので負荷は無視できる）
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const LIVE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+/// 使用率の読み取り周期（statusline フックが書くキャッシュを見に行く間隔）
+const USAGE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// ペインフォーカス。キー入力はフォーカス中のペインにだけ流す
 #[derive(Clone, Copy, PartialEq)]
@@ -104,6 +102,11 @@ pub(crate) struct App {
     pub(crate) term_size: (u16, u16), // (width, height)
     // サイドバー行 → クリック動作の対応（draw で構築）
     pub(crate) sidebar_rows: Vec<Option<RowAction>>,
+    // サイドバー上部の固定行数（ccdesk 版表示・更新告知・区切り線・+ new session・
+    // 区切り線・⊞ group・集計行）。更新告知の有無で増減するので定数にはできない。
+    // 正本は draw（積んだ行数をそのまま記録する）で、ヒットテストとスクロール計算は
+    // sidebar_rows と同じく「最後に描いた値」を読む
+    pub(crate) sidebar_header_rows: usize,
     // サイドバーのスクロール位置（先頭に表示する行 index。draw でクランプ）
     pub(crate) sidebar_scroll: usize,
     // ↑↓ で選択を動かした直後だけ true: 次の draw で選択行が見える位置へ追従する
@@ -121,12 +124,20 @@ pub(crate) struct App {
     pub(crate) footer_refresh: Arc<std::sync::atomic::AtomicBool>,
     // claude update 実行中（ボタン連打防止と "updating…" 表示）
     pub(crate) claude_updating: Arc<std::sync::atomic::AtomicBool>,
-    // 使用率表示（opt-in: config.json の usage_display = "on"）
+    // ccdesk 自身の新しいリリース（起動時 1 回のチェック）。
+    // 新しい版があるときだけ Some = サイドバーの更新告知行を出す
+    pub(crate) ccdesk_latest: Option<String>,
+    pub(crate) ccdesk_latest_shared: Arc<Mutex<Option<String>>>,
+    pub(crate) ccdesk_latest_dirty: Arc<std::sync::atomic::AtomicBool>,
+    // 使用率表示（opt-in: config.json の usage_display = "on"）。
+    // 表示するかどうかの判断は供給元（DataSource::usage）が持つので、ここは
+    // dispatch 時に statusline フックを注入するかの判断だけに使う
     pub(crate) usage_display: bool,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) last_usage_read: std::time::Instant,
-    // スクリーンショット撮影用の架空データ描画（--demo）
-    pub(crate) demo: bool,
+    // 画面に出す値の供給元（実データ / 撮影用の固定データ）。起動時に 1 度だけ選ばれ、
+    // 以降ここを通る限り「今 demo か」を問う必要が無い
+    pub(crate) source: Box<dyn DataSource>,
     // Ctrl+X の 2 度押し削除（short id と 1 回目 stop の時刻。2 秒以内の再押下 = rm）
     pub(crate) pending_delete: Option<(String, std::time::Instant)>,
     // `claude --bg` は ~1s かかるため別スレッドで実行し、完了を channel で受ける
@@ -167,9 +178,23 @@ impl App {
 
     pub(crate) fn open_new_view(&mut self) {
         self.right_view = RightView::New(NewState::browse(&self.dispatch_cwd));
-        save_state("last_view", "new"); // 次回起動時に同じ画面を復元する
+        // 次回起動時に同じ画面を復元する
+        self.source.save_window(WindowItem::LastView("new"));
     }
 
+    /// ポーラーの書き込み先をまとめて渡す。どのポーラーを起こすかは供給元が決めるので、
+    /// 呼び出し側は demo かどうかを知らない
+    pub(crate) fn poll_sinks(&self) -> PollSinks {
+        PollSinks {
+            agents: self.agents_shared.clone(),
+            agents_dirty: self.agents_dirty.clone(),
+            footer: self.footer_shared.clone(),
+            footer_dirty: self.footer_dirty.clone(),
+            footer_refresh: self.footer_refresh.clone(),
+            ccdesk_latest: self.ccdesk_latest_shared.clone(),
+            ccdesk_latest_dirty: self.ccdesk_latest_dirty.clone(),
+        }
+    }
 
     /// フォーカス変更（PTY への focus in/out 通知つき）。
     /// サイドバーへ移った瞬間は state.json を即スキャンして表示を最新化する
@@ -198,7 +223,7 @@ impl App {
         self.right_view = RightView::Sessions;
         // 次回起動時に同じセッションを復元する
         if let Some(short) = self.sessions.get(idx).and_then(|s| s.attach_id.clone()) {
-            save_state("last_view", &short);
+            self.source.save_window(WindowItem::LastView(&short));
         }
         if self.focus == Focus::Terminal
             && let Some(session) = self.sessions.get_mut(idx) {
@@ -335,11 +360,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             app.last_scan.elapsed() > SCAN_INTERVAL
         };
         if scan_due {
-            app.jobs = if app.demo {
-                demo_jobs() // 撮影用: 実セッションを一切表示しない
-            } else {
-                scan_jobs(JOBS_LIMIT)
-            };
+            app.jobs = app.source.jobs();
             app.last_scan = std::time::Instant::now();
             if !hot {
                 app.rescan_hot_until = None;
@@ -353,7 +374,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                     if let Some(id) = &outcome.id {
                         // 起動に成功したフォルダだけを次回の new session 初期値にする。
                         // 保存は UI スレッドに寄せて state.json の書込み競合を避ける
-                        save_state("last_folder", &outcome.cwd);
+                        app.source.save_window(WindowItem::LastFolder(&outcome.cwd));
                         attach_by_id(app, id, &outcome.label, &outcome.cwd);
                     }
                     if let Some(err) = outcome.error {
@@ -370,20 +391,11 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 }
             }
         }
-        // 使用率キャッシュ（statusline フックが書く）を 5 秒毎に読む
-        if app.demo {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            app.usage = Some(UsageInfo {
-                five: Some((34.0, now + 2 * 3600 + 40 * 60)),
-                seven: Some((58.0, now + 3 * 86400 + 5 * 3600)),
-                stale: false,
-            });
-        } else if app.usage_display && app.last_usage_read.elapsed() > Duration::from_secs(5) {
+        // 使用率を 5 秒毎に取り込む（実データなら statusline フックが書いた
+        // キャッシュ、撮影用なら固定値。どちらを読むかは供給元が決める）
+        if app.last_usage_read.elapsed() > USAGE_INTERVAL {
             app.last_usage_read = std::time::Instant::now();
-            let usage = read_usage();
+            let usage = app.source.usage();
             if usage != app.usage {
                 app.usage = usage;
                 force_draw = true;
@@ -396,6 +408,18 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         {
             app.footer = app
                 .footer_shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            force_draw = true;
+        }
+        // ccdesk 自身の新しいリリース（起動時チェック）を取り込む
+        if app
+            .ccdesk_latest_dirty
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            app.ccdesk_latest = app
+                .ccdesk_latest_shared
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
@@ -520,7 +544,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                                 }
                                 Some(RowAction::ToggleGroup) => {
                                     // 画面上の行位置（固定ヘッダーより下はスクロール補正）
-                                    let y = if app.selected_row < SIDEBAR_HEADER_ROWS {
+                                    let y = if app.selected_row < app.sidebar_header_rows {
                                         app.selected_row
                                     } else {
                                         app.selected_row.saturating_sub(app.sidebar_scroll)
@@ -753,7 +777,8 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         MouseEventKind::Up(MouseButton::Left) if app.dragging => {
             app.dragging = false;
             app.resize_sessions(); // 最終サイズを確定
-            save_state("sidebar_width", &app.sidebar_width.to_string());
+            app.source
+                .save_window(WindowItem::SidebarWidth(app.sidebar_width));
             return Ok(false);
         }
         _ if app.dragging => return Ok(false),
@@ -799,7 +824,7 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         let r = mouse.row.saturating_sub(1) as usize;
         let row = if mouse.row == 0 || r >= sl.capacity {
             usize::MAX // 枠線・フッター帯 → どの行にも対応しない
-        } else if r < SIDEBAR_HEADER_ROWS {
+        } else if r < app.sidebar_header_rows {
             r
         } else {
             r + app.sidebar_scroll
@@ -995,19 +1020,13 @@ fn run_popup_action(app: &mut App, popup: &Popup, label: &str) {
 }
 
 /// グルーピング切替（UI クリック / Ctrl+S 共通）。選択は ~/.ccdesk/config.json に永続化
+/// （撮影用の供給元は保存しない ＝ 開発者の設定を踏まない）
 fn toggle_grouping(app: &mut App) {
     app.grouping = match app.grouping {
         Grouping::State => Grouping::Directory,
         Grouping::Directory => Grouping::State,
     };
-    save_setting(
-        "grouping",
-        if app.grouping == Grouping::Directory {
-            "directory"
-        } else {
-            "state"
-        },
-    );
+    app.source.save_window(WindowItem::Grouping(app.grouping));
 }
 
 /// stop/delete 後の反映を早める（数秒間 1 秒間隔で再スキャン）
