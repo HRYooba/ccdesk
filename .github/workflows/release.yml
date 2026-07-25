@@ -32,7 +32,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  # Build the Windows binary and attach it (zip + sha256) to the release.
+  # Build the Windows binary and attach it (raw .exe + sha256) to the release.
   upload-assets:
     needs: create-release
     runs-on: windows-latest
@@ -50,13 +50,27 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
-      - name: Build and upload binary
-        uses: taiki-e/upload-rust-binary-action@v1
-        with:
-          bin: ccdesk
-          target: x86_64-pc-windows-msvc
-          # Produces ccdesk-<tag>-x86_64-pc-windows-msvc.zip
-          archive: $bin-$tag-$target
-          zip: all
-          checksum: sha256
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        run: cargo build --release --locked
+
+      # taiki-e/upload-rust-binary-action をやめて明示ステップにした理由:
+      # アーカイブを作らなくなったのでアクションの仕事は「名前を付けて上げる」だけに
+      # なり、かつそのアクションの命名は $bin-$tag-$target 前提でタグを抜いた
+      # 固定名を作れない。`ccdesk update` は「バージョンを含まない固定名」を前提に
+      # タグからダウンロード URL を組み立てるため、ここは自前で名付ける
+      - name: Upload assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 資産名にバージョンを入れない（更新機能が URL を組み立てられるように）。
+          # 消費側の対応箇所: src/update.rs の ASSET_NAME
+          asset=ccdesk-x86_64-pc-windows-msvc.exe
+          cp target/release/ccdesk.exe "$asset"
+          # sha256 の書式は sha256sum の text モードそのまま = "<hex>␠␠<ファイル名>"。
+          # 人間は `sha256sum -c ccdesk-...exe.sha256` で検証でき、`ccdesk update` は
+          # 1 行目の先頭トークンをハッシュとして読む（src/update.rs の
+          # parse_sha256_file と対応。書式を変えるなら両側を同時に変える）
+          sha256sum "$asset" > "$asset.sha256"
+          cat "$asset.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$asset" "$asset.sha256" --clobber
