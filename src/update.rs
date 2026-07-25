@@ -90,8 +90,9 @@ pub(crate) fn newer_tag() -> Option<String> {
 }
 
 /// 直前の自己更新で退避した `<exe>.old` を消す。更新した当のプロセスが生きている
-/// 間はファイルが掴まれていて消せないので、次回起動時のこの 1 回が唯一の掃除機会。
-/// 「無い」「まだ掴まれている」はどちらも正常なので失敗は無視する
+/// 間はファイルが掴まれていて消せないので、掃除は次にプロセスを起こしたときになる。
+/// 呼ぶのは TUI 起動（`main`）と `doctor` の 2 箇所で、`ccdesk update` の出力も
+/// その 2 つを案内する。「無い」「まだ掴まれている」はどちらも正常なので失敗は無視する
 pub(crate) fn cleanup_old_exe() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::remove_file(old_exe_path(&exe));

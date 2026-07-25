@@ -38,10 +38,13 @@ pub(crate) fn update_self() -> anyhow::Result<()> {
     // 失敗時はここで Err を返して非ゼロ終了する。検証を通らなければ
     // インストール済みの実行ファイルには触れていない（update::install 参照）
     let installed = update::install(&tag)?;
+    // 「次回起動時に消える」とだけ書くと doctor などのサブコマンドでも消えると
+    // 読めてしまう。実際に掃除するのは TUI 起動と doctor なので、そう書く
     println!(
         "installed ccdesk {tag} at {}\n\
          this process keeps running {}; the new version applies on next launch\n\
-         the previous exe is parked at {} and is deleted at the next launch",
+         the previous exe is parked at {}; it is removed the next time you start \
+         the TUI or run `ccdesk doctor`",
         installed.exe.display(),
         env!("CARGO_PKG_VERSION"),
         installed.old.display()
@@ -137,6 +140,11 @@ pub(crate) fn statusline_hook() -> anyhow::Result<()> {
 /// TUI を起動しないので raw mode には入らず、色照会もここで直接行う
 pub(crate) fn run_doctor() -> anyhow::Result<()> {
     let mut failed = false;
+
+    // 自己更新の残骸を掃除する。TUI 起動でも消すが、更新後に TUI を開かず
+    // doctor だけ叩く使い方があるため、環境を診るこの入口でも同じことをする
+    // （`ccdesk update` の出力もこの 2 つを案内している）
+    update::cleanup_old_exe();
 
     // claude CLI が PATH にあるか（バージョン文字列も表示）
     match std::process::Command::new("claude")
