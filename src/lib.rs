@@ -417,7 +417,32 @@ fn kv_load(path: Option<std::path::PathBuf>, key: &str) -> Option<String> {
     Some(v.get(key)?.as_str()?.to_string())
 }
 
-fn kv_save(path: Option<std::path::PathBuf>, key: &str, value: &str) {
+/// 文字列配列の読み取り。**読みは寛容**で、値の形が想定と違えば「保存が無い」ものとして
+/// 扱う（ファイル無し・壊れた JSON・オブジェクトでない・キー無し・配列でない・
+/// 要素が文字列でない）。state.json はユーザーが手で直す想定のファイルではないので、
+/// 壊れていたら起動を止めるより既定値で先へ進むのが唯一の親切な選択になる
+fn kv_load_list(path: Option<std::path::PathBuf>, key: &str) -> Vec<String> {
+    let Some(path) = path else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    v.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// キー 1 つの read-modify-write。**書き込みの作法（プロセス内ロック・オブジェクト以外の
+/// 上書き・tmp → rename）をここ 1 箇所に持つ**ので、値が文字列でも配列でも同じ保証になる
+fn kv_put(path: Option<std::path::PathBuf>, key: &str, value: serde_json::Value) {
     let Some(path) = path else { return };
     let _guard = KV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut v = std::fs::read_to_string(&path)
@@ -427,12 +452,29 @@ fn kv_save(path: Option<std::path::PathBuf>, key: &str, value: &str) {
     if !v.is_object() {
         v = serde_json::json!({});
     }
-    v[key] = serde_json::Value::String(value.to_string());
+    v[key] = value;
     // 読み手が書きかけの JSON を見ないよう tmp → rename で置く
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, serde_json::to_string_pretty(&v).unwrap_or_default()).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }
+}
+
+fn kv_save(path: Option<std::path::PathBuf>, key: &str, value: &str) {
+    kv_put(path, key, serde_json::Value::String(value.to_string()));
+}
+
+fn kv_save_list(path: Option<std::path::PathBuf>, key: &str, values: &[String]) {
+    kv_put(
+        path,
+        key,
+        serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| serde_json::Value::String(v.clone()))
+                .collect(),
+        ),
+    );
 }
 
 pub fn load_setting(key: &str) -> Option<String> {
@@ -451,6 +493,159 @@ pub fn save_state(key: &str, value: &str) {
     kv_save(state_path(), key, value);
 }
 
+/// 複数値の状態（プロジェクト一覧）。単値と同じ state.json に、同じ書き込み作法で置く
+/// ＝ 保存経路を増やさない
+pub fn load_state_list(key: &str) -> Vec<String> {
+    kv_load_list(state_path(), key)
+}
+
+pub fn save_state_list(key: &str, values: &[String]) {
+    kv_save_list(state_path(), key, values);
+}
+
+/// 2 つのパスが同じフォルダを指すか。**「同じフォルダか」の判断はここ 1 箇所だけ**に置く
+/// （登録リストの重複排除・登録解除の対象照合・セッション行をどの見出しへ入れるかの
+/// 振り分けが別々の答えを出すと、見出しが 2 つに割れたり登録解除が空振りする）。
+///
+/// 大小・区切りの種類・末尾の区切りを無視するのは、突き合わせる文字列の出自が違うため:
+/// 登録リストは ccdesk が保存した文字列、セッションの cwd は claude が記録した文字列、
+/// 新規セッションのフォルダはユーザーが打った文字列。Windows 専用ツールなので
+/// `C:\dev\api` と `c:/dev/api\` は同じフォルダであり、別扱いにする理由が無い
+/// （`/` も Windows の正当な区切りで、フォルダ欄に打ち込める）。
+///
+/// 正規化はこの範囲に留める（`canonicalize` を使わない）: 実在しないフォルダも
+/// 突き合わせの対象になるうえ、ディスクを触る比較を描画のたびに走らせられない
+pub fn same_dir(a: &str, b: &str) -> bool {
+    dir_key(a) == dir_key(b)
+}
+
+/// [`same_dir`] の比較キー。`C:\` のようなルートは末尾の区切りを落とさない（落とすと
+/// ドライブ指定 `C:` になり、Windows では「そのドライブのカレント」を指す別物になる）
+fn dir_key(path: &str) -> String {
+    let unified = path.replace('/', "\\").to_lowercase();
+    let trimmed = unified.trim_end_matches('\\');
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        unified
+    } else {
+        trimmed.to_string()
+    }
+}
+
 // 注: 旧実装（~/.claude/sessions レジストリ読み・roster.json・JSONL transcript パース・
 // プロセス親子関係の遡り）は監査指摘により削除した。ライブ状態は正規の
 // `claude agents --json` を唯一のソースとする。
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// テスト専用の JSON ファイル。~/.ccdesk は触らない（開発者の state.json を踏まない）
+    fn temp_json(name: &str, contents: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ccdesk-test-{}-{name}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("state.json");
+        match contents {
+            Some(text) => std::fs::write(&path, text).expect("テスト用ファイルが書けない"),
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        path
+    }
+
+    /// 壊れた / 古い形式の state.json でも読みは失敗しない（＝起動が止まらない）。
+    /// 保存形式を足したときに一番壊れやすいのがここなので、想定外の形を並べて固定する
+    #[test]
+    fn state_reads_tolerate_missing_broken_and_legacy_shapes() {
+        let cases = [
+            ("missing", None),
+            ("empty", Some("")),
+            ("broken", Some("{\"projects\": [\"C:\\\\dev\\\\a\"")), // 閉じ括弧なし
+            ("not-object", Some("[1, 2, 3]")),
+            ("no-key", Some("{\"sidebar_width\": \"33\"}")),
+            // 旧形式: 単値しか無かった頃の state.json に配列キーが無い / 型が違う
+            ("legacy-string", Some("{\"projects\": \"C:\\\\dev\\\\a\"}")),
+            ("mixed-array", Some("{\"projects\": [1, null, {}]}")),
+        ];
+        for (name, contents) in cases {
+            let path = temp_json(name, contents);
+            assert!(
+                kv_load_list(Some(path.clone()), "projects").is_empty(),
+                "{name} で配列読みが空にならない"
+            );
+            // 単値読みも同じ寛容さ。旧形式（文字列が入っていた頃）だけは値として読めるので
+            // ケースを分ける（ケース名で例外を作ると何を保証しているのか読めなくなる）
+            let single = kv_load(Some(path), "projects");
+            if name == "legacy-string" {
+                assert_eq!(single.as_deref(), Some("C:\\dev\\a"), "旧形式の単値が読めない");
+            } else {
+                assert!(single.is_none(), "{name} で単値読みが None にならない");
+            }
+        }
+        // 配列の中に文字列と非文字列が混ざっていたら、文字列だけを拾う
+        let path = temp_json("partial-array", Some("{\"projects\": [\"C:\\\\dev\\\\a\", 7]}"));
+        assert_eq!(kv_load_list(Some(path), "projects"), ["C:\\dev\\a"]);
+    }
+
+    /// 書きは単値・配列が同じファイルに共存し、読み直しても他のキーを壊さない。
+    /// 旧形式の単値が入っていたキーを配列で上書きしても読めることまで含める
+    #[test]
+    fn state_writes_keep_other_keys_and_round_trip() {
+        let path = temp_json("round-trip", Some("{\"projects\": \"legacy\"}"));
+        let some = |p: &std::path::PathBuf| Some(p.clone());
+        kv_save(some(&path), "sidebar_width", "33");
+        let projects = vec!["C:\\dev\\a".to_string(), "C:\\dev\\b".to_string()];
+        kv_save_list(some(&path), "projects", &projects);
+        assert_eq!(kv_load(some(&path), "sidebar_width").as_deref(), Some("33"));
+        assert_eq!(kv_load_list(some(&path), "projects"), projects);
+        // 空配列も「0 件」として保存できる（キーごと消す実装だと未保存と区別できない）
+        kv_save_list(some(&path), "projects", &[]);
+        assert!(kv_load_list(some(&path), "projects").is_empty());
+        assert_eq!(
+            kv_load(some(&path), "sidebar_width").as_deref(),
+            Some("33"),
+            "配列の書き込みが他のキーを消している"
+        );
+        // オブジェクトでないファイルは作り直す（壊れた state.json で保存が死なない）
+        let broken = temp_json("write-over-broken", Some("[1,2,3]"));
+        kv_save_list(some(&broken), "projects", &projects);
+        assert_eq!(kv_load_list(some(&broken), "projects"), projects);
+    }
+
+    /// フォルダの同一判定。**大小と末尾の区切りは無視する**（登録リスト・claude が記録した
+    /// cwd・ユーザーの打鍵という出自の違う 3 種類を突き合わせるため）
+    #[test]
+    fn same_dir_ignores_case_and_trailing_separators() {
+        for (a, b) in [
+            ("C:\\dev\\api", "c:\\dev\\api"),
+            ("C:\\dev\\api", "C:\\dev\\api\\"),
+            ("C:\\dev\\api\\", "c:\\DEV\\Api"),
+            ("C:\\dev\\api", "C:/dev/api/"), // / も Windows の正当な区切り
+            ("C:/dev/api", "c:\\DEV\\api\\"),
+            ("C:\\", "c:/"),
+        ] {
+            assert!(same_dir(a, b), "{a:?} と {b:?} が同じフォルダにならない");
+        }
+        // 別フォルダは別。末端名が同じでも親が違えば別（見出しが混ざってはいけない）
+        for (a, b) in [
+            ("C:\\dev\\api", "C:\\dev\\api2"),
+            ("C:\\work\\api", "C:\\dev\\api"),
+            ("C:\\dev\\api", ""),
+        ] {
+            assert!(!same_dir(a, b), "{a:?} と {b:?} が同じフォルダ扱いになった");
+        }
+    }
+
+    /// ドライブ直下は区切りを落とさない。`C:\` を `C:` に丸めると Windows では
+    /// 「そのドライブのカレントディレクトリ」を指す別物になる
+    #[test]
+    fn same_dir_keeps_the_drive_root_separator() {
+        assert_eq!(dir_key("C:\\"), "c:\\");
+        assert_eq!(dir_key("C:/"), "c:\\", "区切りの種類はキーに残さない");
+        assert!(!same_dir("C:\\", "C:"), "ドライブ直下とドライブ指定を同一視している");
+        // 末尾を落として空になる入力でも panic せず、そのまま比較キーになる
+        assert_eq!(dir_key("\\"), "\\");
+        assert_eq!(dir_key("/"), "\\");
+        assert_eq!(dir_key(""), "");
+    }
+}

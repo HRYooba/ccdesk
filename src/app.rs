@@ -8,13 +8,13 @@ use crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 
-use ccdesk::{log_error, BgJob};
+use ccdesk::{log_error, same_dir, BgJob};
 
 use crate::accounts::Account;
 use crate::keys::{encode_key, forward_mouse};
 use crate::poll::{AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo};
 use crate::session::Session;
-use crate::source::{AccountAction, DataSource, PollSinks, WindowItem};
+use crate::source::{AccountAction, DataSource, PollSinks, WindowItem, PROJECTS_LIMIT};
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
 use crate::ui::{draw, popup_rect, row_at, sidebar_layout};
 
@@ -40,9 +40,11 @@ pub(crate) enum Focus {
 /// 保持すると実行時に別セッションを stop/rm し得る
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum RowAction {
-    New,           // 新規セッション画面を開く
-    NewIn(String), // 指定フォルダで新規セッション画面を開く（プロジェクト見出しの +）
-    ToggleGroup,   // グルーピング切替（state ⇔ directory）
+    New, // 新規セッション画面を開く
+    /// プロジェクト見出し行 = そのフォルダのメニュー（new session / remove project）を開く。
+    /// **クリックで即セッションが立つ行ではない**（起動は開いたメニューの中で選ぶ）
+    Project(String),
+    ToggleGroup, // グルーピング切替（state ⇔ directory）
     Open(String),  // short id: ウィンドウが開いていれば切替、無ければ claude attach
     UpdateCcdesk,  // ccdesk 自身を更新（サイドバー先頭の版行）
     UpdateClaude,  // claude 本体を更新（同じく版行）
@@ -103,10 +105,9 @@ pub(crate) enum PopupKind {
     },
     /// アカウント 1 件への操作（Account から遷移する 2 階層目）
     AccountActions { account: AccountItem },
-    /// プロジェクト単位の操作
-    // 構築側（プロジェクト見出しクリック）はプロジェクト永続化の作業が入れる
-    #[allow(dead_code)]
-    Project { cwd: String },
+    /// プロジェクト単位の操作。`has_sessions` は開いた時点の写し（[`PopupKind::Session`] の
+    /// `stopped` と同じ作り）で、`remove project` を出せるかの判断に使う
+    Project { cwd: String, has_sessions: bool },
 }
 
 /// 項目を選んだときに起きること。**選択 index から作る**ので、表示名が同じ項目が
@@ -160,9 +161,13 @@ impl PopupKind {
                 ("switch".to_string(), true),
                 ("unregister".to_string(), true),
             ],
-            PopupKind::Project { .. } => vec![
+            // **セッションが残っているフォルダは登録解除させない。** 見出しの一覧は
+            // 「登録リスト ∪ セッションの cwd」なので、登録を外してもセッション由来で
+            // 見出しは出続ける。押せるのに表示が変わらないのは嘘なので、
+            // stop と同じ仕組み（実行可能フラグ）で落とす
+            PopupKind::Project { has_sessions, .. } => vec![
                 ("new session".to_string(), true),
-                ("remove project".to_string(), true),
+                ("remove project".to_string(), !has_sessions),
             ],
         }
     }
@@ -211,7 +216,7 @@ impl PopupKind {
                 1 => Some(PopupAction::UnregisterAccount(account.id.clone())),
                 _ => None,
             },
-            PopupKind::Project { cwd } => match index {
+            PopupKind::Project { cwd, .. } => match index {
                 0 => Some(PopupAction::NewSessionIn(cwd.clone())),
                 1 => Some(PopupAction::RemoveProject(cwd.clone())),
                 _ => None,
@@ -328,6 +333,11 @@ pub(crate) struct App {
     // 下部バーに数秒表示するエラー等の通知
     pub(crate) notice: Option<(String, std::time::Instant)>,
     pub(crate) grouping: Grouping,
+    // 登録済みプロジェクト（ディレクトリ）の絶対パス。**この Vec が登録内容の正本**で、
+    // 変更のたび全量を供給元へ書き戻す。directory グルーピングの見出しは
+    // 「この一覧 ∪ セッションの cwd」なので、セッションが 0 本になっても
+    // ここに残っている限り見出しは消えない（＝そのフォルダで新規を開く入口が残る）
+    pub(crate) projects: Vec<String>,
     pub(crate) popup: Option<Popup>,
     pub(crate) focus: Focus,
 }
@@ -397,6 +407,7 @@ impl Default for App {
             spawn_rx: None,
             notice: None,
             grouping: Grouping::State,
+            projects: Vec::new(),
             popup: None,
             // サイドバー側にしておく（set_focus が PTY へ通知を出さない）
             focus: Focus::Sidebar,
@@ -800,21 +811,16 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                                     app.set_focus(Focus::Terminal);
                                 }
                                 Some(RowAction::ToggleGroup) => {
-                                    // 画面上の行位置（固定ヘッダーより下はスクロール補正）
-                                    let y = if app.selected_row < app.sidebar_header_rows {
-                                        app.selected_row
-                                    } else {
-                                        app.selected_row.saturating_sub(app.sidebar_scroll)
-                                    } as u16
-                                        + 1;
                                     app.popup = Some(Popup {
                                         kind: PopupKind::Group,
-                                        anchor_y: y,
+                                        anchor_y: selected_row_y(app),
                                         selected: 0,
                                     });
                                 }
-                                Some(RowAction::NewIn(cwd)) => {
-                                    dispatch_session(app, cwd, String::new());
+                                // 見出し行はメニューを開くだけ（セッションは起動しない）
+                                Some(RowAction::Project(cwd)) => {
+                                    let y = selected_row_y(app);
+                                    open_project_popup(app, cwd, y);
                                 }
                                 Some(RowAction::Open(short)) => {
                                     open_short(app, &short);
@@ -946,15 +952,81 @@ pub(crate) fn start_new_session(app: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// そのフォルダを登録プロジェクトへ加える。**プロジェクトの登録経路はここだけ**
+/// （明示的な「追加」UI は持たず、セッションを作った時点で登録される）。
+/// 並びは登録順＝新しいものが末尾で、画面上の並びは見出し側がアルファベット順に決める
+fn register_project(app: &mut App, cwd: &str) {
+    if cwd.is_empty() || app.projects.iter().any(|p| same_dir(p, cwd)) {
+        return;
+    }
+    app.projects.push(cwd.to_string());
+    // 上限を超えたら古い側から落とす。登録が自動なので、放っておくと
+    // 「一度試しただけのフォルダ」が state.json に永久に積まれ見出しも際限なく増える。
+    // 落ちたフォルダにセッションが残っていれば見出しは cwd 由来で出続けるので、
+    // 落ちたこと自体が操作の邪魔にならない
+    let excess = app.projects.len().saturating_sub(PROJECTS_LIMIT);
+    app.projects.drain(..excess);
+    app.source.save_window(WindowItem::Projects(&app.projects));
+}
+
+/// 登録プロジェクトから外す。セッションが残っているかの判断はメニュー側
+/// （[`PopupKind::entries`] が項目を無効にする）で済んでいるので、ここは削るだけ
+fn remove_project(app: &mut App, cwd: &str) {
+    let before = app.projects.len();
+    app.projects.retain(|p| !same_dir(p, cwd));
+    if app.projects.len() != before {
+        app.source.save_window(WindowItem::Projects(&app.projects));
+    }
+}
+
+/// そのフォルダにセッションがあるか。材料は jobs と attach 中のウィンドウで、
+/// **描画側が見出しの配下へ振り分ける集合と同じ**（片方だけを見ると、
+/// 行が出ているのに `remove project` が押せてしまう）
+fn project_has_sessions(app: &App, cwd: &str) -> bool {
+    app.jobs.iter().any(|j| same_dir(&j.cwd, cwd))
+        || app.sessions.iter().any(|s| same_dir(&s.cwd, cwd))
+}
+
+/// プロジェクト見出し行のメニューを開く（Enter とクリックで同じものが出る）。
+/// `has_sessions` は開いた時点の写しにする（[`PopupKind::Project`] 参照）
+fn open_project_popup(app: &mut App, cwd: String, anchor_y: u16) {
+    let has_sessions = project_has_sessions(app, &cwd);
+    app.popup = Some(Popup {
+        kind: PopupKind::Project { cwd, has_sessions },
+        anchor_y,
+        selected: 0,
+    });
+}
+
+/// キーボード選択行の画面 y。固定ヘッダーより下はスクロール分を引く。
+/// メニューの矩形はこの 1 つ下に出るので、Enter でメニューを開く行は全部この式を使う
+fn selected_row_y(app: &App) -> u16 {
+    let row = if app.selected_row < app.sidebar_header_rows {
+        app.selected_row
+    } else {
+        app.selected_row.saturating_sub(app.sidebar_scroll)
+    };
+    row as u16 + 1
+}
+
 /// 指定フォルダ・プロンプトで `claude --bg` をディスパッチし、完了後に attach する
-/// （プロジェクト見出しの + は空プロンプトで直接ここに来る）
+/// （見出しメニューの new session は空プロンプトで直接ここに来る）
 fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
     if app.spawn_rx.is_some() {
         return; // 起動処理中の多重ディスパッチを防ぐ
     }
+    // そのフォルダで作業を始めた ＝ プロジェクト。**登録をここに置くのが要点**で、
+    // new session 画面の起動ボタンと見出しメニューの new session はどちらも
+    // この関数へ収束するため、経路が増えても登録漏れが起きない
+    register_project(app, &cwd);
+    app.dispatch_cwd = cwd.clone();
+    // 撮影用データは本物のセッションを起こさない（架空の一覧に実セッションが混ざらない）。
+    // フォルダの登録と初期値の更新までは済んでいるので、供給元が違っても状態の育ち方は同じ
+    if !app.source.spawns_sessions() {
+        return;
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     app.spawn_rx = Some(rx);
-    app.dispatch_cwd = cwd.clone();
     // 使用率表示（opt-in）: dispatch にだけ statusline フックが効く（実測）
     let inject = app.usage_display.then(write_inject_settings).flatten();
     std::thread::spawn(move || {
@@ -1124,10 +1196,10 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                         selected: 0,
                     });
                 }
-                Some(RowAction::NewIn(cwd)) => {
-                    // セッション切替クリックと同じく、フォーカスは右ペインへ
-                    dispatch_session(app, cwd, String::new());
-                    app.set_focus(Focus::Terminal);
+                // 見出し行クリックはメニューを開くだけ。**フォーカスは移さない**
+                // （メニューがキーを受ける。セッション行クリックとは動作が違う）
+                Some(RowAction::Project(cwd)) => {
+                    open_project_popup(app, cwd, mouse.row);
                 }
                 Some(RowAction::Open(short)) => {
                     open_short(app, &short);
@@ -1317,7 +1389,7 @@ fn run_popup_action(app: &mut App, action: PopupAction, anchor_y: u16) {
                 selected: 0,
             });
         }
-        // プロジェクト見出しの + と同じ動作（同じ知識を 2 つ持たない）
+        // 空プロンプトで起動する（登録は dispatch_session が行う）
         PopupAction::NewSessionIn(cwd) => dispatch_session(app, cwd, String::new()),
         // アカウント操作は 3 つとも供給元へ流す（実処理は [`crate::accounts`]、
         // demo は実ファイルを触らない）。**実行後にメニューを開き直さない**:
@@ -1329,8 +1401,7 @@ fn run_popup_action(app: &mut App, action: PopupAction, anchor_y: u16) {
         PopupAction::UnregisterAccount(email) => {
             apply_account(app, AccountAction::Unregister(&email), "登録解除")
         }
-        // メニュー基盤だけ先に用意した項目。実処理はプロジェクト永続化の作業が入れる
-        PopupAction::RemoveProject(_) => {}
+        PopupAction::RemoveProject(cwd) => remove_project(app, &cwd),
     }
 }
 
@@ -1926,6 +1997,7 @@ mod tests {
     fn project_menu_carries_its_folder_into_each_action() {
         let kind = PopupKind::Project {
             cwd: "C:\\dev\\shop-app".to_string(),
+            has_sessions: false,
         };
         assert_eq!(
             labels(&kind, Grouping::State),
@@ -2300,12 +2372,19 @@ mod tests {
                 last_view: None,
                 dispatch_cwd: String::new(),
                 grouping: Grouping::State,
+                projects: Vec::new(),
             }
         }
 
         fn save_window(&self, _item: WindowItem<'_>) {}
 
         fn spawn_pollers(&self, _sinks: PollSinks) {}
+
+        // テストが実プロセス（claude --bg）を起こさない。既定の供給元
+        // （[`crate::source::DemoSource`]）と同じ約束を、差し替えた側でも守る
+        fn spawns_sessions(&self) -> bool {
+            false
+        }
 
         fn accounts(&self) -> Vec<Account> {
             self.stored.clone()
@@ -2656,5 +2735,234 @@ mod tests {
                 "済んだ / 走っている更新を再実行している"
             );
         }
+    }
+
+    /// テスト用のセッション 1 本（cwd だけが関心事）
+    fn job_in(short: &str, cwd: &str) -> BgJob {
+        BgJob {
+            short: short.to_string(),
+            cwd: cwd.to_string(),
+            state: "working".to_string(),
+            tempo: String::new(),
+            name: String::new(),
+            needs: String::new(),
+            detail: String::new(),
+            result: String::new(),
+            children: Vec::new(),
+            mtime: std::time::SystemTime::now(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    fn project(cwd: &str, has_sessions: bool) -> PopupKind {
+        PopupKind::Project {
+            cwd: cwd.to_string(),
+            has_sessions,
+        }
+    }
+
+    /// **セッションが残っているプロジェクトは登録解除できない。** 一覧は
+    /// 「登録リスト ∪ セッションの cwd」なので、外しても見出しは出続ける ＝
+    /// 押せるのに何も変わらないことになる。stop と同じ実行可能フラグで落とす
+    #[test]
+    fn project_menu_disables_remove_while_sessions_remain() {
+        assert_eq!(
+            project("C:\\dev\\api", false).entries(Grouping::Directory),
+            [
+                ("new session".to_string(), true),
+                ("remove project".to_string(), true),
+            ]
+        );
+        assert_eq!(
+            project("C:\\dev\\api", true).entries(Grouping::Directory),
+            [
+                ("new session".to_string(), true),
+                ("remove project".to_string(), false),
+            ],
+            "セッションが残っているのに remove project が選べる"
+        );
+    }
+
+    /// 無効な項目は Enter でも実行されない（登録が残る）
+    #[test]
+    fn picking_a_disabled_remove_project_does_nothing() {
+        let mut app = test_app(34, TERM);
+        app.projects = vec!["C:\\dev\\api".to_string()];
+        open(&mut app, project("C:\\dev\\api", true), 5);
+        handle_popup_key(&mut app, KeyCode::Down); // remove project を選ぶ
+        handle_popup_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.projects,
+            ["C:\\dev\\api"],
+            "無効な remove project が実行された"
+        );
+    }
+
+    /// 見出し行クリックでそのフォルダのメニューが開く（`+` を押して即起動ではない）。
+    /// **フォーカスはサイドバーに残る**（開いたメニューがキーを受ける）
+    #[test]
+    fn clicking_a_project_heading_opens_its_menu() {
+        let mut app = test_app(34, TERM);
+        app.sidebar_rows = vec![Some(RowAction::Project("C:\\dev\\api".to_string()))];
+        app.sidebar_header_rows = 1;
+        handle_mouse(&mut app, &click(5, 1)).unwrap();
+        let popup = app.popup.as_ref().expect("メニューが開いていない");
+        assert_eq!(popup.kind, project("C:\\dev\\api", false));
+        assert_eq!(popup.anchor_y, 1, "クリックした行の下に出る");
+        assert!(app.focus == Focus::Sidebar, "フォーカスが右ペインへ移った");
+        assert!(app.spawn_rx.is_none(), "クリックでセッションが起動している");
+    }
+
+    /// メニューを開く時点でセッションの有無を写す。**同名の末端ディレクトリが別パスに
+    /// 2 つあっても、判定は開いた行のフルパスで行う**（片方にだけセッションがある状況で
+    /// 取り違えると、消せるはずの登録が消せなくなる）
+    #[test]
+    fn opening_a_project_menu_reads_sessions_for_that_exact_folder() {
+        let mut app = test_app(34, TERM);
+        app.jobs = vec![job_in("s1", "C:\\work\\api")];
+        // セッションを持つ側
+        open_project_popup(&mut app, "C:\\work\\api".to_string(), 3);
+        assert_eq!(app.popup.as_ref().unwrap().kind, project("C:\\work\\api", true));
+        // 末端名が同じでも別パスならセッション無し扱い
+        open_project_popup(&mut app, "C:\\dev\\api".to_string(), 3);
+        assert_eq!(
+            app.popup.as_ref().unwrap().kind,
+            project("C:\\dev\\api", false),
+            "同名末端のフォルダのセッションを拾っている"
+        );
+        // 大小・末尾の区切り違いは同じフォルダとして拾う
+        open_project_popup(&mut app, "c:\\work\\api\\".to_string(), 3);
+        assert_eq!(
+            app.popup.as_ref().unwrap().kind,
+            project("c:\\work\\api\\", true),
+            "大小違いのセッションを取りこぼしている"
+        );
+    }
+
+    /// 登録は自動（明示的な追加 UI は無い）。重複・大小違い・末尾の区切り違いは
+    /// 同じフォルダなので増えない
+    #[test]
+    fn registering_a_project_is_idempotent_per_folder() {
+        let mut app = test_app(34, TERM);
+        register_project(&mut app, "C:\\dev\\api");
+        register_project(&mut app, "C:\\dev\\api");
+        register_project(&mut app, "c:\\dev\\api\\");
+        assert_eq!(app.projects, ["C:\\dev\\api"]);
+        // 別フォルダは末尾に積む（並びは登録順。表示の並びは見出し側が決める）
+        register_project(&mut app, "C:\\dev\\web");
+        assert_eq!(app.projects, ["C:\\dev\\api", "C:\\dev\\web"]);
+        // 空文字は登録しない（cwd が取れなかった経路で空の見出しを作らない）
+        register_project(&mut app, "");
+        assert_eq!(app.projects, ["C:\\dev\\api", "C:\\dev\\web"]);
+    }
+
+    /// 上限を超えたら古い側から落とす（登録が自動なので放っておくと際限なく積まれる）
+    #[test]
+    fn registering_beyond_the_limit_drops_the_oldest() {
+        let mut app = test_app(34, TERM);
+        for i in 0..PROJECTS_LIMIT + 1 {
+            register_project(&mut app, &format!("C:\\dev\\p{i}"));
+        }
+        assert_eq!(app.projects.len(), PROJECTS_LIMIT, "上限を超えて積まれている");
+        assert_eq!(
+            app.projects.first().map(String::as_str),
+            Some("C:\\dev\\p1"),
+            "最古の登録が落ちていない"
+        );
+        assert_eq!(
+            app.projects.last().map(String::as_str),
+            Some(format!("C:\\dev\\p{PROJECTS_LIMIT}").as_str()),
+            "最新の登録が入っていない"
+        );
+    }
+
+    /// 登録解除は対象フォルダだけを外す。**同名の末端が別パスにあっても取り違えない**
+    #[test]
+    fn removing_a_project_only_drops_that_folder() {
+        let mut app = test_app(34, TERM);
+        app.projects = vec![
+            "C:\\dev\\api".to_string(),
+            "C:\\work\\api".to_string(),
+            "C:\\dev\\web".to_string(),
+        ];
+        remove_project(&mut app, "C:\\work\\api");
+        assert_eq!(app.projects, ["C:\\dev\\api", "C:\\dev\\web"]);
+        // 大小・末尾の区切り違いでも同じフォルダとして外れる
+        remove_project(&mut app, "c:\\dev\\API\\");
+        assert_eq!(app.projects, ["C:\\dev\\web"]);
+        // 登録に無いフォルダを外しても何も起きない
+        remove_project(&mut app, "C:\\nope");
+        assert_eq!(app.projects, ["C:\\dev\\web"]);
+    }
+
+    /// メニューの remove project が、開いた行のフォルダに効く
+    #[test]
+    fn the_remove_project_row_unregisters_the_folder_it_was_opened_for() {
+        let mut app = test_app(34, TERM);
+        app.projects = vec!["C:\\dev\\api".to_string(), "C:\\work\\api".to_string()];
+        open(&mut app, project("C:\\work\\api", false), 5);
+        handle_popup_key(&mut app, KeyCode::Down);
+        handle_popup_key(&mut app, KeyCode::Enter);
+        assert!(app.popup.is_none(), "実行後もメニューが開いている");
+        assert_eq!(app.projects, ["C:\\dev\\api"]);
+    }
+
+    /// **自動登録の経路 1: 新規セッション画面の起動。** 供給元が撮影用データなので
+    /// 本物の `claude --bg` は起きず、フォルダの登録と初期値の更新だけが観測できる
+    #[test]
+    fn launching_from_the_new_session_view_registers_its_folder() {
+        let dir = std::env::temp_dir().to_string_lossy().to_string();
+        let mut app = test_app(34, TERM);
+        app.right_view = RightView::New(NewState::browse(&dir));
+        start_new_session(&mut app).unwrap();
+        assert_eq!(app.projects, std::slice::from_ref(&dir), "起動したフォルダが登録されない");
+        assert_eq!(app.dispatch_cwd, dir);
+        assert!(app.spawn_rx.is_none(), "撮影用データで claude を起動している");
+    }
+
+    /// **自動登録の経路 2: 見出しメニューの new session。** 経路 1 と同じ
+    /// `dispatch_session` に収束するので、登録の知識は 1 箇所で足りている
+    #[test]
+    fn picking_new_session_from_the_project_menu_registers_its_folder() {
+        let mut app = test_app(34, TERM);
+        open(&mut app, project("C:\\dev\\api", false), 5);
+        handle_popup_key(&mut app, KeyCode::Enter); // 先頭 = new session
+        assert!(app.popup.is_none(), "実行後もメニューが開いている");
+        assert_eq!(app.projects, ["C:\\dev\\api"]);
+        assert_eq!(app.dispatch_cwd, "C:\\dev\\api");
+    }
+
+    /// 登録・解除は撮影用の供給元では永続化されない ＝ **テストが開発者の
+    /// ~/.ccdesk/state.json を書き換えない**（保存経路を足したときの事故を止める）
+    #[test]
+    fn registering_through_the_test_app_never_touches_the_real_state_file() {
+        let before = ccdesk::load_state_list("projects");
+        let mut app = test_app(34, TERM);
+        register_project(&mut app, "C:\\must-not-be-persisted");
+        remove_project(&mut app, "C:\\must-not-be-persisted");
+        assert_eq!(
+            ccdesk::load_state_list("projects"),
+            before,
+            "テストが実ユーザーの state.json を書き換えている"
+        );
+    }
+
+    /// Enter でメニューを開く行の画面 y。固定ヘッダーはスクロールに動かされず、
+    /// その下はスクロール分だけ引く（矩形はこの 1 つ下に出る）
+    #[test]
+    fn selected_row_y_corrects_for_scroll_below_the_fixed_header() {
+        let mut app = test_app(34, TERM);
+        app.sidebar_header_rows = 7;
+        app.sidebar_scroll = 4;
+        // ヘッダー内はスクロールの影響を受けない
+        app.selected_row = 2;
+        assert_eq!(selected_row_y(&app), 3);
+        // ヘッダーより下はスクロール分を引く
+        app.selected_row = 10;
+        assert_eq!(selected_row_y(&app), 7);
+        // 引きすぎても 0 未満にならない
+        app.sidebar_scroll = 99;
+        assert_eq!(selected_row_y(&app), 1);
     }
 }
