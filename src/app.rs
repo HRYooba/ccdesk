@@ -247,7 +247,12 @@ fn write_inject_settings() -> Option<std::path::PathBuf> {
 /// `is_ansi_code_supported()` を true 決め打ちで実装しているため、VT 処理の無い
 /// レガシー Windows コンソールでは他コマンドが winapi 経路を通る一方この 2 つだけ
 /// 生 ANSI を書き、`[?2026h` が文字として表示され得る。ccdesk は ConPTY を
-/// 前提とするため許容する
+/// 前提とするため許容する。
+///
+/// カーソルの `Show` はここでは出さない。panic 時は ratatui の hook が
+/// alt screen を離脱し、その後の巻き戻しで Terminal の Drop が
+/// （hidden_cursor が立っていれば）`?25h` を出すので、通常画面に戻った後に
+/// 復帰する順序が既に成立している。ここで二重に出す必要はない
 struct SyncOutput;
 
 impl SyncOutput {
@@ -273,31 +278,41 @@ impl Drop for SyncOutput {
 ///
 /// ratatui は 1 フレームを「差分 + 非表示/表示 + MoveTo」の複数 flush に分けて書く。
 /// 途中状態を端末に観測させないため全体を同期出力で囲む（非対応端末は無視するだけ）。
-/// カーソル位置は可視性に関係なく常に渡し、隠したいときは draw の後で隠す
-/// （位置を渡さないと MoveTo が出ず、物理カーソルが差分の最終セルに残る）。
+/// 見せるフレームだけ ratatui に位置を渡し、隠すフレームは位置を渡さず（= None）
+/// 自前の MoveTo でカーソルをペイン内へ駐車させる。この非対称が要点で、理由は 2 つ:
 ///
-/// 隠すのに生の `cursor::Hide` ではなく `Terminal::hide_cursor` を通すのが要点。
-/// ratatui は自前の hidden_cursor フラグを持ち、Terminal の Drop ではそれが立って
-/// いるときだけ `?25h` を出す。位置ありの draw は毎回 show_cursor を呼んでフラグを
-/// false に戻すため、生 ANSI で隠すと「実際は隠れているのにフラグは false」になり、
-/// alt screen 離脱で DECTCEM を復元しない端末では終了後のシェルにカーソルが戻らない。
-/// hide_cursor は draw が MoveTo を出した後に呼ぶので位置は確定済み
-/// （= IME のアンカーは維持され、元のバグは再発しない）
+/// 1. 終了後にカーソルが隠れたまま残るのを防ぐ。ratatui は自前の hidden_cursor
+///    フラグを持ち、Terminal の Drop ではそれが立っているときだけ `?25h` を出す。
+///    フラグが立つのは位置 None（= 内部で hide_cursor を通る）のときだけなので、
+///    位置を常に渡して生の `cursor::Hide` で隠すとフラグが永久に false のまま
+///    「実際は隠れているのに ratatui は表示中だと思っている」状態になり、
+///    alt screen 離脱で DECTCEM を復元しない端末では終了後のシェルにカーソルが戻らない。
+/// 2. 毎フレームの `?25h` を出さない。位置ありの draw は毎回 show_cursor を呼ぶため、
+///    隠すフレームでも Show → MoveTo → Hide を送ることになり、DECTCEM の実装が
+///    素直でない端末ではこれがちらつきになる。None ならそもそも Show を出さない。
+///
+/// 元の IME バグ（位置を渡さないと MoveTo が出ず、物理カーソルが差分の最終セル
+/// = サイドバーに残る）は自前の MoveTo で駐車させるので再発しない。差分描画側の
+/// MoveTo 省略判定（last_pos）は Backend::draw のメソッドローカルで毎回リセット
+/// されるため、後から MoveTo を出しても次フレームの差分とは干渉しない。
+/// 生 stdout と CrosstermBackend<Stdout> は同一のグローバル stdout を共有するので
+/// 書き込み順序も保証される
 fn draw_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
     let _sync = SyncOutput::begin();
-    let mut visible = true;
-    // map で CompletedFrame を落として terminal の借用を切る（下で hide_cursor を呼ぶため）
-    let drawn = terminal
-        .draw(|frame| {
-            let cursor = draw(frame, app);
+    // 隠すフレームでカーソルを駐車させたい位置（Some = 非表示フレーム）
+    let mut park: Option<ratatui::layout::Position> = None;
+    let drawn = terminal.draw(|frame| {
+        let cursor = draw(frame, app);
+        if cursor.visible {
             frame.set_cursor_position(cursor.pos);
-            visible = cursor.visible;
-        })
-        .map(|_| ());
-    if !visible {
-        let _ = terminal.hide_cursor();
-    }
+        } else {
+            park = Some(cursor.pos);
+        }
+    });
     drawn?;
+    if let Some(pos) = park {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::MoveTo(pos.x, pos.y));
+    }
     Ok(())
 }
 
