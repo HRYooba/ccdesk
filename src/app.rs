@@ -898,13 +898,15 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                         let row_in = (mouse.row - layout.list_top) as usize;
                         if row_in < state.shown {
                             let idx = state.scroll + row_in;
-                            let reclick = state.focus == NewFocus::Browser && state.dir_idx == idx;
-                            state.dir_idx = idx;
-                            state.focus = NewFocus::Browser;
                             // 起動ボタン行もフォルダ行と同じ 2 段階（選択 → 再クリック）にする。
                             // 1 クリックで起動すると、プロンプト入力中に一覧へフォーカスを
                             // 移すだけのクリックが書きかけのプロンプトでセッションを起動して
-                            // しまう（supervisor 管理なので取り消せない）
+                            // しまう（supervisor 管理なので取り消せない）。
+                            // 判定はクリックで選択を動かす前に取る（動かした後では
+                            // 常に dir_idx == idx になり 2 段階が崩れる）
+                            let reclick = state.click_activates(idx);
+                            state.select(idx);
+                            state.focus = NewFocus::Browser;
                             if reclick {
                                 if state.selected_is_launch() {
                                     launch = true;
@@ -919,12 +921,11 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                 }
                 MouseEventKind::ScrollUp => {
                     state.focus = NewFocus::Browser;
-                    state.dir_idx = state.dir_idx.saturating_sub(1);
+                    state.select_prev();
                 }
                 MouseEventKind::ScrollDown => {
                     state.focus = NewFocus::Browser;
-                    state.dir_idx =
-                        (state.dir_idx + 1).min(state.entries.len().saturating_sub(1));
+                    state.select_next();
                 }
                 _ => {}
             }

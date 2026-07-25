@@ -155,6 +155,15 @@ pub(crate) struct NewState {
     pub(crate) path: TextField,
     pub(crate) prompt: TextField,
     pub(crate) focus: NewFocus,
+    /// 今の選択行が「一覧の作り直しで既定へ戻った結果」か（＝利用者が選んだ行ではない）。
+    ///
+    /// クリックの 2 段階（選択 → 再クリックで実行）を守るために要る。一覧を作り直すと
+    /// `dir_idx` は 0 = 起動ボタン行に戻るが `focus` は Browser のまま残るので、これが
+    /// 無いと「フォルダ行を再クリックして潜った直後の起動ボタン 1 クリック」が
+    /// 再クリック扱いになり、書きかけのプロンプトでセッションが起動してしまう
+    /// （supervisor 管理なので取り消せない）。作り直しで立て、明示的な選択移動
+    /// （↑↓・ホイール・選択を動かすクリック）で倒す
+    pub(crate) selection_from_rebuild: bool,
 }
 
 impl NewState {
@@ -170,6 +179,7 @@ impl NewState {
             path,
             prompt: TextField::default(),
             focus: NewFocus::Prompt,
+            selection_from_rebuild: true,
         }
     }
 
@@ -177,8 +187,40 @@ impl NewState {
         self.cur_dir = dir;
         self.path.set_text(&self.cur_dir);
         self.entries = Self::list_entries(&self.cur_dir);
-        self.dir_idx = 0;
+        self.reset_selection(0);
+    }
+
+    /// 一覧を作り直したときの選択リセット。`selection_from_rebuild` の立て忘れを
+    /// 防ぐため、作り直し側の `dir_idx` 代入はすべてここを通す
+    fn reset_selection(&mut self, idx: usize) {
+        self.dir_idx = idx;
         self.scroll = 0;
+        self.selection_from_rebuild = true;
+    }
+
+    /// 利用者の明示操作で選択行を動かす（↑↓・ホイール・選択を動かすクリック）。
+    /// ここを通った選択だけが「再クリックで実行」の対象になる
+    pub(crate) fn select(&mut self, idx: usize) {
+        self.dir_idx = idx;
+        self.selection_from_rebuild = false;
+    }
+
+    /// 1 行上へ
+    pub(crate) fn select_prev(&mut self) {
+        self.select(self.dir_idx.saturating_sub(1));
+    }
+
+    /// 1 行下へ（末尾で止まる）
+    pub(crate) fn select_next(&mut self) {
+        self.select((self.dir_idx + 1).min(self.entries.len().saturating_sub(1)));
+    }
+
+    /// `idx` 行のクリックがその行のアクション（起動 / 潜る）を実行してよいか。
+    /// 実行するのは「利用者が選んだ行を、一覧にフォーカスしたまま再クリックした」
+    /// ときだけ。一覧の作り直しで既定へ戻った選択は対象外
+    /// （[`NewState::selection_from_rebuild`] 参照）
+    pub(crate) fn click_activates(&self, idx: usize) -> bool {
+        self.focus == NewFocus::Browser && self.dir_idx == idx && !self.selection_from_rebuild
     }
 
     /// Folder フィールドの内容を確定: 存在するディレクトリならそこへ移動して true
@@ -295,8 +337,7 @@ impl NewState {
             if t != self.cur_dir {
                 self.cur_dir = t;
                 self.entries = Self::list_entries(&self.cur_dir);
-                self.dir_idx = 0;
-                self.scroll = 0;
+                self.reset_selection(0);
             }
             return;
         }
@@ -322,7 +363,7 @@ impl NewState {
                 });
                 // 断片を打鍵中は最初の一致フォルダを選ぶ。index 0 は常設の起動ボタン
                 // なので 0 のままにすると、絞り込んだ直後の → / Enter が何も起こらない
-                self.dir_idx = if frag.is_empty() {
+                let idx = if frag.is_empty() {
                     0
                 } else {
                     self.entries
@@ -330,7 +371,7 @@ impl NewState {
                         .position(|row| matches!(row, BrowseRow::Dir(_)))
                         .unwrap_or(0)
                 };
-                self.scroll = 0;
+                self.reset_selection(idx);
                 return;
             }
         }
@@ -346,7 +387,7 @@ impl NewState {
 /// Browser の Enter は「選択行の実行」なので、フォルダ行では移動になる。
 /// 起動ボタン行の Enter は 1 打鍵で起動する（明示的な操作なので確認を挟まない）。
 /// マウスは同じ扱いにしない: 誤クリックで起動しないよう、クリックはフォルダ行と同じ
-/// 「選択 → 再クリックで実行」の 2 段階（app::handle_mouse 側）
+/// 「選択 → 再クリックで実行」の 2 段階（判定は [`NewState::click_activates`]）
 pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Result<()> {
     let RightView::New(state) = &mut app.right_view else {
         return Ok(());
@@ -395,11 +436,8 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
             }
         }
         NewFocus::Browser => match key.code {
-            KeyCode::Up => state.dir_idx = state.dir_idx.saturating_sub(1),
-            KeyCode::Down => {
-                state.dir_idx =
-                    (state.dir_idx + 1).min(state.entries.len().saturating_sub(1));
-            }
+            KeyCode::Up => state.select_prev(),
+            KeyCode::Down => state.select_next(),
             // Enter = 選択行の実行。起動ボタン行なら起動、フォルダ行なら → と同じく移動
             KeyCode::Enter => {
                 if state.selected_is_launch() {
@@ -1010,6 +1048,73 @@ mod tests {
         state.refresh_from_input();
         assert_eq!(state.dir_idx, 0);
         assert!(state.selected_is_launch());
+    }
+
+    /// 一覧を作り直した直後の選択（既定の起動ボタン行）はクリック 1 回で実行しない。
+    /// 「フォルダ行を再クリックして潜る → その位置で起動ボタンを 1 回クリック」で
+    /// 書きかけのプロンプトのままセッションが起動してしまうのを防ぐ
+    #[test]
+    fn rebuilt_selection_needs_an_explicit_click_before_activating() {
+        let tmp = TempDir::new("click-guard");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        state.focus = NewFocus::Browser;
+        // 初期表示の選択も「利用者が選んだ行」ではない
+        assert!(state.selected_is_launch());
+        assert!(!state.click_activates(0));
+
+        // フォルダ行のクリックで選択が動く → 再クリックで潜れる
+        state.select(2);
+        assert_eq!(state.entries[state.dir_idx], BrowseRow::Dir("sub_a".into()));
+        assert!(state.click_activates(2));
+        state.descend();
+
+        // 潜った先では dir_idx が 0 = 起動ボタンへ戻るが focus は Browser のまま。
+        // ここが 1 クリックで起動すると取り消せない誤発火になる
+        assert_eq!(state.cur_dir, root.join("sub_a").to_string_lossy());
+        assert!(state.selected_is_launch());
+        assert!(
+            !state.click_activates(0),
+            "作り直し直後の起動ボタンが 1 クリックで起動する"
+        );
+
+        // 起動ボタン行を明示的にクリック（1 回目）した後は次のクリックで起動する
+        state.select(0);
+        assert!(state.click_activates(0));
+    }
+
+    /// 一覧の作り直しはすべて選択を無効化する（set_dir / refresh_from_input の両分岐）。
+    /// 明示的な選択移動（↑↓・ホイール・選択を動かすクリック）だけが有効化する
+    #[test]
+    fn every_list_rebuild_invalidates_the_selection() {
+        let tmp = TempDir::new("click-guard-rebuild");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+
+        // 断片フィルタでの作り直し
+        state.select(2);
+        assert!(!state.selection_from_rebuild);
+        state.path.set_text(&root.join("sub").to_string_lossy());
+        state.refresh_from_input();
+        assert!(state.selection_from_rebuild, "フィルタでの作り直し");
+        assert!(!state.click_activates(state.dir_idx));
+
+        // 実在パス全体を入れた作り直し
+        state.select(1);
+        state.path.set_text(&root.join("sub_b").to_string_lossy());
+        state.refresh_from_input();
+        assert!(state.selection_from_rebuild, "パス確定での作り直し");
+
+        // set_dir（→ / Enter での移動もここを通る）
+        state.select(0);
+        state.set_dir(root.to_string_lossy().to_string());
+        assert!(state.selection_from_rebuild, "set_dir");
+
+        // 明示操作で倒れる
+        state.select_next();
+        assert!(!state.selection_from_rebuild, "↓ / ホイール下");
+        state.select_prev();
+        assert!(!state.selection_from_rebuild, "↑ / ホイール上");
     }
 
     #[test]
