@@ -221,10 +221,13 @@ fn parse_account(auth_json: &str, profile: Option<(&str, &str)>) -> AccountStatu
 ///    （大小文字は無視する。email と orgName の表記差で漏らさないため）。
 ///    組織名が利用者本人の email で始まるなら、既に出している email 以上の
 ///    情報を持たないので出す価値が無い
-/// 2. **自動生成名の形 + 既知の個人プラン**: `"…'s Organization"` のように
-///    自動生成名の形をしていて、かつ `subscriptionType` が既知の個人プラン。
+/// 2. **自動生成名の形 + 既知の個人プラン**: `"…'s Organization"` という所有格の
+///    形（実測値と同じ形）をしていて、かつ `subscriptionType` が既知の個人プラン。
 ///    個人プランに実在の Team/Enterprise 組織は無いので、email 由来でない
-///    自動生成名（表示名由来・大小文字違い）も落とせる
+///    自動生成名（表示名由来・大小文字違い）も落とせる。
+///    照合は所有格まで含めて見る: `"Organization"` で終わるだけを条件にすると
+///    `"Contoso Organization"` のような実在の組織名を個人プランで消してしまい、
+///    「組織名自体が情報を持たないときだけ落とす」不変条件を破る
 ///
 /// 2 の個人プランは「既知の値の**ホワイトリスト**」であって、team 系の値を並べた
 /// ブラックリストではない。ブラックリストにすると、未知の値（将来のプラン名や
@@ -242,8 +245,9 @@ fn is_personal_org(org: &str, email: &str, subscription_type: Option<&str>) -> b
             .to_ascii_lowercase()
             .starts_with(&email.to_ascii_lowercase());
     // 自動生成名の形（実測は "<email>'s Organization"）。email 由来でない
-    // 変種を規則 2 で拾うための条件
-    let auto_shaped = org.contains("'s Organization") || org.ends_with("Organization");
+    // 変種を規則 2 で拾うための条件。所有格 "'s" まで含めて見るので、
+    // "Contoso Organization" のような実在の組織名は形が一致しない
+    let auto_shaped = org.to_ascii_lowercase().contains("'s organization");
     let personal_plan =
         auto_shaped && subscription_type.is_some_and(|t| PERSONAL_PLANS.contains(&t));
     email_derived || personal_plan
@@ -768,6 +772,19 @@ mod tests {
             parse_account(&auth_json("Alice's Organization", None), None),
             AccountStatus::LoggedIn("taro · Alice's Organization".into())
         );
+    }
+
+    /// 規則 2 は所有格 "'s Organization" の形だけを自動生成名と見なす。
+    /// `"Organization"` で終わるだけの実在組織名は、個人プランでも消さない
+    #[test]
+    fn keeps_real_org_name_ending_with_organization_on_personal_plan() {
+        for plan in ["free", "pro", "max"] {
+            assert_eq!(
+                parse_account(&auth_json("Contoso Organization", Some(plan)), None),
+                AccountStatus::LoggedIn("taro · Contoso Organization".into()),
+                "plan: {plan:?}"
+            );
+        }
     }
 
     /// ホワイトリストの要: 未知の `subscriptionType` は落とす根拠にしない。
