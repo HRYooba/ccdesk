@@ -152,6 +152,7 @@ fn main() -> anyhow::Result<()> {
         spawn_rx: None,
         notice: None,
         grouping: window.grouping,
+        projects: window.projects,
         popup: None,
         focus: Focus::Terminal,
         source,

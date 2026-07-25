@@ -497,6 +497,34 @@ pub fn save_state_list(key: &str, values: &[String]) {
     kv_save_list(state_path(), key, values);
 }
 
+/// 2 つのパスが同じフォルダを指すか。**「同じフォルダか」の判断はここ 1 箇所だけ**に置く
+/// （登録リストの重複排除・登録解除の対象照合・セッション行をどの見出しへ入れるかの
+/// 振り分けが別々の答えを出すと、見出しが 2 つに割れたり登録解除が空振りする）。
+///
+/// 大小・区切りの種類・末尾の区切りを無視するのは、突き合わせる文字列の出自が違うため:
+/// 登録リストは ccdesk が保存した文字列、セッションの cwd は claude が記録した文字列、
+/// 新規セッションのフォルダはユーザーが打った文字列。Windows 専用ツールなので
+/// `C:\dev\api` と `c:/dev/api\` は同じフォルダであり、別扱いにする理由が無い
+/// （`/` も Windows の正当な区切りで、フォルダ欄に打ち込める）。
+///
+/// 正規化はこの範囲に留める（`canonicalize` を使わない）: 実在しないフォルダも
+/// 突き合わせの対象になるうえ、ディスクを触る比較を描画のたびに走らせられない
+pub fn same_dir(a: &str, b: &str) -> bool {
+    dir_key(a) == dir_key(b)
+}
+
+/// [`same_dir`] の比較キー。`C:\` のようなルートは末尾の区切りを落とさない（落とすと
+/// ドライブ指定 `C:` になり、Windows では「そのドライブのカレント」を指す別物になる）
+fn dir_key(path: &str) -> String {
+    let unified = path.replace('/', "\\").to_lowercase();
+    let trimmed = unified.trim_end_matches('\\');
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        unified
+    } else {
+        trimmed.to_string()
+    }
+}
+
 // 注: 旧実装（~/.claude/sessions レジストリ読み・roster.json・JSONL transcript パース・
 // プロセス親子関係の遡り）は監査指摘により削除した。ライブ状態は正規の
 // `claude agents --json` を唯一のソースとする。
@@ -539,10 +567,14 @@ mod tests {
                 kv_load_list(Some(path.clone()), "projects").is_empty(),
                 "{name} で配列読みが空にならない"
             );
-            assert!(
-                kv_load(Some(path), "projects").is_none() || name == "legacy-string",
-                "{name} で単値読みが None にならない"
-            );
+            // 単値読みも同じ寛容さ。旧形式（文字列が入っていた頃）だけは値として読めるので
+            // ケースを分ける（ケース名で例外を作ると何を保証しているのか読めなくなる）
+            let single = kv_load(Some(path), "projects");
+            if name == "legacy-string" {
+                assert_eq!(single.as_deref(), Some("C:\\dev\\a"), "旧形式の単値が読めない");
+            } else {
+                assert!(single.is_none(), "{name} で単値読みが None にならない");
+            }
         }
         // 配列の中に文字列と非文字列が混ざっていたら、文字列だけを拾う
         let path = temp_json("partial-array", Some("{\"projects\": [\"C:\\\\dev\\\\a\", 7]}"));
@@ -572,5 +604,42 @@ mod tests {
         let broken = temp_json("write-over-broken", Some("[1,2,3]"));
         kv_save_list(some(&broken), "projects", &projects);
         assert_eq!(kv_load_list(some(&broken), "projects"), projects);
+    }
+
+    /// フォルダの同一判定。**大小と末尾の区切りは無視する**（登録リスト・claude が記録した
+    /// cwd・ユーザーの打鍵という出自の違う 3 種類を突き合わせるため）
+    #[test]
+    fn same_dir_ignores_case_and_trailing_separators() {
+        for (a, b) in [
+            ("C:\\dev\\api", "c:\\dev\\api"),
+            ("C:\\dev\\api", "C:\\dev\\api\\"),
+            ("C:\\dev\\api\\", "c:\\DEV\\Api"),
+            ("C:\\dev\\api", "C:/dev/api/"), // / も Windows の正当な区切り
+            ("C:/dev/api", "c:\\DEV\\api\\"),
+            ("C:\\", "c:/"),
+        ] {
+            assert!(same_dir(a, b), "{a:?} と {b:?} が同じフォルダにならない");
+        }
+        // 別フォルダは別。末端名が同じでも親が違えば別（見出しが混ざってはいけない）
+        for (a, b) in [
+            ("C:\\dev\\api", "C:\\dev\\api2"),
+            ("C:\\work\\api", "C:\\dev\\api"),
+            ("C:\\dev\\api", ""),
+        ] {
+            assert!(!same_dir(a, b), "{a:?} と {b:?} が同じフォルダ扱いになった");
+        }
+    }
+
+    /// ドライブ直下は区切りを落とさない。`C:\` を `C:` に丸めると Windows では
+    /// 「そのドライブのカレントディレクトリ」を指す別物になる
+    #[test]
+    fn same_dir_keeps_the_drive_root_separator() {
+        assert_eq!(dir_key("C:\\"), "c:\\");
+        assert_eq!(dir_key("C:/"), "c:\\", "区切りの種類はキーに残さない");
+        assert!(!same_dir("C:\\", "C:"), "ドライブ直下とドライブ指定を同一視している");
+        // 末尾を落として空になる入力でも panic せず、そのまま比較キーになる
+        assert_eq!(dir_key("\\"), "\\");
+        assert_eq!(dir_key("/"), "\\");
+        assert_eq!(dir_key(""), "");
     }
 }

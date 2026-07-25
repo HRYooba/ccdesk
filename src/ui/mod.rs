@@ -9,6 +9,8 @@ use ratatui::Frame;
 use std::time::Duration;
 use tui_term::widget::PseudoTerminal;
 
+use ccdesk::same_dir;
+
 use crate::app::{App, Focus, Popup, RightView, RowAction, SelfUpdate};
 use crate::poll::{classify, AccountStatus, Bucket, Group, Grouping, StateView};
 use crate::session::SessionStatus;
@@ -189,6 +191,47 @@ fn version_rows(
             None,
         ),
     ]
+}
+
+/// directory グルーピングの見出し行。返すのは (見出しの表示文字列, 対象フォルダ) で、
+/// 1 要素目は**画面に出る文字列そのもの**（見出しに何を出すかの知識をここだけに持つ）。
+///
+/// 一覧は「登録リスト ∪ セッションの cwd」の**和集合**。登録リスト側があるので
+/// セッションが 0 本になっても見出しは消えず、そのフォルダで新規を開く入口が残る
+/// （以前はセッションの cwd から導出するだけだったので、最後のセッションが消えると
+/// 見出しごと消えていた）。未登録でセッションだけあるフォルダも従来どおり出す。
+///
+/// 並びは末端ディレクトリ名のアルファベット順（大小無視）で従来どおり。**同名の末端が
+/// 別パスに複数あるときはフルパスで決める**: キーが末端名だけだと安定ソートの入力順
+/// （＝セッションの走査順）で並びが変わり、同じ画面が再描画で入れ替わり得る
+fn project_rows(projects: &[String], session_cwds: &[&str]) -> Vec<(String, String)> {
+    let mut dirs: Vec<&str> = Vec::new();
+    // 登録リストが先。state.json を手で直された場合の自己重複もここで落ちる
+    for cwd in projects.iter().map(String::as_str).chain(session_cwds.iter().copied()) {
+        if !dirs.iter().any(|d| same_dir(d, cwd)) {
+            dirs.push(cwd);
+        }
+    }
+    let leaf_key = |cwd: &str| {
+        std::path::Path::new(cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    };
+    dirs.sort_by(|a, b| leaf_key(a).cmp(&leaf_key(b)).then_with(|| a.cmp(b)));
+    dirs.into_iter()
+        .map(|cwd| {
+            // 見出しはプロジェクト名（末端ディレクトリ名）だけ。**ここに `+` は出さない**:
+            // 行の動作はメニューを開くことなので、「押したら即セッションが立つ」という
+            // ヒントは嘘になる。末端が取れないのはドライブ直下（`C:\`）等だけなので、
+            // その場合はパスをそのまま出す（ホーム短縮が効く形にはならない）
+            let leaf = std::path::Path::new(cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| cwd.to_string());
+            (leaf, cwd.to_string())
+        })
+        .collect()
 }
 
 /// ccdesk 自身の版行の状態。更新の進行状態が版チェックの結果より優先する
@@ -393,14 +436,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // サイドバー: 行の正本は agents --json（ライブ）+ state.json（summary 補完）。
     // 自分の PTY 行は「attach ウィンドウ」としてだけ出す
     let active = app.active;
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    let shorten = |p: &str| {
-        if !home.is_empty() && p.starts_with(&home) {
-            format!("~{}", &p[home.len()..])
-        } else {
-            p.to_string()
-        }
-    };
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -703,44 +738,24 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             }
         }
         Grouping::Directory => {
-            // ディレクトリの並びはプロジェクト名のアルファベット順で固定。
+            // 見出しに出すフォルダと並びの決定は project_rows に閉じている。
             // 選択・stop・delete 等の操作では並び替えない
-            let mut cwds: Vec<&str> = Vec::new();
-            for j in &app.jobs {
-                if !cwds.contains(&j.cwd.as_str()) {
-                    cwds.push(&j.cwd);
-                }
-            }
-            for d in &data {
-                if !cwds.contains(&d.cwd.as_str()) {
-                    cwds.push(&d.cwd);
-                }
-            }
-            cwds.sort_by_key(|c| {
-                std::path::Path::new(c)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_lowercase())
-                    .unwrap_or_default()
-            });
-            for cwd in cwds {
+            let mut cwds: Vec<&str> = app.jobs.iter().map(|j| j.cwd.as_str()).collect();
+            cwds.extend(data.iter().map(|d| d.cwd.as_str()));
+            for (heading, cwd) in project_rows(&app.projects, &cwds) {
                 items.push(ListItem::new(Line::from("")));
                 rows.push(None);
-                // 見出し = プロジェクト名（末端ディレクトリ名）+ このフォルダで新規を開く +
-                let leaf = std::path::Path::new(cwd)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| shorten(cwd));
                 let cur = rows.len();
                 let highlighted = hovered == Some(cur) || selected == cur;
                 let mut style = Style::default().fg(ui().dim);
                 if highlighted {
                     style = style.bg(ui().hl_bg).fg(ui().emph);
                 }
-                items.push(ListItem::new(
-                    Line::from(vec![Span::raw(leaf), Span::raw("  +")]).style(style),
-                ));
-                rows.push(Some(RowAction::NewIn(cwd.to_string())));
-                for d in data.iter().filter(|d| d.cwd == cwd) {
+                items.push(ListItem::new(Line::from(heading).style(style)));
+                rows.push(Some(RowAction::Project(cwd.clone())));
+                // 配下のセッション行。見出しの一覧と同じ同一判定を使う
+                // （ここだけ厳密一致にすると大小違いのセッションが行き場を失う）
+                for d in data.iter().filter(|d| same_dir(&d.cwd, &cwd)) {
                     push_data_row(&mut items, &mut rows, d);
                 }
             }
@@ -1178,6 +1193,229 @@ mod tests {
         for y in [sl.account_y - 1, sl.account_y, sl.account_y + 1] {
             assert_eq!(row_at(y, sl.capacity, 7, 0), usize::MAX, "y={y}");
         }
+    }
+
+    /// 見出しの表示文字列だけを取り出す
+    fn headings(projects: &[&str], cwds: &[&str]) -> Vec<String> {
+        let projects: Vec<String> = projects.iter().map(|p| p.to_string()).collect();
+        project_rows(&projects, cwds)
+            .into_iter()
+            .map(|(heading, _)| heading)
+            .collect()
+    }
+
+    /// **この不具合の直接のリグレッションテスト。** 登録済みのフォルダは
+    /// セッションが 0 本でも見出しが残る（＝そのフォルダで新規を開く入口が消えない）。
+    /// 以前はセッションの cwd から一覧を導いていたので、最後のセッションが消えると
+    /// 見出しごと消えていた
+    #[test]
+    fn a_registered_project_keeps_its_heading_with_zero_sessions() {
+        assert_eq!(headings(&["C:\\dev\\api"], &[]), ["api"]);
+        // セッションが 1 本も無くても登録の数だけ見出しが出る
+        assert_eq!(
+            headings(&["C:\\dev\\api", "C:\\dev\\web"], &[]),
+            ["api", "web"]
+        );
+        // 登録が空でセッションも無ければ 1 行も出ない（空の見出しを作らない）
+        assert!(headings(&[], &[]).is_empty());
+    }
+
+    /// 一覧は「登録リスト ∪ セッションの cwd」。未登録+セッションあり / 登録済み+0 本 /
+    /// 両方（登録済みでセッションもある）の 3 通りが同じ 1 つの並びに出る
+    #[test]
+    fn project_rows_are_the_union_of_registrations_and_session_folders() {
+        // 未登録だがセッションがあるフォルダは従来どおり出る
+        assert_eq!(headings(&[], &["C:\\dev\\api"]), ["api"]);
+        // 3 通りが混ざっても和集合。登録済みでセッションもあるフォルダは 1 度だけ
+        assert_eq!(
+            headings(
+                &["C:\\dev\\empty", "C:\\dev\\both"],
+                &["C:\\dev\\both", "C:\\dev\\unregistered"]
+            ),
+            ["both", "empty", "unregistered"]
+        );
+        // 大小・末尾の区切り違いは同じフォルダなので見出しは割れない
+        assert_eq!(
+            headings(&["C:\\dev\\api"], &["c:\\dev\\api\\", "C:\\DEV\\api"]),
+            ["api"]
+        );
+        // 登録リスト自体が重複していても 1 度だけ（state.json を手で直された場合）
+        assert_eq!(headings(&["C:\\dev\\api", "C:\\dev\\api"], &[]), ["api"]);
+    }
+
+    /// 並びは末端ディレクトリ名のアルファベット順・大小無視（従来仕様）。
+    /// 登録とセッションのどちらの由来かで優先されない
+    #[test]
+    fn project_rows_sort_by_leaf_name_ignoring_case() {
+        assert_eq!(
+            headings(&["C:\\dev\\Zebra", "C:\\dev\\apple"], &["C:\\dev\\Mango"]),
+            ["apple", "Mango", "Zebra"]
+        );
+        // 入力の順序を変えても同じ並び（＝走査順に依存しない）
+        assert_eq!(
+            headings(&["C:\\dev\\apple"], &["C:\\dev\\Mango", "C:\\dev\\Zebra"]),
+            ["apple", "Mango", "Zebra"]
+        );
+    }
+
+    /// **同名の末端ディレクトリが別パスに 2 つあっても混ざらない。** 見出しは同名で
+    /// 並ぶが、対象フォルダはフルパスで区別され、並びはフルパスで一意に決まる
+    /// （末端名だけをキーにすると入力順で入れ替わる）
+    #[test]
+    fn project_rows_keep_same_named_leaves_apart_by_full_path() {
+        let projects = ["C:\\work\\api".to_string(), "C:\\dev\\api".to_string()];
+        let rows = project_rows(&projects, &[]);
+        assert_eq!(
+            rows,
+            [
+                ("api".to_string(), "C:\\dev\\api".to_string()),
+                ("api".to_string(), "C:\\work\\api".to_string()),
+            ],
+            "同名末端がフルパス順で並んでいない"
+        );
+        // 入力順を入れ替えても並びは同じ
+        let flipped = ["C:\\dev\\api".to_string(), "C:\\work\\api".to_string()];
+        assert_eq!(project_rows(&flipped, &[]), rows, "入力順で並びが変わった");
+    }
+
+    /// 見出しは末端ディレクトリ名だけ。**`+` は出さない**（行の動作はメニューを開くことで、
+    /// 「押したら即セッションが立つ」というヒントは嘘になる）
+    #[test]
+    fn project_headings_carry_no_plus_hint() {
+        let rows = project_rows(&["C:\\dev\\api".to_string()], &["C:\\dev\\web"]);
+        for (heading, cwd) in &rows {
+            assert!(!heading.contains('+'), "見出しに + が残っている: {heading:?}");
+            assert_eq!(heading.trim(), heading, "見出しに余分な空白がある: {heading:?}");
+            assert!(cwd.starts_with("C:\\"), "対象がフルパスでない: {cwd:?}");
+        }
+        assert_eq!(rows[0], ("api".to_string(), "C:\\dev\\api".to_string()));
+    }
+
+    /// 末端ディレクトリ名が取れないパス（ドライブ直下）でも見出しを落とさない。
+    /// 登録は自動なので、ドライブ直下でセッションを作れば一覧に入り得る
+    #[test]
+    fn project_rows_fall_back_to_the_path_when_there_is_no_leaf() {
+        assert_eq!(
+            project_rows(&["C:\\".to_string()], &[]),
+            [("C:\\".to_string(), "C:\\".to_string())]
+        );
+    }
+
+    /// サイドバーを実際に描いて (行データ, その行の表示文字列) を返す。
+    /// **描画を経由するのが要点**で、`project_rows` の結果が本当に画面と
+    /// クリック判定へ届いているか（登録リストが draw に配線されているか）を見る
+    fn render_sidebar(app: &mut App) -> Vec<(Option<RowAction>, String)> {
+        let (w, h) = app.term_size;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("端末が作れない");
+        terminal.draw(|frame| {
+            draw(frame, app);
+        })
+        .expect("描画に失敗");
+        let buffer = terminal.backend().buffer().clone();
+        // 固定ヘッダーの下はスクロール分ずれるが、このテストは行数が窓に収まる
+        // 前提なので scroll = 0（描画側がクランプ済み）
+        assert_eq!(app.sidebar_scroll, 0, "テストの前提（スクロール無し）が崩れている");
+        app.sidebar_rows
+            .iter()
+            .enumerate()
+            .map(|(idx, action)| {
+                let y = idx as u16 + 1; // 上枠の次の行から積まれる
+                let text: String = (1..app.sidebar_width.saturating_sub(1))
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                (action.clone(), text.trim_end().to_string())
+            })
+            .collect()
+    }
+
+    /// **登録リストが画面に届いていることの検証（配線のテスト）。** セッションを
+    /// 1 本も持たない登録フォルダの見出しが描かれ、その行はメニューを開く
+    /// [`RowAction::Project`] を持ち、**`+` は付かない**
+    #[test]
+    fn the_directory_grouping_draws_registered_projects_without_sessions() {
+        let mut app = App {
+            term_size: (60, 40),
+            sidebar_width: 34,
+            grouping: Grouping::Directory,
+            projects: vec!["C:\\dev\\empty-project".to_string()],
+            ..Default::default()
+        };
+        let rows = render_sidebar(&mut app);
+        let heading = rows
+            .iter()
+            .find(|(action, _)| {
+                matches!(action, Some(RowAction::Project(cwd)) if cwd == "C:\\dev\\empty-project")
+            })
+            .expect("登録フォルダの見出しが描かれていない");
+        assert_eq!(heading.1, "empty-project", "見出しの文字列が末端名だけでない");
+        assert!(!heading.1.contains('+'), "見出しに + が残っている: {:?}", heading.1);
+        // **見出しだけを出す**（「no sessions」等の説明行を挟まない）。セッションが
+        // 0 本なので、この見出しがサイドバー最後の行になる
+        let idx = rows.iter().position(|(_, t)| t == "empty-project").unwrap();
+        assert_eq!(
+            idx + 1,
+            rows.len(),
+            "見出しの下に行が積まれている: {:?}",
+            &rows[idx + 1..]
+        );
+        assert!(
+            !rows.iter().any(|(_, t)| t.contains("no session")),
+            "セッション 0 本の説明行が出ている"
+        );
+    }
+
+    /// 撮影用データを directory グルーピングで描いたときの見出しの並び。
+    /// **`--demo` の Ctrl+S で出る画面そのもの**を固定する: セッションを持たない
+    /// 登録フォルダ（infra）の見出しが残り、`+` は付かず、見出し行はメニューを開く
+    #[test]
+    fn the_demo_data_shows_every_project_heading_in_the_directory_grouping() {
+        use crate::source::{DataSource, DemoSource};
+        let mut app = App {
+            term_size: (60, 40),
+            sidebar_width: 34,
+            grouping: Grouping::Directory,
+            jobs: DemoSource.jobs(),
+            projects: DemoSource.window_state().projects,
+            ..Default::default()
+        };
+        let rows = render_sidebar(&mut app);
+        let headings: Vec<&str> = rows
+            .iter()
+            .filter(|(action, _)| matches!(action, Some(RowAction::Project(_))))
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(
+            headings,
+            ["api", "docs", "infra", "shop-app"],
+            "撮影用データの見出しの並びが変わった"
+        );
+        // infra は demo セッションを持たないフォルダ。見出しの直後は空行 or 次の見出しで、
+        // セッション行は付かない（＝ 0 本でも見出しだけが残る）
+        let infra = rows.iter().position(|(_, t)| t == "infra").unwrap();
+        assert_eq!(rows[infra + 1].1, "", "infra の下にセッション行が出ている");
+        assert!(
+            matches!(&rows[infra + 2].0, Some(RowAction::Project(cwd)) if cwd.ends_with("shop-app")),
+            "空のフォルダの次が別の見出しになっていない"
+        );
+    }
+
+    /// `+ new session` 行は従来どおり残る（見出しから消した `+` と混同しない）
+    #[test]
+    fn the_new_session_row_keeps_its_plus() {
+        let mut app = App {
+            term_size: (60, 40),
+            sidebar_width: 34,
+            grouping: Grouping::Directory,
+            projects: vec!["C:\\dev\\api".to_string()],
+            ..Default::default()
+        };
+        let rows = render_sidebar(&mut app);
+        assert!(
+            rows.iter()
+                .any(|(action, text)| action == &Some(RowAction::New) && text == "+ new session"),
+            "+ new session 行が消えている"
+        );
     }
 
     /// inner が潰れてもペイン矩形の外（枠の列や端末外）へ出ない。

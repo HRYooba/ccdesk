@@ -141,6 +141,12 @@ pub(crate) trait DataSource {
 
     /// バックグラウンド取得の開始。**demo は 1 本も起こさない**
     fn spawn_pollers(&self, sinks: PollSinks);
+
+    /// 新規セッションの要求で実際に `claude --bg` を起こすか。
+    /// **撮影用データは起こさない**（架空のセッション一覧に本物のセッションが混ざると、
+    /// 撮影の再現性が壊れるうえ開発者の環境にセッションが残る）。起こさない供給元では
+    /// 新規セッションの要求はフォルダの登録と初期値の更新までで止まる
+    fn spawns_sessions(&self) -> bool;
 }
 
 /// 実データ。~/.claude と ~/.ccdesk を読み、ポーラーで claude CLI と
@@ -220,6 +226,10 @@ impl DataSource for LiveSource {
         }
     }
 
+    fn spawns_sessions(&self) -> bool {
+        true
+    }
+
     fn spawn_pollers(&self, sinks: PollSinks) {
         spawn_agents_poller(sinks.agents, sinks.agents_dirty);
         spawn_footer_poller(sinks.footer, sinks.footer_dirty, sinks.footer_refresh);
@@ -261,6 +271,10 @@ impl DataSource for DemoSource {
     fn save_window(&self, _item: WindowItem<'_>) {
         // 撮影が開発者の state.json / config.json を書き換えない
         // （サイドバー幅・最後に開いた画面・グルーピング・プロジェクト一覧を踏み潰さない）
+    }
+
+    fn spawns_sessions(&self) -> bool {
+        false
     }
 
     fn spawn_pollers(&self, _sinks: PollSinks) {

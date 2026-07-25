@@ -15,6 +15,12 @@ Agent View.
 
 - **Persistent sidebar** with every Claude Code session across all projects,
   grouped by state (Ready for review / Needs input / Working / Completed) or by directory
+- **Persistent projects** — a directory becomes a project the moment you start a session in it,
+  and its heading stays in the directory grouping even after its last session is gone, so the
+  way in is never lost. Clicking a heading opens `new session` / `remove project`;
+  `remove project` is disabled while sessions remain there, since the folder would keep its
+  heading anyway. Registrations survive a restart but are only visible in the directory
+  grouping — the state grouping has no directory headings to show them on
 - **Official lifecycle** — new sessions dispatch via `claude --bg`, windows are
   `claude attach` clients; stop/delete use `claude stop` / `claude rm`
 - **Live status** from `claude agents --json` (rename, state changes reflect in ~2 s)
@@ -82,7 +88,7 @@ ccdesk --help     # show usage
 ```
 
 Settings (grouping, opt-ins) live in `~/.ccdesk/config.json`; window state
-(sidebar width, last screen, last folder) in `~/.ccdesk/state.json`.
+(sidebar width, last screen, last folder, registered projects) in `~/.ccdesk/state.json`.
 Errors and panics are appended to `~/.ccdesk/error.log`.
 
 ## Usage display (opt-in)
