@@ -20,6 +20,16 @@
 #
 # --size sets the terminal to its final dimensions at launch, so ccdesk lays out
 # once and we never resize a running TUI (resizing leaves stale glyphs).
+#
+# Process cleanup follows the same "never guess" rule. An earlier version closed the
+# capture window with `Get-Process ccdesk | Stop-Process`, which killed EVERY running
+# ccdesk -- including the developer's own, and this script is typically run from a
+# Claude Code session hosted inside ccdesk, so it killed the session that started it.
+# The demo process is now identified the same way the window is: snapshot the ccdesk
+# pids before launching, and afterwards only touch a pid that is both new AND running
+# the exact `<resolved exe> --demo` command line we issued. If nothing matches we warn
+# and kill nothing, because leaving a stray demo window open is recoverable while
+# killing someone's live session is not.
 param(
   [Parameter(Mandatory=$true)][string]$Exe,
   [Parameter(Mandatory=$true)][string]$Out,
@@ -27,6 +37,11 @@ param(
   [int]$Rows = 34,
   [int]$SettleSec = 6
 )
+
+# Resolve the exe up front: the demo process is later recognised by its command line,
+# which only matches if wt.exe was handed the same absolute path we compare against.
+# Resolve-Path also turns a typo into an immediate failure instead of an empty capture.
+$ExePath = (Resolve-Path -LiteralPath $Exe).ProviderPath
 
 Add-Type -AssemblyName System.Drawing
 Add-Type -Namespace Win -Name Api -MemberDefinition @'
@@ -56,15 +71,32 @@ function Get-TerminalWindows {
   return $script:acc
 }
 
-Get-Process ccdesk -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 400
+# Only processes that appeared after the launch and carry our demo command line. WT
+# hosts every window in one process, so the ccdesk we start is a child of the shared
+# WindowsTerminal.exe -- the parent pid cannot tell our window from the developer's,
+# which is why the command line is the discriminator.
+function Get-DemoProcess {
+  param([int[]]$ExcludePids)
+  return @(Get-CimInstance Win32_Process -Filter "Name='ccdesk.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $ExcludePids -notcontains [int]$_.ProcessId } |
+    Where-Object {
+      $_.CommandLine -and
+      $_.CommandLine.IndexOf($ExePath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+      $_.CommandLine -match '(^|\s)--demo(\s|$)'
+    })
+}
+
+# No pre-launch cleanup: a leftover demo window from an aborted run cannot corrupt the
+# capture (the window diff below ignores any window that already existed), so there is
+# nothing to gain from killing processes this run did not start.
+$beforePids = @(Get-Process ccdesk -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.Id })
 
 $before = @(Get-TerminalWindows)
 
 Start-Process wt.exe -ArgumentList @(
   '-w','new','--size',"$Cols,$Rows",
   'new-tab','--suppressApplicationTitle','--title','ccdesk',
-  '--', $Exe, '--demo'
+  '--', $ExePath, '--demo'
 )
 
 $h = [IntPtr]::Zero
@@ -96,6 +128,13 @@ $g.CopyFromScreen($r.Left, $r.Top, 0, 0, (New-Object System.Drawing.Size $w, $ht
 $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
 $g.Dispose(); $bmp.Dispose()
 
-Get-Process ccdesk -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+# Close only what we launched; exiting ccdesk makes WT close the window with it.
+$demo = Get-DemoProcess -ExcludePids $beforePids
+if ($demo.Count -eq 0) {
+  Write-Warning "no new '$ExePath --demo' process found: closing nothing, so the capture window may still be open"
+} else {
+  foreach ($p in $demo) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+  "closed demo ccdesk: $(($demo | ForEach-Object { $_.ProcessId }) -join ', ')"
+}
 
 "saved: $Out size=${w}x${ht}"
