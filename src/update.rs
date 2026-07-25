@@ -5,8 +5,14 @@
 //!
 //! Windows では**動いている実行ファイルを上書きできない**（`Device or resource
 //! busy`）が、**別名へ改名することはできる**（実測）。そのため差し替えは
-//! 「現行 exe を `<exe>.old` へ退避 → 新しい exe を元のパスへ置く」で行う。
-//! 走っているプロセスは現行版のまま動き続け、新しい版は次回起動から有効になる。
+//! 「新しい exe を `<exe>.new` へ置く → 現行 exe を `<exe>.old` へ退避 →
+//! `<exe>.new` を元のパスへ改名」の 3 手で行う。走っているプロセスは現行版のまま
+//! 動き続け、新しい版は次回起動から有効になる。
+//!
+//! 順序には意味がある: 重い処理（別ボリュームからのコピー）を最初の 1 手に閉じ込めると、
+//! 残る 2 手は同一ディレクトリ内の rename = メタデータ操作だけになる。実行ファイルが
+//! 存在しない窓がバイナリサイズに比例して開くことがなく、宛先に部分的に書かれた
+//! ファイルが残る経路も無い。
 
 /// 配布元。ダウンロード URL の基点
 const REPO_URL: &str = "https://github.com/HRYooba/ccdesk";
@@ -50,8 +56,24 @@ pub(crate) fn latest_tag() -> Option<String> {
         .ok()?
         .get("tag_name")
         .and_then(|t| t.as_str())
-        .filter(|t| !t.is_empty())
+        .filter(|t| is_plausible_tag(t))
         .map(str::to_string)
+}
+
+/// タグとして受け入れる形か（ASCII 英数と `._-+` だけ、64 文字以内）。
+///
+/// 取得したタグはダウンロード URL・サイドバーの告知・`ccdesk update` の標準出力の
+/// 3 箇所へそのまま流れる。git の ref 名規則が制御文字・空白・`..` を禁じているので
+/// 正規のリリースなら必ず通るが、応答が壊れていた場合に端末制御文字や極端に長い
+/// 文字列が画面へ出るのをここで止める。[`ccdesk::version_newer`] は各パートの
+/// **先頭の数字だけ**を見る寛容なパーサで、後ろにゴミが付いたタグでも「新しい」と
+/// 判定を通してしまうため、新旧比較の前段でふるう必要がある
+fn is_plausible_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 64
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
 }
 
 /// タグ（"v0.3.0"）がこのビルドより新しいか。判定はフッターの更新判定と同じ
@@ -103,25 +125,78 @@ fn install_at(exe: &std::path::Path, exe_url: &str, sha_url: &str) -> anyhow::Re
         .as_deref()
         .and_then(parse_sha256_file)
         .ok_or_else(|| anyhow::anyhow!("could not read the published SHA-256 ({sha_url})"))?;
+    // 検証と使用は同一ハンドルではない（ここでハッシュを取り、下で move する）。
+    // `%TEMP%` は Windows 既定でユーザー毎なので他ユーザーは間に割り込めないが、
+    // `TEMP` を共有ディレクトリに向けている環境では未検証バイナリが入りうる
     let actual = certutil_hash(&new_exe)?;
     if !actual.eq_ignore_ascii_case(&published) {
         anyhow::bail!("SHA-256 mismatch (published {published}, downloaded {actual})");
     }
 
+    // 検証済みの中身を、まず差し替え先と**同じディレクトリ**へ置く。一時ディレクトリが
+    // 別ドライブのときのコピー（数 MB）はこの時点で終わるので、実行ファイルに触る残りの
+    // 2 手は同一ディレクトリ内の rename = メタデータ操作だけになる。「exe が存在しない
+    // 窓」がコピー時間ぶん開かず、宛先に中途半端な内容が残る経路も無くなる
+    let staged = staged_exe_path(exe);
+    let _ = std::fs::remove_file(&staged);
+    move_file(&new_exe, &staged).map_err(|e| {
+        anyhow::anyhow!("could not stage the new exe at {}: {e}", staged.display())
+    })?;
+
     let old = old_exe_path(exe);
-    // Windows の rename は既存の宛先を上書きしないので、前回の残骸を先に消す
+    // 既存の `.old` が走っているプロセスに掴まれているとロックで rename が失敗するので、
+    // 掴まれていない残骸は先に落としておく（Windows の rename は既存の宛先を
+    // **置き換える**ので、消せなかった場合も結果は変わらない = 掴まれていればどちらも
+    // ロックで失敗し、下の park_error がその旨を伝える）
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(exe, &old)
-        .map_err(|e| anyhow::anyhow!("could not move the current exe aside: {e}"))?;
-    if let Err(e) = move_file(&new_exe, exe) {
-        // 退避したまま終わると実行ファイルが無くなる。必ず戻す
-        let _ = std::fs::rename(&old, exe);
+    if let Err(e) = std::fs::rename(exe, &old) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(park_error(exe, &old, &e));
+    }
+    // ここから exe が一瞬存在しない。失敗したら必ず退避した現行版を戻す。
+    // 直前の手が rename なので宛先は空であり、部分的に書かれたファイルは残らない
+    if let Err(e) = std::fs::rename(&staged, exe) {
+        let restored = std::fs::rename(&old, exe);
+        let _ = std::fs::remove_file(&staged);
+        if let Err(re) = restored {
+            // 復旧まで失敗した = 実行ファイルが無い状態で終わる唯一の経路。
+            // 手で戻せば直ることを必ず伝える（黙って落ちると復旧手段が伝わらない）
+            anyhow::bail!(
+                "could not install the new exe ({e}) and could not restore the previous one ({re}); \
+                 ccdesk has no executable right now -- rename {} back to {} by hand to recover",
+                old.display(),
+                exe.display()
+            );
+        }
         return Err(anyhow::anyhow!("could not install the new exe: {e}"));
     }
     Ok(Installed {
         exe: exe.to_path_buf(),
         old,
     })
+}
+
+/// 退避 rename が失敗したときのエラー文面。`PermissionDenied` は原因が 2 つあり、
+/// **どちらなのかは残骸の有無で判別できる**ので対処まで伝える:
+/// 消せなかった `.old` が残っているなら走っているプロセスがそのイメージを掴んでいる、
+/// 残っていないなら実行ファイルのあるディレクトリに書き込み権限が無い
+fn park_error(exe: &std::path::Path, old: &std::path::Path, e: &std::io::Error) -> anyhow::Error {
+    if e.kind() != std::io::ErrorKind::PermissionDenied {
+        return anyhow::anyhow!("could not move the current exe aside: {e}");
+    }
+    if old.exists() {
+        anyhow::anyhow!(
+            "could not move the current exe aside: {} is still held by a running ccdesk -- \
+             quit it and try again ({e})",
+            old.display()
+        )
+    } else {
+        anyhow::anyhow!(
+            "could not move the current exe aside: no write access to {} -- \
+             run the update from an elevated shell, or install ccdesk somewhere you own ({e})",
+            exe.parent().unwrap_or(exe).display()
+        )
+    }
 }
 
 /// タグ → (実行ファイルの URL, その `.sha256` の URL)
@@ -179,9 +254,13 @@ fn parse_certutil_hash(out: &str) -> Option<String> {
         .map(|s| s.to_ascii_lowercase())
 }
 
-/// `.sha256` ファイルからハッシュを取り出す。書式は `sha256sum` の text モードと
-/// 同じ `<hex>␠␠<ファイル名>` で、先頭トークンがハッシュ（生産側は
-/// .github/workflows/release.yml の "Upload assets"）
+/// `.sha256` ファイルからハッシュを取り出す。
+///
+/// 受け入れる書式は **「先頭の空白区切りトークンが 64 桁の 16 進数」だけ**で、それ以降は
+/// 問わない。`sha256sum` は同じ内容でもモードで区切りが変わる（text は `<hex>␠␠<名前>`、
+/// binary は `<hex>␠*<名前>`。Windows の GNU coreutils は **binary が既定**なので
+/// 生産側が実際に出すのは後者）ため、区切りやファイル名に依存させない。
+/// 生産側は .github/workflows/release.yml の "Upload assets"
 fn parse_sha256_file(text: &str) -> Option<String> {
     text.split_whitespace()
         .next()
@@ -194,16 +273,33 @@ fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// 退避先 `<exe>.old`。拡張子を置き換えず末尾に足す
-/// （`ccdesk.exe` → `ccdesk.exe.old`。`with_extension` だと `ccdesk.old` になる）
-fn old_exe_path(exe: &std::path::Path) -> std::path::PathBuf {
+/// 実行ファイルの隣に置く作業用パス `<exe><suffix>`。拡張子は**置き換えず末尾に足す**
+/// （`ccdesk.exe` + ".old" → `ccdesk.exe.old`。`with_extension` だと `ccdesk.old` に
+/// なり、拡張子なしの実行ファイルでは本体そのものを指してしまう）
+fn sibling_path(exe: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     let mut path = exe.as_os_str().to_os_string();
-    path.push(".old");
+    path.push(suffix);
     std::path::PathBuf::from(path)
 }
 
+/// 退避先 `<exe>.old`。更新した当のプロセスが掴んでいるので更新直後は消せない
+fn old_exe_path(exe: &std::path::Path) -> std::path::PathBuf {
+    sibling_path(exe, ".old")
+}
+
+/// 差し替え直前の置き場 `<exe>.new`。差し替え先と同じディレクトリなので、ここへ
+/// 置いた後はボリューム内の rename だけで差し替えが終わる。
+/// 差し替えの途中で kill されたときだけ残るが、次回の更新が置く前に消すので
+/// 溜まり続けることはない（起動時の [`cleanup_old_exe`] では消さない:
+/// 別シェルで進行中の更新からステージ済みのファイルを奪ってしまうため）
+fn staged_exe_path(exe: &std::path::Path) -> std::path::PathBuf {
+    sibling_path(exe, ".new")
+}
+
 /// ファイルを移す。一時ディレクトリと実行ファイルが別ボリュームだと rename は
-/// 失敗するので、そのときはコピーしてから元を消す
+/// 失敗するので、そのときはコピーしてから元を消す。
+/// 実行ファイル本体には使わない（宛先は必ず `<exe>.new`）ので、コピーが途中で
+/// 失敗しても壊れるのはステージ用の一時ファイルだけ
 fn move_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
     if std::fs::rename(from, to).is_ok() {
         return Ok(());
@@ -341,10 +437,10 @@ mod tests {
         assert!(from_certutil.eq_ignore_ascii_case(&from_file));
     }
 
-    /// 退避先は拡張子を置き換えず末尾に足す（`ccdesk.old` にすると
+    /// 作業用パスは拡張子を置き換えず末尾に足す（`ccdesk.old` にすると
     /// 掃除対象を取り違え、拡張子なしの実行ファイルも壊す）
     #[test]
-    fn appends_old_suffix_without_replacing_the_extension() {
+    fn appends_work_suffixes_without_replacing_the_extension() {
         assert_eq!(
             old_exe_path(std::path::Path::new("C:\\bin\\ccdesk.exe")),
             std::path::PathBuf::from("C:\\bin\\ccdesk.exe.old")
@@ -353,6 +449,54 @@ mod tests {
             old_exe_path(std::path::Path::new("C:\\bin\\ccdesk")),
             std::path::PathBuf::from("C:\\bin\\ccdesk.old")
         );
+        // ステージ先も同じ流儀。退避先とは別のパスであること（同じだと退避を潰す）
+        assert_eq!(
+            staged_exe_path(std::path::Path::new("C:\\bin\\ccdesk.exe")),
+            std::path::PathBuf::from("C:\\bin\\ccdesk.exe.new")
+        );
+        assert_ne!(
+            staged_exe_path(std::path::Path::new("C:\\bin\\ccdesk.exe")),
+            old_exe_path(std::path::Path::new("C:\\bin\\ccdesk.exe"))
+        );
+    }
+
+    /// 資産名は生産側（ワークフロー）と一字一句一致していないと、以後の
+    /// `ccdesk update` が全件 404 になる。リリースを打つまで気付けない類の破損なので
+    /// ここで静的に縛る（`include_str!` はコンパイル時に解決されるので、
+    /// ワークフローを消した・移した場合もビルドが割れて気付ける）
+    #[test]
+    fn the_workflow_uploads_the_asset_name_the_updater_downloads() {
+        let yml = include_str!("../.github/workflows/release.yml");
+        assert!(
+            yml.contains(&format!("asset={ASSET_NAME}")),
+            "release.yml がアップロードする資産名が ASSET_NAME ({ASSET_NAME}) とずれている"
+        );
+        // `.sha256` の URL は実行ファイル URL への接尾で組み立てる（asset_urls）ので、
+        // 生産側も同じ名前 + ".sha256" で上げていること
+        assert!(
+            yml.contains("\"$asset.sha256\""),
+            "release.yml が <資産名>.sha256 以外の名前でチェックサムを上げている"
+        );
+    }
+
+    /// タグは URL・画面・stdout の 3 箇所へ流れるので、素朴な版文字列以外は入口で弾く
+    #[test]
+    fn rejects_tags_that_are_not_plain_version_strings() {
+        assert!(is_plausible_tag("v0.3.0"));
+        assert!(is_plausible_tag("v1.2.3-rc.1"));
+        assert!(is_plausible_tag("0.3.0+build.1"));
+        for bad in [
+            "",
+            "v1.0.0\u{1b}[2J",  // 端末制御文字（version_newer は通してしまう）
+            "v1.0.0\nv2.0.0",   // 改行
+            "v1.0/../../evil",  // パス区切り
+            "v1.0.0 ",          // 空白
+            "ｖ１.０.０",       // 非 ASCII
+        ] {
+            assert!(!is_plausible_tag(bad), "input: {bad:?}");
+        }
+        // 長すぎるタグ（画面とログを埋めない）
+        assert!(!is_plausible_tag(&"v1.0.0".repeat(20)));
     }
 
     /// スコープを抜けるときにディレクトリごと消す作業場。
@@ -421,6 +565,10 @@ mod tests {
             "現行 exe が <exe>.old へ退避されていない"
         );
         assert_eq!(installed.old, old_exe_path(&exe));
+        assert!(
+            !staged_exe_path(&exe).exists(),
+            "ステージ用の <exe>.new が残っている"
+        );
     }
 
     /// SHA-256 が合わないときはインストール済みの exe に触らない。
@@ -438,6 +586,10 @@ mod tests {
         assert!(err.to_string().contains("mismatch"), "{err}");
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "OLD BINARY");
         assert!(!old_exe_path(&exe).exists(), "退避ファイルが残っている");
+        assert!(
+            !staged_exe_path(&exe).exists(),
+            "検証前にステージしている（検証を通るまで exe の隣に何も置かない）"
+        );
     }
 
     /// ダウンロード失敗（存在しないアセット = 新リリースに .exe が無い等）でも同じ。
@@ -452,6 +604,69 @@ mod tests {
         assert!(err.to_string().contains("download failed"), "{err}");
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "OLD BINARY");
         assert!(!old_exe_path(&exe).exists());
+        assert!(!staged_exe_path(&exe).exists());
+    }
+
+    /// ステージ（`<exe>.new` への配置）に失敗しても実行ファイルには触らない。
+    /// ステージは実行ファイルを退避する**前**の手なので、ここで折り返せば
+    /// 「退避したのに新版が入らない」状態には入らない。
+    /// 失敗の作り方: `<exe>.new` をディレクトリにして rename もコピーも通らなくする
+    #[test]
+    fn leaves_the_installed_exe_untouched_when_staging_fails() {
+        let ws = Workspace::new("install-stage-fail");
+        let exe = ws.write("ccdesk.exe", "OLD BINARY");
+        let asset = ws.write(ASSET_NAME, "NEW BINARY");
+        ws.write(
+            &format!("{ASSET_NAME}.sha256"),
+            &format!("{}  {ASSET_NAME}\n", sha256_of(&asset)),
+        );
+        std::fs::create_dir_all(staged_exe_path(&exe)).unwrap();
+
+        let err = install_at(
+            &exe,
+            &ws.url(ASSET_NAME),
+            &ws.url(&format!("{ASSET_NAME}.sha256")),
+        )
+        .expect_err("ステージに失敗したのに成功を返している");
+        assert!(err.to_string().contains("could not stage"), "{err}");
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "OLD BINARY");
+        assert!(!old_exe_path(&exe).exists(), "退避まで進んでしまっている");
+    }
+
+    /// 退避（`<exe>.old` への改名）に失敗しても実行ファイルは残り、ステージ済みの
+    /// `<exe>.new` も片付ける（失敗のたびに数 MB を置き去りにしない）。
+    /// 失敗の作り方: `<exe>.old` をディレクトリにして改名先を塞ぐ。実運用で塞がるのは
+    /// 「走っている ccdesk が前回の `.old` を掴んでいる」ケース
+    #[test]
+    fn keeps_the_exe_and_clears_the_stage_when_parking_fails() {
+        let ws = Workspace::new("install-park-fail");
+        let exe = ws.write("ccdesk.exe", "OLD BINARY");
+        let asset = ws.write(ASSET_NAME, "NEW BINARY");
+        ws.write(
+            &format!("{ASSET_NAME}.sha256"),
+            &format!("{}  {ASSET_NAME}\n", sha256_of(&asset)),
+        );
+        std::fs::create_dir_all(old_exe_path(&exe)).unwrap();
+
+        let err = install_at(
+            &exe,
+            &ws.url(ASSET_NAME),
+            &ws.url(&format!("{ASSET_NAME}.sha256")),
+        )
+        .expect_err("退避に失敗したのに成功を返している");
+        assert!(
+            err.to_string().contains("could not move the current exe aside"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&exe).unwrap(),
+            "OLD BINARY",
+            "退避に失敗したのに実行ファイルが失われている"
+        );
+        assert!(
+            !staged_exe_path(&exe).exists(),
+            "ステージした <exe>.new が残っている"
+        );
     }
 
     /// ローカルビルドがリリースより新しいときに更新を勧めない
