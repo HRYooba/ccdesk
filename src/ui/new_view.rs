@@ -601,6 +601,24 @@ pub(crate) fn new_view_cursor(
     }
 }
 
+/// 一覧に描ける行数。0 件メッセージ（"no matching folders"）を出す場合は
+/// その 1 行を必ず確保する。
+///
+/// `no_folder_rows` が真なら一覧は起動ボタン 1 行だけなので、`list_height >= 2` では
+/// 両方が収まり従来どおり。問題は `list_height == 1`（`layout.ok` が許す下限）で、
+/// メッセージを行の後ろへ足すと ratatui の Paragraph に切られて「なぜ一覧が空か」が
+/// 見えなくなる。そのときはメッセージを優先する: 起動ボタンは PROMPT 欄の Enter と
+/// 同じ `cur_dir` での起動なので、失うのは重複した導線だけ。一方メッセージは
+/// 他のどこにも出ない情報
+fn list_rows_for_message(no_folder_rows: bool, list_height: u16) -> usize {
+    let height = list_height as usize;
+    if no_folder_rows {
+        height.saturating_sub(1)
+    } else {
+        height
+    }
+}
+
 /// 新規セッション画面の描画（フォルダブラウザ + 初回チャット入力）。
 /// starting = `claude --bg` 実行中（別スレッド）: プロンプト欄に進行中表示を出す
 pub(crate) fn draw_new_view(
@@ -637,7 +655,8 @@ pub(crate) fn draw_new_view(
     let inner = layout.inner;
 
     // 一覧のスクロールウィンドウを更新（縦が足りなければ list_height 側が縮む）
-    let max_visible = layout.list_height as usize;
+    // 0 件メッセージは起動ボタン行より優先する（[`list_rows_for_message`] 参照）
+    let max_visible = list_rows_for_message(state.no_folder_rows(), layout.list_height);
     if state.dir_idx < state.scroll {
         state.scroll = state.dir_idx;
     } else if max_visible > 0 && state.dir_idx >= state.scroll + max_visible {
@@ -1115,6 +1134,55 @@ mod tests {
         assert!(!state.selection_from_rebuild, "↓ / ホイール下");
         state.select_prev();
         assert!(!state.selection_from_rebuild, "↑ / ホイール上");
+    }
+
+    /// 0 件メッセージ用の 1 行を確保する。list_height == 1（layout.ok の下限）では
+    /// 起動ボタン行より優先する
+    #[test]
+    fn reserves_a_line_for_the_no_match_message() {
+        assert_eq!(list_rows_for_message(false, 1), 1);
+        assert_eq!(list_rows_for_message(false, 5), 5);
+        assert_eq!(
+            list_rows_for_message(true, 1),
+            0,
+            "1 行しか無いならメッセージを優先する"
+        );
+        assert_eq!(list_rows_for_message(true, 5), 4);
+        assert_eq!(list_rows_for_message(true, 0), 0);
+    }
+
+    /// 一覧が 1 行しか取れない高さでも「なぜ空なのか」が画面に出る。
+    /// メッセージを行の後ろへ足していた実装では Paragraph に切られて消えていた
+    #[test]
+    fn renders_no_match_message_in_the_shortest_pane() {
+        let tmp = TempDir::new("short-pane");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        // 一致するサブフォルダが無い断片 = 起動ボタン行だけが残る
+        state.path.set_text(&root.join("zzz").to_string_lossy());
+        state.refresh_from_input();
+        assert!(state.no_folder_rows());
+
+        // 一覧に 1 行だけ割ける最小の高さ
+        let pane = Rect::new(0, 0, 40, 14);
+        assert_eq!(NewLayout::compute(pane).list_height, 1);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(pane.width, pane.height))
+                .unwrap();
+        terminal
+            .draw(|frame| {
+                draw_new_view(frame, pane, &mut state, true, false);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..pane.height)
+            .flat_map(|y| (0..pane.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buffer.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect();
+        assert!(
+            text.contains("no matching folders"),
+            "0 件の理由が描画されていない: {text:?}"
+        );
     }
 
     #[test]
