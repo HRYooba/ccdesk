@@ -956,13 +956,25 @@ pub(crate) fn start_new_session(app: &mut App) -> anyhow::Result<()> {
 
 /// そのフォルダを登録プロジェクトへ加える。**プロジェクトの登録経路はここだけ**
 /// （明示的な「追加」UI は持たず、セッションを作った時点で登録される）。
-/// 並びは登録順＝新しいものが末尾で、画面上の並びは見出し側がアルファベット順に決める
+///
+/// 並びは**最近使った順**で、末尾が最後に使ったフォルダ。既に登録済みでも末尾へ
+/// 動かすのが要点: 追い出しは先頭から起きるので、動かさないと「毎日使っているが
+/// 最初に登録したフォルダ」が次の 1 件で落ちる ＝ 上限が LRU ではなく FIFO になり、
+/// この一覧が防ごうとしている失敗（最後のセッションを消すと見出し＝入口が消える）を
+/// 自分で招く。画面上の並びは見出し側がアルファベット順に決めるので、
+/// この並び替えは表示には出ない
 fn register_project(app: &mut App, cwd: &str) {
-    if cwd.is_empty() || app.projects.iter().any(|p| same_dir(p, cwd)) {
+    if cwd.is_empty() {
         return;
     }
-    app.projects.push(cwd.to_string());
-    // 上限を超えたら古い側から落とす。登録が自動なので、放っておくと
+    // 登録済みなら**その表記のまま**末尾へ動かす（同じフォルダの大小・末尾区切り違いで
+    // 保存済みの見た目が入れ替わらない。同一性の判定は same_dir が持つ）
+    let entry = match app.projects.iter().position(|p| same_dir(p, cwd)) {
+        Some(i) => app.projects.remove(i),
+        None => cwd.to_string(),
+    };
+    app.projects.push(entry);
+    // 上限を超えたら**最も長く使っていない側**から落とす。登録が自動なので、放っておくと
     // 「一度試しただけのフォルダ」が state.json に永久に積まれ見出しも際限なく増える。
     // 落ちたフォルダにセッションが残っていれば見出しは cwd 由来で出続けるので、
     // 落ちたこと自体が操作の邪魔にならない
@@ -2887,6 +2899,35 @@ mod tests {
             app.projects.last().map(String::as_str),
             Some(format!("C:\\dev\\p{PROJECTS_LIMIT}").as_str()),
             "最新の登録が入っていない"
+        );
+    }
+
+    /// **使い直したフォルダは追い出されない（最近使った順で残す）。** 上限まで
+    /// 埋まった状態で毎日使っているフォルダが、次の 1 件で落ちてはいけない
+    /// （登録が消え、最後のセッションを消した時点で見出し＝入口まで消える）
+    #[test]
+    fn reusing_a_folder_keeps_it_when_the_limit_evicts() {
+        let mut app = test_app(34, TERM);
+        for i in 0..PROJECTS_LIMIT {
+            register_project(&mut app, &format!("C:\\dev\\p{i}"));
+        }
+        // 最初に登録したフォルダを使い直す ＝ 最近使った側へ動く
+        register_project(&mut app, "C:\\dev\\p0");
+        register_project(&mut app, "C:\\dev\\new");
+        assert_eq!(app.projects.len(), PROJECTS_LIMIT, "上限を超えて積まれている");
+        assert!(
+            app.projects.iter().any(|p| p == "C:\\dev\\p0"),
+            "使い直したフォルダが落ちた"
+        );
+        // 代わりに落ちるのは「最も長く使っていない」p1（p0 は使い直した時点で末尾へ動く）
+        assert!(
+            !app.projects.iter().any(|p| p == "C:\\dev\\p1"),
+            "上限を超えたのに最も長く使っていない登録が残っている"
+        );
+        assert_eq!(
+            app.projects.last().map(String::as_str),
+            Some("C:\\dev\\new"),
+            "最後に使ったフォルダが末尾に来ていない"
         );
     }
 
