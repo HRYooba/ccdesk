@@ -881,11 +881,6 @@ mod tests {
             assert!(contains(pane, cursor.pos), "非表示でも位置は確定させる");
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     /// テスト用の一時ディレクトリ。drop で必ず再帰削除するので、
     /// アサーション失敗（= panic）で抜けても後片付けが漏れない
