@@ -246,13 +246,23 @@ fn clip_to_width(s: &str, width: u16) -> String {
     out
 }
 
-/// モーダルの矩形。描画とクリック判定で同じ計算を共有する
+/// モーダルの矩形。描画とクリック判定で同じ計算を共有する。
+///
+/// 幅は内容が決める（[`crate::app::PopupKind::width`]）ので、サイドバーより広い
+/// メニューは右ペインに被る。アカウント表示名や email を切って読めなくするより、
+/// 被せて全部読ませる方を選んだ。
+///
+/// ただし**端末の外へは出さない**: 矩形が画面外へ出ると ratatui の描画が壊れるので、
+/// 幅・高さを端末サイズで丸めてから位置を決める（項目数が端末の高さを超える場合は
+/// 入る分だけを描く）
 pub(crate) fn popup_rect(app: &App, popup: &Popup) -> Rect {
-    let entries = popup.entries(app.grouping);
-    let width = 14u16;
-    let height = entries.len() as u16 + 2;
-    let x = 1u16.min(app.sidebar_width.saturating_sub(width));
-    let y = (popup.anchor_y + 1).min(app.term_size.1.saturating_sub(height));
+    let entries = popup.kind.entries(app.grouping);
+    let (term_w, term_h) = (app.term_size.0.max(1), app.term_size.1.max(1));
+    let width = popup.kind.width(app.grouping).min(term_w);
+    let height = entries.len().saturating_add(2).min(term_h as usize) as u16;
+    // 左端はサイドバー内の x=1 固定。端末に収まらないときだけ左へ寄せる
+    let x = 1u16.min(term_w - width);
+    let y = popup.anchor_y.saturating_add(1).min(term_h - height);
     Rect::new(x, y, width, height)
 }
 
@@ -830,7 +840,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
 
     // コンテキストメニュー（モーダル）。矩形はクリック判定と同じ popup_rect を使う
     if let Some(popup) = &app.popup {
-        let entries = popup.entries(app.grouping);
+        let entries = popup.kind.entries(app.grouping);
         let area = popup_rect(app, popup);
         frame.render_widget(ratatui::widgets::Clear, area);
         let lines: Vec<ListItem> = entries
