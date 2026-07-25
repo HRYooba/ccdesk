@@ -21,10 +21,11 @@ Agent View.
 - **Account line** in the sidebar footer, showing the signed-in Claude account, the same value
   `ccdesk doctor` prints. A login or logout that rewrites `~/.claude/.credentials.json` shows
   up in ~1 s; where credentials live outside that file, only the ~60 s refresh applies
-- **Version and self-update row** at the top of the sidebar: ccdesk's own version, plus a
-  clickable `⟳ update ccdesk vX → vY` row when a newer release exists. The check runs once
-  per launch (no polling). The download is verified by SHA-256 before anything is replaced;
-  the running process keeps the old version and the new one applies on the next launch
+- **Version line and update notice** at the top of the sidebar: ccdesk's own version, plus a
+  `⟳ vX.Y.Z · run: ccdesk update` notice when a newer release exists. The check runs once per
+  launch (no polling); the notice is informational — updating is always `ccdesk update`, which
+  verifies the download by SHA-256 before replacing anything. The running process keeps the old
+  version and the new one applies on the next launch
 - **Mouse-first**: click to switch/focus, ☰ menu for stop/delete, drag the border to resize
 - **Keyboard**: `Ctrl+X` stop→delete, `Ctrl+S` toggle grouping, `Alt+←/→` pane focus,
   `Ctrl+Q` quit — everything else passes through to claude untouched. On the new-session
