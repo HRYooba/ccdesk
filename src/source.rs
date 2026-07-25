@@ -407,17 +407,41 @@ mod tests {
         assert_eq!(window.grouping, Grouping::State);
     }
 
-    /// 撮影は開発者の設定を書き換えない。保存要求を投げても state.json は変わらない
-    /// （万一漏れても実害が小さい値を渡す: 存在しない last_view は
-    ///  次回起動で new session 画面へフォールバックするだけ）
+    /// このテストしか書き得ない番人の値。**「実ファイルが変わっていないこと」を
+    /// 検査に使わないための道具**で、テストが投げた保存要求の値が実ファイルに
+    /// 現れたかどうかだけを見る。
+    ///
+    /// プロセス ID で一意にするのが要点で、これが 2 つの落とし穴を同時に閉じる:
+    /// - **同時に走る書き手で落ちない。** 開発者が ccdesk を使っていれば、
+    ///   セッションを切り替えるたびに live 側が `WindowItem::LastView` を保存する。
+    ///   前後の一致を検査する形は、その書き込みが 2 回の読み取りの間に挟まるだけで
+    ///   落ちる（＝偶然ではなく構造的に落ちるテストになる）
+    /// - **過去の実行が後の実行を落とさない。** 万一漏れて書かれた値が残っても、
+    ///   次の実行は別の pid を使うので古い値には反応しない
+    fn write_sentinel(kind: &str) -> String {
+        format!("demo-must-not-write-{kind}-{}", std::process::id())
+    }
+
+    /// 撮影は開発者の設定を書き換えない。保存要求を投げても、その値は
+    /// state.json に現れない（漏れても実害が小さい値を渡す: 存在しない last_view は
+    /// 次回起動で new session 画面へフォールバックし、last_folder も
+    /// 実在しないパスなら起動ディレクトリへ落ちるだけ）。
+    /// 検査の形の理由は [`write_sentinel`] を参照
     #[test]
     fn demo_does_not_persist_window_state() {
-        let before = load_state("last_view");
-        DemoSource.save_window(WindowItem::LastView("demo-must-not-write"));
-        assert_eq!(
-            load_state("last_view"),
-            before,
-            "demo が state.json を書き換えている"
+        let view = write_sentinel("view");
+        let folder = write_sentinel("folder");
+        DemoSource.save_window(WindowItem::LastView(&view));
+        DemoSource.save_window(WindowItem::LastFolder(&folder));
+        assert_ne!(
+            load_state("last_view").as_deref(),
+            Some(view.as_str()),
+            "demo が state.json（last_view）を書き換えている"
+        );
+        assert_ne!(
+            load_state("last_folder").as_deref(),
+            Some(folder.as_str()),
+            "demo が state.json（last_folder）を書き換えている"
         );
     }
 
@@ -491,28 +515,37 @@ mod tests {
         assert_eq!(accounts, sorted);
     }
 
-    /// **撮影はアカウントファイルを書かない。** 保管の変更要求を投げても
-    /// `~/.ccdesk/accounts.json` は作られない（実アカウントのトークンを触らせない）。
-    /// ここでは実パスの **存在だけ** を前後で比べる（読むだけで書き込まない）
+    /// **撮影はアカウントファイルを書かない。** 保管の変更要求を投げても、
+    /// その email は実 `accounts.json` に現れない（実アカウントのトークンを触らせない）。
+    ///
+    /// 検査の形は [`write_sentinel`] と同じ理由で「番人の値が現れたか」だけを見る。
+    /// 実ファイルの状態（存在・中身）を前後で比べる形は、開発者がアカウントを
+    /// 登録・切替したタイミングで落ちる ＝ 検査したい事実と関係のない理由で落ちる。
+    ///
+    /// 保管に無い相手への `Switch` も混ぜてある: 実データならこの要求は必ず
+    /// `Err`（no stored credentials）になるので、`Ok` で返ること自体が
+    /// **ストアを引きに行っていない**ことの証拠になる（ファイルを見ない検査）
     #[test]
     fn demo_does_not_write_the_account_store() {
-        let store = ccdesk::accounts_store_path();
-        let existed = store.as_ref().map(|p| p.exists());
-        let account = Account::new("you@example.com", "you · Acme, Inc.");
+        let email = format!("{}@invalid", write_sentinel("account"));
+        let account = Account::new(&email, "demo");
         for action in [
             AccountAction::Register(&account),
             AccountAction::Switch {
-                email: "you@personal.example",
+                email: &email,
                 active: Some(&account),
             },
-            AccountAction::Unregister("you@personal.example"),
+            AccountAction::Unregister(&email),
         ] {
             DemoSource.apply_account(action).expect("撮影で失敗を出さない");
         }
-        assert_eq!(
-            store.as_ref().map(|p| p.exists()),
-            existed,
-            "demo が保管ファイルを作っている"
+        // 読むのはドメイン API 経由（email とラベルだけ。トークンは手元に取らない）
+        let stored = AccountStore::detect()
+            .map(|store| store.list())
+            .unwrap_or_default();
+        assert!(
+            !stored.iter().any(|a| a.email == email),
+            "demo が保管ファイルへ書いている"
         );
     }
 
