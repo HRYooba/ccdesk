@@ -24,8 +24,8 @@ mod update;
 use app::{clamp_sidebar, instant_ago, open_short, run, App, Focus, RightView, JOBS_LIMIT};
 use cli::{print_usage, run_doctor, show_logs, statusline_hook, update_self};
 use poll::{
-    demo_footer, demo_jobs, spawn_agents_poller, spawn_footer_poller, spawn_self_update_check,
-    FooterInfo, Grouping, SelfUpdate,
+    demo_footer, demo_jobs, spawn_agents_poller, spawn_ccdesk_version_check, spawn_footer_poller,
+    FooterInfo, Grouping,
 };
 use theme::HOST_COLORS;
 
@@ -143,10 +143,9 @@ fn main() -> anyhow::Result<()> {
         footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        self_update: SelfUpdate::default(),
-        self_update_shared: Arc::new(Mutex::new(SelfUpdate::default())),
-        self_update_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        ccdesk_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ccdesk_latest: None,
+        ccdesk_latest_shared: Arc::new(Mutex::new(None)),
+        ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         usage_display: load_setting("usage_display").as_deref() == Some("on"),
         usage: None,
         last_usage_read: instant_ago(Duration::from_secs(60)),
@@ -172,8 +171,11 @@ fn main() -> anyhow::Result<()> {
             app.footer_dirty.clone(),
             app.footer_refresh.clone(),
         );
-        // ccdesk 自身の更新チェックは起動時 1 回だけ（周期ポーリングしない）
-        spawn_self_update_check(app.self_update_shared.clone(), app.self_update_dirty.clone());
+        // ccdesk 自身の版チェックは起動時 1 回だけ（周期ポーリングしない）
+        spawn_ccdesk_version_check(
+            app.ccdesk_latest_shared.clone(),
+            app.ccdesk_latest_dirty.clone(),
+        );
     }
     // 前回開いていた画面を復元: セッションを見ていたなら再 attach、それ以外は new session 画面
     match load_state("last_view") {

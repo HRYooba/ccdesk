@@ -10,10 +10,10 @@ use std::time::Duration;
 use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, Focus, Popup, RightView, RowAction};
-use crate::poll::{classify, AccountStatus, Bucket, Group, Grouping, SelfUpdate, StateView};
+use crate::poll::{classify, AccountStatus, Bucket, Group, Grouping, StateView};
 use crate::session::SessionStatus;
 use crate::theme::{
-    ui, usage_color, C_ATTENTION, C_FAIL, C_OK, C_WORKING, FOCUS_BORDER, MUTED_FG,
+    ui, usage_color, C_ATTENTION, C_FAIL, C_WORKING, FOCUS_BORDER, MUTED_FG,
 };
 use crate::ui::new_view::draw_new_view;
 
@@ -38,7 +38,7 @@ pub(crate) struct SidebarLayout {
     /// フッターを描くか（狭すぎる端末では描かない = クリックも受けない）
     pub(crate) footer_visible: bool,
     /// フッターの claude 更新行（`⟳ update claude X → Y`）を出すか。
-    /// サイドバー先頭にある ccdesk 自身の更新行とは別物
+    /// サイドバー先頭にある ccdesk 自身の更新告知（クリック不可）とは別物
     pub(crate) update_row_visible: bool,
     /// アカウント行の画面 y（footer_visible のときだけ有効）
     pub(crate) account_y: u16,
@@ -65,27 +65,34 @@ pub(crate) fn sidebar_layout(app: &App) -> SidebarLayout {
     }
 }
 
-/// ccdesk 更新行のラベルと色。
+/// サイドバーを横断する区切り線のテキスト（枠の内側幅ぶん）
+fn separator_text(inner_width: u16) -> String {
+    "─".repeat(inner_width as usize)
+}
+
+/// 更新告知の文面。**クリックできない告知**なので、何をすれば更新できるかを
+/// 文面に入れる（実行手段は `ccdesk update` だけ）。
 ///
-/// フッターには claude 用の更新行（`⟳ update claude X → Y`）が既にあるので、
-/// **どの状態でも "ccdesk" を含めて**押し間違いが起きないようにする。
-/// 見た目（記号と色の使い方）は claude 側の行に揃える。
-/// 純関数なので文言の取り違えをテストで固定できる
-fn self_update_label(state: &SelfUpdate, updating: bool) -> (String, Color) {
-    if updating {
-        return ("⟳ updating ccdesk…".to_string(), C_WORKING);
+/// 幅の予算: サイドバー既定 34 桁 = 内側 32 桁。長い版番号で溢れても意図が残るよう
+/// 版番号を先に置く（List は右端で切るだけなので、後ろの語から失われる）
+fn update_notice(tag: &str) -> String {
+    format!("⟳ {tag} · run: ccdesk update")
+}
+
+/// サイドバー最上部の固定行（ccdesk 自身の版 / 更新告知 / 区切り線）。
+///
+/// 版行と区切り線は常時、告知行は新しいリリースがあるときだけ。どの行も
+/// クリックできないので、呼び出し側は `sidebar_rows` へ `None` を積む
+/// （区切り線と同じ扱い）。Frame に触らない純関数なので行構成をテストで固定できる
+fn ccdesk_info_rows(latest: Option<&str>, inner_width: u16) -> Vec<(String, Style)> {
+    let dim = Style::default().fg(ui().dim);
+    let mut rows = vec![(format!("ccdesk v{}", env!("CARGO_PKG_VERSION")), dim)];
+    if let Some(tag) = latest {
+        // 告知は本文色。dim だと更新の存在に気づかない
+        rows.push((update_notice(tag), Style::default().fg(MUTED_FG)));
     }
-    match state {
-        SelfUpdate::Available(tag) => (
-            format!("⟳ update ccdesk v{} → {tag}", env!("CARGO_PKG_VERSION")),
-            MUTED_FG,
-        ),
-        // 自動で再起動はしない。次回起動から有効になることだけ伝える
-        SelfUpdate::Installed(tag) => (format!("✓ ccdesk {tag} — restart to apply"), C_OK),
-        SelfUpdate::Failed(msg) => (format!("× ccdesk update failed: {msg}"), C_FAIL),
-        // 行自体が出ないので到達しない（[`App::self_update_row_visible`]）
-        SelfUpdate::UpToDate => (String::new(), MUTED_FG),
-    }
+    rows.push((separator_text(inner_width), dim));
+    rows
 }
 
 /// モーダルの矩形。描画とクリック判定で同じ計算を共有する
@@ -442,42 +449,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             rows.push(Some(d.action.clone()));
         };
 
-    // サイドバー内を横断する区切り線（同じ線を 2 か所で使う）
-    let separator = || {
-        ListItem::new(
-            Line::from("─".repeat(chunks[0].width.saturating_sub(2) as usize))
-                .style(Style::default().fg(ui().dim)),
-        )
-    };
+    let inner_width = chunks[0].width.saturating_sub(2);
 
-    // 先頭: ccdesk 自身のバージョン
-    items.push(ListItem::new(
-        Line::from(format!("ccdesk v{}", env!("CARGO_PKG_VERSION")))
-            .style(Style::default().fg(ui().dim)),
-    ));
-    rows.push(None);
-    // 新しいリリースがあるときだけ出る更新行（クリックで更新）。
-    // フッターの claude 更新行（⟳ update claude X → Y）とは別のアクションなので、
-    // どの状態でも文言に "ccdesk" を入れて必ず区別できるようにする
-    if app.self_update_row_visible() {
-        let cur = rows.len();
-        let highlighted = hovered == Some(cur) || selected == cur;
-        let ccdesk_updating = app
-            .ccdesk_updating
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let (label, color) = self_update_label(&app.self_update, ccdesk_updating);
-        let mut style = Style::default().fg(color);
-        if highlighted {
-            style = style.bg(ui().hl_bg).fg(ui().emph);
-        }
-        items.push(ListItem::new(Line::from(label).style(style)));
-        // 押せるのは「更新できる」ときだけ（更新中・更新済み・失敗の行は表示専用）
-        let clickable = !ccdesk_updating && matches!(app.self_update, SelfUpdate::Available(_));
-        rows.push(clickable.then_some(RowAction::UpdateSelf));
+    // 先頭: ccdesk 自身の版・更新告知・区切り線（いずれもクリック不可）
+    for (text, style) in ccdesk_info_rows(app.ccdesk_latest.as_deref(), inner_width) {
+        items.push(ListItem::new(Line::from(text).style(style)));
+        rows.push(None);
     }
-    // 区切り線: 自分自身の情報とセッション操作（+ new session 以下）を分ける
-    items.push(separator());
-    rows.push(None);
 
     // 新規セッション
     {
@@ -491,7 +469,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         rows.push(Some(RowAction::New));
     }
     // 区切り線: new session（アクション）とセッション一覧領域を分ける（Desktop 風）
-    items.push(separator());
+    items.push(ListItem::new(
+        Line::from(separator_text(inner_width)).style(Style::default().fg(ui().dim)),
+    ));
     rows.push(None);
     // グルーピング切替（クリックで state ⇔ directory）
     {
@@ -523,7 +503,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         .style(Style::default().fg(ui().dim)),
     ));
     rows.push(None);
-    // ここまでが固定ヘッダー。行数は更新行の有無で変わるので、積んだ数をそのまま
+    // ここまでが固定ヘッダー。行数は更新告知の有無で変わるので、積んだ数をそのまま
     // 正本にする（ヒットテストとスクロール計算が読む。定数と二重管理にしない）
     let header_n = rows.len();
 
@@ -866,42 +846,46 @@ mod tests {
         }
     }
 
-    /// ccdesk の更新行は、フッターの claude 更新行と必ず文言で区別できること。
-    /// どちらも `⟳ update … → …` の形なので、"ccdesk" が入らないと押し間違える
+    /// 行構成: 版行と区切り線は常時、告知行は新しいリリースがあるときだけ。
+    /// 告知の有無で行数が 1 だけ変わる（この差が固定ヘッダー行数の増減になる）
     #[test]
-    fn self_update_label_never_looks_like_the_claude_row() {
-        let states = [
-            SelfUpdate::Available("v9.9.9".into()),
-            SelfUpdate::Installed("v9.9.9".into()),
-            SelfUpdate::Failed("SHA-256 mismatch".into()),
-        ];
-        for state in &states {
-            for updating in [false, true] {
-                let (label, _) = self_update_label(state, updating);
-                assert!(label.contains("ccdesk"), "{label:?}");
-                assert!(!label.contains("claude"), "{label:?}");
-            }
-        }
+    fn ccdesk_info_rows_add_only_the_notice_when_an_update_exists() {
+        let without = ccdesk_info_rows(None, 32);
+        let with = ccdesk_info_rows(Some("v9.9.9"), 32);
+        assert_eq!(without.len(), 2, "版行と区切り線だけのはず");
+        assert_eq!(with.len(), 3, "告知行が 1 行増えるだけのはず");
+        // 版行は先頭・区切り線は末尾で、告知はその間に入る（前後が動かない）
+        assert_eq!(with[0].0, without[0].0);
+        assert_eq!(with[2].0, without[1].0);
+        assert!(with[0].0.contains(env!("CARGO_PKG_VERSION")), "{:?}", with[0].0);
+        assert_eq!(with[2].0, separator_text(32));
     }
 
-    /// 各状態が伝えるべきことを固定する: 更新できる版・実行中・
-    /// 「再起動で有効」・失敗
+    /// 告知はクリックできないので、文面だけで「新しい版がある」と
+    /// 「`ccdesk update` を実行すればよい」の両方が伝わること
     #[test]
-    fn self_update_label_states() {
-        let (available, _) = self_update_label(&SelfUpdate::Available("v9.9.9".into()), false);
-        assert!(available.contains(env!("CARGO_PKG_VERSION")) && available.contains("v9.9.9"));
+    fn update_notice_states_the_new_version_and_the_command() {
+        let notice = update_notice("v9.9.9");
+        assert!(notice.contains("v9.9.9"), "{notice:?}");
+        assert!(notice.contains("ccdesk update"), "{notice:?}");
+        // フッターの claude 更新行（⟳ update claude X → Y）と混同しない
+        assert!(!notice.contains("claude"), "{notice:?}");
+    }
 
-        let (updating, _) = self_update_label(&SelfUpdate::Available("v9.9.9".into()), true);
-        assert!(updating.contains("updating"));
-
-        let (installed, _) = self_update_label(&SelfUpdate::Installed("v9.9.9".into()), false);
-        assert!(
-            installed.contains("v9.9.9") && installed.contains("restart"),
-            "更新後に再起動が必要なことを伝えていない: {installed:?}"
-        );
-
-        let (failed, _) = self_update_label(&SelfUpdate::Failed("mismatch".into()), false);
-        assert!(failed.contains("failed") && failed.contains("mismatch"));
+    /// 既定のサイドバー幅（34 桁 = 内側 32 桁）で切られない。
+    /// 溢れる場合も版番号が先に来るので意図は残る
+    #[test]
+    fn update_notice_fits_the_default_sidebar_width() {
+        for tag in ["v0.3.0", "v1.2.3", "v10.20.30"] {
+            let notice = update_notice(tag);
+            assert!(
+                notice.chars().count() <= 32,
+                "既定幅に収まらない: {notice:?} ({} 桁)",
+                notice.chars().count()
+            );
+            // 先頭が版番号側（切られても版が残る語順）
+            assert!(notice.starts_with(&format!("⟳ {tag}")), "{notice:?}");
+        }
     }
 
     /// inner が潰れてもペイン矩形の外（枠の列や端末外）へ出ない。

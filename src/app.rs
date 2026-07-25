@@ -11,7 +11,7 @@ use ratatui::layout::{Position, Rect};
 use ccdesk::{log_error, save_setting, save_state, scan_jobs, BgJob};
 
 use crate::keys::{encode_key, forward_mouse};
-use crate::poll::{demo_jobs, read_usage, AgentInfo, FooterInfo, Grouping, SelfUpdate, UsageInfo};
+use crate::poll::{demo_jobs, read_usage, AgentInfo, FooterInfo, Grouping, UsageInfo};
 use crate::session::Session;
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
 use crate::ui::{draw, popup_rect, sidebar_layout};
@@ -41,8 +41,6 @@ pub(crate) enum RowAction {
     NewIn(String), // 指定フォルダで新規セッション画面を開く（プロジェクト見出しの +）
     ToggleGroup,   // グルーピング切替（state ⇔ directory）
     Open(String),  // short id: ウィンドウが開いていれば切替、無ければ claude attach
-    // ccdesk 自身の更新（サイドバー先頭の更新行）。フッターの claude 更新行とは別物
-    UpdateSelf,
 }
 
 /// モーダルの種類
@@ -102,8 +100,8 @@ pub(crate) struct App {
     pub(crate) term_size: (u16, u16), // (width, height)
     // サイドバー行 → クリック動作の対応（draw で構築）
     pub(crate) sidebar_rows: Vec<Option<RowAction>>,
-    // サイドバー上部の固定行数（ccdesk 版表示・更新行・区切り線・+ new session・
-    // 区切り線・⊞ group・集計行）。更新行の有無で増減するので定数にはできない。
+    // サイドバー上部の固定行数（ccdesk 版表示・更新告知・区切り線・+ new session・
+    // 区切り線・⊞ group・集計行）。更新告知の有無で増減するので定数にはできない。
     // 正本は draw（積んだ行数をそのまま記録する）で、ヒットテストとスクロール計算は
     // sidebar_rows と同じく「最後に描いた値」を読む
     pub(crate) sidebar_header_rows: usize,
@@ -124,12 +122,11 @@ pub(crate) struct App {
     pub(crate) footer_refresh: Arc<std::sync::atomic::AtomicBool>,
     // claude update 実行中（ボタン連打防止と "updating…" 表示）
     pub(crate) claude_updating: Arc<std::sync::atomic::AtomicBool>,
-    // ccdesk 自身の更新（起動時 1 回のチェック + 更新行クリックの結果）
-    pub(crate) self_update: SelfUpdate,
-    pub(crate) self_update_shared: Arc<Mutex<SelfUpdate>>,
-    pub(crate) self_update_dirty: Arc<std::sync::atomic::AtomicBool>,
-    // ccdesk update 実行中（行の連打防止と "updating…" 表示）
-    pub(crate) ccdesk_updating: Arc<std::sync::atomic::AtomicBool>,
+    // ccdesk 自身の新しいリリース（起動時 1 回のチェック）。
+    // 新しい版があるときだけ Some = サイドバーの更新告知行を出す
+    pub(crate) ccdesk_latest: Option<String>,
+    pub(crate) ccdesk_latest_shared: Arc<Mutex<Option<String>>>,
+    pub(crate) ccdesk_latest_dirty: Arc<std::sync::atomic::AtomicBool>,
     // 使用率表示（opt-in: config.json の usage_display = "on"）
     pub(crate) usage_display: bool,
     pub(crate) usage: Option<UsageInfo>,
@@ -177,16 +174,6 @@ impl App {
     pub(crate) fn open_new_view(&mut self) {
         self.right_view = RightView::New(NewState::browse(&self.dispatch_cwd));
         save_state("last_view", "new"); // 次回起動時に同じ画面を復元する
-    }
-
-    /// ccdesk の更新行を出すか。未取得・最新のときだけ出さない
-    /// （更新中・更新済み・失敗はどれも状況を伝える必要がある）。
-    /// この判定がそのまま `sidebar_header_rows` の増減になるので、
-    /// 行を積む draw と同じ関数を見る
-    pub(crate) fn self_update_row_visible(&self) -> bool {
-        self.ccdesk_updating
-            .load(std::sync::atomic::Ordering::Relaxed)
-            || self.self_update != SelfUpdate::UpToDate
     }
 
     /// フォーカス変更（PTY への focus in/out 通知つき）。
@@ -419,13 +406,13 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 .clone();
             force_draw = true;
         }
-        // ccdesk 自身の更新状態（起動時チェック / 更新スレッド）を取り込む
+        // ccdesk 自身の新しいリリース（起動時チェック）を取り込む
         if app
-            .self_update_dirty
+            .ccdesk_latest_dirty
             .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            app.self_update = app
-                .self_update_shared
+            app.ccdesk_latest = app
+                .ccdesk_latest_shared
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
@@ -548,7 +535,6 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                                     app.open_new_view();
                                     app.set_focus(Focus::Terminal);
                                 }
-                                Some(RowAction::UpdateSelf) => start_self_update(app),
                                 Some(RowAction::ToggleGroup) => {
                                     // 画面上の行位置（固定ヘッダーより下はスクロール補正）
                                     let y = if app.selected_row < app.sidebar_header_rows {
@@ -881,8 +867,6 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                     open_short(app, &short);
                     app.set_focus(Focus::Terminal);
                 }
-                // 更新行はサイドバーに留まる（右ペインの表示を変えない）
-                Some(RowAction::UpdateSelf) => start_self_update(app),
                 None => {}
             }
         }
@@ -1191,42 +1175,6 @@ fn start_claude_update(app: &mut App) {
             .output();
         updating.store(false, std::sync::atomic::Ordering::Relaxed);
         refresh.store(true, std::sync::atomic::Ordering::Relaxed);
-        dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-    });
-}
-
-/// ccdesk 自身の更新を実行する（サイドバーの更新行クリック / Enter）。
-/// ダウンロード → SHA-256 検証 → 実行ファイル差し替えで数秒かかるので別スレッドへ出す。
-/// 走っているプロセスは現行版のまま動き続け、新しい版は次回起動から有効
-/// （claude 側と同じ扱い。ccdesk を自動で再起動はしない）
-fn start_self_update(app: &mut App) {
-    // 押せるのは「新しいリリースがある」状態のときだけ。更新済み・失敗の行は表示専用
-    let SelfUpdate::Available(tag) = app.self_update.clone() else {
-        return;
-    };
-    if app
-        .ccdesk_updating
-        .swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
-        return; // 実行中の多重起動を防ぐ
-    }
-    let updating = app.ccdesk_updating.clone();
-    let shared = app.self_update_shared.clone();
-    let dirty = app.self_update_dirty.clone();
-    std::thread::spawn(move || {
-        let next = match crate::update::install(&tag) {
-            Ok(_) => SelfUpdate::Installed(tag),
-            Err(e) => {
-                log_error(&format!("ccdesk update 失敗: {e}"));
-                SelfUpdate::Failed(e.to_string())
-            }
-        };
-        *shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
-        // 先に結果を置いてから実行中フラグを下ろす（"updating…" のまま
-        // 古いラベルへ戻る中間状態を UI に見せない）
-        updating.store(false, std::sync::atomic::Ordering::Relaxed);
         dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 }
