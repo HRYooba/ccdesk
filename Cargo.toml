@@ -1,6 +1,6 @@
 [package]
 name = "ccdesk"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Claude Code session manager TUI modeled after Claude Desktop and Agent View — see, switch, and drive all your sessions in one terminal"
 license = "MIT"
