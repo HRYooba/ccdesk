@@ -14,7 +14,10 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use ccdesk::{load_setting, load_state, save_setting, save_state, scan_jobs, BgJob};
+use ccdesk::{
+    load_setting, load_state, load_state_list, save_setting, save_state, save_state_list,
+    scan_jobs, BgJob,
+};
 
 use crate::poll::{
     read_usage, spawn_agents_poller, spawn_ccdesk_version_check, spawn_footer_poller,
@@ -23,6 +26,16 @@ use crate::poll::{
 
 /// サイドバーに載せるセッション数の上限（state.json の走査本数）
 pub(crate) const JOBS_LIMIT: usize = 50;
+
+/// 登録プロジェクト（ディレクトリ）の保持上限。
+///
+/// **上限を設ける判断**: 登録は自動（セッションを作った時点）なので、無制限だと
+/// 「一度だけ試したフォルダ」が state.json に永久に積まれ、サイドバーの見出しも
+/// 際限なく増える。溢れたら古い側から落とす ＝ 最近使ったフォルダが残るので、
+/// 落ちたことが操作の邪魔にならない（セッションがあるフォルダは登録から落ちても
+/// セッション由来で見出しが出続ける）。本数はセッション上限（[`JOBS_LIMIT`]）と
+/// 同じ 50 に揃える: サイドバーに同時に載り得る規模を超えて持つ意味が無い
+pub(crate) const PROJECTS_LIMIT: usize = 50;
 
 /// 実データ側のサイドバー既定幅（保存値が無いとき）
 const DEFAULT_SIDEBAR_WIDTH: u16 = 34;
@@ -48,6 +61,19 @@ const DEMO_SIDEBAR_WIDTH: u16 = 44;
 /// 撮影用の new session 画面の初期フォルダ（実フォルダを出さない）
 const DEMO_CWD: &str = "C:\\dev\\shop-app";
 
+/// 撮影用の登録プロジェクト（実プロジェクトパスを出さない）。
+///
+/// 実データでは「セッションを作ったフォルダ」が自動登録されるので、撮影用も
+/// [`demo_jobs`] の 3 フォルダを登録済みにしておく（demo だけ登録の意味が違う、
+/// という状態を作らない）。末尾の 1 件はセッションを持たないフォルダで、
+/// **セッションが 0 本でも見出しが残る**ことを directory グルーピングの撮影で見せる枠
+const DEMO_PROJECTS: [&str; 4] = [
+    "C:\\dev\\shop-app",
+    "C:\\dev\\api",
+    "C:\\dev\\docs",
+    "C:\\dev\\infra",
+];
+
 /// 起動時に復元するウィンドウ状態。
 /// 「どんな画面で始まるか」は撮影の再現性に直接効くので、セッションデータと同じく
 /// 供給元から受け取る（demo は固定値、live は state.json / config.json）
@@ -58,6 +84,12 @@ pub(crate) struct WindowState {
     /// new session の初期フォルダ
     pub(crate) dispatch_cwd: String,
     pub(crate) grouping: Grouping,
+    /// 登録済みプロジェクト（ディレクトリ）の絶対パス。セッションが 0 本になっても
+    /// directory グルーピングの見出しを残すための実体。
+    /// **Grouping::State では表示に現れない**（state 別の並びにディレクトリ見出しが
+    /// 無いため）。保持しているのは表示の都合ではなくユーザーの登録内容なので、
+    /// グルーピングに関係なく読み書きする
+    pub(crate) projects: Vec<String>,
 }
 
 /// 永続化するウィンドウ状態の 1 項目。
@@ -69,6 +101,9 @@ pub(crate) enum WindowItem<'a> {
     SidebarWidth(u16),
     LastFolder(&'a str),
     Grouping(Grouping),
+    /// 登録プロジェクトの一覧。**差分ではなく全量で渡す**（正本は App 側の一覧で、
+    /// 「今の全量」を書き切る形にしておけば追加と削除で保存経路が分かれない）
+    Projects(&'a [String]),
 }
 
 /// バックグラウンド取得の書き込み先（ポーラーが書き、run ループが dirty で取り込む）
@@ -157,6 +192,14 @@ impl DataSource for LiveSource {
                 Some("directory") => Grouping::Directory,
                 _ => Grouping::State,
             },
+            // **存在しないディレクトリも落とさない**（dispatch_cwd の is_dir と対照的）:
+            // リムーバブルドライブ・ネットワークドライブ・未マウントの作業領域は
+            // 「今この瞬間見えない」だけで、消えたわけではない。ここで黙って隠すと
+            // ドライブを挿し直したときに見出しが復活する理由が読めないし、
+            // 登録を外す操作（remove project）も出せなくなる。
+            // 見えないフォルダで new session を選んだ場合は `claude --bg` が
+            // 失敗して下部バーに出るので、間違いは操作した時点で伝わる
+            projects: load_state_list("projects"),
         }
     }
 
@@ -173,6 +216,7 @@ impl DataSource for LiveSource {
                     Grouping::State => "state",
                 },
             ),
+            WindowItem::Projects(projects) => save_state_list("projects", projects),
         }
     }
 
@@ -210,12 +254,13 @@ impl DataSource for DemoSource {
             last_view: None, // 撮影は必ず new session 画面から始める
             dispatch_cwd: DEMO_CWD.to_string(),
             grouping: Grouping::State,
+            projects: DEMO_PROJECTS.iter().map(|p| p.to_string()).collect(),
         }
     }
 
     fn save_window(&self, _item: WindowItem<'_>) {
         // 撮影が開発者の state.json / config.json を書き換えない
-        // （サイドバー幅・最後に開いた画面・グルーピングを踏み潰さない）
+        // （サイドバー幅・最後に開いた画面・グルーピング・プロジェクト一覧を踏み潰さない）
     }
 
     fn spawn_pollers(&self, _sinks: PollSinks) {
@@ -328,6 +373,49 @@ mod tests {
         assert!(window.last_view.is_none(), "撮影は new session 画面から");
         assert_eq!(window.dispatch_cwd, DEMO_CWD);
         assert_eq!(window.grouping, Grouping::State);
+        assert_eq!(window.projects, DEMO_PROJECTS, "登録プロジェクトも固定値");
+    }
+
+    /// 撮影用の登録プロジェクトは実パスを含まず、demo セッションのフォルダを
+    /// 全部含み（自動登録の結果として整合する）、セッション 0 本のフォルダも 1 件持つ
+    /// （directory グルーピングで見出しだけが残る見た目を撮れる）
+    #[test]
+    fn demo_projects_cover_every_demo_session_folder_plus_an_empty_one() {
+        let projects = DemoSource.window_state().projects;
+        for path in &projects {
+            assert!(path.starts_with("C:\\dev\\"), "実パスらしい登録: {path:?}");
+        }
+        let jobs = DemoSource.jobs();
+        for job in &jobs {
+            assert!(
+                projects.contains(&job.cwd),
+                "セッションのあるフォルダが未登録: {:?}",
+                job.cwd
+            );
+        }
+        let empty: Vec<&String> = projects
+            .iter()
+            .filter(|p| !jobs.iter().any(|j| &j.cwd == *p))
+            .collect();
+        assert_eq!(
+            empty.len(),
+            1,
+            "セッション 0 本の登録フォルダがちょうど 1 件でない: {empty:?}"
+        );
+    }
+
+    /// 撮影はプロジェクト一覧も書かない（開発者の登録を踏み潰さない）
+    #[test]
+    fn demo_does_not_persist_projects() {
+        let before = load_state_list("projects");
+        DemoSource.save_window(WindowItem::Projects(&[
+            "C:\\demo-must-not-write".to_string()
+        ]));
+        assert_eq!(
+            load_state_list("projects"),
+            before,
+            "demo が projects を書き換えている"
+        );
     }
 
     /// 撮影は開発者の設定を書き換えない。保存要求を投げても state.json は変わらない

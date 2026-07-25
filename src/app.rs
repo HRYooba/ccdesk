@@ -39,9 +39,12 @@ pub(crate) enum Focus {
 /// 保持すると実行時に別セッションを stop/rm し得る
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum RowAction {
-    New,           // 新規セッション画面を開く
-    NewIn(String), // 指定フォルダで新規セッション画面を開く（プロジェクト見出しの +）
-    ToggleGroup,   // グルーピング切替（state ⇔ directory）
+    New, // 新規セッション画面を開く
+    /// プロジェクト見出し行 = そのフォルダのメニュー（new session / remove project）を開く。
+    /// **クリック即起動ではない**ので `NewIn` から改名した: 見出しから消した `+`
+    /// （押したら即セッションが立つというヒント）と同じ嘘を型名に残さない
+    Project(String),
+    ToggleGroup, // グルーピング切替（state ⇔ directory）
     Open(String),  // short id: ウィンドウが開いていれば切替、無ければ claude attach
     UpdateCcdesk,  // ccdesk 自身を更新（サイドバー先頭の版行）
     UpdateClaude,  // claude 本体を更新（同じく版行）
