@@ -132,14 +132,35 @@ fn build_command(
     cmd
 }
 
+/// **claude の入力欄の行頭に描かれる文字。**
+///
+/// 正本は実際に描かれた画面で、推測ではない: v2.1.220 を PTY で起こして vt100 の
+/// スクリーンを読むと、入力行は `❯`（U+276F）+ U+00A0（no-break space）で始まる。
+/// 枠付きの入力欄（`│ > `）だった頃の ASCII の `>` も残してあるのは、claude の版で
+/// この文字が変わり得るため。
+///
+/// **候補はこの 1 つの表だけが持つ**（[`input_is_empty`] が引く）ので、
+/// 版が変わって文字が増えてもここへ足すだけで済む。**表に無い文字で描かれた場合は
+/// 「入力欄が見つからない」＝ 送らない側へ倒れる**ので、外したときの害は
+/// 「名前が transcript 経由になる」だけで、打ちかけを消す方へは倒れない
+const PROMPT_MARKS: [char; 2] = ['❯', '>'];
+
 /// カーソルより左の 1 行から「入力欄が空か」を読む（[`Session::input_line_is_empty`] の
 /// 判断。画面を組まずに検査できる）。
 ///
-/// 最後の `>`（claude の入力プロンプト）より右に文字が無ければ空。**`>` が無ければ
-/// 空とは言わない** ＝ 判断がつかないときは「送れない」側へ倒れる
+/// 最後の [`PROMPT_MARKS`] の文字より右に文字が無ければ空。**プロンプトが無ければ
+/// 空とは言わない** ＝ 判断がつかないときは「送れない」側へ倒れる。
+///
+/// 空白の判定に `trim` を使うのは、実測の入力行がプロンプトの直後に U+00A0 を
+/// 置くため（Unicode の White_Space なので `trim` が落とす ＝ ASCII 空白だけを
+/// 見る書き方だと「空でない」に化ける）
 fn input_is_empty(line_up_to_cursor: &str) -> bool {
-    match line_up_to_cursor.rfind('>') {
-        Some(at) => line_up_to_cursor[at + 1..].trim().is_empty(),
+    match line_up_to_cursor
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| PROMPT_MARKS.contains(ch))
+    {
+        Some((at, mark)) => line_up_to_cursor[at + mark.len_utf8()..].trim().is_empty(),
         None => false,
     }
 }
@@ -326,14 +347,19 @@ impl Session {
 
     /// **claude の入力欄が空か**（＝ こちらから 1 行送っても打ちかけを壊さないか）。
     ///
-    /// 判定は画面のカーソル行だけを見る: 行内の最後の `>`（claude の入力プロンプト）から
-    /// カーソル位置までに文字が無ければ空。**カーソル行に `>` が無ければ空とは言わない**
-    /// ので、応答生成中・許可待ちのダイアログ・起動直後（まだ入力欄が出ていない）は
-    /// すべて「送れない」側へ倒れる。
+    /// 判定は画面のカーソル行だけを見る: 行内の最後のプロンプト文字
+    /// （[`PROMPT_MARKS`]）からカーソル位置までに文字が無ければ空。
+    ///
+    /// **この判定が守るのは 1 つだけ ＝ ユーザーの打ちかけを消さないこと。**
+    /// 実測（v2.1.220）では応答生成中もカーソルは空の入力行に居るので、
+    /// そのとき送った行は claude が次の turn へ送るぶんとして受け取る（消えない）。
+    /// 選択肢を並べるダイアログはカーソル行がプロンプト行ではない（トラストの
+    /// 確認画面では `Enter to confirm · Esc to cancel` の行）か、行に選択肢の文字が
+    /// 続くかのどちらかなので、どちらも「空ではない」側へ落ちる。
     ///
     /// **claude の画面の形に依存する判定なので、外したときに倒れる向きを選んである**:
-    /// 形が変わって `>` が見つからなくなっても、起きるのは「PTY へ送らず transcript へ
-    /// 書く」＝ 従来どおりの経路で、ユーザーの打ちかけを消す方へは倒れない
+    /// 形が変わってプロンプトが見つからなくなっても、起きるのは「PTY へ送らず
+    /// transcript へ書く」＝ 従来どおりの経路で、ユーザーの打ちかけを消す方へは倒れない
     pub(crate) fn input_line_is_empty(&self) -> bool {
         let parser = self
             .parser
@@ -451,21 +477,28 @@ mod tests {
         assert_eq!(argv(&cmd), ["-r", id().as_str()]);
     }
 
-    /// **入力欄が空だと言えるのは、プロンプト（`>`）が見えていてその右が空のときだけ。**
+    /// **入力欄が空だと言えるのは、プロンプト文字が見えていてその右が空のときだけ。**
     ///
-    /// この判断が守るのは 2 つ: ユーザーの打ちかけの文字を消さないこと（打ちかけが
-    /// あるときは送らない ＝ 呼び手が transcript へ倒れる）と、claude が入力を
-    /// 受け付けていない画面（応答生成中・許可待ち・起動直後）へ打鍵を投げないこと。
-    /// **判断がつかない形はすべて「空ではない」側**へ倒す
+    /// 入力は**実際に描かれた画面の写し**を使う（claude v2.1.220 を PTY で起こし、
+    /// vt100 のカーソル行を `contents_between` で読んだもの）。理想化した文字列で
+    /// 検査していた頃は、この関数が ASCII の `>` を探していて実機では一度も
+    /// 真にならないのに、テストだけが通っていた
     #[test]
     fn the_input_is_only_empty_when_the_prompt_is_visible_and_nothing_follows_it() {
-        // claude の入力枠（枠線 + プロンプト）。カーソルはプロンプトの直後
+        // 実測: 入力行は `❯` + U+00A0 で始まる（カーソルはその直後）
+        assert!(input_is_empty("\u{276f}\u{a0}"));
+        // 実測: 打ちかけの文字があるとプロンプトの右に残る ＝ 送ると混ざる
+        assert!(!input_is_empty("\u{276f}\u{a0}half-typed"));
+        assert!(!input_is_empty("\u{276f}\u{a0}/ren"));
+        // 実測: 選択肢のダイアログは同じ `❯` を選択マーカーに使うが、右に文字が続く
+        assert!(!input_is_empty("\u{276f} 1. Yes, I trust this folder"));
+        // 実測: ダイアログ表示中のカーソル行（プロンプトが見えない）
+        assert!(!input_is_empty(" Enter to confirm \u{b7} Esc to cancel"));
+        // 枠付きの入力欄だった頃の形（[`PROMPT_MARKS`] に残してある ASCII の `>`）
         assert!(input_is_empty("│ > "));
         assert!(input_is_empty(">"));
-        // 打ちかけの文字がある ＝ 送ると混ざる
         assert!(!input_is_empty("│ > half-typed message"));
-        assert!(!input_is_empty("│ > /ren"));
-        // プロンプトが見えない行（応答生成中のスピナー行・許可待ち・空の画面）
+        // プロンプトが見えない行はすべて「空ではない」側
         for line in ["", "  ", "✻ Thinking…", "│ 1. Yes, allow once"] {
             assert!(!input_is_empty(line), "claimed the input is empty for {line:?}");
         }
