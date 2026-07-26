@@ -639,15 +639,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         if let Some(rx) = app.spawn_rx.take() {
             match rx.try_recv() {
                 Ok(outcome) => {
-                    if let Some(id) = &outcome.id {
-                        // 起動に成功したフォルダだけを次回の new session 初期値にする。
-                        // 保存は UI スレッドに寄せて state.json の書込み競合を避ける
-                        app.source.save_window(WindowItem::LastFolder(&outcome.cwd));
-                        attach_by_id(app, id, &outcome.label, &outcome.cwd);
-                    }
-                    if let Some(err) = outcome.error {
-                        set_notice(app, err);
-                    }
+                    apply_spawn_outcome(app, outcome);
                     app.last_scan = instant_ago(SCAN_INTERVAL);
                     app.last_live_scan = instant_ago(LIVE_SCAN_INTERVAL);
                     force_draw = true;
@@ -954,8 +946,34 @@ pub(crate) fn start_new_session(app: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// そのフォルダを登録プロジェクトへ加える。**プロジェクトの登録経路はここだけ**
-/// （明示的な「追加」UI は持たず、セッションを作った時点で登録される）。
+/// `claude --bg` の結果を状態へ反映する（run ループが `spawn_rx` で受けて呼ぶ）。
+///
+/// **「そのフォルダを使った」の記録をここ 1 箇所に集める**のが要点: 登録プロジェクトと
+/// new session 画面の初期値（[`WindowItem::LastFolder`]）は同じ操作に対する 2 つの
+/// 永続化なので、判断が別だと通知は失敗を報告しているのに見出しだけが生える。
+/// 起動できないフォルダ（打ち間違い・権限が無い・古いネットワークパス）を登録すると
+/// state.json に永久に残るので、**成功した起動だけを記録する**。打った文字列は
+/// `dispatch_cwd`（メモリ上の初期値）に残るので、直して押し直す邪魔にはならない。
+/// 保存を UI スレッドに寄せているのは state.json の書込み競合を避けるため
+fn apply_spawn_outcome(app: &mut App, outcome: SpawnOutcome) {
+    // 成否の判定は `error` 1 つ。`id` で判定しないのは、セッションを起こさない供給元
+    // （撮影用）が「起動を試していない ＝ 失敗もしていない」形でここへ来るため
+    // （実起動では id が取れなければ必ず error が入る ＝ 実データでの判定は変わらない）
+    if outcome.error.is_none() {
+        app.source.save_window(WindowItem::LastFolder(&outcome.cwd));
+        register_project(app, &outcome.cwd);
+    }
+    if let Some(id) = &outcome.id {
+        attach_by_id(app, id, &outcome.label, &outcome.cwd);
+    }
+    if let Some(err) = outcome.error {
+        set_notice(app, err);
+    }
+}
+
+/// そのフォルダを登録プロジェクトへ加える。**呼ばれるのは [`apply_spawn_outcome`]
+/// だけ**（明示的な「追加」UI は持たず、セッションの起動が成功した時点で登録される。
+/// 「登録するか」の判断を散らさないため、呼び出し口を増やさない）。
 ///
 /// 並びは**最近使った順**で、末尾が最後に使ったフォルダ。既に登録済みでも末尾へ
 /// 動かすのが要点: 追い出しは先頭から起きるので、動かさないと「毎日使っているが
@@ -986,7 +1004,7 @@ fn register_project(app: &mut App, cwd: &str) {
 /// 起動時に、既にあるセッションの cwd を登録へ埋め戻す（初回読み込みで 1 度だけ）。
 ///
 /// **既存ユーザーのための経路**: 登録は [`register_project`]（＝ ccdesk から
-/// セッションを作ったとき）だけで起きるので、以前から使っているフォルダは
+/// 立てたセッションの起動が成功したとき）だけで起きるので、以前から使っているフォルダは
 /// 「セッションの cwd」由来でしか見出しが出ない ＝ 最後のセッションを消した時点で
 /// 見出し（＝そのフォルダで新規を開く入口）が消える。ccdesk から次のセッションを
 /// 立てるまでその状態が続くので、起動時に埋めておく。
@@ -1070,21 +1088,29 @@ fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
         set_notice(app, "セッション起動中 — 完了してからもう一度".to_string());
         return;
     }
-    // そのフォルダで作業を始めた ＝ プロジェクト。**登録をここに置くのが要点**で、
-    // new session 画面の起動ボタンと見出しメニューの new session はどちらも
-    // この関数へ収束するため、経路が増えても登録漏れが起きない
-    register_project(app, &cwd);
+    // フォルダの登録はここでは行わない（起動が成功してから ＝ [`apply_spawn_outcome`]）。
+    // 打った文字列は new session 画面の初期値として持つだけに留める
     app.dispatch_cwd = cwd.clone();
     // 起動したら打ち先はそのセッションなので、フォーカスを端末へ移す。
-    // **登録と同じ理由でここに置く**（起動の経路が増えてもフォーカス漏れが起きない）。
+    // **ここに置くのが要点**で、new session 画面の起動ボタンと見出しメニューの
+    // new session はどちらもこの関数へ収束するため、経路が増えても漏れが起きない。
     // 完了後の attach 側に置けないのは、[`App::show_session`] が
     // 「フォーカスは動かさない」契約で、セッション切替と共用のため。
     // 起動完了までの ~1 秒はまだ前のセッションがキーを受ける ＝ 打つには早い状態なので、
     // 下部バーの "starting session…"（`spawn_rx` を見て出る）でそれを見せる
     app.set_focus(Focus::Terminal);
     // 撮影用データは本物のセッションを起こさない（架空の一覧に実セッションが混ざらない）。
-    // フォルダの登録と初期値の更新までは済んでいるので、供給元が違っても状態の育ち方は同じ
+    // 起動しない ＝ 失敗もしないので、「成功したが attach する id は無い」結果を
+    // その場で作って実データと同じ反映経路へ渡す（attach だけを飛ばす ＝
+    // demo だけフォルダの登録の意味が違う、という状態を作らない）
     if !app.source.spawns_sessions() {
+        let outcome = SpawnOutcome {
+            id: None,
+            label: String::new(),
+            cwd,
+            error: None,
+        };
+        apply_spawn_outcome(app, outcome);
         return;
     }
     let (tx, rx) = std::sync::mpsc::channel();
@@ -3037,6 +3063,38 @@ mod tests {
         assert!(
             app.focus == Focus::Terminal,
             "起動したのにキー入力がサイドバーに残る"
+        );
+    }
+
+    /// **起動に失敗したフォルダは登録しない。** 通知が失敗を報告しているのに見出しが
+    /// 生えると、打ち間違い・権限の無いフォルダ・古いネットワークパスが state.json に
+    /// 永久に残る（new session 画面の初期値と同じ判断に揃える ＝ 同じ操作に対する
+    /// 2 つの永続化が別の答えを出さない）
+    #[test]
+    fn a_failed_launch_registers_no_folder() {
+        let mut app = test_app(34, TERM);
+        let failed = SpawnOutcome {
+            id: None,
+            label: String::new(),
+            cwd: "C:\\dev\\api".to_string(),
+            error: Some("claude --bg 起動失敗".to_string()),
+        };
+        apply_spawn_outcome(&mut app, failed);
+        assert!(app.projects.is_empty(), "起動に失敗したフォルダが登録された");
+        assert!(app.notice.is_some(), "失敗が伝わっていない");
+        // 成否の判定は error 1 つ。id が無くても error が無ければ「起動を試していない」
+        // ＝ 失敗ではないので記録する（セッションを起こさない撮影用の供給元がこの形）
+        let not_launched = SpawnOutcome {
+            id: None,
+            label: String::new(),
+            cwd: "C:\\dev\\web".to_string(),
+            error: None,
+        };
+        apply_spawn_outcome(&mut app, not_launched);
+        assert_eq!(
+            app.projects,
+            ["C:\\dev\\web"],
+            "起動結果の反映で登録されない ＝ 登録の判断が起動前に残っている"
         );
     }
 
