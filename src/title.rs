@@ -46,25 +46,52 @@ pub(crate) const UNTITLED: &str = "new session";
 /// `-` + ハッシュになる（claude 本体の規則。実測）
 const DIR_NAME_LIMIT: usize = 200;
 
-/// transcript の末尾から読む量。
+/// 「末尾」と呼ぶ量。**[`Span::Appended`] の候補にとって十分な幅**で、
+/// 手元の 538 本を測ったとき、最後の `ai-title` は EOF から最大 55 KiB・
+/// 99% が 33 KiB 以内にあった。
 ///
-/// **全部は読まない**: 1 セッションの `.jsonl` は 1 MB を超えることがあり、
-/// 一覧の周期処理で全行パースすると行数ぶんの帯域を毎周使う。手元の 538 本を
-/// 測ったとき、最後の `ai-title` は EOF から最大 55 KiB・99% が 33 KiB 以内に
-/// あったので 64 KiB を取る。**足りなくても壊れない**（下位の候補へ落ちるだけ）
+/// **これは全候補に効く上限ではない**（[`Span`]）。1 度しか書かれない候補は
+/// この外に出るので、初回だけ先頭から読む
 const TAIL_BYTES: u64 = 64 * 1024;
 
 /// ユーザーが付けた名前の行の型名と値のキー。**読み（[`CANDIDATES`] の先頭）と
 /// 書き（[`custom_title_line`]）が同じ 1 組を見る**ので、綴りが片側だけ変わらない
 const CUSTOM_TITLE: (&str, &str) = ("custom-title", "customTitle");
 
-/// transcript の 1 行から拾う候補（型名・値のキー・出どころ）。**この配列の順序が
-/// 優先順そのもの**なので、候補を増やすときに触るのはここだけ
-const CANDIDATES: [(&str, &str, TitleSource); 3] = [
-    (CUSTOM_TITLE.0, CUSTOM_TITLE.1, TitleSource::Custom),
-    ("ai-title", "aiTitle", TitleSource::Ai),
-    ("last-prompt", "lastPrompt", TitleSource::LastPrompt),
+/// 候補が transcript の**どこに現れるか**。走査の範囲はこの性質から機械的に決まる
+/// （[`first_scan_from`] / [`Titles::poll`]）ので、候補と範囲の対応表を別に持たない。
+///
+/// **この区別を落とすと実害が出る**: `custom-title` を末尾 64 KiB だけで探していた
+/// 頃は、長い会話の早い段階でリネームした記録が範囲の外に出て拾えず、
+/// transcript 全体を読む `/resume` のピッカーと名前が食い違っていた
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Span {
+    /// セッション中に繰り返し追記される。最新は必ず末尾側にあるので末尾で足りる
+    Appended,
+    /// リネームの瞬間に 1 度だけ書かれる。**ファイルのどこにあるか分からない**
+    Once,
+}
+
+/// transcript の 1 行から拾う候補（型名・値のキー・出どころ・現れる場所）。
+/// **この配列の順序が優先順そのもの**なので、候補を増やすときに触るのはここだけ
+const CANDIDATES: [(&str, &str, TitleSource, Span); 3] = [
+    (CUSTOM_TITLE.0, CUSTOM_TITLE.1, TitleSource::Custom, Span::Once),
+    ("ai-title", "aiTitle", TitleSource::Ai, Span::Appended),
+    ("last-prompt", "lastPrompt", TitleSource::LastPrompt, Span::Appended),
 ];
+
+/// 走査 1 回で見つかった候補（[`CANDIDATES`] と同じ並び）
+type Found = [Option<String>; CANDIDATES.len()];
+
+/// **初回にファイルのどこから読むか。** [`CANDIDATES`] の性質から導く:
+/// 1 度しか書かれない候補が 1 つでもあれば先頭から、全部が追記型なら末尾だけ
+fn first_scan_from(len: u64) -> u64 {
+    if CANDIDATES.iter().any(|(_, _, _, span)| *span == Span::Once) {
+        0
+    } else {
+        len.saturating_sub(TAIL_BYTES)
+    }
+}
 
 /// 表示名として使える 1 行へ整える。改行・連続空白は 1 つの空白へ畳み、
 /// [`TITLE_LEN`] 文字で切る。
@@ -149,38 +176,49 @@ fn projects_dir() -> Option<PathBuf> {
     Some(ccdesk::claude_dir()?.join("projects"))
 }
 
-/// ファイルの末尾 `bytes` バイトを文字列で読む。
-///
-/// 途中から読むので**先頭行は壊れている**（行の途中・UTF-8 の途中で切れる）。
-/// 壊れたバイトは lossy で受け、先頭の 1 行は丸ごと落とす
-fn read_tail(path: &Path, bytes: u64) -> Option<String> {
+/// ファイルの `from` バイト目から終わりまでを文字列で読む
+/// （壊れたバイトは lossy で受ける ＝ 途中から読んでも失敗しない）
+fn read_from(path: &Path, from: u64) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    let from = len.saturating_sub(bytes);
     file.seek(SeekFrom::Start(from)).ok()?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    if from == 0 {
-        return Some(text);
-    }
-    Some(match text.find('\n') {
-        Some(at) => text[at + 1..].to_string(),
-        // 1 行も完結していない ＝ 拾える候補が無い
-        None => String::new(),
-    })
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// transcript の末尾から表示名を選ぶ。
+/// `want` バイト目以前で一番後ろの行の切れ目（先頭からの位置）。
+/// 走査の範囲を行の途中で割らないための計算で、`\n` の位置しか見ないので
+/// UTF-8 の境界を踏み外さない
+fn line_boundary_before(text: &str, want: usize) -> usize {
+    let mut at = 0;
+    for (index, _) in text.match_indices('\n') {
+        if index + 1 > want {
+            break;
+        }
+        at = index + 1;
+    }
+    at
+}
+
+/// 範囲 `text` を走査して候補を拾う。`spans` に載る性質の候補だけを見るので、
+/// 「末尾でしか探さない候補」と「全体で探す候補」を同じ 1 つの走査で表せる。
 ///
-/// 各候補は**最後に現れたものを採る**（セッション中に何度も追記され、末尾側が最新）。
-/// 選ぶのは [`CANDIDATES`] の順（＝ 優先順）で、**上位が 1 つでも見つかれば
-/// 下位は見ない**。壊れた行・知らない形は捨てる
-fn pick_title(tail: &str) -> Option<(String, TitleSource)> {
-    let mut found: [Option<String>; CANDIDATES.len()] = [None, None, None];
-    for line in tail.lines() {
+/// **後から現れた値が前の値を上書きする**（同じ候補は最後に現れたものが最新）。
+/// 壊れた行・知らない形は捨てる。
+///
+/// **JSON を組む前に型名の文字列で弾く**のが速さの要点: transcript は 1 MB を
+/// 超えることがあり、全行をパースすると走査 1 回に行数ぶんの時間がかかる
+fn scan_into(text: &str, spans: &[Span], found: &mut Found) {
+    let wanted = |span: &Span| spans.contains(span);
+    for line in text.lines() {
         let line = line.trim();
         if !line.starts_with('{') {
+            continue;
+        }
+        if !CANDIDATES
+            .iter()
+            .any(|(name, _, _, span)| wanted(span) && line.contains(name))
+        {
             continue;
         }
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -189,8 +227,8 @@ fn pick_title(tail: &str) -> Option<(String, TitleSource)> {
         let Some(kind) = value.get("type").and_then(Value::as_str) else {
             continue;
         };
-        for (i, (name, key, _)) in CANDIDATES.iter().enumerate() {
-            if kind != *name {
+        for (i, (name, key, _, span)) in CANDIDATES.iter().enumerate() {
+            if kind != *name || !wanted(span) {
                 continue;
             }
             let text = value.get(key).and_then(Value::as_str).map(title_text);
@@ -199,11 +237,19 @@ fn pick_title(tail: &str) -> Option<(String, TitleSource)> {
             }
         }
     }
+}
+
+/// 拾った候補から表示名を選ぶ。順は [`CANDIDATES`]（＝ 優先順）で、
+/// **上位が 1 つでも見つかれば下位は見ない**
+fn pick(found: &Found) -> Option<(String, TitleSource)> {
     CANDIDATES
         .iter()
         .zip(found)
-        .find_map(|((_, _, source), text)| text.map(|text| (text, *source)))
+        .find_map(|((_, _, source, _), text)| text.clone().map(|text| (text, *source)))
 }
+
+/// すべての候補をすべての範囲で探す（走査を範囲で分けない場合の指定）
+const EVERY_SPAN: [Span; 2] = [Span::Once, Span::Appended];
 
 /// ccdesk のリネームが追記する 1 行。**`sessionId` まで入れるのは claude 自身が
 /// 書く形と同じにするため**（実測: `-n` で渡した名前も `/rename` もこの形で残る）。
@@ -245,11 +291,29 @@ fn ends_with_newline(path: &Path) -> std::io::Result<bool> {
     Ok(last[0] == b'\n')
 }
 
+/// 1 本の transcript について「どこまで読んだか」と「そこまでで見つかった候補」。
+///
+/// **走査の状態はこの 1 つに集める**（変化検知の材料も含める）ので、
+/// 「読んだ範囲」と「拾った値」が別々に古くならない。transcript は追記しか
+/// されないので、**一度読んだ範囲は二度と読まない**（初回に全体を読んでも、
+/// 以降の周期で読むのは増えたぶんだけ）
+#[derive(Default)]
+struct Scan {
+    /// 最後に読んだときのファイルの見え方（長さ・更新時刻）。None ＝ 未走査
+    stamp: Option<Stamp>,
+    /// 走査済みの末尾位置。**必ず行の切れ目**なので、次はここから読めば
+    /// 行の途中から始まらない（書きかけの最終行は次回もう一度読む）
+    scanned: u64,
+    /// そこまでで見つかった候補
+    found: Found,
+}
+
 /// transcript と行の表示名のやり取り（読みと書き）。
 ///
 /// **変化した transcript だけを読む**のが読みの要点: 一覧は 2 秒ごとに走るので、
-/// 毎周すべての行の末尾を読むと、動いていないセッションのファイルまで舐め続ける。
-/// 長さと更新時刻が前回と同じなら追記されていないので読まない。
+/// 毎周すべての行を舐めると、動いていないセッションのファイルまで読み続ける。
+/// 長さと更新時刻が前回と同じなら追記されていないので読まない
+/// （どこまで読んだかは [`Scan`]）。
 ///
 /// **パスは注入で受ける**（[`Self::default`] が既定の `~/.claude/projects` を入れる）:
 /// 理由は [`crate::sessions`] と同じで、テストが実ユーザーの transcript を
@@ -258,8 +322,8 @@ pub(crate) struct Titles {
     /// transcript を探す根（`~/.claude/projects`）。取れない環境では None ＝
     /// 読みも書きも何もしない
     projects: Option<PathBuf>,
-    /// 最後に読んだ transcript の見え方（長さ・更新時刻）
-    seen: HashMap<SessionId, Stamp>,
+    /// 行ごとの走査の状態（変化検知と拾った候補）
+    seen: HashMap<SessionId, Scan>,
     /// **まだ transcript へ載せられていないリネーム。** transcript は 1 ターン目が
     /// 終わるまで作られないので、その間のリネームはここで持って次の [`Self::flush`]
     /// で載せに行く。
@@ -307,15 +371,55 @@ impl Titles {
     }
 
     /// 行の transcript から表示名を拾う。**読む必要が無い（追記されていない）**
-    /// / transcript が無い / 候補が見つからない、のいずれも None
+    /// / transcript が無い / 候補が見つからない、のいずれも None。
+    ///
+    /// 読む範囲の決め方は 2 段:
+    ///
+    /// - **初回**は [`first_scan_from`]（＝ [`CANDIDATES`] の性質）が決める。
+    ///   先頭側では 1 度しか書かれない候補（[`Span::Once`]）だけを探し、末尾
+    ///   [`TAIL_BYTES`] では全部を探す ＝ 追記型の候補を先頭側でパースしない
+    /// - **2 回目以降**は増えたぶんだけを全候補で走査する。transcript は追記しか
+    ///   されないので、これで初回と同じ答えが保たれる（`/resume` のピッカーと同じ）
     pub(crate) fn poll(&mut self, row: &SessionRow) -> Option<(String, TitleSource)> {
         let path = self.path(row)?;
         let meta = std::fs::metadata(&path).ok()?;
         let stamp = (meta.len(), meta.modified().ok());
-        if self.seen.insert(row.session_id.clone(), stamp) == Some(stamp) {
+        let scan = self.seen.entry(row.session_id.clone()).or_default();
+        if scan.stamp == Some(stamp) {
             return None;
         }
-        pick_title(&read_tail(&path, TAIL_BYTES)?)
+        // 縮んだ ＝ 追記ではなく作り直された。覚えた範囲も候補も当てにならない
+        if meta.len() < scan.scanned {
+            *scan = Scan::default();
+        }
+        let first = scan.stamp.is_none();
+        let from = if first {
+            first_scan_from(meta.len())
+        } else {
+            scan.scanned
+        };
+        let mut text = read_from(&path, from)?;
+        let mut start = from;
+        // 行の途中から読んだ初回だけ、壊れた先頭行を落とす
+        // （追記ぶんの読み直しは常に行の切れ目から始まる）
+        if first && from > 0 {
+            let at = text.find('\n').map_or(text.len(), |at| at + 1);
+            text = text.split_off(at);
+            start += at as u64;
+        }
+        // 走査するのは行が完結している範囲まで（書きかけの最終行は次回に回す）
+        let complete = text.rfind('\n').map_or(0, |at| at + 1);
+        let text = &text[..complete];
+        scan.stamp = Some(stamp);
+        scan.scanned = start + complete as u64;
+        if first {
+            let split = line_boundary_before(text, text.len().saturating_sub(TAIL_BYTES as usize));
+            scan_into(&text[..split], &[Span::Once], &mut scan.found);
+            scan_into(&text[split..], &EVERY_SPAN, &mut scan.found);
+        } else {
+            scan_into(text, &EVERY_SPAN, &mut scan.found);
+        }
+        pick(&scan.found)
     }
 
     /// ユーザーが付けた名前を transcript へ載せる（claude の `/rename` と同じ場所）。
@@ -359,6 +463,15 @@ impl Titles {
         }
         self.pending.remove(&row.session_id);
     }
+}
+
+/// テスト用: 文字列を丸ごと走査して表示名を選ぶ（本番の [`Titles::poll`] は
+/// 範囲を分けて走るので、範囲の話を抜きにした優先順の検査はこれを使う）
+#[cfg(test)]
+fn pick_title(text: &str) -> Option<(String, TitleSource)> {
+    let mut found = Found::default();
+    scan_into(text, &EVERY_SPAN, &mut found);
+    pick(&found)
 }
 
 #[cfg(test)]
@@ -667,36 +780,137 @@ pub(crate) mod tests {
         }
     }
 
-    /// 末尾読みは**先頭の壊れた行を落とす**。読んだ範囲に候補が無ければ None
+    /// **1 度しか書かれない候補は、末尾 [`TAIL_BYTES`] より前にあっても拾う。**
+    ///
+    /// これが実機で起きた食い違いの直接の再現: 長い会話の早い段階でリネームすると
+    /// `custom-title` は末尾の範囲から出るので、末尾しか読まない実装では
+    /// `last-prompt` へ落ちる一方、transcript 全体を読む `/resume` のピッカーは
+    /// リネームした名前を出す
     #[test]
-    fn reading_the_tail_drops_the_partial_first_line() {
-        let dir = std::env::temp_dir().join(format!(
-            "ccdesk-title-tail-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("t.jsonl");
-        let ai = line("ai-title", "aiTitle", "tail name");
-        std::fs::write(&path, format!("{}\n{ai}\n", line("ai-title", "aiTitle", "head name")))
-            .unwrap();
+    fn a_rename_before_the_tail_window_is_still_found() {
+        let temp = TempProjects::new("a_rename_before_the_tail_window_is_still_found");
+        let mut titles = temp.titles();
+        let row = row("44444444-4444-4444-8444-444444444444");
+        // 1 行目にリネーム、そのあと末尾の範囲を越える量の会話を積む
+        let custom = line("custom-title", "customTitle", "named early on");
+        let filler = line("assistant", "text", &"x".repeat(2_000));
+        let bulk = std::iter::repeat_n(filler.as_str(), (TAIL_BYTES as usize / 2_000) + 8)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = line("last-prompt", "lastPrompt", "the latest prompt");
+        titles.write_transcript(&row, &format!("{custom}\n{bulk}\n{prompt}\n"));
+        let path = titles.path(&row).unwrap();
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > TAIL_BYTES,
+            "the premise broke — the transcript fits in the tail window"
+        );
 
-        // 全部読めば先頭も見える（が、最後に現れた方を採る）
         assert_eq!(
-            pick_title(&read_tail(&path, 4096).unwrap()),
-            Some(("tail name".to_string(), TitleSource::Ai))
+            titles.poll(&row),
+            Some(("named early on".to_string(), TitleSource::Custom)),
+            "the rename outside the tail window was not found"
         );
-        // 末尾だけを読むと先頭の行は（壊れているので）落ちる。
-        // 最後の行 + その手前の改行だけが入る量にする
-        let tail = read_tail(&path, ai.len() as u64 + 2).unwrap();
-        assert!(!tail.contains("head name"), "kept the broken head line: {tail:?}");
+    }
+
+    /// **2 回目以降は増えたぶんだけを読む**（transcript は追記しかされない）。
+    /// 初回に拾った候補は覚えているので、**追記に含まれない上位の候補が
+    /// 下位へ落ちない**（リネーム済みの行が次の発話で名前を失わない）
+    #[test]
+    fn later_polls_only_read_what_was_appended() {
+        let temp = TempProjects::new("later_polls_only_read_what_was_appended");
+        let mut titles = temp.titles();
+        let row = row("55555555-5555-4555-8555-555555555555");
+        let custom = line("custom-title", "customTitle", "kept name");
+        titles.write_transcript(&row, &format!("{custom}\n"));
         assert_eq!(
-            pick_title(&tail),
-            Some(("tail name".to_string(), TitleSource::Ai))
+            titles.poll(&row),
+            Some(("kept name".to_string(), TitleSource::Custom))
         );
-        // 1 行も完結しない量しか読めなければ、拾える候補は無い
-        assert_eq!(pick_title(&read_tail(&path, 3).unwrap()), None);
-        assert!(read_tail(&dir.join("missing.jsonl"), 4096).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        // 変わっていなければ読まない
+        assert_eq!(titles.poll(&row), None, "re-read a transcript that did not change");
+
+        // 追記（上位の候補は含まれない）。覚えているので上位のまま
+        let path = titles.path(&row).unwrap();
+        let prompt = line("last-prompt", "lastPrompt", "a later prompt");
+        append_line(&path, &prompt).unwrap();
+        assert_eq!(
+            titles.poll(&row),
+            Some(("kept name".to_string(), TitleSource::Custom)),
+            "the remembered custom title was lost when only the appended part was read"
+        );
+
+        // 追記に上位の候補が含まれれば、そちらへ更新される（リネーム直後）
+        append_line(&path, &line("custom-title", "customTitle", "renamed later")).unwrap();
+        assert_eq!(
+            titles.poll(&row),
+            Some(("renamed later".to_string(), TitleSource::Custom))
+        );
+    }
+
+    /// **書きかけの最終行は走査済みにしない**（claude が書いている途中で読むと
+    /// 行が途中で切れる）。次の周期で改行まで届いたら、そこで初めて拾える
+    #[test]
+    fn a_half_written_last_line_is_read_again_next_time() {
+        let temp = TempProjects::new("a_half_written_last_line_is_read_again_next_time");
+        let mut titles = temp.titles();
+        let row = row("66666666-6666-4666-8666-666666666666");
+        let prompt = line("last-prompt", "lastPrompt", "first prompt");
+        let custom = line("custom-title", "customTitle", "arrives in two writes");
+        let (head, tail) = custom.split_at(custom.len() / 2);
+        titles.write_transcript(&row, &format!("{prompt}\n{head}"));
+        assert_eq!(
+            titles.poll(&row),
+            Some(("first prompt".to_string(), TitleSource::LastPrompt))
+        );
+        // 残りが届いた（行が完結した）
+        titles.write_transcript(&row, &format!("{prompt}\n{head}{tail}\n"));
+        assert_eq!(
+            titles.poll(&row),
+            Some(("arrives in two writes".to_string(), TitleSource::Custom))
+        );
+    }
+
+    /// **大きい transcript でも走査は現実的な時間で終わる**（型名の文字列で
+    /// 先に弾くので、行数ぶんの JSON パースをしない）。
+    ///
+    /// 上限は実測の 30 倍以上に取ってある ＝ 遅い CI でも揺れないが、
+    /// 「全行をパースする実装へ戻した」ときは超える
+    #[test]
+    fn a_large_transcript_is_scanned_quickly() {
+        let temp = TempProjects::new("a_large_transcript_is_scanned_quickly");
+        let mut titles = temp.titles();
+        let row = row("77777777-7777-4777-8777-777777777777");
+        let filler = line("assistant", "text", &"x".repeat(1_000));
+        let bulk = std::iter::repeat_n(filler.as_str(), 1_200)
+            .collect::<Vec<_>>()
+            .join("\n");
+        titles.write_transcript(
+            &row,
+            &format!("{bulk}\n{}\n", line("ai-title", "aiTitle", "big one")),
+        );
+        assert!(
+            std::fs::metadata(titles.path(&row).unwrap()).unwrap().len() > 1_000_000,
+            "the premise broke — the transcript is not large"
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            titles.poll(&row),
+            Some(("big one".to_string(), TitleSource::Ai))
+        );
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(2), "scanning took {took:?}");
+    }
+
+    /// 走査の範囲を行の途中で割らない（`\n` の位置だけを見る）
+    #[test]
+    fn the_scan_range_ends_on_a_line_boundary() {
+        let text = "aaa\nbbb\nccc\n";
+        assert_eq!(line_boundary_before(text, 0), 0);
+        assert_eq!(line_boundary_before(text, 4), 4);
+        assert_eq!(line_boundary_before(text, 7), 4);
+        assert_eq!(line_boundary_before(text, 8), 8);
+        assert_eq!(line_boundary_before(text, 999), 12);
+        // 改行が 1 つも無ければ「切れ目は先頭だけ」
+        assert_eq!(line_boundary_before("no newline here", 5), 0);
     }
 }
