@@ -117,6 +117,23 @@ impl TitleSource {
         }
     }
 
+    /// 優先順（**大きいほど優先**）。表示名を差し替えてよいかの判断に使う
+    /// （[`crate::app`] の `refresh_titles`）。
+    ///
+    /// **順位を数で持つ理由**: transcript から拾える候補は読んだ範囲によって
+    /// 変わる（上位の候補が末尾から遠ざかると見えなくなる）。順位を比べずに
+    /// 拾えたものへ差し替えると、`ai-title` の付いた行が turn ごとに
+    /// `last-prompt` へ落ちて名前がちらつく
+    pub(crate) fn rank(self) -> u8 {
+        match self {
+            Self::Custom => 4,
+            Self::Ai => 3,
+            Self::LastPrompt => 2,
+            Self::FirstPrompt => 1,
+            Self::Derived => 0,
+        }
+    }
+
     /// 保存表記からの復元。**未知の値は [`Self::Derived`]**（読みは寛容に:
     /// 手編集や将来の版が書いた値で起動を止めない）
     pub(crate) fn parse(text: &str) -> Self {
@@ -181,10 +198,9 @@ impl SessionRow {
 
     /// 未読か（状態ラベルの前に `●` を出す判定）。
     ///
-    /// **描画に繋ぐのはフェーズ3**（`docs/foreground-migration.md`）。判定そのものは
-    /// 行の意味論なのでここが持ち、`updated_at` を進める側（[`crate::app`] の
-    /// `mark_state`）とテストが既に依存している ＝ 描画待ちで消す理由が無い
-    #[allow(dead_code)]
+    /// **判定は行の意味論なのでここが持つ**: `updated_at` を進める側（[`crate::app`]
+    /// の `touch`）・既読にする側（同 `mark_opened`）・描画（[`crate::ui`]）が
+    /// どれもこの 1 つの式を見る
     pub(crate) fn unread(&self) -> bool {
         self.updated_at > self.last_opened_at
     }
@@ -586,6 +602,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(temp.store().list()[0].title_source, TitleSource::Derived);
+    }
+
+    /// **表示名の優先順**（CLI 本体と同じ並び）。保存表記の読み書きと同じ表から
+    /// 出るので、片方だけ増えた状態にならない
+    #[test]
+    fn title_sources_are_ordered_by_the_priority_of_their_origin() {
+        let order = [
+            TitleSource::Derived,
+            TitleSource::FirstPrompt,
+            TitleSource::LastPrompt,
+            TitleSource::Ai,
+            TitleSource::Custom,
+        ];
+        for pair in order.windows(2) {
+            assert!(
+                pair[0].rank() < pair[1].rank(),
+                "{:?} が {:?} より優先されている",
+                pair[0],
+                pair[1]
+            );
+        }
+        // 保存表記を往復しても順位は変わらない（読みと順位が別の表になっていない）
+        for source in order {
+            assert_eq!(TitleSource::parse(source.as_str()).rank(), source.rank());
+        }
     }
 
     /// 壊れた / 想定外の形でも読みは失敗しない（＝起動が止まらない）。

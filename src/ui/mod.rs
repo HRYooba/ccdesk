@@ -21,6 +21,53 @@ use crate::theme::{
 };
 use crate::ui::new_view::draw_new_view;
 
+/// 未読マーカー（状態ラベルの前に出る）。**既読も同じ幅を取る**ので、
+/// 未読が付いたり消えたりしても状態ラベルの桁が動かない
+const UNREAD_MARK: &str = "● ";
+const READ_MARK: &str = "  ";
+
+fn unread_mark(unread: bool) -> &'static str {
+    if unread {
+        UNREAD_MARK
+    } else {
+        READ_MARK
+    }
+}
+
+/// 1 行に出す状態を決める。**hook が主、`agents --json` が従**
+/// （`docs/foreground-migration.md` のフェーズ3）。
+///
+/// - 死んでいる行 ＝ 最後に観測した state のまま（空 ＝ 一度も観測していない行は
+///   動いていない）。生きている行の判断材料は使わない
+/// - 生きている行は hook（[`crate::hooks`]）が答える。turn 単位で届くので
+///   Working / Needs input / Done を取り違えない
+/// - ただし**生きている行の `stopped` は捨てる**: 生死の真実は PTY の
+///   `try_wait`（[`crate::session::Session::alive`]）で、再開した直後は前回の
+///   `SessionEnd` が保管に残っている ＝ 次の `SessionStart` が届くまでの
+///   数秒だけ「動いているのに Stopped」に見えてしまう
+/// - hook が一度も来ていない行だけ `agents --json` の `status` へ落ちる
+///   （ccdesk が起こしていないセッション・注入が効かなかった場合）
+/// - `status` も無い（ポーラーが拾う前）間は出力の変化から推す
+fn row_state(
+    alive: bool,
+    last_state: &str,
+    hook: Option<&str>,
+    status: &str,
+    heuristic: Option<SessionStatus>,
+) -> StateView {
+    if !alive {
+        let state = if last_state.is_empty() { "stopped" } else { last_state };
+        return classify(state, false);
+    }
+    let hook = hook.filter(|state| *state != "stopped");
+    match (hook, status, heuristic) {
+        (Some(state), _, _) => classify(state, true),
+        (None, "", Some(SessionStatus::Working)) => classify("working", true),
+        (None, "", _) => classify("blocked", true),
+        (None, status, _) => classify(foreground_state(status), true),
+    }
+}
+
 /// リセット時刻のローカル表記。当日なら "14:00"、別日なら "7/29 09:00"
 fn fmt_reset_at(resets_at: u64) -> String {
     use chrono::{Datelike, Local, TimeZone, Timelike};
@@ -591,6 +638,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         color: Color,
         label: String,
         is_active_window: bool,
+        /// 未読（[`crate::sessions::SessionRow::unread`]）＝ 状態ラベルの前に `●`
+        unread: bool,
         status_label: &'static str,
         age: String,
         bucket: Bucket,
@@ -622,17 +671,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             .find(|a| a.is_interactive() && a.session_id == row.session_id.as_str())
             .map(|a| a.status.as_str())
             .unwrap_or_default();
-        let view = match (alive, status, window.map(|(_, w)| w.heuristic)) {
-            // 死んでいる窓・窓の無い行は、最後に観測した state のまま出す
-            // （空 ＝ 一度も観測していない行は動いていない）
-            (false, _, _) if row.last_state.is_empty() => classify("stopped", false),
-            (false, _, _) => classify(&row.last_state, false),
-            // status が無い（まだ書かれていない・ポーラーが拾う前）間は
-            // 出力の変化から推す
-            (true, "", Some(SessionStatus::Working)) => classify("working", true),
-            (true, "", _) => classify("blocked", true),
-            (true, status, _) => classify(foreground_state(status), true),
-        };
+        let view = row_state(
+            alive,
+            &row.last_state,
+            app.hook_states.get(&row.session_id),
+            status,
+            window.map(|(_, w)| w.heuristic),
+        );
         // 経過時間: 動いている窓は最後の出力から、止まっている行は最後の更新から
         let age_secs = match window {
             Some((_, w)) if alive => w.idle_secs,
@@ -647,6 +692,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             label: row.title.clone(),
             is_active_window: window.is_some_and(|(i, _)| i == active)
                 && matches!(app.right_view, RightView::Sessions),
+            unread: row.unread(),
             status_label: view.label,
             age: fmt_age(age_secs),
             bucket: view.bucket,
@@ -696,7 +742,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 Span::styled(d.glyph, Style::default().fg(d.color)),
                 Span::raw(" "),
                 Span::styled(d.label.clone(), name_style),
-                Span::raw("  "),
+                Span::raw(" "),
+                // 未読マーカー。既読も同じ幅なので状態ラベルの桁は動かない
+                Span::styled(unread_mark(d.unread), Style::default().fg(ui().emph)),
                 Span::styled(d.status_label, Style::default().fg(d.color)),
             ];
             spans.push(Span::raw(" · "));
@@ -1102,6 +1150,65 @@ mod tests {
         use unicode_width::UnicodeWidthStr;
         assert_eq!(UPDATE_MARK.width(), 1, "⟳ が 1 桁でない");
         assert_eq!("☰".width(), 2, "☰ は 2 桁（⟳ と同じ扱いにはできない）");
+    }
+
+    /// **未読マーカーは既読と同じ幅を取る。** 幅が違うと、未読が付いたり消えたり
+    /// するたびに状態ラベルが横へずれる（行が変わったこと自体が読み取りにくくなる）
+    #[test]
+    fn the_unread_marker_and_its_empty_slot_are_the_same_width() {
+        use unicode_width::UnicodeWidthStr;
+        assert_eq!(unread_mark(true), UNREAD_MARK);
+        assert_eq!(unread_mark(false), READ_MARK);
+        assert_eq!(
+            UNREAD_MARK.width(),
+            READ_MARK.width(),
+            "未読と既読で桁が違う: {UNREAD_MARK:?} / {READ_MARK:?}"
+        );
+        assert!(READ_MARK.trim().is_empty(), "既読の位置に文字が出ている");
+    }
+
+    /// **生きている行の状態は hook が主、`agents --json` が従。**
+    /// hook は turn 単位で届くので Done を区別できるが、`status` からは出せない
+    #[test]
+    fn a_live_row_prefers_the_hook_state_over_the_live_status() {
+        let label = |hook, status, heuristic| {
+            row_state(true, "stopped", hook, status, heuristic).label
+        };
+        // hook が居れば status も出力ヒューリスティックも見ない
+        assert_eq!(label(Some("done"), "busy", Some(SessionStatus::Working)), "Done");
+        assert_eq!(label(Some("working"), "idle", None), "Working");
+        assert_eq!(label(Some("blocked"), "busy", None), "Needs input");
+        // hook が一度も来ていない行は status から導く
+        assert_eq!(label(None, "busy", None), "Working");
+        assert_eq!(label(None, "idle", None), "Needs input");
+        // status も無い間は出力の変化から推す
+        assert_eq!(label(None, "", Some(SessionStatus::Working)), "Working");
+        assert_eq!(label(None, "", Some(SessionStatus::NeedsInput)), "Needs input");
+        assert_eq!(label(None, "", None), "Needs input");
+    }
+
+    /// **生きている行の `stopped` は捨てる。** 再開した直後は前回の `SessionEnd` が
+    /// 保管に残っているので、そのまま出すと「動いているのに Stopped」になる
+    /// （生死の真実は PTY の `try_wait`）
+    #[test]
+    fn a_live_row_ignores_a_stale_stopped_from_the_previous_run() {
+        assert_eq!(row_state(true, "", Some("stopped"), "busy", None).label, "Working");
+        assert_eq!(row_state(true, "", Some("stopped"), "idle", None).label, "Needs input");
+        // 死んでいる行では捨てない（そこは本当に止まっている）
+        assert_eq!(row_state(false, "stopped", None, "", None).label, "Stopped");
+    }
+
+    /// **死んでいる行は最後に観測した state のまま**（生きている行の材料は使わない）。
+    /// 一度も観測していない行 ＝ 動いていない
+    #[test]
+    fn a_dead_row_shows_the_last_state_it_was_seen_in() {
+        let label = |last_state| row_state(false, last_state, Some("working"), "busy", None).label;
+        assert_eq!(label("done"), "Done");
+        assert_eq!(label("stopped"), "Stopped");
+        assert_eq!(label(""), "Stopped", "観測していない行が動いているように見える");
+        // 死んでいる行はアイコンの形も生死を表す（✻ ではなく ∙）
+        assert!(!row_state(false, "done", None, "", None).alive);
+        assert!(row_state(true, "", Some("done"), "", None).alive);
     }
 
     /// 更新の有無で行構成が変わらない（固定ヘッダー行数もマーカー桁の位置も動かない）。

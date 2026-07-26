@@ -257,6 +257,22 @@ pub fn sessions_store_path() -> Option<std::path::PathBuf> {
     Some(ccdesk_dir()?.join("sessions.json"))
 }
 
+/// hook が書いた state の受け渡し先 ~/.ccdesk/hook-states.json。
+/// 子の claude へ `--settings` で注入した hook（`ccdesk hook <event>`）が書き、
+/// TUI が周期的に読む（`crate::hooks` が形式の正本）
+pub fn hook_states_path() -> Option<std::path::PathBuf> {
+    Some(ccdesk_dir()?.join("hook-states.json"))
+}
+
+/// 現在時刻の epoch ms。**行の時刻・hook の時刻はすべてこの単位**
+/// （`SessionRow` と `hook-states.json` が同じ物差しを使う）
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// エラーの集約先 ~/.ccdesk/error.log へ時刻付きで追記する。
 /// panic（TUI は画面ごと消えて読めない）と実行時エラー（attach 失敗等）の両方が集まる
 pub fn log_error(msg: &str) {

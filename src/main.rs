@@ -15,12 +15,14 @@ use ccdesk::{load_setting, log_error};
 mod accounts;
 mod app;
 mod cli;
+mod hooks;
 mod keys;
 mod poll;
 mod session;
 mod sessions;
 mod source;
 mod theme;
+mod title;
 mod ui;
 mod update;
 
@@ -42,6 +44,11 @@ fn main() -> anyhow::Result<()> {
         Some("logs") => return show_logs(),
         // 使用率表示（opt-in）が起こしたセッションへ注入する内部フック
         Some("statusline-hook") => return statusline_hook(),
+        // セッションの状態を受け取る内部フック（`--settings` で注入し、
+        // 子の claude が turn ごとに `ccdesk hook <event>` として起こす）
+        Some("hook") => {
+            return hooks::run_hook(std::env::args().nth(2).unwrap_or_default().as_str())
+        }
         Some("update") => return update_self(),
         Some("--help" | "-h" | "help") => {
             print_usage();
@@ -75,6 +82,9 @@ fn main() -> anyhow::Result<()> {
     };
     // セッション一覧・フッター・ウィンドウ状態はすべて供給元から受け取る
     let sessions = source.sessions();
+    // hook（子の claude が書く state）の写しも起動時に 1 度読む。
+    // 以降は一覧の読み直しと同じ周期で取り直す（app::adopt_hook_states）
+    let hook_states = source.hook_states();
     let footer = source.footer();
     let window = source.window_state();
     // 保管済みアカウントは起動時に 1 度読む（以降はアカウント行を開いた時と
@@ -125,6 +135,8 @@ fn main() -> anyhow::Result<()> {
         agents_shared: Arc::new(Mutex::new(Vec::new())),
         agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         sessions,
+        hook_states,
+        titles: title::TitleWatcher::default(),
         last_scan: std::time::Instant::now(),
         last_live_scan: std::time::Instant::now(),
         sidebar_width: window.sidebar_width,

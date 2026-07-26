@@ -113,13 +113,20 @@ Accounts you register from the account line are stored in
 `~/.ccdesk/accounts.json` — it holds their OAuth tokens, so treat it exactly
 like `~/.claude/.credentials.json` and never share or copy it elsewhere.
 
+ccdesk passes the official `--settings` flag to the `claude` sessions it starts
+to install turn-level hooks that report each session's state (working / waiting
+for input / done) back to ccdesk — that is what the sidebar shows. The hooks
+run `ccdesk hook <event>`, so no external scripts are installed, and they write
+only to `~/.ccdesk/hook-states.json`. Sessions opened outside ccdesk are
+unaffected.
+
 ## Usage display (opt-in)
 
 Add `"usage_display": "on"` to `~/.ccdesk/config.json` to show your Claude
 rate-limit usage (5h / 7d windows, with time until reset) at the bottom right.
 
-When enabled, ccdesk passes the official `--settings` flag to the `claude`
-sessions it starts to install a status-line hook. The hook saves the
+When enabled, ccdesk adds a status-line hook to the same injected settings
+file it already passes with `--settings`. The hook saves the
 official rate-limit JSON that Claude Code provides to status lines, and then
 chains to your own status line if you have one configured — your display keeps
 working unchanged. No files outside `~/.ccdesk/` are modified, and sessions

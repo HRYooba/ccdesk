@@ -8,14 +8,16 @@ use crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 
-use ccdesk::{log_error, same_dir};
+use ccdesk::{log_error, now_ms, same_dir};
 
 use crate::accounts::{Account, AccountChange, ActiveAccount, Outgoing};
+use crate::hooks::HookStates;
 use crate::keys::{encode_key, forward_mouse};
 use crate::poll::{AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo};
 use crate::session::{Launch, Session};
 use crate::sessions::{SessionId, SessionRow, TitleSource};
 use crate::source::{AccountAction, DataSource, PollSinks, WindowItem, PROJECTS_LIMIT};
+use crate::title::{title_text, TitleWatcher, UNTITLED};
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
 use crate::ui::{draw, popup_rect, row_at, sidebar_layout};
 
@@ -281,6 +283,13 @@ pub(crate) struct App {
     pub(crate) agents_dirty: Arc<std::sync::atomic::AtomicBool>,
     /// サイドバーに並ぶ行。**正本は `~/.ccdesk/sessions.json`**（供給元が読み書きする）
     pub(crate) sessions: Vec<SessionRow>,
+    /// hook（`--settings` で注入した公式 hook）が書いた state の写し。
+    /// **生きている行の state はこれが主**で、hook が一度も来ていない行だけ
+    /// `agents --json` の `status` へ落ちる（[`crate::hooks`]）
+    pub(crate) hook_states: HookStates,
+    /// transcript から表示名を追う道具。**読んだ transcript の見え方を覚えている**
+    /// ので、追記されていないファイルは読み直さない（[`crate::title`]）
+    pub(crate) titles: TitleWatcher,
     pub(crate) last_scan: std::time::Instant,
     pub(crate) last_live_scan: std::time::Instant,
     pub(crate) sidebar_width: u16,
@@ -387,6 +396,8 @@ impl Default for App {
             agents_shared: Arc::new(Mutex::new(Vec::new())),
             agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Vec::new(),
+            hook_states: HookStates::default(),
+            titles: TitleWatcher::default(),
             last_scan: std::time::Instant::now(),
             last_live_scan: std::time::Instant::now(),
             sidebar_width: 34,
@@ -511,15 +522,19 @@ impl App {
             }
     }
 
+    /// **今ペインに出ているセッション**（右ペインがセッション表示でないなら None）。
+    /// 「キー入力の宛先」と「ユーザーが見ている行」がどちらもこの 1 つの判断から出る
+    fn shown_session(&self) -> Option<&SessionId> {
+        matches!(self.right_view, RightView::Sessions)
+            .then(|| self.windows.get(self.active).map(|w| &w.session_id))
+            .flatten()
+    }
+
     /// **キー入力が今このセッションへ届く形になっているか。**
     /// `focus` は見ない: 判定したいのは「端末へ流したとき誰に届くか」で、
     /// 流すかどうかを決める側（[`lift_input_gate`]）がこれを材料にする
     fn showing(&self, id: &SessionId) -> bool {
-        matches!(self.right_view, RightView::Sessions)
-            && self
-                .windows
-                .get(self.active)
-                .is_some_and(|w| &w.session_id == id)
+        self.shown_session() == Some(id)
     }
 }
 
@@ -530,25 +545,6 @@ pub(crate) fn instant_ago(d: Duration) -> std::time::Instant {
     std::time::Instant::now()
         .checked_sub(d)
         .unwrap_or_else(std::time::Instant::now)
-}
-
-/// 使用率表示 opt-in 用の注入 settings ファイルを書き、そのパスを返す。
-/// セッション起動時に `--settings` で渡す。コマンドのパスは / 区切り必須:
-/// claude は statusline を bash 経由で実行するため \ 区切りはエスケープとして
-/// 食われる（実測）
-fn write_inject_settings() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = ccdesk::ccdesk_dir()?;
-    let exe_fwd = exe.to_string_lossy().replace('\\', "/");
-    let settings = serde_json::json!({
-        "statusLine": {
-            "type": "command",
-            "command": format!("\"{exe_fwd}\" statusline-hook"),
-        }
-    });
-    let path = dir.join("inject-settings.json");
-    std::fs::write(&path, settings.to_string()).ok()?;
-    Some(path)
 }
 
 /// 同期出力（DECSET 2026）のスコープガード。Drop で閉じるため、draw のクロージャが
@@ -646,6 +642,11 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         }
         if app.last_scan.elapsed() > SCAN_INTERVAL {
             refresh_sessions(app);
+            // 一覧を読み直した直後に、hook の state と transcript の表示名を載せる。
+            // **順序に意味がある**: 読み直しは丸ごとの置き換えなので、先に載せると
+            // その場で上書きされる
+            adopt_hook_states(app);
+            refresh_titles(app);
             app.last_scan = std::time::Instant::now();
             force_draw = true; // 並びが変わったら即描画（表示と行データのずれを残さない）
         }
@@ -1045,17 +1046,10 @@ fn rows_dropped_while_open<'a>(
         .collect()
 }
 
-/// epoch ms（行の時刻はすべてこの単位。[`crate::sessions::SessionRow`]）
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// 行の状態を書き換えて保存する（行が無ければ何もしない）。
 /// **プロセスが死んでも行は残す**ので、窓を閉じる側はここで状態だけを残す
 fn mark_state(app: &mut App, id: &SessionId, state: &str) {
+    let showing = app.showing(id);
     let Some(row) = app.sessions.iter_mut().find(|r| &r.session_id == id) else {
         return;
     };
@@ -1063,8 +1057,93 @@ fn mark_state(app: &mut App, id: &SessionId, state: &str) {
         return;
     }
     row.last_state = state.to_string();
-    // 行の内容を変えたら `updated_at` を進める（マージの後勝ち判定の材料）
+    touch(row, showing);
+    save_sessions(app);
+}
+
+/// 行の内容を変えたことを記録する。**`updated_at` を進める**のはマージの後勝ち判定
+/// （[`crate::sessions`] の `merge_sessions`）の材料であり、未読
+/// （[`SessionRow::unread`]）の材料でもあるため。
+///
+/// **ペインに出ている行は未読にしない**（`shown` が真なら既読も一緒に進める）:
+/// 未読が答えるのは「見ていない間に動いたか」で、目の前で動いている行に `●` が
+/// 点くのはその問いへの答えになっていない
+fn touch(row: &mut SessionRow, shown: bool) {
     row.updated_at = now_ms();
+    if shown {
+        row.last_opened_at = row.updated_at;
+    }
+}
+
+/// hook が書いた state を読み直し、行へ載せる。
+///
+/// **保管（`last_state`）へ写すのが要点**: hook の受け渡しファイルは動いている
+/// セッションのための短命な写しなので、そこだけに置くと ccdesk を落とした時点で
+/// 「最後にどうなったか」が消える（次の起動で全部の行が Stopped に見える）。
+/// 生きている行の表示は写した値ではなく hook の写しから直接引く（[`crate::ui`]）
+fn adopt_hook_states(app: &mut App) {
+    app.hook_states = app.source.hook_states();
+    let updates: Vec<(SessionId, String)> = app
+        .sessions
+        .iter()
+        .filter_map(|row| {
+            let state = app.hook_states.get(&row.session_id)?;
+            (state != row.last_state).then(|| (row.session_id.clone(), state.to_string()))
+        })
+        .collect();
+    for (id, state) in updates {
+        mark_state(app, &id, &state);
+    }
+}
+
+/// transcript から表示名を拾い直す（優先順と読み方は [`crate::title`]）。
+///
+/// **[`TitleSource::Custom`] の行は触らない。** ユーザーが付けた名前を、あとから
+/// 来る AI 生成の名前が踏まないため（`docs/foreground-migration.md` の title の行）。
+/// 副作用として、claude 側で `/rename` を二度目に使っても追従しない ＝ 一度
+/// 名前が確定した行の名前は、ccdesk のリネームでしか変わらなくなる
+fn refresh_titles(app: &mut App) {
+    let shown = app.shown_session().cloned();
+    let mut titles = std::mem::take(&mut app.titles);
+    let mut changed = false;
+    for row in &mut app.sessions {
+        if row.title_source == TitleSource::Custom {
+            continue;
+        }
+        let Some((title, source)) = titles.poll(row) else {
+            continue;
+        };
+        // **格下げはしない**（[`TitleSource::rank`]）: transcript から拾える候補は
+        // 読んだ範囲で変わるので、上位の候補が末尾から遠ざかった行の名前が
+        // turn ごとに下位へ落ちてちらつく
+        if source.rank() < row.title_source.rank() {
+            continue;
+        }
+        if row.title == title && row.title_source == source {
+            continue;
+        }
+        row.title = title;
+        row.title_source = source;
+        touch(row, shown.as_ref() == Some(&row.session_id));
+        changed = true;
+    }
+    app.titles = titles;
+    if changed {
+        save_sessions(app);
+    }
+}
+
+/// その行を既読にする。**ペインを開いた時点**が既読の契機で、
+/// 開き方（切替・`claude -r` での再開・起動時の復元）は問わない
+fn mark_opened(app: &mut App, id: &SessionId) {
+    let Some(row) = app.sessions.iter_mut().find(|r| &r.session_id == id) else {
+        return;
+    };
+    if !row.unread() {
+        return;
+    }
+    // 時計が巻き戻っていても既読にする（`updated_at` を下回らせない）
+    row.last_opened_at = now_ms().max(row.updated_at);
     save_sessions(app);
 }
 
@@ -1177,13 +1256,6 @@ fn selected_row_y(app: &App) -> u16 {
     row as u16 + 1
 }
 
-/// 表示名に使うプロンプトの桁数。**行に出す名前の長さの正本はここ 1 箇所**
-/// （title の本格的な決め方はフェーズ3。`docs/foreground-migration.md`）
-const TITLE_FROM_PROMPT: usize = 30;
-
-/// プロンプトの無いセッションの表示名
-const UNTITLED: &str = "new session";
-
 /// 指定フォルダ・プロンプトで前景セッションを 1 本起こす
 /// （見出しメニューの new session は空プロンプトで直接ここに来る）。
 ///
@@ -1218,13 +1290,16 @@ fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
 /// **行を足すのは起動できてから**（起動できなかったセッションを一覧に残さない）
 fn start_foreground(app: &mut App, cwd: &str, prompt: &str) -> Launched {
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-    let title: String = if prompt.is_empty() {
-        UNTITLED.to_string()
+    // 起動時に渡すプロンプトは、そのセッションの**先頭ユーザープロンプト**そのもの。
+    // transcript を読み直さずに優先順の 5 段目を満たせる（[`crate::title`]）
+    let title = title_text(prompt);
+    let (title, title_source) = if title.is_empty() {
+        (UNTITLED.to_string(), TitleSource::Derived)
     } else {
-        prompt.chars().take(TITLE_FROM_PROMPT).collect()
+        (title, TitleSource::FirstPrompt)
     };
-    // 使用率表示（opt-in）の statusline フックを注入する
-    let settings = app.usage_display.then(write_inject_settings).flatten();
+    // state を取る hook と、使用率表示（opt-in）の statusline を注入する
+    let settings = crate::hooks::inject_settings(app.usage_display);
     let (rows, cols) = app.pane_size();
     let window = Session::spawn(
         &session_id,
@@ -1243,9 +1318,7 @@ fn start_foreground(app: &mut App, cwd: &str, prompt: &str) -> Launched {
         session_id.clone(),
         cwd,
         title,
-        // 起動時の名前はプロンプト（無ければ既定）から作った暫定値。
-        // CLI 本体と同じ優先順を実装するのはフェーズ3
-        TitleSource::Derived,
+        title_source,
         now_ms(),
     ));
     save_sessions(app);
@@ -2110,6 +2183,8 @@ fn expire_input_gate(app: &mut App) -> bool {
 /// `No conversation found` になる・実測）。失敗（cwd 消失等）は握りつぶさず
 /// 下部バーへ通知する
 pub(crate) fn open_session(app: &mut App, id: &SessionId) {
+    // **ペインを開いた時点が既読の契機**（切替も再開も同じ ＝ ここ 1 箇所で済む）
+    mark_opened(app, id);
     if let Some(i) = app.windows.iter().position(|w| &w.session_id == id) {
         app.show_session(i);
         return;
@@ -2118,7 +2193,7 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) {
         return; // 再読み込みで消えた行（クリックと削除の競合）は何もしない
     };
     let (title, cwd) = (row.title.clone(), row.cwd.clone());
-    let settings = app.usage_display.then(write_inject_settings).flatten();
+    let settings = crate::hooks::inject_settings(app.usage_display);
     let (rows, cols) = app.pane_size();
     match Session::spawn(
         id,
@@ -2759,6 +2834,10 @@ mod tests {
     struct TestSource {
         accounts: AccountBackend,
         projects: ProjectsBackend,
+        /// hook が書いた state の写し（[`DataSource::hook_states`] が返す値）。
+        /// 実ファイルを読まないので、テストが開発者の
+        /// `~/.ccdesk/hook-states.json` に左右されない
+        hooks: HookStates,
     }
 
     /// アカウント側の振る舞い
@@ -2810,6 +2889,7 @@ mod tests {
             Self {
                 accounts,
                 projects: ProjectsBackend::Absent,
+                hooks: HookStates::default(),
             }
         }
 
@@ -2818,6 +2898,16 @@ mod tests {
             Self {
                 accounts: AccountBackend::Absent,
                 projects,
+                hooks: HookStates::default(),
+            }
+        }
+
+        /// hook が書いた state だけを見る供給元
+        fn for_hooks(hooks: HookStates) -> Self {
+            Self {
+                accounts: AccountBackend::Absent,
+                projects: ProjectsBackend::Absent,
+                hooks,
             }
         }
     }
@@ -2833,6 +2923,11 @@ mod tests {
 
         fn store_sessions(&self, next: &[SessionRow]) -> Vec<SessionRow> {
             next.to_vec()
+        }
+
+        // 実ファイル（`~/.ccdesk/hook-states.json`）は読まない
+        fn hook_states(&self) -> HookStates {
+            self.hooks.clone()
         }
 
         fn footer(&self) -> FooterInfo {
@@ -4243,6 +4338,79 @@ mod tests {
         );
         // ディスクに載っていれば戻すものは無い（通常の読み直し）
         assert!(rows_dropped_while_open(&mine, &mine, &open).is_empty());
+    }
+
+    /// hook が書いた state を持つ App（行は 1 本、窓は開いていない）
+    fn app_with_hooks(rows: &[SessionRow], hooks: HookStates) -> App {
+        App {
+            sessions: rows.to_vec(),
+            source: Arc::new(TestSource::for_hooks(hooks)),
+            ..Default::default()
+        }
+    }
+
+    fn row_of<'a>(app: &'a App, id: &str) -> &'a SessionRow {
+        app.sessions
+            .iter()
+            .find(|r| r.session_id.as_str() == id)
+            .expect("行が消えている")
+    }
+
+    /// **hook が書いた state は行へ載り、行は未読になる。**
+    ///
+    /// 保管（`last_state`）へ写すのが要点で、写さないと ccdesk を落とした時点で
+    /// 「最後にどうなったか」が消える。写しそのもの（[`App::hook_states`]）も
+    /// 更新される ＝ 生きている行の表示はそちらから引ける
+    #[test]
+    fn a_hook_state_lands_on_the_row_and_marks_it_unread() {
+        let rows = [session_row("s", "C:\\dev\\api", 1), session_row("t", "C:\\dev\\web", 1)];
+        let mut app = app_with_hooks(&rows, HookStates::from_pairs([("s", "done")]));
+        assert!(!row_of(&app, "s").unread(), "作った直後の行が未読になっている");
+
+        adopt_hook_states(&mut app);
+        assert_eq!(row_of(&app, "s").last_state, "done");
+        assert!(row_of(&app, "s").unread(), "状態が変わった行が未読にならない");
+        assert_eq!(app.hook_states.get(&SessionId::new("s")), Some("done"));
+        // hook の無い行は触らない（`agents --json` の従経路で表示される）
+        assert_eq!(row_of(&app, "t").last_state, "");
+        assert!(!row_of(&app, "t").unread(), "hook の来ていない行を未読にしている");
+
+        // 同じ state をもう一度受けても行は動かない（未読が延々と点き直さない）
+        let before = row_of(&app, "s").clone();
+        adopt_hook_states(&mut app);
+        assert_eq!(row_of(&app, "s"), &before, "同じ state で行が書き換わっている");
+    }
+
+    /// **ペインを開いた時点で既読になる**（開き方は問わない ＝ [`open_session`] の
+    /// 入口 1 箇所で済ませてある）。消えた行を指しても何も起きない
+    #[test]
+    fn opening_a_pane_marks_the_row_read() {
+        let rows = [session_row("s", "C:\\dev\\api", 1)];
+        let mut app = app_with_hooks(&rows, HookStates::from_pairs([("s", "done")]));
+        adopt_hook_states(&mut app);
+        assert!(row_of(&app, "s").unread());
+
+        mark_opened(&mut app, &SessionId::new("s"));
+        let row = row_of(&app, "s");
+        assert!(!row.unread(), "開いても未読のまま");
+        assert!(row.last_opened_at >= row.updated_at, "既読の時刻が更新より前");
+
+        mark_opened(&mut app, &SessionId::new("消えた行"));
+        assert_eq!(app.sessions.len(), 1, "知らない行で一覧が動いた");
+    }
+
+    /// **ペインに出ている行は未読にしない。** 未読が答えるのは「見ていない間に
+    /// 動いたか」なので、目の前で動いている行に `●` が点くのは答えになっていない
+    #[test]
+    fn a_change_on_the_shown_row_does_not_make_it_unread() {
+        let mut row = session_row("s", "C:\\dev\\api", 1);
+        touch(&mut row, false);
+        assert!(row.unread(), "見ていない行が未読にならない");
+
+        let mut row = session_row("s", "C:\\dev\\api", 1);
+        touch(&mut row, true);
+        assert!(!row.unread(), "見ている行が未読になっている");
+        assert_eq!(row.last_opened_at, row.updated_at);
     }
 
     /// Enter でメニューを開く行の画面 y。固定ヘッダーはスクロールに動かされず、

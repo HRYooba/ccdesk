@@ -22,6 +22,7 @@ use ccdesk::{
 };
 
 use crate::accounts::{Account, AccountChange, AccountStore, ActiveAccount, Outgoing};
+use crate::hooks::HookStates;
 use crate::poll::{
     read_usage, spawn_agents_poller, spawn_ccdesk_version_check, spawn_footer_poller,
     AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo,
@@ -185,6 +186,11 @@ pub(crate) trait DataSource: Send + Sync {
     /// 画面には出続けるのに再起動で消える / 消したはずの行が戻る、が起きる。
     /// 呼び手はこれを自分の一覧として取り込む ＝ 正本は sessions.json 1 つのまま
     fn store_sessions(&self, next: &[SessionRow]) -> Vec<SessionRow>;
+
+    /// hook（子の claude へ `--settings` で注入したもの）が書いた state の写し。
+    /// **生きている行の state はこれが主**で、hook が一度も来ていない行だけ
+    /// `claude agents --json` の `status` へ落ちる（[`crate::hooks`]）
+    fn hook_states(&self) -> HookStates;
 
     /// フッター（アカウント・バージョン）の初期値。
     /// live はポーラーが後から埋めるので既定値でよい
@@ -385,6 +391,9 @@ impl LiveSource {
         if let Some(store) = &sessions {
             store.cleanup_leftover_tmp();
         }
+        // hook の受け渡しファイルも同じ理由（書き手は短命な hook プロセスなので、
+        // rename の前に殺されると tmp が残る）
+        crate::hooks::cleanup_leftover_tmp();
         Self {
             usage_display,
             projects_baseline: Mutex::new(Vec::new()),
@@ -410,6 +419,10 @@ impl DataSource for LiveSource {
             Some(store) => store.store(next),
             None => next.to_vec(),
         }
+    }
+
+    fn hook_states(&self) -> HookStates {
+        crate::hooks::read_states()
     }
 
     fn footer(&self) -> FooterInfo {
@@ -546,6 +559,12 @@ impl DataSource for DemoSource {
         next.to_vec()
     }
 
+    fn hook_states(&self) -> HookStates {
+        // 撮影は実セッションの hook を読まない。空 ＝ 行の状態は
+        // [`demo_sessions`] が持つ `last_state` だけで決まる（固定の画面になる）
+        HookStates::default()
+    }
+
     fn footer(&self) -> FooterInfo {
         demo_footer()
     }
@@ -615,10 +634,7 @@ fn demo_sessions() -> Vec<SessionRow> {
         ("optimize image pipeline", "done", "C:\\dev\\api"),
         ("migrate to vite", "stopped", "C:\\dev\\shop-app"),
     ];
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let now = ccdesk::now_ms();
     rows.iter()
         .enumerate()
         .map(|(i, (title, state, cwd))| {

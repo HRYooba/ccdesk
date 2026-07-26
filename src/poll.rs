@@ -663,8 +663,10 @@ pub(crate) struct StateView {
 /// [`classify`] が読む state 値へ写す。**呼ぶのは status が空でないときだけ**
 /// （空 ＝ まだ書かれていない・拾えていないので、判断の材料が無い）。
 ///
-/// **フェーズ2の暫定**: ここから出るのは Working か Needs input の 2 つだけ
-/// （`docs/foreground-migration.md` のフェーズ3で hooks 由来の state に置き換わる）。
+/// **これは従の経路**（`docs/foreground-migration.md` のフェーズ3）: 状態の主は
+/// hook（[`crate::hooks`]）で、ここへ落ちるのは hook が一度も来ていない行だけ
+/// （ccdesk が起こしていないセッション・注入が効かなかった場合）。
+/// hook のように Done を区別できないので、出るのは Working か Needs input の 2 つ。
 /// `busy` 以外を Needs input へ倒すのは、前景セッションが `busy` でないなら
 /// ユーザーの入力を待っているため（`idle` = プロンプト待ち、`waiting` = 確認待ち）
 pub(crate) fn foreground_state(status: &str) -> &'static str {

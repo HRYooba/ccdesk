@@ -8,6 +8,8 @@
 （写すと片方だけ直った状態が黙って生まれる）。
 
 - 一覧のストア: `src/sessions.rs`
+- 状態の受け渡し（注入する hook と、その受け口）: `src/hooks.rs`
+- 表示名の決め方（transcript の読みを含む）: `src/title.rs`
 - 供給元の口: `src/source.rs` の `DataSource`
 - 排他と原子的書き込み: `src/lib.rs` の `Lock` / `write_json_atomically` / `reap_leftover_tmp`
 
@@ -35,7 +37,7 @@ Claude Desktop も同じ構造（独自の JSON ストアを一覧の正本に�
 | 起動 | PTY で `claude --session-id <uuid> -n <title>`。`CLAUDE_CODE_CHILD_SESSION` / `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID` / `CLAUDECODE` / `CLAUDE_JOB_DIR` 等の継承環境変数を除去（継承すると transcript 保存が無効になる実測あり） |
 | 一覧の正本 | `~/.ccdesk/sessions.json` |
 | title | CLI 本体と同じ優先順: `customTitle` > `aiTitle` > `lastPrompt` > `firstPrompt`。ccdesk のリネームは customTitle の位置 |
-| state | hooks（`Notification`=入力待ち / `Stop`=完了 / `UserPromptSubmit`=実行中）+ `claude agents --json` の `status`。**要約文は出さない** |
+| state | **hooks が主・`claude agents --json` の `status` が従**。どのイベントがどの state を意味するかは `src/hooks.rs` の `HOOK_EVENTS` が正本。**要約文は出さない**（Working / Needs input / Done / Stopped の 4 つだけ） |
 | 未読 | `updated_at > last_opened_at`。状態ラベルの前に `●` |
 | メニュー | ピン留め / 既読にする / 名前を変更 / 閉じる / アーカイブ / 削除 |
 | ショートカット | `Ctrl+S` `Ctrl+X` を撤去。予約は `Ctrl+Q` と `Alt+←→` のみ |
@@ -69,10 +71,13 @@ flowchart LR
         store[(~/.ccdesk/sessions.json<br/>一覧の正本)]
         rows[サイドバーの行]
     end
-    ccdesk -->|PTY: claude --session-id uuid| child[claude 前景プロセス]
+    ccdesk -->|PTY: claude --session-id uuid --settings 注入| child[claude 前景プロセス]
     child --> jsonl[(~/.claude/projects/**/*.jsonl<br/>transcript / 削除しない)]
-    child -->|hooks: Notification / Stop / UserPromptSubmit| store
-    agents[claude agents --json] -->|status| store
+    child -->|hooks: ccdesk hook イベント| hookstates[(~/.ccdesk/hook-states.json<br/>state の受け渡し)]
+    hookstates --> rows
+    hookstates --> store
+    jsonl -->|title| store
+    agents[claude agents --json] -->|status: hook が来ない行だけ| rows
     store --> rows
 ```
 
@@ -151,16 +156,37 @@ flowchart LR
   Needs input）と PTY 生存（無ければ Stopped）から出す
 - 一覧の読み書きを UI に繋ぎ、`src/sessions.rs` 冒頭の `#![allow(dead_code)]` を外した
 
-### フェーズ3: 状態・title・未読
+### フェーズ3: 状態・title・未読（済）
 
-- hooks（`Notification` / `Stop` / `UserPromptSubmit`）で `last_state` を更新
-  （フェーズ2 が書くのは `stopped` だけ。生きている行の状態は毎周
-  `agents --json` から導いていて保管に残っていない）
-- `claude agents --json` の `status` と突き合わせる
-- title の優先順（上表）を実装。ccdesk のリネームは `customTitle` の位置
-  （フェーズ2 の title は起動時のプロンプト先頭 30 桁 ＝ `TitleSource::Derived` 固定）
-- 未読（`updated_at > last_opened_at`）と `●` の描画（判定は
-  `SessionRow::unread` が既に持っている）
+**この段階の本質は、行に出る 3 つの値の出どころを公式 IF と ccdesk 自身へ寄せたこと。**
+状態は hook（公式 IF）、名前は transcript、未読は行が持つ時刻だけで決まるようになった。
+
+- **状態を hook で取る。** `--settings` へ hook を注入し、受け口は ccdesk 自身の
+  サブコマンド（`ccdesk hook <event>`）にした ＝ 外部スクリプトを撒かないので、
+  ccdesk を置き換えれば hook も入れ替わる。注入ファイルは使用率表示の statusLine と
+  同じ 1 本（`--settings` は 1 つしか渡せない）で、**hook は常に・statusLine は
+  opt-in のときだけ**載る
+- **載せるのは turn 単位のイベントだけ。** hook は毎回 ccdesk を 1 プロセス起こすので、
+  `PreToolUse` / `PostToolUse` のような道具ごとに飛ぶイベントを足すと、Windows の
+  プロセス起動コストがそのままセッションの遅さになる
+- 受けた state は `~/.ccdesk/hook-states.json` へ置き、TUI が一覧と同じ周期で読む。
+  **hook が主・`agents --json` の `status` が従**（hook が一度も来ていない行だけ
+  従へ落ちる）で、受けた state は行の `last_state` へも写す
+  （写さないと ccdesk を落とした時点で「最後にどうなったか」が消える）
+- **生きている行の `stopped` は捨てる**: 生死の真実は PTY の `try_wait` なので、
+  再開直後に前回の `SessionEnd` が残っていても「動いているのに Stopped」にならない
+- **title は transcript の末尾だけを読む。** `custom-title` / `ai-title` /
+  `last-prompt` を拾い、優先順で選ぶ。先頭ユーザープロンプトは起動時に ccdesk が
+  渡したものなので transcript を読み直さない（行はすべて ccdesk が起こしている）。
+  **格下げはしない**（上位の候補が末尾から遠ざかっても名前が下位へ落ちない）
+- 未読（`updated_at > last_opened_at`）を状態ラベルの前の `●` として描画。
+  既読は同じ幅の空白なので桁が動かない。既読になるのは**ペインを開いた時点**と、
+  **ペインに出ている行が動いたとき**（見ている行に `●` が点かない）
+
+**受け入れたリスク**: transcript は非公開の内部形式なので、形が変われば
+`custom-title` / `ai-title` / `last-prompt` は拾えなくなる。そのときは起動時に
+決めた名前（先頭プロンプト / 既定）が残るだけで、機能は落ちない
+（パースは行単位で捨てるので壊れた JSON でも止まらない）。
 
 ### フェーズ4: メニューとショートカット
 
