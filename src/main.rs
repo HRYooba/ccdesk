@@ -12,6 +12,7 @@ use crossterm::event::{
 };
 use ccdesk::{load_setting, log_error};
 
+mod accounts;
 mod app;
 mod cli;
 mod keys;
@@ -22,7 +23,7 @@ mod theme;
 mod ui;
 mod update;
 
-use app::{clamp_sidebar, instant_ago, open_short, run, App, Focus, RightView};
+use app::{clamp_sidebar, instant_ago, open_short, run, App, Focus, RightView, SelfUpdate};
 use cli::{print_usage, run_doctor, show_logs, statusline_hook, update_self};
 use poll::FooterInfo;
 use source::{DataSource, DemoSource, LiveSource};
@@ -66,15 +67,18 @@ fn main() -> anyhow::Result<()> {
     let usage_display = load_setting("usage_display").as_deref() == Some("on");
     // demo / 実データの選択はこの 1 箇所だけ。以降のコードは供給元を通すので
     // 「今 demo か」を問う分岐を持たない（＝分岐の書き漏らしで実データが漏れない）
-    let source: Box<dyn DataSource> = if demo {
-        Box::new(DemoSource)
+    let source: Arc<dyn DataSource> = if demo {
+        Arc::new(DemoSource)
     } else {
-        Box::new(LiveSource::new(usage_display))
+        Arc::new(LiveSource::new(usage_display))
     };
     // セッション一覧・フッター・ウィンドウ状態はすべて供給元から受け取る
     let jobs = source.jobs();
     let footer = source.footer();
     let window = source.window_state();
+    // 保管済みアカウントは起動時に 1 度読む（以降はアカウント行を開いた時と
+    // 保管を変更した後に取り直す。変えるのはこの UI だけなのでポーリングしない）
+    let accounts = source.accounts();
 
     // ホスト端末の実 fg/bg を OSC 10/11 で照会。
     // raw mode / alt screen に入る前に行う。非対応端末はヒューリスティックで
@@ -140,7 +144,9 @@ fn main() -> anyhow::Result<()> {
         footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
         footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        accounts,
         claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
         ccdesk_latest: None,
         ccdesk_latest_shared: Arc::new(Mutex::new(None)),
         ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -149,13 +155,20 @@ fn main() -> anyhow::Result<()> {
         last_usage_read: instant_ago(Duration::from_secs(60)),
         pending_delete: None,
         spawn_rx: None,
+        account_job: None,
+        input_gate: None,
         notice: None,
         grouping: window.grouping,
+        projects: window.projects,
         popup: None,
         focus: Focus::Terminal,
         source,
     };
     clamp_sidebar(&mut app); // 保存値が現在の端末幅を超えていたら丸める
+    // 既にあるセッションのフォルダを登録へ埋め戻す（以前から使っているフォルダの
+    // 見出しが、最後のセッションを消した時点で消えないように）。jobs を読んだ後・
+    // 画面を組む前のこの位置に置く: 埋め戻しは初回の一覧に効く必要がある
+    app::backfill_projects(&mut app);
     // バックグラウンド取得の起動。撮影用の供給元は 1 本も起こさないので、
     // ここに `if !demo` は要らない
     app.source.spawn_pollers(app.poll_sinks());
