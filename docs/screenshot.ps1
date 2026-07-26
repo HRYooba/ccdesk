@@ -40,8 +40,15 @@ param(
 
 # Resolve the exe up front: the demo process is later recognised by its command line,
 # which only matches if wt.exe was handed the same absolute path we compare against.
-# Resolve-Path also turns a typo into an immediate failure instead of an empty capture.
-$ExePath = (Resolve-Path -LiteralPath $Exe).ProviderPath
+#
+# -ErrorAction Stop is load-bearing. Resolve-Path reports a missing path as a
+# NON-terminating error by default, so without it a typo leaves $ExePath as $null and
+# the script keeps going (verified): wt.exe is handed a null argument so there is
+# nothing to capture, and the cleanup pass compares command lines against that null
+# ($_.CommandLine.IndexOf($null, ...) returns -1 for every candidate), so
+# Get-DemoProcess matches nothing and the capture window is left open. Fail here
+# instead -- that is the only point where a bad -Exe is still cheap to report.
+$ExePath = (Resolve-Path -LiteralPath $Exe -ErrorAction Stop).ProviderPath
 
 Add-Type -AssemblyName System.Drawing
 Add-Type -Namespace Win -Name Api -MemberDefinition @'
