@@ -25,16 +25,17 @@ reopen one and it resumes from its transcript.
   `claude --session-id <uuid>` in the pane and reopening a row resumes it with
   `claude -r`; `close` ends the process while the row stays (resume it any time) and
   `delete` drops the row (your transcripts in `~/.claude/projects/` are never removed)
-- **A menu per row** — clicking the `=` at the head of a session row, or pressing `←` with
-  the sidebar focused, opens `pin` / `mark as read` / `rename` / `close` / `archive` /
-  `delete`. `close` is the only entry that greys out, and only when no window is open.
+- **A menu per row** — clicking the `=` at the head of a session row, or pressing `Enter` with
+  the sidebar focused, opens `open` / `pin` / `mark as read` / `rename` / `close` / `archive` /
+  `delete`. `open` is the same thing a click on the row body does (switch to the window, or
+  resume with `claude -r`), and it is how the keyboard opens a session. `close` is the only
+  entry that greys out, and only when no window is open.
   Pinned rows sort to the top of their group; archived rows leave the normal list and
   collect under an `Archived` section at the bottom (in either grouping), which is where
   you `unarchive` them; `rename` turns the row itself into an input — `Enter` keeps the
   name, `Esc` throws it away. **None of these operations gets its own shortcut key**: one
   entry point means one thing to read, and every key ccdesk does not reserve is a key
-  claude Code still gets. `←` is not reserved either — it only means "menu" while the
-  sidebar has focus
+  claude Code still gets
 - **Live status** from `claude agents --json` (state changes reflect in ~2 s)
 - **Account line** in the sidebar footer, showing the signed-in Claude account, the same value
   `ccdesk doctor` prints. A login or logout that rewrites `~/.claude/.credentials.json` shows
@@ -71,12 +72,14 @@ reopen one and it resumes from its transcript.
   to it, `⊞ group` row to switch grouping, account line for account switching, drag the
   border to resize
 - **Keyboard**: ccdesk reserves exactly two things — `Alt+←/→` pane focus and `Ctrl+Q`
-  quit. **Everything else passes through to claude untouched**, including `Ctrl+S` and
-  `Ctrl+X`. With the sidebar focused, `↑↓` select — past the bottom of the list they reach
-  the account line in the footer — `Enter`/`→` opens the selected row and `←` opens its
-  menu; rows whose only action is a menu (project headings, `⊞ group`, the account line)
-  open the same menu either way. In an open menu, `↑↓` select, `Enter` runs and `Esc`
-  closes. On the new-session screen, `Tab` cycles fields, `Enter` runs the selected
+  quit. **Everything else passes through to claude untouched**, including `Ctrl+S`, `Ctrl+X`
+  and a bare `←`/`→`. With the sidebar focused there are only two keys: `↑↓` select — past
+  the bottom of the list they reach the account line in the footer — and `Enter` does
+  whatever the selected row does. That is a menu for session rows, project headings,
+  `⊞ group` and the account line; the new-session screen for `+ new session`; the update
+  for a version row that has one; and nothing at all for a version row that is up to date.
+  The bottom bar spells out which of those it is. In an open menu, `↑↓` select, `Enter` runs
+  and `Esc` closes. On the new-session screen, `Tab` cycles fields, `Enter` runs the selected
   folder-list row, and `Esc` cancels the path edit while the path field has focus and
   otherwise returns to the session pane. **The bottom bar always names the keys that work
   where your keystrokes are going**

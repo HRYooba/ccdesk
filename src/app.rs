@@ -58,6 +58,43 @@ pub(crate) enum RowAction {
     UpdateClaude,  // claude 本体を更新（同じく版行）
 }
 
+/// サイドバー一覧に積まれた 1 行（[`App::sidebar_rows`] の要素）。
+///
+/// **「飾り」と「押しても何も起きない行」を型で分けるのが要点。** 以前は
+/// `Option<RowAction>` の `None` がその両方を意味していたので、更新の無い版行が
+/// 区切り線と同じ扱いになり、選択もホバーもハイライトも一括で漏れていた
+/// （3 箇所が別々に `is_some()` を見ていたため、そこへ `if` を足すと
+/// 「実体のある行か」の知識が 3 つに増える）。
+///
+/// 型で分けたので判断は [`Self::selectable`] 1 つに集まり、
+/// キーボードの選択・マウスのホバー・描画のハイライトが同じ答えを読む
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum SidebarRow {
+    /// 区切り線・空行・グループ見出し・集計行 ＝ 画面を組む飾りで、行の実体が無い。
+    /// 選択もホバーもしない
+    Decoration,
+    /// 実体はある行だが、今は押しても何も起きない（更新の無い版行）。
+    /// 選択とホバーの対象で、Enter は無反応
+    Inert,
+    /// 押すと動く行
+    Action(RowAction),
+}
+
+impl SidebarRow {
+    /// 選択・ホバー・ハイライトの対象か ＝ **飾りではない（行の実体がある）か**
+    pub(crate) fn selectable(&self) -> bool {
+        !matches!(self, Self::Decoration)
+    }
+
+    /// 押したときの動作。飾りと無反応な行は `None`
+    pub(crate) fn action(&self) -> Option<&RowAction> {
+        match self {
+            Self::Action(action) => Some(action),
+            Self::Decoration | Self::Inert => None,
+        }
+    }
+}
+
 /// サイドバーで指せる位置。**キーボード選択（[`App::selection`]）と
 /// マウスホバー（[`App::hovered`]）が共有する**ので、型が表すのは「選択」ではなく
 /// 「位置」だけ（選択かホバーかの意味はフィールド名が持つ）。
@@ -169,6 +206,9 @@ pub(crate) enum PopupKind {
 /// 副作用は持たず、実行は [`run_popup_action`] だけが行う
 #[derive(Debug, PartialEq)]
 enum PopupAction {
+    /// そのセッションを開く（窓があれば切替、無ければ `claude -r` で再開）。
+    /// **行クリックと同じ [`open_session`]** を通る ＝ 開く経路を 2 つ持たない
+    OpenSession(SessionId),
     /// ピン留めの入切（ピンした行は各グループの先頭へ）
     TogglePin(SessionId),
     /// 未読を消す（`last_opened_at` を今にする）
@@ -204,9 +244,15 @@ impl PopupKind {
             // 二次操作はここに集約する（ショートカットキーを併設しない ＝
             // 入口を 2 つ持たない。`docs/foreground-migration.md`）。
             //
+            // **先頭は `open`**: サイドバーのキーは `↑↓` と `Enter` だけになり、
+            // セッション行の `Enter` もこのメニューを開くので、キーボードから
+            // セッションを開く導線はこの項目になる（窓が開いていれば切替、
+            // 無ければ再開 ＝ 行クリックとまったく同じ [`open_session`]）。
+            // 停止中の行でも再開できるので落とさない。
+            //
             // **`close` だけが窓の有無で落ちる**: 窓が無い行は既に止まっているので、
             // 押せるのに何も起きない項目になる（`remove project` と同じ扱い）。
-            // 他の 5 つは窓の有無に関係なく行に効く ＝ 停止中でも選べる。
+            // 他は窓の有無に関係なく行に効く ＝ 停止中でも選べる。
             // 入切する 2 つは**今の状態の逆を出す**（`● ` 印だとどちらが起きるか
             // 読めない。ここは選択ではなく動作の名前）
             PopupKind::Session {
@@ -215,6 +261,7 @@ impl PopupKind {
                 open,
                 ..
             } => vec![
+                ("open".to_string(), true),
                 (if *pinned { "unpin" } else { "pin" }.to_string(), true),
                 ("mark as read".to_string(), true),
                 ("rename".to_string(), true),
@@ -274,12 +321,13 @@ impl PopupKind {
     fn action(&self, index: usize) -> Option<PopupAction> {
         match self {
             PopupKind::Session { id, .. } => match index {
-                0 => Some(PopupAction::TogglePin(id.clone())),
-                1 => Some(PopupAction::MarkRead(id.clone())),
-                2 => Some(PopupAction::StartRename(id.clone())),
-                3 => Some(PopupAction::Close(id.clone())),
-                4 => Some(PopupAction::ToggleArchive(id.clone())),
-                5 => Some(PopupAction::Delete(id.clone())),
+                0 => Some(PopupAction::OpenSession(id.clone())),
+                1 => Some(PopupAction::TogglePin(id.clone())),
+                2 => Some(PopupAction::MarkRead(id.clone())),
+                3 => Some(PopupAction::StartRename(id.clone())),
+                4 => Some(PopupAction::Close(id.clone())),
+                5 => Some(PopupAction::ToggleArchive(id.clone())),
+                6 => Some(PopupAction::Delete(id.clone())),
                 _ => None,
             },
             PopupKind::Group => match index {
@@ -390,8 +438,8 @@ pub(crate) struct App {
     pub(crate) dragging: bool,
     pub(crate) last_drag_resize: std::time::Instant,
     pub(crate) term_size: (u16, u16), // (width, height)
-    // サイドバー行 → クリック動作の対応（draw で構築）
-    pub(crate) sidebar_rows: Vec<Option<RowAction>>,
+    // サイドバーに積まれた行（draw で構築）。飾りと押せない行の区別は [`SidebarRow`]
+    pub(crate) sidebar_rows: Vec<SidebarRow>,
     // サイドバー上部の固定行数（ccdesk 版行・claude 版行・区切り線・+ new session・
     // 区切り線・⊞ group・集計行）。正本は draw（積んだ行数をそのまま記録する）で、
     // ヒットテストとスクロール計算は sidebar_rows と同じく「最後に描いた値」を読む
@@ -1025,55 +1073,85 @@ fn handle_sidebar_key(app: &mut App, key: &KeyEvent) {
     match key.code {
         KeyCode::Up => move_selection(app, -1),
         KeyCode::Down => move_selection(app, 1),
-        // `←` = その行のメニュー（`→` / Enter の「開く」の対）
-        KeyCode::Left => open_row_menu(app),
-        KeyCode::Enter | KeyCode::Right => open_selection(app),
+        KeyCode::Enter => run_enter(app),
         _ => {}
     }
 }
 
-/// **`Enter` / `→` = 選択位置を開く。** 開くものがメニューしか無い位置
-/// （見出し行・グルーピング行・アカウント行）では [`open_row_menu`] と同じものが出る
-/// ＝ 同じメニューを開く経路を 2 つ書かない
-fn open_selection(app: &mut App) {
+/// 選択行で `Enter` が起こすこと。**この型が「下部バーに出す語」と「実行」の
+/// 共通の正本**なので、行の種類を足したときに案内だけが黙って古くなることがない
+/// （[`Self::label`] と [`run_enter`] はどちらもここを網羅する match ＝
+/// 変種を足せばコンパイルが通らない）。
+///
+/// 行の種類からの写像は [`selected_enter`] 1 箇所で、そこは [`RowAction`] を
+/// 網羅する match なので**行の種類を足しても漏れない**
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Enter {
+    /// その行のメニューを開く（セッション行・見出し行・`⊞ group` 行・アカウント行）
+    Menu,
+    /// 新規セッション画面を開く（`+ new session`）
+    NewSession,
+    UpdateCcdesk,
+    UpdateClaude,
+}
+
+impl Enter {
+    /// 下部バーへ出す語（`Enter <label>` の形で並ぶ）
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Menu => "menu",
+            Self::NewSession => "new session",
+            // どちらの版行も利用者から見れば「更新する」1 つの動作
+            Self::UpdateCcdesk | Self::UpdateClaude => "update",
+        }
+    }
+}
+
+/// いま選択している位置で `Enter` が起こすこと（何も起きない位置は `None`）。
+///
+/// **キーボードの実行と下部バーの案内が読む唯一の写像。** 版行は更新が無いと
+/// [`SidebarRow::Inert`] ＝ 選択はできるが `Enter` は何もしないので `None` になる
+pub(crate) fn selected_enter(app: &App) -> Option<Enter> {
     let SidebarPos::Row(row) = app.selection else {
         // アカウント行が持つのはメニューだけ
-        open_row_menu(app);
-        return;
+        return Some(Enter::Menu);
     };
-    match app.sidebar_rows.get(row).cloned().flatten() {
-        Some(RowAction::New) => {
+    match app.sidebar_rows.get(row)?.action()? {
+        RowAction::New => Some(Enter::NewSession),
+        RowAction::Open(_) | RowAction::Project(_) | RowAction::ToggleGroup => Some(Enter::Menu),
+        RowAction::UpdateCcdesk => Some(Enter::UpdateCcdesk),
+        RowAction::UpdateClaude => Some(Enter::UpdateClaude),
+    }
+}
+
+/// **`Enter` = 選択行の動作。** サイドバーのキーは `↑↓`（選択）とこれだけで、
+/// `←` `→` は持たない: 「開く」と「メニュー」の 2 つを持つのはセッション行だけ
+/// なので、方向で区別すると他の行では嘘の案内になる。セッションを開く導線は
+/// メニューの `open`（[`PopupKind::Session`] の先頭項目）へ寄せた。
+///
+/// 何をするかの判断は [`selected_enter`] が持ち、ここは実行だけ
+fn run_enter(app: &mut App) {
+    match selected_enter(app) {
+        Some(Enter::Menu) => open_row_menu(app),
+        Some(Enter::NewSession) => {
             app.open_new_view();
             app.set_focus(Focus::Terminal);
         }
-        Some(RowAction::Open(id)) => {
-            open_session(app, &id);
-            app.set_focus(Focus::Terminal);
-        }
-        Some(RowAction::Project(_)) | Some(RowAction::ToggleGroup) => open_row_menu(app),
-        Some(RowAction::UpdateCcdesk) => start_ccdesk_update(app),
-        Some(RowAction::UpdateClaude) => start_claude_update(app),
+        Some(Enter::UpdateCcdesk) => start_ccdesk_update(app),
+        Some(Enter::UpdateClaude) => start_claude_update(app),
         None => {}
     }
 }
 
-/// **`←` = 選択行のメニュー。** キーボードからも二次操作へ入れるようにする
-/// （メニューが唯一の入口なので、行頭 `=` のクリックしか無いと操作が手に届かない）。
-///
-/// **規則は行の種類で分けない**: メニューを持つ行なら同じものが開き、持たない行
-/// （`+ new session` / 版行 ＝ 押した瞬間に何かが起きる行）では何も起きない。
-/// フッターのアカウント行も同じ規則で扱う（例外を作らない）。
-/// 予約キー（[`reserved_key`]）には足さない ＝ 端末側にフォーカスがあれば
-/// `←` は今までどおり claude へ渡る（ペイン移動は `Alt+←` なので衝突しない）。
-///
-/// 位置はクリックで開くときと同じ [`selected_row_y`]（開き方で場所が変わらない）
+/// 選択行のメニューを開く（[`Enter::Menu`] の実行）。
+/// **位置はクリックで開くときと同じ [`selected_row_y`]**（開き方で場所が変わらない）
 fn open_row_menu(app: &mut App) {
     let anchor_y = selected_row_y(app);
     let SidebarPos::Row(row) = app.selection else {
         open_account_popup(app, anchor_y);
         return;
     };
-    match app.sidebar_rows.get(row).cloned().flatten() {
+    match app.sidebar_rows.get(row).and_then(SidebarRow::action).cloned() {
         Some(RowAction::Open(id)) => open_session_popup(app, &id, anchor_y),
         Some(RowAction::Project(cwd)) => open_project_popup(app, cwd, anchor_y),
         Some(RowAction::ToggleGroup) => {
@@ -1650,9 +1728,14 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             app.sidebar_header_rows,
             app.sidebar_scroll,
         );
-        let action = app.sidebar_rows.get(row).cloned().flatten();
-        // hover: クリック可能な行の上にいるときだけハイライト
-        app.hovered = action.as_ref().map(|_| SidebarPos::Row(row));
+        let hit = app.sidebar_rows.get(row).cloned();
+        let action = hit.as_ref().and_then(SidebarRow::action).cloned();
+        // hover: **実体のある行**の上にいるときだけハイライト（飾りは光らせない）。
+        // 押しても何も起きない行も行なので、ここは動作の有無では見ない
+        app.hovered = hit
+            .as_ref()
+            .filter(|row| row.selectable())
+            .map(|_| SidebarPos::Row(row));
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             // サイドバー内クリックはサイドバーへフォーカス。
             // 行クリックは右ペインの内容だけ切り替える（フォーカス移動は右ペインクリック or Enter）
@@ -1660,7 +1743,7 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             // 名前の入力中に他所を押したら取り消す（クリックでは確定させない ＝
             // 押し間違いで名前が変わらない。確定は Enter だけ）
             app.rename = None;
-            if action.is_some() {
+            if hit.as_ref().is_some_and(SidebarRow::selectable) {
                 app.selection = SidebarPos::Row(row);
             }
             // 行頭の `=` クリック → コンテキストメニューを開く（記号 1 桁 +
@@ -1797,7 +1880,7 @@ fn session_open(app: &mut App, id: &SessionId) -> bool {
         .any(|w| &w.session_id == id && w.alive())
 }
 
-/// セッション行のメニューを開く（行頭の `=` クリック / `←`）。
+/// セッション行のメニューを開く（行頭の `=` クリック / 選択行の `Enter`）。
 /// 項目の見た目に効く 3 つ（ピン留め・アーカイブ・窓の有無）は開いた時点の写し
 fn open_session_popup(app: &mut App, id: &SessionId, anchor_y: u16) {
     let open = session_open(app, id);
@@ -1882,6 +1965,11 @@ fn activate_popup(app: &mut App, index: usize) {
 /// 判定は [`PopupKind::action`]（純関数）に置く
 fn run_popup_action(app: &mut App, action: PopupAction, anchor_y: u16) {
     match action {
+        // 開いたら打ち先はそのセッションなので、行クリックと同じくフォーカスを端末へ移す
+        PopupAction::OpenSession(id) => {
+            open_session(app, &id);
+            app.set_focus(Focus::Terminal);
+        }
         PopupAction::TogglePin(id) => {
             edit_row(app, &id, Unread::Keep, |row| row.pinned = !row.pinned)
         }
@@ -2270,7 +2358,9 @@ fn remove_window(app: &mut App, idx: usize) {
     }
 }
 
-/// サイドバーの選択を、押して意味のある位置へ上下に移動する。
+/// サイドバーの選択を、**行の実体がある位置**へ上下に移動する
+/// （飾り ＝ [`SidebarRow::Decoration`] は飛ばす。押しても何も起きない行は止まる ＝
+/// 「触れる行」の集合はホバーと同じ [`SidebarRow::selectable`] 1 つで決まる）。
 ///
 /// **一覧の下端の先はフッターのアカウント行**（マウスで押せる行はキーボードでも
 /// 届く）。描いていないフッターへは行かない ＝ 判断はマウスの当たり判定と同じ
@@ -2299,7 +2389,7 @@ fn move_selection(app: &mut App, dir: i32) {
         if row < 0 {
             return; // 端で止まる
         }
-        if app.sidebar_rows[row as usize].is_some() {
+        if app.sidebar_rows[row as usize].selectable() {
             app.selection = SidebarPos::Row(row as usize);
             app.sidebar_follow_sel = true; // 次の draw で選択行が見えるようスクロール
             return;
@@ -2607,13 +2697,15 @@ mod tests {
         }
     }
 
-    /// **メニューは 6 項目。** 落ちるのは `close` だけで、それは窓が開いていない行で
-    /// 押しても何も起きないから（他の 5 つは停止中の行にも効く）
+    /// **メニューは 7 項目で、先頭が `open`。** 落ちるのは `close` だけで、それは
+    /// 窓が開いていない行で押しても何も起きないから（他の 6 つは停止中の行にも効く ＝
+    /// `open` は止まっている行を `claude -r` で再開する）
     #[test]
     fn session_menu_disables_close_only_when_no_window_is_open() {
         assert_eq!(
             session("s1", true).entries(Grouping::State),
             [
+                ("open".to_string(), true),
                 ("pin".to_string(), true),
                 ("mark as read".to_string(), true),
                 ("rename".to_string(), true),
@@ -2628,7 +2720,7 @@ mod tests {
                 .into_iter()
                 .map(|(_, enabled)| enabled)
                 .collect::<Vec<_>>(),
-            [true, true, true, false, true, true],
+            [true, true, true, true, false, true, true],
             "close must be the only entry disabled when there is no window"
         );
     }
@@ -2643,22 +2735,28 @@ mod tests {
             open: false,
         };
         let labels = labels(&marked, Grouping::State);
-        assert_eq!(labels[0], "unpin", "a pinned row must show unpin");
-        assert_eq!(labels[4], "unarchive", "an archived row must show unarchive");
+        assert!(labels.contains(&"unpin".to_string()), "a pinned row must show unpin: {labels:?}");
+        assert!(
+            labels.contains(&"unarchive".to_string()),
+            "an archived row must show unarchive: {labels:?}"
+        );
+        assert!(!labels.contains(&"pin".to_string()), "both states are listed: {labels:?}");
+        assert!(!labels.contains(&"archive".to_string()), "both states are listed: {labels:?}");
     }
 
-    /// 6 項目それぞれの動作は行 index から引く（ラベル文字列で分岐しない）
+    /// 7 項目それぞれの動作は行 index から引く（ラベル文字列で分岐しない）
     #[test]
     fn session_menu_maps_each_row_index_to_its_action() {
         let kind = session("abc123", true);
         let id = || SessionId::new("abc123");
-        assert_eq!(kind.action(0), Some(PopupAction::TogglePin(id())));
-        assert_eq!(kind.action(1), Some(PopupAction::MarkRead(id())));
-        assert_eq!(kind.action(2), Some(PopupAction::StartRename(id())));
-        assert_eq!(kind.action(3), Some(PopupAction::Close(id())));
-        assert_eq!(kind.action(4), Some(PopupAction::ToggleArchive(id())));
-        assert_eq!(kind.action(5), Some(PopupAction::Delete(id())));
-        assert_eq!(kind.action(6), None, "an index past the last entry must do nothing");
+        assert_eq!(kind.action(0), Some(PopupAction::OpenSession(id())));
+        assert_eq!(kind.action(1), Some(PopupAction::TogglePin(id())));
+        assert_eq!(kind.action(2), Some(PopupAction::MarkRead(id())));
+        assert_eq!(kind.action(3), Some(PopupAction::StartRename(id())));
+        assert_eq!(kind.action(4), Some(PopupAction::Close(id())));
+        assert_eq!(kind.action(5), Some(PopupAction::ToggleArchive(id())));
+        assert_eq!(kind.action(6), Some(PopupAction::Delete(id())));
+        assert_eq!(kind.action(7), None, "an index past the last entry must do nothing");
     }
 
     /// grouping メニューは現在の選択に ● を付け、各行はその grouping を指す
@@ -2692,7 +2790,7 @@ mod tests {
             pinned: true,
             ..session_row("abc123", "C:\\dev\\api", 1)
         }];
-        app.sidebar_rows = vec![Some(RowAction::Open(SessionId::new("abc123")))];
+        app.sidebar_rows = vec![SidebarRow::Action(RowAction::Open(SessionId::new("abc123")))];
         app.sidebar_header_rows = 1;
         handle_mouse(&mut app, &click(0, 1)).unwrap();
         let popup = app.popup.as_ref().expect("menu must be open");
@@ -2708,7 +2806,7 @@ mod tests {
         );
         assert_eq!(
             labels(&popup.kind, app.grouping),
-            ["unpin", "mark as read", "rename", "close", "archive", "delete"]
+            ["open", "unpin", "mark as read", "rename", "close", "archive", "delete"]
         );
         assert_eq!(popup.anchor_y, 1, "must open below the clicked row");
     }
@@ -2718,7 +2816,7 @@ mod tests {
     #[test]
     fn clicking_the_group_row_and_picking_a_row_switches_grouping() {
         let mut app = test_app(34, TERM);
-        app.sidebar_rows = vec![Some(RowAction::ToggleGroup)];
+        app.sidebar_rows = vec![SidebarRow::Action(RowAction::ToggleGroup)];
         app.sidebar_header_rows = 1;
         handle_mouse(&mut app, &click(5, 1)).unwrap();
         assert_eq!(
@@ -2898,11 +2996,18 @@ mod tests {
     #[test]
     fn disabled_item_is_not_executed() {
         let mut app = test_app(34, TERM);
-        open(&mut app, session("s1", false), 3);
-        for _ in 0..3 {
+        let kind = session("s1", false);
+        // 位置は並びから引く（項目を足したときに黙って別の行を突かない）
+        let close = kind
+            .entries(app.grouping)
+            .iter()
+            .position(|(label, _)| label == "close")
+            .expect("the close entry is gone");
+        open(&mut app, kind, 3);
+        for _ in 0..close {
             handle_popup_key(&mut app, KeyCode::Down); // close を選ぶ
         }
-        assert_eq!(app.popup.as_ref().unwrap().selected, 3);
+        assert_eq!(app.popup.as_ref().unwrap().selected, close);
         handle_popup_key(&mut app, KeyCode::Enter);
         assert!(
             app.popup.is_some(),
@@ -3071,15 +3176,239 @@ mod tests {
         );
     }
 
+    // ── 行の種類・下部バーの案内（描画を通した検査） ──────────────────────
+
+    /// **サイドバーに出る行の種類が 1 フレームで全部そろう `App`。**
+    /// 版行（更新あり = ccdesk / 更新なし = claude）・区切り線・`+ new session`・
+    /// `⊞ group`・集計行・プロジェクト見出し・セッション行が積まれ、
+    /// フッターのアカウント行も描かれる。
+    ///
+    /// 行の一覧は**描画が積んだ結果**を読む（種類を書き写した表を持たない）
+    fn app_with_every_row_kind() -> App {
+        let mut app = test_app(34, (120, 40));
+        app.grouping = Grouping::Directory; // 見出し行を出す
+        app.projects = vec!["C:\\dev\\api".to_string()];
+        app.sessions = vec![session_row("s", "C:\\dev\\api", 1)];
+        // ccdesk の版行 = 更新あり、claude の版行 = 更新なし（＝ 押しても何も起きない行）
+        app.ccdesk_latest = Some("v9.9.9".to_string());
+        app
+    }
+
+    /// 1 フレーム描いて最下行（下部バーの案内）を読む。**本番と同じ [`draw`]** を通す
+    /// ので、サイドバーの行の積み方と案内の対応がそのまま検査対象になる
+    fn drawn_bottom_bar(app: &mut App) -> String {
+        let (w, h) = app.term_size;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
+            .expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw(frame, app);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..w).map(|x| buffer[(x, h - 1)].symbol()).collect()
+    }
+
+    /// 触れる位置（一覧の実体のある行 + フッターのアカウント行）を、
+    /// **描画が積んだ行から**列挙する
+    fn touchable_positions(app: &mut App) -> Vec<SidebarPos> {
+        drawn_bottom_bar(app); // 1 フレーム描いて行を積む
+        (0..app.sidebar_rows.len())
+            .filter(|row| app.sidebar_rows[*row].selectable())
+            .map(SidebarPos::Row)
+            .chain(std::iter::once(SidebarPos::Account))
+            .collect()
+    }
+
+    /// **案内に出る `Enter` は、その行で `Enter` が本当にすることの名前。**
+    /// 行の種類ごとの対応表をテストに書き写さず、[`Enter::label`]（動作の名前の正本）と
+    /// 描画結果を突き合わせる。行の種類が増えても [`selected_enter`] の網羅 match が
+    /// コンパイル時に対応を強制するので、この検査はそのまま新しい種類へ効く
+    #[test]
+    fn the_bottom_bar_names_what_enter_does_on_the_selected_row() {
+        let mut app = app_with_every_row_kind();
+        let positions = touchable_positions(&mut app);
+        assert!(positions.len() > 5, "the fixture stopped covering the row kinds: {positions:?}");
+        let mut verbs: Vec<&'static str> = Vec::new();
+        for pos in positions {
+            let mut app = app_with_every_row_kind();
+            drawn_bottom_bar(&mut app); // 行を積む
+            app.selection = pos;
+            let bar = drawn_bottom_bar(&mut app);
+            assert!(bar.contains("↑↓ select"), "{pos:?}: {bar:?}");
+            match selected_enter(&app) {
+                Some(enter) => {
+                    verbs.push(enter.label());
+                    assert!(
+                        bar.contains(&format!("Enter {}", enter.label())),
+                        "{pos:?}: the bar does not name what Enter does: {bar:?}"
+                    );
+                }
+                // 押しても何も起きない行では `Enter` を出さない（出したら嘘になる）
+                None => assert!(
+                    !bar.contains("Enter"),
+                    "{pos:?}: the bar offers Enter where nothing happens: {bar:?}"
+                ),
+            }
+        }
+        // 舐めた行が「メニュー」1 色になっていない ＝ 種類ごとの違いが本当に出ている
+        for verb in ["menu", "new session", "update"] {
+            assert!(verbs.contains(&verb), "no row offered {verb:?}: {verbs:?}");
+        }
+    }
+
+    /// **案内した `Enter` は本当に効き、案内しなかった `Enter` は本当に効かない。**
+    /// 語と実装が別々に育つのを止めるための突き合わせ。
+    ///
+    /// 版行の `update` だけは押さない: 実行すると本物のダウンロードと
+    /// `claude update` が走るため（案内と実行が同じ [`selected_enter`] を読むことは
+    /// [`run_enter`] の網羅 match が保証する）
+    #[test]
+    fn enter_does_exactly_what_the_bottom_bar_said() {
+        let mut app = app_with_every_row_kind();
+        for pos in touchable_positions(&mut app) {
+            let mut app = app_with_every_row_kind();
+            drawn_bottom_bar(&mut app);
+            app.selection = pos;
+            let expected = selected_enter(&app);
+            if matches!(expected, Some(Enter::UpdateCcdesk | Enter::UpdateClaude)) {
+                continue;
+            }
+            press(&mut app, KeyCode::Enter);
+            match expected {
+                Some(Enter::Menu) => assert!(app.popup.is_some(), "{pos:?}: no menu opened"),
+                Some(Enter::NewSession) => assert!(
+                    matches!(app.right_view, RightView::New(_)),
+                    "{pos:?}: the new session screen did not open"
+                ),
+                Some(Enter::UpdateCcdesk | Enter::UpdateClaude) => unreachable!(),
+                None => {
+                    assert!(app.popup.is_none(), "{pos:?}: a menu opened on a row that offers nothing");
+                    assert!(
+                        matches!(app.right_view, RightView::Sessions),
+                        "{pos:?}: the right pane switched on a row that offers nothing"
+                    );
+                    assert_eq!(state_name(&app), "Idle", "{pos:?}: an update started");
+                }
+            }
+        }
+    }
+
+    /// **案内は同じフレームの選択行を見る（1 フレーム遅れない）。**
+    ///
+    /// 案内が読む材料は「選択位置」と「一覧に積まれた行」の 2 つで、後者を作るのは
+    /// サイドバーの描画そのもの。**下部バーを先に描くと材料が 1 フレーム古くなる**ので、
+    /// (a) 最初のフレーム（行がまだ積まれていない）と
+    /// (b) 選択行の種類がそのフレームで変わった場合に、案内が実際の行と食い違う。
+    /// どちらも「触れる行なのに `Enter` を出さない / 何も起きないのに `Enter` を出す」
+    /// という嘘になる
+    #[test]
+    fn the_bottom_bar_reads_the_same_frame_as_the_sidebar() {
+        // (a) 最初の 1 フレームから正しい。行を積む前に案内を作っていると
+        // 「選択行が無い」ことになり `Enter` が落ちる
+        let mut app = app_with_every_row_kind();
+        let first = drawn_bottom_bar(&mut app);
+        assert_eq!(app.selection, SidebarPos::Row(0), "the fixture's premise broke");
+        assert!(
+            first.contains("Enter update"),
+            "the first frame's hint does not know the selected row yet: {first:?}"
+        );
+
+        // (b) 同じ選択位置のまま行の種類が変わったら、そのフレームで案内も変わる
+        // （更新が終わって版行が「押しても何も起きない行」になった状況）
+        app.ccdesk_latest = None;
+        let after = drawn_bottom_bar(&mut app);
+        assert_eq!(app.sidebar_rows[0], SidebarRow::Inert, "the row kind did not change");
+        assert!(
+            !after.contains("Enter"),
+            "the hint still describes the row from the previous frame: {after:?}"
+        );
+    }
+
+    /// **`↑↓` の直後の 1 フレームで案内が入れ替わる。** 行の種類で `Enter` の意味が
+    /// 違うので、選択が動いたのに案内が残ると「押したら何が起きるか」が読めなくなる
+    #[test]
+    fn the_bottom_bar_switches_verbs_as_the_selection_moves() {
+        let mut app = app_with_every_row_kind();
+        // 先頭の触れる行 = ccdesk の版行（更新あり）
+        let update_row = drawn_bottom_bar(&mut app);
+        assert!(update_row.contains("Enter update"), "the premise broke: {update_row:?}");
+
+        // 1 つ下は claude の版行（更新なし）＝ `Enter` を出さない行
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selection, SidebarPos::Row(1), "the selection did not move");
+        let inert_row = drawn_bottom_bar(&mut app);
+        assert!(
+            !inert_row.contains("Enter"),
+            "the hint lagged behind the selection: {inert_row:?}"
+        );
+
+        // さらに下は `+ new session`（区切り線は飛ばす）＝ 別の動詞になる
+        press(&mut app, KeyCode::Down);
+        let new_session_row = drawn_bottom_bar(&mut app);
+        assert!(
+            new_session_row.contains("Enter new session"),
+            "the hint did not switch to the next row's verb: {new_session_row:?}"
+        );
+
+        // 戻しても同じフレームで戻る（片方向だけ追従しているのではない）
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(drawn_bottom_bar(&mut app), update_row, "the hint did not follow back");
+    }
+
+    /// **更新の無い版行も「触れる行」。** 押しても何も起きないが行の実体はあるので、
+    /// `↑↓` で止まり、マウスを乗せればホバーする（以前は区切り線と同じ扱いで、
+    /// 選択・ホバー・ハイライトの全部から漏れていた）
+    #[test]
+    fn a_version_row_without_an_update_is_still_selectable_and_hoverable() {
+        let mut app = app_with_every_row_kind();
+        drawn_bottom_bar(&mut app);
+        // claude の版行（更新なし）は行 1。飾りではないことを描画結果から確かめる
+        assert_eq!(app.sidebar_rows[1], SidebarRow::Inert, "the fixture's premise broke");
+
+        app.selection = SidebarPos::Row(0);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selection, SidebarPos::Row(1), "↑↓ skipped the row");
+
+        handle_mouse(&mut app, &moved(3, 2)).unwrap(); // 版行 1 の画面 y は 2
+        assert_eq!(app.hovered, Some(SidebarPos::Row(1)), "the row is not hoverable");
+    }
+
+    /// **区切り線は飾りなので触れない。** 「押しても何も起きない行」と同じ扱いに
+    /// してしまうと、実体の無い行に選択が止まってハイライトが出る
+    #[test]
+    fn a_separator_is_neither_selectable_nor_hoverable() {
+        let mut app = app_with_every_row_kind();
+        drawn_bottom_bar(&mut app);
+        let separator = app
+            .sidebar_rows
+            .iter()
+            .position(|row| *row == SidebarRow::Decoration)
+            .expect("no decoration row was stacked");
+
+        // ↑↓ はこの行を飛ばす（下から上へ・上から下への両方向）
+        app.selection = SidebarPos::Row(separator.saturating_sub(1));
+        press(&mut app, KeyCode::Down);
+        assert_ne!(app.selection, SidebarPos::Row(separator), "↑↓ stopped on a decoration row");
+        app.selection = SidebarPos::Row(separator + 1);
+        press(&mut app, KeyCode::Up);
+        assert_ne!(app.selection, SidebarPos::Row(separator), "↑↓ stopped on a decoration row");
+
+        // マウスを乗せてもホバーしない
+        handle_mouse(&mut app, &moved(3, separator as u16 + 1)).unwrap();
+        assert_eq!(app.hovered, None, "a decoration row is hovered");
+    }
+
     /// ヘッダーの版行 2 本 + 区切り線 + `+ new session` を積んだサイドバー。
     /// 版行のヒットテストを見るテストの土台
     fn app_with_version_rows(sidebar_width: u16) -> App {
         let mut app = test_app(sidebar_width, TERM);
         app.sidebar_rows = vec![
-            Some(RowAction::UpdateCcdesk),
-            Some(RowAction::UpdateClaude),
-            None, // 区切り線
-            Some(RowAction::New),
+            SidebarRow::Action(RowAction::UpdateCcdesk),
+            SidebarRow::Action(RowAction::UpdateClaude),
+            SidebarRow::Decoration, // 区切り線
+            SidebarRow::Action(RowAction::New),
         ];
         app.sidebar_header_rows = 4;
         app
@@ -3105,7 +3434,7 @@ mod tests {
                 assert_eq!(app.hovered, Some(SidebarPos::Row(row)), "y={y} col={col}");
                 assert_eq!(app.selection, SidebarPos::Row(row), "y={y} col={col}");
                 assert_eq!(
-                    app.sidebar_rows[row].as_ref(),
+                    app.sidebar_rows[row].action(),
                     Some(&expected),
                     "y={y} col={col}"
                 );
@@ -3486,7 +3815,7 @@ mod tests {
     fn app_with_hoverable_rows() -> App {
         let active = Account::new("a@example.com", "taro");
         let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
-        app.sidebar_rows = vec![Some(RowAction::New)];
+        app.sidebar_rows = vec![SidebarRow::Action(RowAction::New)];
         app.sidebar_header_rows = 1;
         app
     }
@@ -3604,7 +3933,11 @@ mod tests {
     fn the_arrow_keys_reach_the_account_row_below_the_list() {
         let active = Account::new("a@example.com", "taro");
         let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
-        app.sidebar_rows = vec![Some(RowAction::New), None, Some(RowAction::ToggleGroup)];
+        app.sidebar_rows = vec![
+            SidebarRow::Action(RowAction::New),
+            SidebarRow::Decoration,
+            SidebarRow::Action(RowAction::ToggleGroup),
+        ];
         app.sidebar_header_rows = 3;
         app.selection = SidebarPos::Row(0);
 
@@ -3619,8 +3952,7 @@ mod tests {
     }
 
     /// **アカウント行はマウスとキーボードで同じ場所に同じメニューが開く。**
-    /// `Enter` / `→`（開く）も `←`（メニュー）も、この行が持つのはメニューだけなので
-    /// 同じものを出す
+    /// キーボードの入口は `Enter` だけ（`←` `→` はサイドバーから撤去した）
     #[test]
     fn the_account_menu_opens_the_same_way_from_the_mouse_and_the_keyboard() {
         let active = Account::new("a@example.com", "taro");
@@ -3629,17 +3961,12 @@ mod tests {
         handle_mouse(&mut app, &click(3, sl.account_y)).unwrap();
         let by_mouse = app.popup.take().expect("menu must be open from the mouse click");
 
-        for code in [KeyCode::Enter, KeyCode::Right, KeyCode::Left] {
-            app.popup = None;
-            app.selection = SidebarPos::Account;
-            press(&mut app, code);
-            let popup = app
-                .popup
-                .as_ref()
-                .unwrap_or_else(|| panic!("menu must be open for {code:?}"));
-            assert_eq!(popup.kind, by_mouse.kind, "a different menu must not open for {code:?}");
-            assert_eq!(popup.anchor_y, sl.account_y, "{code:?} must open at the same position");
-        }
+        app.popup = None;
+        app.selection = SidebarPos::Account;
+        press(&mut app, KeyCode::Enter);
+        let popup = app.popup.as_ref().expect("menu must be open for Enter");
+        assert_eq!(popup.kind, by_mouse.kind, "a different menu must not open from the keyboard");
+        assert_eq!(popup.anchor_y, sl.account_y, "Enter must open at the same position");
     }
 
     /// フッターが無い（狭い）端末ではアカウント行は描かれないので選択対象にもしない。
@@ -3653,7 +3980,7 @@ mod tests {
             !sidebar_layout(&app).footer_visible,
             "the footer must be hidden for this test's premise"
         );
-        app.sidebar_rows = vec![Some(RowAction::New)];
+        app.sidebar_rows = vec![SidebarRow::Action(RowAction::New)];
         app.sidebar_header_rows = 1;
         app.selection = SidebarPos::Row(0);
         press(&mut app, KeyCode::Down);
@@ -4338,7 +4665,7 @@ mod tests {
     #[test]
     fn clicking_a_project_heading_opens_its_menu() {
         let mut app = test_app(34, TERM);
-        app.sidebar_rows = vec![Some(RowAction::Project("C:\\dev\\api".to_string()))];
+        app.sidebar_rows = vec![SidebarRow::Action(RowAction::Project("C:\\dev\\api".to_string()))];
         app.sidebar_header_rows = 1;
         handle_mouse(&mut app, &click(5, 1)).unwrap();
         let popup = app.popup.as_ref().expect("no menu opened");
@@ -4990,13 +5317,13 @@ mod tests {
         assert_eq!(selected_row_y(&app), 1);
     }
 
-    // ── 二次操作（ポップアップの 6 項目）と、撤去したショートカット ──────────
+    // ── 二次操作（ポップアップの項目）と、撤去したショートカット ──────────
 
     /// 行 1 本だけを持ち、その行を選択しているサイドバー
     fn app_with_row(id: &str) -> App {
         let mut app = test_app(34, TERM);
         app.sessions = vec![session_row(id, "C:\\dev\\api", 1)];
-        app.sidebar_rows = vec![Some(RowAction::Open(SessionId::new(id)))];
+        app.sidebar_rows = vec![SidebarRow::Action(RowAction::Open(SessionId::new(id)))];
         app.sidebar_header_rows = 1;
         app
     }
@@ -5152,7 +5479,7 @@ mod tests {
     #[test]
     fn the_rename_input_swallows_the_list_keys() {
         let mut app = app_with_row("s");
-        app.sidebar_rows.push(Some(RowAction::New));
+        app.sidebar_rows.push(SidebarRow::Action(RowAction::New));
         run_popup_action(&mut app, PopupAction::StartRename(SessionId::new("s")), 0);
         press(&mut app, KeyCode::Down);
         assert_eq!(
@@ -5163,15 +5490,15 @@ mod tests {
         assert!(app.rename.is_some(), "↑↓ closed the input");
     }
 
-    /// **`←` はどの行でも「その行のメニュー」。** 種類ごとに別のキーを覚えさせない
-    /// （`→` / Enter の「開く」の対として 1 本の規則にする）
+    /// **`Enter` はメニューを持つ行ではその行のメニュー。** セッション行も同じで、
+    /// 開く導線はそのメニューの `open` になった（種類ごとに別のキーを覚えさせない）
     #[test]
-    fn the_left_key_opens_the_menu_of_whatever_row_is_selected() {
+    fn enter_opens_the_menu_of_whatever_row_has_one() {
         let mut app = app_with_row("s");
         app.sidebar_rows = vec![
-            Some(RowAction::Open(SessionId::new("s"))),
-            Some(RowAction::Project("C:\\dev\\api".to_string())),
-            Some(RowAction::ToggleGroup),
+            SidebarRow::Action(RowAction::Open(SessionId::new("s"))),
+            SidebarRow::Action(RowAction::Project("C:\\dev\\api".to_string())),
+            SidebarRow::Action(RowAction::ToggleGroup),
         ];
         app.sidebar_header_rows = 3;
         for (row, expected) in [
@@ -5182,7 +5509,7 @@ mod tests {
         ] {
             app.popup = None;
             app.selection = SidebarPos::Row(row);
-            press(&mut app, KeyCode::Left);
+            press(&mut app, KeyCode::Enter);
             let popup = app
                 .popup
                 .as_ref()
@@ -5193,41 +5520,99 @@ mod tests {
         }
     }
 
-    /// メニューを持たない行（押した瞬間に何かが起きる行）では `←` は無反応
+    /// **セッションのメニューの `open` で本当にセッションが開く。** キーボードから
+    /// セッションを開く導線はこれ 1 本なので、項目が並んでいるだけでなく
+    /// 行クリックと同じ結果（[`open_session`] を通って既読になり、打ち先が端末へ移る）
+    /// になることを見る。
+    ///
+    /// 行の cwd に**存在しないフォルダ**を置いてあるのは、この単体テストで本物の
+    /// `claude -r` を起こさないため（起動は cwd の解決で失敗して終わる）
     #[test]
-    fn the_left_key_does_nothing_on_rows_without_a_menu() {
+    fn the_session_menu_open_entry_opens_the_session() {
         let mut app = test_app(34, TERM);
+        app.sessions = vec![SessionRow {
+            updated_at: 2, // last_opened_at より後 ＝ 未読
+            ..session_row("s", "C:\\ccdesk-test-no-such-folder", 1)
+        }];
+        app.sidebar_rows = vec![SidebarRow::Action(RowAction::Open(SessionId::new("s")))];
+        app.sidebar_header_rows = 1;
+        app.selection = SidebarPos::Row(0);
+        assert!(only_row(&app).unread(), "the row must start unread for this test's premise");
+
+        press(&mut app, KeyCode::Enter); // 行のメニュー
+        let index = app
+            .popup
+            .as_ref()
+            .expect("no menu opened")
+            .kind
+            .entries(app.grouping)
+            .iter()
+            .position(|(label, _)| label == "open")
+            .expect("the menu has no open entry");
+        assert_eq!(index, 0, "open must be the first entry");
+
+        activate_popup(&mut app, index);
+        assert!(app.popup.is_none(), "the menu stayed open after open ran");
+        // 開いた行は既読になり（[`mark_opened`] ＝ open_session の唯一の入口）、
+        // 打鍵の宛先はそのセッションになる
+        assert!(!only_row(&app).unread(), "open did not mark the row as read");
+        assert_eq!(app.focus, Focus::Terminal, "open did not move the keys to the pane");
+    }
+
+    /// **`←` `→` はサイドバーから撤去した。** 「開く」と「メニュー」の 2 つを持つのは
+    /// セッション行だけなので、方向で区別すると他の行では嘘になる。
+    /// どの種類の行でも無反応であることを見る（残っていれば選択・メニュー・
+    /// 右ペインのどれかが動く）
+    #[test]
+    fn the_arrow_keys_across_the_sidebar_do_nothing() {
+        let mut app = app_with_row("s");
         app.sidebar_rows = vec![
-            Some(RowAction::UpdateCcdesk),
-            Some(RowAction::UpdateClaude),
-            None, // 区切り線
-            Some(RowAction::New),
+            SidebarRow::Action(RowAction::UpdateCcdesk),
+            SidebarRow::Inert, // 更新の無い版行
+            SidebarRow::Decoration, // 区切り線
+            SidebarRow::Action(RowAction::New),
+            SidebarRow::Action(RowAction::Open(SessionId::new("s"))),
+            SidebarRow::Action(RowAction::Project("C:\\dev\\api".to_string())),
+            SidebarRow::Action(RowAction::ToggleGroup),
         ];
-        app.sidebar_header_rows = 4;
-        for row in 0..app.sidebar_rows.len() {
-            app.selection = SidebarPos::Row(row);
-            press(&mut app, KeyCode::Left);
-            assert!(app.popup.is_none(), "row={row}: a menu opened");
-            assert!(
-                matches!(app.right_view, RightView::Sessions),
-                "row={row}: the right pane switched"
-            );
+        app.sidebar_header_rows = app.sidebar_rows.len();
+        let positions = (0..app.sidebar_rows.len())
+            .map(SidebarPos::Row)
+            .chain(std::iter::once(SidebarPos::Account));
+        for pos in positions {
+            for code in [KeyCode::Left, KeyCode::Right] {
+                app.selection = pos;
+                app.popup = None;
+                press(&mut app, code);
+                assert!(app.popup.is_none(), "{pos:?}: {code:?} opened a menu");
+                assert_eq!(app.selection, pos, "{pos:?}: {code:?} moved the selection");
+                assert!(
+                    matches!(app.right_view, RightView::Sessions),
+                    "{pos:?}: {code:?} switched the right pane"
+                );
+                assert_eq!(state_name(&app), "Idle", "{pos:?}: {code:?} started an update");
+            }
         }
     }
 
-    /// **`←` はサイドバーの中だけの話。** 予約キーではないので、端末側に
-    /// フォーカスがあれば今までどおりカーソルキーとして claude へ渡る
-    /// （ペインの移動は `Alt+←` なので衝突しない）
+    /// **`←` `→` はサイドバーの外では今までどおり。** 予約キーではないので、
+    /// 端末側にフォーカスがあればカーソルキーとして claude へ渡る
+    /// （ペインの移動は `Alt+←→` なので衝突しない）
     #[test]
-    fn the_left_key_is_not_reserved_and_still_reaches_claude() {
-        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
-        assert_eq!(reserved_key(&left), None, "← is reserved");
+    fn the_arrow_keys_are_not_reserved_and_still_reach_claude() {
         let parser = ccdesk::new_parser(24, 80, 0);
-        assert_eq!(
-            encode_key(&left, &parser),
-            b"\x1b[D",
-            "← does not reach claude as a cursor key"
-        );
+        for (code, seq) in [
+            (KeyCode::Left, b"\x1b[D".as_slice()),
+            (KeyCode::Right, b"\x1b[C".as_slice()),
+        ] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            assert_eq!(reserved_key(&key), None, "{code:?} is reserved");
+            assert_eq!(
+                encode_key(&key, &parser),
+                seq,
+                "{code:?} does not reach claude as a cursor key"
+            );
+        }
     }
 
     /// **撤去した打鍵は claude のものへ戻った。** 予約キーに載っていないので

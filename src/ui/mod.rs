@@ -13,7 +13,8 @@ use tui_term::widget::PseudoTerminal;
 use ccdesk::dir_key;
 
 use crate::app::{
-    active_unstored, App, Focus, Popup, RightView, RowAction, SelfUpdate, SidebarPos,
+    active_unstored, selected_enter, App, Focus, Popup, RightView, RowAction, SelfUpdate,
+    SidebarPos, SidebarRow,
 };
 use crate::poll::{
     classify, foreground_state, AccountStatus, Bucket, Group, Grouping, StateView,
@@ -214,8 +215,9 @@ impl UpdateState {
         }
     }
 
-    /// クリックで更新を始められるか（＝行にアクションを付けるか）。
-    /// 実行中と再起動待ちはもう押す意味が無いので、ハイライトも出さない
+    /// 押して更新を始められるか（＝行に動作を付けるか）。実行中と再起動待ちは
+    /// もう押す意味が無いので付けない。**それでも行は行**なので、選択・ホバーの
+    /// 対象からは外れない（[`SidebarRow::Inert`]）
     fn actionable(self) -> bool {
         self == Self::Available
     }
@@ -262,28 +264,38 @@ fn version_row(name: &str, version: &str, state: UpdateState, inner_width: u16) 
 ///
 /// 2 つの更新をここへ集約する（下部フッターには置かない ＝ 同じことを 2 箇所に出さない）。
 /// **行数は更新の有無で変わらない**ので、固定ヘッダー行数もマーカー桁の位置も動かない。
-/// Frame に触らない純関数なので、4 状態の文面と当たり判定をテストで固定できる
+/// Frame に触らない純関数なので、4 状態の文面と当たり判定をテストで固定できる。
+///
+/// **更新が無い版行は [`SidebarRow::Inert`]**（押しても何も起きないが行の実体はある）。
+/// 飾りは区切り線だけ ＝ 版行は更新の有無に関係なく選択・ホバーできる
 fn version_rows(
     ccdesk: UpdateState,
     claude_version: &str,
     claude: UpdateState,
     inner_width: u16,
-) -> Vec<(String, Style, Option<RowAction>)> {
+) -> Vec<(String, Style, SidebarRow)> {
+    let row = |state: UpdateState, action: RowAction| {
+        if state.actionable() {
+            SidebarRow::Action(action)
+        } else {
+            SidebarRow::Inert
+        }
+    };
     vec![
         (
             version_row("ccdesk", env!("CARGO_PKG_VERSION"), ccdesk, inner_width),
             ccdesk.style(),
-            ccdesk.actionable().then_some(RowAction::UpdateCcdesk),
+            row(ccdesk, RowAction::UpdateCcdesk),
         ),
         (
             version_row("claude", claude_version, claude, inner_width),
             claude.style(),
-            claude.actionable().then_some(RowAction::UpdateClaude),
+            row(claude, RowAction::UpdateClaude),
         ),
         (
             separator_text(inner_width),
             Style::default().fg(ui().dim),
-            None,
+            SidebarRow::Decoration,
         ),
     ]
 }
@@ -548,46 +560,54 @@ impl FrameCursor {
 /// 一覧）。順序が別々だと、案内と実際の受け手がずれる。
 ///
 /// `None` は新規セッション画面だけ ＝ 案内をペイン内に持つので下部バーへ重ねない
-fn context_hint(app: &App) -> Option<(&'static str, &'static str)> {
+fn context_hint(app: &App) -> Option<(&'static str, String)> {
     if app.focus == Focus::Terminal {
         if matches!(app.right_view, RightView::New(_)) {
             return None;
         }
         // ccdesk が取るのは予約キーだけ。残りは全部 claude が受ける
-        return Some(("terminal", "all keys pass through to claude"));
+        return Some(("terminal", "all keys pass through to claude".to_string()));
     }
     if app.rename.is_some() {
         // 名前の入力中は入力の作法だけ（一覧の操作は全部この入力へ渡っている）
-        return Some(("rename", "Enter rename · Esc cancel"));
+        return Some(("rename", "Enter rename · Esc cancel".to_string()));
     }
     if app.popup.is_some() {
         // メニューは開いている間すべてのキーを飲む ＝ 一覧のキーは出さない
-        return Some(("popup", "↑↓ select · Enter run · Esc close"));
+        return Some(("popup", "↑↓ select · Enter run · Esc close".to_string()));
     }
-    Some(("sidebar", "↑↓ select · Enter/→ open · ← menu"))
+    Some(("sidebar", sidebar_hint(app)))
 }
 
-pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
-    // 最下行は横断のキーヒントバー
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(frame.area());
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(app.sidebar_width),
-            Constraint::Min(1),
-        ])
-        .split(vert[0]);
+/// サイドバーの案内。**選択行で本当に効くキーだけ**を並べる。
+///
+/// `↑↓` はどの行でも効くが、`Enter` が何をするかは行の種類で違う
+/// （メニュー / 新規セッション / 更新 / 何もしない）。その語は
+/// [`crate::app::Enter::label`] ＝ **動作の名前の正本**から取るので、
+/// 「行の種類 → 案内」の対応表をここに持たない: 種類を足したときに
+/// 案内だけが黙って古くなることが起きない。
+///
+/// 押しても何も起きない行（更新の無い版行）では `Enter` を出さない
+fn sidebar_hint(app: &App) -> String {
+    match selected_enter(app) {
+        Some(enter) => format!("↑↓ select · Enter {}", enter.label()),
+        None => "↑↓ select".to_string(),
+    }
+}
 
+/// 最下行の横断バー。**通知があれば数秒それを出し、無ければキーヒント**を出す。
+///
+/// **呼ぶのはサイドバーを積んだ後**（[`draw`] の並び）: 案内は選択行の種類で
+/// 変わり、その選択行は [`App::sidebar_rows`] を組んだ結果に依るので、
+/// 先に描くと 1 フレーム古い行の案内が出る
+fn draw_bottom_bar(frame: &mut Frame, area: Rect, app: &mut App) {
     // 下部バー: 通知（起動失敗等）があれば数秒それを出し、無ければキーヒント
     if let Some((msg, at)) = &app.notice {
         if at.elapsed() < Duration::from_secs(5) {
             frame.render_widget(
                 ratatui::widgets::Paragraph::new(Line::from(format!(" {msg}")))
                     .style(Style::default().fg(C_FAIL)),
-                vert[1],
+                area,
             );
         } else {
             app.notice = None;
@@ -654,7 +674,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         let bar = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(1), Constraint::Length(usage_w)])
-            .split(vert[1]);
+            .split(area);
         // new session 画面のヒントはペイン内に出すため、下部バーには重ねない
         frame.render_widget(
             ratatui::widgets::Paragraph::new(Line::from(hint_spans))
@@ -668,6 +688,21 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             );
         }
     }
+}
+
+pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
+    // 最下行は横断のキーヒントバー
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(frame.area());
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(app.sidebar_width),
+            Constraint::Min(1),
+        ])
+        .split(vert[0]);
 
     // サイドバー: **行の正本は `~/.ccdesk/sessions.json`**（`app.sessions`）。
     // 生死は自分の子プロセス（`child.try_wait()`）が、生きている行のライブ状態は
@@ -806,10 +841,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     let (selection, hovered) = (app.selection, app.hovered);
     let is_highlighted = |pos: SidebarPos| selection == pos || hovered == Some(pos);
     let mut items: Vec<ListItem> = Vec::new();
-    let mut rows: Vec<Option<RowAction>> = Vec::new();
+    let mut rows: Vec<SidebarRow> = Vec::new();
 
     let push_data_row =
-        |items: &mut Vec<ListItem>, rows: &mut Vec<Option<RowAction>>, d: &RowData| {
+        |items: &mut Vec<ListItem>, rows: &mut Vec<SidebarRow>, d: &RowData| {
             let cur = rows.len();
             let highlighted = is_highlighted(SidebarPos::Row(cur));
             let mut line_style = Style::default();
@@ -823,7 +858,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                     Line::from(format!("{RENAME_PREFIX}{text}"))
                         .style(line_style.bg(ui().hl_bg).fg(ui().emph)),
                 ));
-                rows.push(Some(d.action.clone()));
+                rows.push(SidebarRow::Action(d.action.clone()));
                 return;
             }
             let name_style = if d.is_active_window {
@@ -855,13 +890,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 Style::default().fg(ui().dim),
             ));
             items.push(ListItem::new(Line::from(spans).style(line_style)));
-            rows.push(Some(d.action.clone()));
+            rows.push(SidebarRow::Action(d.action.clone()));
         };
 
     let inner_width = chunks[0].width.saturating_sub(2);
 
     // 先頭: ccdesk / claude の版行と区切り線。更新があるときだけ行全体がクリック可
-    for (text, style, action) in version_rows(
+    for (text, style, row) in version_rows(
         ccdesk_update_state(app),
         &app.footer.current,
         claude_update_state(app),
@@ -869,11 +904,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     ) {
         let cur = rows.len();
         let mut style = style;
-        if action.is_some() && is_highlighted(SidebarPos::Row(cur)) {
+        // ハイライトの条件は他の行と同じ「実体のある行か」だけ
+        // （更新が無い版行も選択・ホバーできる ＝ 触れる行と光る行がずれない）
+        if row.selectable() && is_highlighted(SidebarPos::Row(cur)) {
             style = style.bg(ui().hl_bg).fg(ui().emph);
         }
         items.push(ListItem::new(Line::from(text).style(style)));
-        rows.push(action);
+        rows.push(row);
     }
 
     // 新規セッション
@@ -885,13 +922,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             style = style.bg(ui().hl_bg).fg(ui().emph);
         }
         items.push(ListItem::new(Line::from("+ new session").style(style)));
-        rows.push(Some(RowAction::New));
+        rows.push(SidebarRow::Action(RowAction::New));
     }
     // 区切り線: new session（アクション）とセッション一覧領域を分ける（Desktop 風）
     items.push(ListItem::new(
         Line::from(separator_text(inner_width)).style(Style::default().fg(ui().dim)),
     ));
-    rows.push(None);
+    rows.push(SidebarRow::Decoration);
     // グルーピング切替（クリックで state ⇔ directory）
     {
         let cur = rows.len();
@@ -912,7 +949,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             ])
             .style(style),
         ));
-        rows.push(Some(RowAction::ToggleGroup));
+        rows.push(SidebarRow::Action(RowAction::ToggleGroup));
     }
     // ヘッダー集計行（公式ヘッダー相当）
     items.push(ListItem::new(
@@ -921,7 +958,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         ))
         .style(Style::default().fg(ui().dim)),
     ));
-    rows.push(None);
+    rows.push(SidebarRow::Decoration);
     // ここまでが固定ヘッダー。積んだ数をそのまま正本にする
     // （ヒットテストとスクロール計算が読む。定数と二重管理にしない）
     let header_n = rows.len();
@@ -946,11 +983,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                     continue;
                 }
                 items.push(ListItem::new(Line::from("")));
-                rows.push(None);
+                rows.push(SidebarRow::Decoration);
                 items.push(ListItem::new(
                     Line::from(group.title()).style(Style::default().fg(ui().dim)),
                 ));
-                rows.push(None);
+                rows.push(SidebarRow::Decoration);
                 for d in members {
                     push_data_row(&mut items, &mut rows, d);
                 }
@@ -972,7 +1009,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             let data_keys: Vec<String> = data.iter().map(|d| dir_key_of(&d.cwd)).collect();
             for row in project_rows(&app.projects, &cwds) {
                 items.push(ListItem::new(Line::from("")));
-                rows.push(None);
+                rows.push(SidebarRow::Decoration);
                 let cur = rows.len();
                 let highlighted = is_highlighted(SidebarPos::Row(cur));
                 let mut style = Style::default().fg(ui().dim);
@@ -980,7 +1017,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                     style = style.bg(ui().hl_bg).fg(ui().emph);
                 }
                 items.push(ListItem::new(Line::from(row.heading).style(style)));
-                rows.push(Some(RowAction::Project(row.cwd)));
+                rows.push(SidebarRow::Action(RowAction::Project(row.cwd)));
                 // 配下のセッション行。見出しの一覧と同じ同一判定キーで振り分ける
                 // （ここだけ厳密一致にすると大小違いのセッションが行き場を失う）
                 let members = ordered(
@@ -1006,11 +1043,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     let archived = ordered(data.iter().filter(|d| d.archived).collect());
     if !archived.is_empty() {
         items.push(ListItem::new(Line::from("")));
-        rows.push(None);
+        rows.push(SidebarRow::Decoration);
         items.push(ListItem::new(
             Line::from(ARCHIVED_TITLE).style(Style::default().fg(ui().dim)),
         ));
-        rows.push(None);
+        rows.push(SidebarRow::Decoration);
         for d in archived {
             push_data_row(&mut items, &mut rows, d);
         }
@@ -1024,20 +1061,16 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     app.sidebar_rows = rows;
     app.sidebar_header_rows = header_n;
     // 選択が浮いたら（行構成が変わった / 狭くてフッターが消えた）先頭の
-    // クリック可能行へ寄せる。**押せない位置に選択を残さない**
+    // 触れる行へ寄せる。**実体の無い位置に選択を残さない**
     let selection_lost = match app.selection {
-        SidebarPos::Row(row) => app
-            .sidebar_rows
-            .get(row)
-            .map(|r| r.is_none())
-            .unwrap_or(true),
+        SidebarPos::Row(row) => !app.sidebar_rows.get(row).is_some_and(SidebarRow::selectable),
         SidebarPos::Account => !sl.footer_visible,
     };
     if selection_lost {
         app.selection = SidebarPos::Row(
             app.sidebar_rows
                 .iter()
-                .position(|r| r.is_some())
+                .position(SidebarRow::selectable)
                 .unwrap_or(0),
         );
     }
@@ -1126,13 +1159,22 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         if is_highlighted(SidebarPos::Account) {
             account_style = account_style.bg(ui().hl_bg).fg(ui().emph);
         }
+        // **スタイルは `Line` ではなく `Paragraph` へ載せる。** `Paragraph` は
+        // 自分のスタイルを矩形全体へ塗ってから文字を書くので、帯が一覧の行と同じ
+        // 行幅いっぱいまで伸びる。`Line` に載せると塗られるのは文字が占める桁だけで、
+        // 一覧の行（`ListItem` ＝ ratatui がリスト幅まで埋める）より短い帯になる
         frame.render_widget(
-            ratatui::widgets::Paragraph::new(
-                Line::from(clip_to_width(&account, fw)).style(account_style),
-            ),
+            ratatui::widgets::Paragraph::new(Line::from(clip_to_width(&account, fw)))
+                .style(account_style),
             Rect::new(fx, account_y, fw, 1),
         );
     }
+
+    // 最下行の横断バー。**サイドバーを積んだ後に描くのが要点**で、案内は選択行の
+    // 種類で変わるため、先に描くと 1 フレーム前の行の案内が出る（選択を動かした
+    // フレームで案内が追いつかない）。矩形は重ならないので描く順序は見た目に影響しない
+    draw_bottom_bar(frame, vert[1], app);
+
 
     // 右ペイン → コンテキストメニューの順で描く。**この順序が意味を持つ**:
     // メニューの幅は内容が決めるので、サイドバーが狭いと矩形が右ペインへ食い込む
@@ -1150,9 +1192,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
 /// そのセッションの行 index（[`RowAction::Open`] を持つ行）。
 /// 名前の編集中のカーソルを置く行を、**描画が積んだ一覧そのもの**から引く
 /// （行の並びは編集中も読み直しで動くので、開始時の index を覚えない）
-fn row_of_session(rows: &[Option<RowAction>], id: &SessionId) -> Option<usize> {
+fn row_of_session(rows: &[SidebarRow], id: &SessionId) -> Option<usize> {
     rows.iter()
-        .position(|action| matches!(action, Some(RowAction::Open(row_id)) if row_id == id))
+        .position(|row| matches!(row.action(), Some(RowAction::Open(row_id)) if row_id == id))
 }
 
 /// コンテキストメニュー（モーダル）。矩形はクリック判定と同じ [`popup_rect`] を使う。
@@ -1417,7 +1459,16 @@ mod tests {
             assert!(rows[0].0.contains(env!("CARGO_PKG_VERSION")), "{:?}", rows[0].0);
             assert!(rows[1].0.contains("claude v2.1.220"), "{:?}", rows[1].0);
             assert_eq!(rows[2].0, separator_text(DEFAULT_INNER));
-            assert!(rows[2].2.is_none(), "the separator must not be clickable");
+            // **区切り線だけが飾り。** 版行は更新の有無に関係なく行の実体がある
+            assert_eq!(
+                rows[2].2,
+                SidebarRow::Decoration,
+                "the separator must not be a row you can touch"
+            );
+            assert!(
+                rows[0].2.selectable() && rows[1].2.selectable(),
+                "a version row dropped out of the selection at {ccdesk:?} / {claude:?}"
+            );
         }
         // 版が未取得なら番号を出さない（誤情報を出さない）
         let rows = version_rows(UpdateState::Current, "", UpdateState::Current, DEFAULT_INNER);
@@ -1467,24 +1518,32 @@ mod tests {
         }
     }
 
-    /// クリックできるのは「更新がある」行だけ。実行中・再起動待ちは押しても
-    /// 意味が無いのでアクションを付けない（ハイライトも出さない）
+    /// 押して更新できるのは「更新がある」行だけ。実行中・再起動待ちは押しても
+    /// 意味が無いので動作を付けない。**それでも行は行**なので
+    /// [`SidebarRow::Inert`] ＝ 選択・ホバーの対象からは外れない
     #[test]
     fn version_rows_are_clickable_only_when_an_update_is_available() {
-        let actions = |ccdesk, claude| {
+        let rows_of = |ccdesk, claude| {
             let rows = version_rows(ccdesk, "2.1.220", claude, DEFAULT_INNER);
             (rows[0].2.clone(), rows[1].2.clone())
         };
         assert_eq!(
-            actions(UpdateState::Available, UpdateState::Available),
-            (Some(RowAction::UpdateCcdesk), Some(RowAction::UpdateClaude))
+            rows_of(UpdateState::Available, UpdateState::Available),
+            (
+                SidebarRow::Action(RowAction::UpdateCcdesk),
+                SidebarRow::Action(RowAction::UpdateClaude)
+            )
         );
         for state in [
             UpdateState::Current,
             UpdateState::Running,
             UpdateState::Restart,
         ] {
-            assert_eq!(actions(state, state), (None, None), "{state:?}");
+            assert_eq!(
+                rows_of(state, state),
+                (SidebarRow::Inert, SidebarRow::Inert),
+                "{state:?}"
+            );
         }
     }
 
@@ -1619,8 +1678,8 @@ mod tests {
             DEFAULT_INNER,
         );
         // 版行はヘッダーの 0・1 行目（区切り線が 2 行目）
-        assert_eq!(header[0].2, Some(RowAction::UpdateCcdesk));
-        assert_eq!(header[1].2, Some(RowAction::UpdateClaude));
+        assert_eq!(header[0].2.action(), Some(&RowAction::UpdateCcdesk));
+        assert_eq!(header[1].2.action(), Some(&RowAction::UpdateClaude));
         // 画面 y=1 が ccdesk 行、y=2 が claude 行（スクロール位置に関係なく固定）
         for scroll in [0usize, 5, 99] {
             assert_eq!(row_at(1, sl.capacity, 7, scroll), 0);
@@ -1789,7 +1848,7 @@ mod tests {
                 let rows = render_sidebar(&mut app);
                 let headings = rows
                     .iter()
-                    .filter(|(action, _)| matches!(action, Some(RowAction::Project(_))))
+                    .filter(|(row, _)| matches!(row.action(), Some(RowAction::Project(_))))
                     .count();
                 assert_eq!(headings, n, "n={n}: heading count does not match");
             });
@@ -1855,7 +1914,7 @@ mod tests {
     /// サイドバーを実際に描いて (行データ, その行の表示文字列) を返す。
     /// **描画を経由するのが要点**で、`project_rows` の結果が本当に画面と
     /// クリック判定へ届いているか（登録リストが draw に配線されているか）を見る
-    fn render_sidebar(app: &mut App) -> Vec<(Option<RowAction>, String)> {
+    fn render_sidebar(app: &mut App) -> Vec<(SidebarRow, String)> {
         let (w, h) = app.term_size;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("failed to create terminal");
@@ -1870,12 +1929,12 @@ mod tests {
         app.sidebar_rows
             .iter()
             .enumerate()
-            .map(|(idx, action)| {
+            .map(|(idx, row)| {
                 let y = idx as u16 + 1; // 上枠の次の行から積まれる
                 let text: String = (1..app.sidebar_width.saturating_sub(1))
                     .map(|x| buffer[(x, y)].symbol())
                     .collect();
-                (action.clone(), text.trim_end().to_string())
+                (row.clone(), text.trim_end().to_string())
             })
             .collect()
     }
@@ -1895,8 +1954,8 @@ mod tests {
         let rows = render_sidebar(&mut app);
         let heading = rows
             .iter()
-            .find(|(action, _)| {
-                matches!(action, Some(RowAction::Project(cwd)) if cwd == "C:\\dev\\empty-project")
+            .find(|(row, _)| {
+                matches!(row.action(), Some(RowAction::Project(cwd)) if cwd == "C:\\dev\\empty-project")
             })
             .expect("the registered project's heading was not drawn");
         assert_eq!(heading.1, "empty-project", "the heading text is not just the leaf name");
@@ -1933,7 +1992,7 @@ mod tests {
         let rows = render_sidebar(&mut app);
         let headings: Vec<&str> = rows
             .iter()
-            .filter(|(action, _)| matches!(action, Some(RowAction::Project(_))))
+            .filter(|(row, _)| matches!(row.action(), Some(RowAction::Project(_))))
             .map(|(_, text)| text.as_str())
             .collect();
         assert_eq!(
@@ -1946,7 +2005,7 @@ mod tests {
         let infra = rows.iter().position(|(_, t)| t == "infra").unwrap();
         assert_eq!(rows[infra + 1].1, "", "a session row is showing under infra");
         assert!(
-            matches!(&rows[infra + 2].0, Some(RowAction::Project(cwd)) if cwd.ends_with("shop-app")),
+            matches!(rows[infra + 2].0.action(), Some(RowAction::Project(cwd)) if cwd.ends_with("shop-app")),
             "the row after the empty folder is not another heading"
         );
     }
@@ -1964,7 +2023,7 @@ mod tests {
         let rows = render_sidebar(&mut app);
         assert!(
             rows.iter()
-                .any(|(action, text)| action == &Some(RowAction::New) && text == "+ new session"),
+                .any(|(row, text)| row.action() == Some(&RowAction::New) && text == "+ new session"),
             "the + new session row is gone"
         );
     }
@@ -1989,7 +2048,7 @@ mod tests {
     fn session_lines(app: &mut App) -> Vec<String> {
         render_sidebar(app)
             .into_iter()
-            .filter(|(action, _)| matches!(action, Some(RowAction::Open(_))))
+            .filter(|(row, _)| matches!(row.action(), Some(RowAction::Open(_))))
             .map(|(_, text)| text)
             .collect()
     }
@@ -2090,7 +2149,7 @@ mod tests {
         assert!(
             !rows
                 .iter()
-                .any(|(action, _)| matches!(action, Some(RowAction::Project(_)))),
+                .any(|(row, _)| matches!(row.action(), Some(RowAction::Project(_)))),
             "a heading is showing for an archive-only folder: {rows:?}"
         );
         // 行そのものは Archived 節に残る（戻す入口）
@@ -2130,7 +2189,7 @@ mod tests {
         let row = app
             .sidebar_rows
             .iter()
-            .position(|a| matches!(a, Some(RowAction::Open(_))))
+            .position(|row| matches!(row.action(), Some(RowAction::Open(_))))
             .expect("no session row");
         let y = row_y(row, app.sidebar_header_rows, app.sidebar_scroll);
         let text: String = (1..app.sidebar_width - 1)
@@ -2161,7 +2220,11 @@ mod tests {
         let bar = drawn_row(&mut app, 29);
         assert!(bar.contains("Ctrl+Q quit"), "{bar:?}");
         assert!(bar.contains("Alt+←→ focus"), "{bar:?}");
-        assert!(bar.contains("← menu"), "the hint does not say how to open the menu: {bar:?}");
+        assert!(bar.contains("↑↓ select"), "{bar:?}");
+        // サイドバーから撤去した打鍵（`←` メニュー / `→` 開く）は案内にも残さない。
+        // `Alt+←→` は残るので、方向キー単体の案内だけを見る
+        assert!(!bar.contains("← menu"), "the hint still offers ← as the menu key: {bar:?}");
+        assert!(!bar.contains("Enter/→"), "the hint still offers → as the open key: {bar:?}");
         assert!(!bar.contains("Ctrl+S"), "the hint still lists a key that was removed: {bar:?}");
         assert!(!bar.contains("Ctrl+X"), "the hint still lists a key that was removed: {bar:?}");
 
@@ -2186,10 +2249,10 @@ mod tests {
             sessions: vec![named_session("s", "C:\\dev\\api", "session")],
             ..Default::default()
         };
-        // 一覧: 開く（Enter / →）とメニュー（←）の両方を出す
+        // 一覧: `↑↓` と、選択行の `Enter` が何をするか（既定の選択は先頭の版行）
         let mut app = base();
         let bar = drawn_row(&mut app, 29);
-        assert!(bar.contains("sidebar: ↑↓ select · Enter/→ open · ← menu"), "{bar:?}");
+        assert!(bar.contains("sidebar: ↑↓ select"), "{bar:?}");
 
         // メニュー表示中: 一覧のキーは全部このメニューが飲むので出さない
         let mut app = App {
@@ -2480,6 +2543,108 @@ mod tests {
         );
         app.hovered = None;
         assert_eq!(drawn_account_row(&mut app), plain);
+    }
+
+    /// 1 フレーム描いて、指定行で**帯（ハイライト背景）が乗っている桁**を返す。
+    ///
+    /// 帯の色や幅を式で書き写さずに「どの桁が塗られたか」だけを取り出すので、
+    /// **行どうしの見た目を突き合わせる**のに使える（見え方を変えたら両方が一緒に動く）
+    fn highlighted_columns(app: &mut App, y: u16) -> Vec<u16> {
+        let (w, h) = app.term_size;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw(frame, app);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..w).filter(|x| buffer[(*x, y)].bg == ui().hl_bg).collect()
+    }
+
+    /// **アカウント行の帯は一覧の行と同じ行幅いっぱいに出る。**
+    ///
+    /// アカウント行は `Paragraph` + `Rect`、一覧の行は `List` の `ListItem` で描かれる。
+    /// `Paragraph` はスタイルを `Line` に載せると**文字が占める桁だけ**が塗られるので、
+    /// リスト幅まで埋める `ListItem` より短い帯になっていた（実機のスクリーンショットで
+    /// `+ new session` は幅いっぱい・アカウント行は文字幅だけ）。
+    ///
+    /// 「同じ幅」は桁数を書き写さず、**同じ App の一覧の行と突き合わせて**見る
+    #[test]
+    fn the_account_row_band_is_as_wide_as_a_list_row() {
+        let mut app = app_with_account_row(vec![active_account()]);
+        // 突き合わせる相手は `+ new session`（文字が短いので帯を埋めているかが出る）。
+        // 行 index は描画結果から引く
+        highlighted_columns(&mut app, 0);
+        let new_row = app
+            .sidebar_rows
+            .iter()
+            .position(|row| row.action() == Some(&RowAction::New))
+            .expect("the + new session row was not stacked");
+        let new_y = row_y(new_row, app.sidebar_header_rows, app.sidebar_scroll);
+        let account_y = sidebar_layout(&app).account_y;
+
+        app.selection = SidebarPos::Row(new_row);
+        let list_band = highlighted_columns(&mut app, new_y);
+        assert!(
+            list_band.len() > "+ new session".len(),
+            "the premise broke — the list row's band stops at its text: {list_band:?}"
+        );
+
+        app.selection = SidebarPos::Account;
+        assert_eq!(
+            highlighted_columns(&mut app, account_y),
+            list_band,
+            "the account row's band is not the same width as a list row's"
+        );
+    }
+
+    /// **更新の無い版行も、触れれば他の行と同じ帯が出る。** 以前は動作の無い行を
+    /// 区切り線と同じ扱いにしていたので、選択もホバーもハイライトも全部から漏れていた。
+    /// 「同じ見え方」は色を書き写さず、**更新のある版行の帯と突き合わせて**見る
+    #[test]
+    fn a_version_row_without_an_update_is_highlighted_like_any_other_row() {
+        // ccdesk = 更新あり（行 0）、claude = 更新なし（行 1）。
+        // 版行は固定ヘッダーの先頭 2 行なので画面 y は上枠の次から 2 行ぶん
+        let mut app = App {
+            term_size: (120, 30),
+            ccdesk_latest: Some("v9.9.9".to_string()),
+            ..Default::default()
+        };
+        let (actionable_y, inert_y) = (1u16, 2u16);
+
+        app.selection = SidebarPos::Row(0);
+        let actionable = highlighted_columns(&mut app, actionable_y);
+        assert!(
+            actionable.len() > 1,
+            "the premise broke — an actionable version row has no band: {actionable:?}"
+        );
+        assert_eq!(app.sidebar_rows[1], SidebarRow::Inert, "row 1 is not the inert version row");
+
+        // 選択で光る
+        app.selection = SidebarPos::Row(1);
+        assert_eq!(
+            highlighted_columns(&mut app, inert_y),
+            actionable,
+            "selecting a version row without an update draws no band"
+        );
+
+        // ホバーでも光る（選択は別の行に置いたまま）
+        app.selection = SidebarPos::Row(0);
+        app.hovered = Some(SidebarPos::Row(1));
+        assert_eq!(
+            highlighted_columns(&mut app, inert_y),
+            actionable,
+            "hovering a version row without an update draws no band"
+        );
+
+        // 区切り線（行 2 = 画面 y 3）は触れても光らない
+        app.hovered = Some(SidebarPos::Row(2));
+        assert_eq!(app.sidebar_rows[2], SidebarRow::Decoration, "row 2 is not the separator");
+        assert!(
+            highlighted_columns(&mut app, 3).is_empty(),
+            "a decoration row is highlighted"
+        );
     }
 
     /// 端末を 1 フレーム描いて、指定行の文字列を返す
