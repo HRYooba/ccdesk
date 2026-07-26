@@ -332,6 +332,11 @@ pub(crate) struct App {
     pub(crate) pending_delete: Option<(String, std::time::Instant)>,
     // `claude --bg` は ~1s かかるため別スレッドで実行し、完了を channel で受ける
     pub(crate) spawn_rx: Option<std::sync::mpsc::Receiver<SpawnOutcome>>,
+    // ターミナルペインへの入力を捨てている間だけ Some（ディスパッチした時刻）。
+    // **`spawn_rx` と寿命を分けてある**: あちらは「まだ結果が届きうる」で、
+    // ハングした `claude --bg` では永久に Some のまま残る
+    // （[`expire_input_gate`] / [`drop_input_while_starting`]）
+    pub(crate) input_gate: Option<std::time::Instant>,
     // 下部バーに数秒表示するエラー等の通知
     pub(crate) notice: Option<(String, std::time::Instant)>,
     pub(crate) grouping: Grouping,
@@ -407,6 +412,7 @@ impl Default for App {
             source: Box::new(crate::source::DemoSource),
             pending_delete: None,
             spawn_rx: None,
+            input_gate: None,
             notice: None,
             grouping: Grouping::State,
             projects: Vec::new(),
@@ -646,10 +652,17 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => app.spawn_rx = Some(rx),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.input_gate = None; // 結果は永久に来ない（捨て続ける理由が消えた）
                     set_notice(app, "claude --bg の実行スレッドが異常終了".to_string());
                     force_draw = true;
                 }
             }
+        }
+        // 起動が応答しないまま期限を過ぎたら入力を取り戻す。**打鍵が無くても
+        // 通知が出る**ように run ループ側で見る（門番の中で期限を見ると、
+        // ハングに気づけるのが「打った人」だけになる）
+        if expire_input_gate(app) {
+            force_draw = true;
         }
         // 使用率を 5 秒毎に取り込む（実データなら statusline フックが書いた
         // キャッシュ、撮影用なら固定値。どちらを読むかは供給元が決める）
@@ -964,6 +977,10 @@ pub(crate) fn start_new_session(app: &mut App) -> anyhow::Result<()> {
 /// `dispatch_cwd`（メモリ上の初期値）に残るので、直して押し直す邪魔にはならない。
 /// 保存を UI スレッドに寄せているのは state.json の書込み競合を避けるため
 fn apply_spawn_outcome(app: &mut App, outcome: SpawnOutcome) {
+    // 結果が届いた ＝ 宛先が決まった（失敗ならこの後 attach しないので、
+    // どちらでも「捨て続ける理由」は消える）。**live と撮影用が合流する
+    // この 1 箇所で降ろす**ので、経路が増えても降ろし漏れが起きない
+    app.input_gate = None;
     // 成否の判定は `error` 1 つ。`id` で判定しないのは、セッションを起こさない供給元
     // （撮影用）が「起動を試していない ＝ 失敗もしていない」形でここへ来るため
     // （実起動では id が取れなければ必ず error が入る ＝ 実データでの判定は変わらない）
@@ -1136,6 +1153,9 @@ fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
     }
     let (tx, rx) = std::sync::mpsc::channel();
     app.spawn_rx = Some(rx);
+    // 宛先のセッションがまだ無い間だけ入力を捨てる（[`drop_input_while_starting`]）。
+    // 期限は [`expire_input_gate`] が見るので、起動がハングしても入力は戻る
+    app.input_gate = Some(std::time::Instant::now());
     // 使用率表示（opt-in）: dispatch にだけ statusline フックが効く（実測）
     let inject = app.usage_display.then(write_inject_settings).flatten();
     std::thread::spawn(move || {
@@ -1904,7 +1924,14 @@ fn set_hint(app: &mut App, msg: String) {
     app.notice = Some((msg, std::time::Instant::now()));
 }
 
-/// 起動処理中（`claude --bg` の完了待ち ＝ `spawn_rx` が生きている間）に
+/// 入力を捨てる門番の期限。`claude --bg` は通常 ~1 秒で返るので、これを超えたら
+/// 「応答しない」と見なす。**これが有界であることが要点**で、
+/// `claude --bg` の待ちにはタイムアウトが無い（結果を受けるスレッドは
+/// `bg.output()` でブロックする）ため、期限を持たないと門番は
+/// プロセスの残りの寿命ぶん降りない ＝ 既存の全セッションへのタイプが死ぬ
+const INPUT_GATE_LIMIT: Duration = Duration::from_secs(10);
+
+/// 起動処理中（[`App::input_gate`] が生きている間）に
 /// ターミナルペインへ来た入力を捨てる。捨てたら `true`（呼び手は何もしない）。
 ///
 /// **打った文字が無関係なセッションへ届かないための門番。** [`dispatch_session`] は
@@ -1918,16 +1945,49 @@ fn set_hint(app: &mut App, msg: String) {
 /// （起動したのにキーがサイドバーへ行き ↑↓ で選択が動く）を戻すことになる。
 /// フォーカスは即座に端末へ移し、**宛先が居ない間だけ入力を捨てる**。
 ///
+/// **見るのは `spawn_rx` ではない。** あちらは「まだ結果が届きうる」を表し、
+/// ハングした起動（ネットワーク・認証プロンプト・AV スキャン）では永久に残るので、
+/// 門番の条件にすると入力が二度と戻らない。期限付きの短命な signal
+/// （[`expire_input_gate`]）に分けてある。
+///
 /// **黙って捨てない**: 下部バーの "starting session…" は通知が出ている間は隠れるため、
 /// 捨てたこと自体をここで伝える（[`set_hint`] ＝ 異常ではないので error.log には残さない）。
 ///
 /// マウスは門番の対象外: 届くのはクリックとホイールでプロンプトへ文字を送る経路ではなく、
 /// 移動イベントごとに案内を出すとノイズになる
 fn drop_input_while_starting(app: &mut App) -> bool {
-    if app.spawn_rx.is_none() {
+    if app.input_gate.is_none() {
         return false;
     }
     set_hint(app, "セッション起動中 — 打った文字は届いていない".to_string());
+    true
+}
+
+/// 応答しない起動から入力を取り戻す（run ループが毎周見る）。降ろしたら `true`。
+///
+/// **打ち先をサイドバーへ戻すのが要点。** 門番を降ろすだけでは、入力は
+/// `right_view` が指したままの**直前まで見ていたセッション**へ流れる ＝ 門番を
+/// 置いた理由そのものが復活する。フォーカスを戻せばキーはサイドバー操作になり、
+/// ユーザーは打ち先を選び直せる（Alt+→ / 行を開く）。
+///
+/// **`spawn_rx` は残す。** 遅れて結果が届けば attach するし、多重ディスパッチの
+/// 抑止も続く（ハングした起動が「次の dispatch」だけを止めるのは、門番を
+/// 入れる前からの挙動で害が小さい）。ハングしたまま終わった場合でも、
+/// 起きたセッションは次の `agents --json` の走査でサイドバーに出る
+fn expire_input_gate(app: &mut App) -> bool {
+    if !app
+        .input_gate
+        .is_some_and(|since| since.elapsed() >= INPUT_GATE_LIMIT)
+    {
+        return false;
+    }
+    app.input_gate = None;
+    app.set_focus(Focus::Sidebar);
+    // ハングしていることを伝える（下部バーと error.log の両方。ここは異常）
+    set_notice(
+        app,
+        "セッション起動が応答しない — 入力をサイドバーへ戻した".to_string(),
+    );
     true
 }
 
@@ -3647,6 +3707,7 @@ mod tests {
         // 撮影用の供給元は実際に claude を起動しないので、完了待ちの状態を作る
         let (_tx, rx) = std::sync::mpsc::channel();
         app.spawn_rx = Some(rx);
+        app.input_gate = Some(std::time::Instant::now());
         assert!(
             drop_input_while_starting(&mut app),
             "起動処理中の入力が前のセッションへ流れる"
@@ -3654,11 +3715,80 @@ mod tests {
         assert!(app.notice.is_some(), "捨てたことが伝わっていない");
         // 起動が終われば宛先は attach したセッション ＝ 素通しに戻る
         // （門番が残り続けるとタイプできない画面になる）
-        app.spawn_rx = None;
+        app.input_gate = None;
         assert!(
             !drop_input_while_starting(&mut app),
             "起動が終わっても入力が捨てられる"
         );
+    }
+
+    /// **結果が届いたら門番は降りる。** 降ろす場所を live と撮影用の合流点
+    /// （[`apply_spawn_outcome`]）に置いてあることの固定で、ここが漏れると
+    /// 起動が成功した後もタイプできない画面になる
+    #[test]
+    fn a_finished_launch_lifts_the_input_gate() {
+        let mut app = test_app(34, TERM);
+        app.input_gate = Some(std::time::Instant::now());
+        apply_spawn_outcome(
+            &mut app,
+            SpawnOutcome {
+                id: None,
+                label: String::new(),
+                cwd: "C:\\dev\\api".to_string(),
+                error: None,
+            },
+        );
+        assert!(
+            !drop_input_while_starting(&mut app),
+            "起動が終わったのに入力が捨てられる"
+        );
+    }
+
+    /// **ハングした起動から入力が有界時間で戻る。**
+    ///
+    /// `claude --bg` の結果を待つスレッドは `bg.output()` でブロックし、
+    /// **タイムアウトを持たない**。門番を `spawn_rx` の生死で判定していた頃は、
+    /// ハング（ネットワーク・認証プロンプト・AV スキャン）で
+    /// **既存の全セッションへのタイプがプロセスの残りの寿命ぶん死んでいた**。
+    /// 期限（[`INPUT_GATE_LIMIT`]）を超えたら門番を降ろす。
+    ///
+    /// **降りた後も、打った文字は直前まで見ていたセッションへ流れない**:
+    /// フォーカスがサイドバーへ戻るので、キーはサイドバー操作として処理される
+    /// （キーが PTY へ行くのは `focus == Terminal` のときだけ）。
+    /// 打ち先はユーザーが選び直す
+    #[test]
+    fn a_hung_launch_gives_input_back_within_a_bounded_time() {
+        let mut app = test_app(34, TERM);
+        // 結果を送らない = ハングした `claude --bg`（受け側は永久に Empty）
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.spawn_rx = Some(rx);
+        app.input_gate = Some(std::time::Instant::now());
+        app.set_focus(Focus::Terminal); // dispatch_session と同じ状態
+
+        // 期限内は門番が効いている（有界 ＝ 即座に降りる、ではない）
+        assert!(!expire_input_gate(&mut app), "期限前に門番が降りている");
+        assert!(
+            drop_input_while_starting(&mut app),
+            "起動処理中の入力が前のセッションへ流れる"
+        );
+
+        // 期限ぶん前にディスパッチした状態（時刻を注入して待たずに検査する）
+        app.input_gate = Some(instant_ago(INPUT_GATE_LIMIT));
+        assert!(expire_input_gate(&mut app), "期限を過ぎても門番が降りない");
+        assert!(
+            !drop_input_while_starting(&mut app),
+            "ハングした起動で入力が永久に死んでいる"
+        );
+        assert!(
+            app.focus == Focus::Sidebar,
+            "門番だけ降ろして打ち先を戻していない（打った文字が古いセッションへ流れる）"
+        );
+        let (msg, _) = app.notice.as_ref().expect("ハングが伝わっていない");
+        assert!(msg.contains("応答しない"), "何が起きたか分からない: {msg:?}");
+        // `spawn_rx` は残す（遅れて届いた結果は attach できる。多重起動の抑止も続く）
+        assert!(app.spawn_rx.is_some(), "遅れて届く結果の受け口を捨てている");
+        // 2 度目は何もしない（毎周通知を出し直さない）
+        assert!(!expire_input_gate(&mut app), "降りた門番をもう一度降ろしている");
     }
 
     /// **起動に失敗したフォルダは登録しない。** 通知が失敗を報告しているのに見出しが

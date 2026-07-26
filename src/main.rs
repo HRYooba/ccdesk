@@ -155,6 +155,7 @@ fn main() -> anyhow::Result<()> {
         last_usage_read: instant_ago(Duration::from_secs(60)),
         pending_delete: None,
         spawn_rx: None,
+        input_gate: None,
         notice: None,
         grouping: window.grouping,
         projects: window.projects,
