@@ -610,7 +610,7 @@ pub(crate) fn spawn_footer_poller(
     });
 }
 
-/// 公式のグルーピング切替（Ctrl+S）。デフォルトは State 別
+/// グルーピング（切替の入口はサイドバーの ⊞ group 行のメニュー）。デフォルトは State 別
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Grouping {
     State,

@@ -1,5 +1,6 @@
 //! サイドバー・右ペインの描画と、描画／クリック判定で共有するジオメトリ計算。
 pub(crate) mod new_view;
+pub(crate) mod text_field;
 
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -16,6 +17,7 @@ use crate::poll::{
     classify, foreground_state, AccountStatus, Bucket, Group, Grouping, StateView,
 };
 use crate::session::SessionStatus;
+use crate::sessions::SessionId;
 use crate::theme::{
     ui, usage_color, C_ATTENTION, C_FAIL, C_WORKING, FOCUS_BORDER, MUTED_FG,
 };
@@ -126,14 +128,56 @@ pub(crate) fn row_at(mouse_row: u16, capacity: usize, header_rows: usize, scroll
     }
 }
 
+/// 行 index → サイドバー内の画面 y。[`row_at`] の逆で、**同じ規則を 2 つ持たない**
+/// ために対で置く（枠の 1 行を足し、固定ヘッダーより下はスクロールぶんを引く）。
+///
+/// 使い手は「行から生えるメニューの位置」（[`crate::app`]）と
+/// 「名前を編集中の行のカーソル位置」の 2 つ。表示窓に入っているかは
+/// [`row_visible`] が別に答える（y だけでは見えているか分からない）
+pub(crate) fn row_y(row: usize, header_rows: usize, scroll: usize) -> u16 {
+    let r = if row < header_rows {
+        row
+    } else {
+        row.saturating_sub(scroll)
+    };
+    (r as u16).saturating_add(1)
+}
+
+/// 行 index が今の表示窓に入っているか。固定ヘッダーは常に見え、その下は
+/// スクロール位置から `tail_capacity` 行ぶんだけが見える。
+/// **描画の絞り込みとカーソルの判断が同じ式を見る**ための共有
+fn row_visible(row: usize, header_rows: usize, scroll: usize, tail_capacity: usize) -> bool {
+    row < header_rows
+        || (row >= header_rows + scroll && row < header_rows + scroll + tail_capacity)
+}
+
 /// サイドバーを横断する区切り線のテキスト（枠の内側幅ぶん）
 fn separator_text(inner_width: u16) -> String {
     "─".repeat(inner_width as usize)
 }
 
-/// 更新マーカー。**表示幅は実測 1 桁**（U+27F3 / unicode-width 0.2.2 で `1`。
-/// East Asian Ambiguous で 2 桁を占める `☰` とは違う）。1 桁だと分かっているので、
-/// 更新が無い行はスペース 1 個で同じ桁を確保できる
+/// アーカイブ済みの行を集める節の見出し。[`Group::title`] と同じ体裁で、
+/// **どちらのグルーピングでも末尾に 1 つだけ**出す（判断は draw のこの節の隣）
+const ARCHIVED_TITLE: &str = "Archived";
+
+/// 行頭のメニュー記号（クリックで二次操作のメニューが開く）。
+///
+/// **ASCII を選んだのは桁の曖昧さを消すため。** 以前使っていたハンバーガー記号
+/// （U+2630）は East Asian Ambiguous ＝ 幅の判定が端末とフォント設定で
+/// 1 桁にも 2 桁にもなる。
+/// ccdesk は 2 桁と実測して桁を数えていたので、1 桁と解釈する端末では
+/// **行全体が横へずれる**。`=` なら常に 1 桁で、前提そのものが消える
+const MENU_MARK: &str = "=";
+
+/// 名前の変更中の行の先頭。**通常の行と同じ「記号 + 空白」から始める**ので、
+/// 編集に入っても名前の桁が横へ動かない（[`MENU_MARK`] と対であることと
+/// 表示幅 2 桁であることはテストで固定する ＝ カーソル位置がこれに乗っている）
+const RENAME_PREFIX: &str = "= ";
+
+/// 更新マーカー。**表示幅は実測 1 桁**（U+27F3 / unicode-width 0.2.2 で `1`）。
+/// 1 桁だと分かっているので、更新が無い行はスペース 1 個で同じ桁を確保できる。
+/// 記号の幅は文字ごとに違い、しかも曖昧なものがある（[`MENU_MARK`] の判断）ので、
+/// 桁の前提に乗せる記号は実測してテストで固定する
 const UPDATE_MARK: &str = "⟳";
 
 /// バージョン行の更新状態。マーカー桁と右端の動詞はこれだけで決まる。
@@ -528,9 +572,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         ];
         if app.focus == Focus::Sidebar {
             hint_spans.push(Span::styled("  sidebar:", Style::default().fg(MUTED_FG)));
-            hint_spans.push(Span::raw(
-                " ↑↓ select · Enter open · Ctrl+S group · Ctrl+X stop→delete",
-            ));
+            // 名前の入力中はその作法だけを出す（一覧の操作は全部そちらへ渡っている）。
+            // 二次操作はメニューにしかないので、打鍵の案内はこの 3 つで尽きる
+            hint_spans.push(Span::raw(if app.rename.is_some() {
+                " Enter rename · Esc cancel"
+            } else {
+                " ↑↓ select · Enter open · ← menu"
+            }));
         }
         // 起こした子がまだ端末を掴んでいないことを出す。**見出しメニューの
         // new session は右ペインの表示を変えない**ので、ここに出さないと無反応に見える。
@@ -643,6 +691,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         status_label: &'static str,
         age: String,
         bucket: Bucket,
+        /// ピン留め（グループ内で先頭へ寄せる）
+        pinned: bool,
+        /// アーカイブ済み（通常の並びから外し、末尾の [`ARCHIVED_TITLE`] へ回す）
+        archived: bool,
+        /// 名前の変更中なら入力中の文字列。**行そのものが入力欄に化ける**
+        /// （[`crate::app::Rename`]）ので、ここが Some の行は通常の描画をしない
+        editing: Option<String>,
     }
     // 公式の Working スピナーは点滅アニメ
     let spinner = if (now_ms / 400).is_multiple_of(2) { "✽" } else { "✻" };
@@ -696,13 +751,22 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             status_label: view.label,
             age: fmt_age(age_secs),
             bucket: view.bucket,
+            pinned: row.pinned,
+            archived: row.archived,
+            editing: app
+                .rename
+                .as_ref()
+                .filter(|r| r.id == row.session_id)
+                .map(|r| r.field.text.clone()),
         });
     }
-    // ヘッダー集計は表示行そのものから数える（分岐の複製をしない = 行数と必ず一致）
+    // ヘッダー集計は表示行そのものから数える（分岐の複製をしない = 行数と必ず一致）。
+    // **アーカイブ済みは数えない**: 通常の一覧から外した行なので、数だけ残ると
+    // 「1 working」と出ているのにどこにも見当たらない状態になる
     let mut awaiting = 0usize;
     let mut working = 0usize;
     let mut completed = 0usize;
-    for d in &data {
+    for d in data.iter().filter(|d| !d.archived) {
         match d.bucket {
             Bucket::Awaiting => awaiting += 1,
             Bucket::Working => working += 1,
@@ -724,6 +788,16 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             if highlighted {
                 line_style = line_style.bg(ui().hl_bg).fg(ui().emph);
             }
+            // 名前の変更中は行そのものが入力欄。**アクションは残す**
+            // （行数と当たり判定を通常時と揃える ＝ 編集中に一覧の座標がずれない）
+            if let Some(text) = &d.editing {
+                items.push(ListItem::new(
+                    Line::from(format!("{RENAME_PREFIX}{text}"))
+                        .style(line_style.bg(ui().hl_bg).fg(ui().emph)),
+                ));
+                rows.push(Some(d.action.clone()));
+                return;
+            }
             let name_style = if d.is_active_window {
                 Style::default().fg(ui().emph).add_modifier(Modifier::BOLD)
             } else {
@@ -731,7 +805,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             };
             let mut spans = vec![
                 Span::styled(
-                    "☰",
+                    MENU_MARK,
                     Style::default().fg(if highlighted {
                         ui().emph
                     } else {
@@ -824,11 +898,22 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // （ヒットテストとスクロール計算が読む。定数と二重管理にしない）
     let header_n = rows.len();
 
+    // 見出しの下に並べる順。**ピン留めが先頭**で、それ以外は元の並びのまま
+    // （安定ソートなので、ピン留め以外の相対順は動かない ＝ 並び替えの知識を
+    // 増やさずに「ピンは上」だけを足す）
+    fn ordered(mut members: Vec<&RowData>) -> Vec<&RowData> {
+        members.sort_by_key(|d| !d.pinned);
+        members
+    }
     match app.grouping {
         Grouping::State => {
             for group in [Group::NeedsInput, Group::Working, Group::Completed] {
-                let members: Vec<&RowData> =
-                    data.iter().filter(|d| d.group == group).collect();
+                // アーカイブ済みは通常のグループに出さない（末尾へ回す）
+                let members = ordered(
+                    data.iter()
+                        .filter(|d| !d.archived && d.group == group)
+                        .collect(),
+                );
                 if members.is_empty() {
                     continue;
                 }
@@ -845,8 +930,14 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         }
         Grouping::Directory => {
             // 見出しに出すフォルダと並びの決定は project_rows に閉じている。
-            // 選択・stop・delete 等の操作では並び替えない
-            let cwds: Vec<&str> = data.iter().map(|d| d.cwd.as_str()).collect();
+            // 選択・close・delete 等の操作では並び替えない。
+            // **アーカイブ済みの cwd は渡さない**: そのフォルダの行が全部アーカイブなら
+            // 見出しも出さない（登録済みフォルダなら登録リスト側から出る）
+            let cwds: Vec<&str> = data
+                .iter()
+                .filter(|d| !d.archived)
+                .map(|d| d.cwd.as_str())
+                .collect();
             // セッション行の振り分けキーも**行ごとに 1 度だけ**作る（見出し × 行の
             // 総当たりになるので、突き合わせのたびに作ると描画 1 回で数千の String に
             // なる。見出し側のキーは project_rows が持っている）
@@ -864,12 +955,36 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 rows.push(Some(RowAction::Project(row.cwd)));
                 // 配下のセッション行。見出しの一覧と同じ同一判定キーで振り分ける
                 // （ここだけ厳密一致にすると大小違いのセッションが行き場を失う）
-                for (d, key) in data.iter().zip(&data_keys) {
-                    if *key == row.key {
-                        push_data_row(&mut items, &mut rows, d);
-                    }
+                let members = ordered(
+                    data.iter()
+                        .zip(&data_keys)
+                        .filter(|(d, key)| !d.archived && **key == row.key)
+                        .map(|(d, _)| d)
+                        .collect(),
+                );
+                for d in members {
+                    push_data_row(&mut items, &mut rows, d);
                 }
             }
+        }
+    }
+    // 末尾のアーカイブ節。**グルーピングに関係なくここへ出す**のが判断で、理由は
+    // アーカイブが state（行の状態）でも cwd（フォルダ）でもなく**行そのものに付いた
+    // 印**だから: state 別ならグループを 1 つ足すだけで済むが、directory 別では
+    // フォルダごとにアーカイブの区画を作ることになり、「隠した」はずの行が
+    // フォルダの数だけ散らばる。1 箇所に集めれば、どちらのグルーピングでも
+    // 「通常の一覧には出ない・戻す場所はここ 1 つ」という同じ規則で読める。
+    // 一覧から**消さない**のは、消すと `unarchive` を選ぶ入口が無くなるため
+    let archived = ordered(data.iter().filter(|d| d.archived).collect());
+    if !archived.is_empty() {
+        items.push(ListItem::new(Line::from("")));
+        rows.push(None);
+        items.push(ListItem::new(
+            Line::from(ARCHIVED_TITLE).style(Style::default().fg(ui().dim)),
+        ));
+        rows.push(None);
+        for d in archived {
+            push_data_row(&mut items, &mut rows, d);
         }
     }
 
@@ -921,10 +1036,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     let visible: Vec<ListItem> = items
         .into_iter()
         .enumerate()
-        .filter(|(i, _)| {
-            *i < header_n
-                || (*i >= header_n + scroll && *i < header_n + scroll + tail_capacity)
-        })
+        .filter(|(i, _)| row_visible(*i, header_n, scroll, tail_capacity))
         .map(|(_, item)| item)
         .collect();
     let list = List::new(visible).block(Block::default().borders(Borders::ALL).border_style(
@@ -935,6 +1047,23 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         },
     ));
     frame.render_widget(list, chunks[0]);
+
+    // 名前の変更中はカーソルを編集位置へ置く。**行が表示窓から出ていれば置かない**
+    // （スクロールで見えていない行の位置へカーソルだけが飛ぶと、IME の変換窓が
+    // 無関係な場所に開く。判断は描画の絞り込みと同じ [`row_visible`]）
+    let rename_cursor = app.rename.as_ref().and_then(|rename| {
+        use unicode_width::UnicodeWidthStr;
+        let row = row_of_session(&app.sidebar_rows, &rename.id)?;
+        row_visible(row, header_n, scroll, tail_capacity).then(|| {
+            let x = chunks[0].x + 1 + RENAME_PREFIX.width() as u16;
+            FrameCursor::shown_at(Position::new(
+                // 入力が枠を越えたらカーソルは内側の右端で止める（枠の外へ出さない）
+                x.saturating_add(rename.field.cursor_x())
+                    .min(chunks[0].x + chunks[0].width.saturating_sub(2)),
+                row_y(row, header_n, scroll),
+            ))
+        })
+    });
 
     // ---- サイドバー下部フッター: 区切り線 / アカウント行 ----
     // claude の更新行はここには無い（上部の版行に集約した）
@@ -974,7 +1103,16 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // 「見えているものが効く」が回復する
     let cursor = draw_right_pane(frame, chunks[1], app);
     draw_popup(frame, app);
-    cursor
+    // 名前の入力中はそこが打鍵の宛先なので、右ペインのカーソルより優先する
+    rename_cursor.unwrap_or(cursor)
+}
+
+/// そのセッションの行 index（[`RowAction::Open`] を持つ行）。
+/// 名前の編集中のカーソルを置く行を、**描画が積んだ一覧そのもの**から引く
+/// （行の並びは編集中も読み直しで動くので、開始時の index を覚えない）
+fn row_of_session(rows: &[Option<RowAction>], id: &SessionId) -> Option<usize> {
+    rows.iter()
+        .position(|action| matches!(action, Some(RowAction::Open(row_id)) if row_id == id))
 }
 
 /// コンテキストメニュー（モーダル）。矩形はクリック判定と同じ [`popup_rect`] を使う。
@@ -1142,14 +1280,24 @@ mod tests {
     /// 既定のサイドバー幅（34 桁）の内側。版行の幅の予算はこの桁数
     const DEFAULT_INNER: u16 = 32;
 
-    /// 更新マーカーの表示幅は 1 桁。**この 1 という実測値に設計が乗っている**:
-    /// 更新が無い行はスペース 1 個でマーカー桁を確保しており、2 桁なら桁がずれる。
-    /// `☰` が 2 桁を占めるのと対照（unicode-width の判定は文字ごとに違う）
+    /// 行頭に置く記号の表示幅は 1 桁。**この 1 という実測値に設計が乗っている**:
+    /// 更新が無い版行はスペース 1 個でマーカー桁を確保しており、2 桁なら桁がずれる。
+    ///
+    /// メニュー記号が ASCII なのはこの前提を測らずに済ませるため
+    /// （U+2630 は East Asian Ambiguous で、端末によって 1 桁にも 2 桁にもなる）。
+    /// 名前の変更中の行頭はその記号と対で、通常の行と同じ桁から名前が始まる
     #[test]
-    fn the_update_marker_is_one_column_wide() {
+    fn the_row_head_marks_are_one_column_wide() {
         use unicode_width::UnicodeWidthStr;
         assert_eq!(UPDATE_MARK.width(), 1, "⟳ が 1 桁でない");
-        assert_eq!("☰".width(), 2, "☰ は 2 桁（⟳ と同じ扱いにはできない）");
+        assert_eq!(MENU_MARK.width(), 1, "メニュー記号が 1 桁でない");
+        assert!(MENU_MARK.is_ascii(), "幅の曖昧な記号に戻っている");
+        assert_eq!(
+            RENAME_PREFIX,
+            format!("{MENU_MARK} "),
+            "編集中の行頭が通常の行とずれている"
+        );
+        assert_eq!(RENAME_PREFIX.width(), 2);
     }
 
     /// **未読マーカーは既読と同じ幅を取る。** 幅が違うと、未読が付いたり消えたり
@@ -1776,6 +1924,212 @@ mod tests {
         );
     }
 
+    // ── ピン留め / アーカイブ / 名前の変更が一覧に効いていることの検証 ──────
+    //
+    // どれも「行が持っている値」→「画面に出る並び」の配線なので、
+    // 実際に 1 フレーム描いて（[`render_sidebar`]）出た行そのものを見る
+
+    /// 名前つきのセッション行 1 本
+    fn named_session(id: &str, cwd: &str, title: &str) -> crate::sessions::SessionRow {
+        crate::sessions::SessionRow::new(
+            crate::sessions::SessionId::new(id),
+            cwd,
+            title,
+            crate::sessions::TitleSource::Derived,
+            0,
+        )
+    }
+
+    /// セッション行（[`MENU_MARK`] で始まる行）の表示文字列だけを、描かれた順に取り出す
+    fn session_lines(app: &mut App) -> Vec<String> {
+        render_sidebar(app)
+            .into_iter()
+            .filter(|(action, _)| matches!(action, Some(RowAction::Open(_))))
+            .map(|(_, text)| text)
+            .collect()
+    }
+
+    /// 一覧の行の並びをそのまま返す（見出し・空行も含む）
+    fn sidebar_texts(app: &mut App) -> Vec<String> {
+        render_sidebar(app).into_iter().map(|(_, t)| t).collect()
+    }
+
+    /// **ピン留めした行はグループ内の先頭へ。** 並べ替えは安定なので、
+    /// ピン留め以外の相対順は動かない（どちらのグルーピングでも同じ規則）
+    #[test]
+    fn a_pinned_row_comes_first_inside_its_group() {
+        for grouping in [Grouping::State, Grouping::Directory] {
+            let mut app = App {
+                term_size: (60, 40),
+                sidebar_width: 34,
+                grouping,
+                sessions: vec![
+                    named_session("a", "C:\\dev\\api", "first"),
+                    named_session("b", "C:\\dev\\api", "second"),
+                    crate::sessions::SessionRow {
+                        pinned: true,
+                        ..named_session("c", "C:\\dev\\api", "pinned")
+                    },
+                ],
+                ..Default::default()
+            };
+            let lines = session_lines(&mut app);
+            assert_eq!(lines.len(), 3, "{grouping:?} で行が欠けている");
+            assert!(lines[0].contains("pinned"), "{grouping:?}: {lines:?}");
+            // 残りは元の並びのまま（ピン留めが並べ替えの規則を増やしていない）
+            assert!(lines[1].contains("first"), "{grouping:?}: {lines:?}");
+            assert!(lines[2].contains("second"), "{grouping:?}: {lines:?}");
+        }
+    }
+
+    /// **アーカイブした行は通常の一覧から消え、末尾の `Archived` 節にだけ出る。**
+    /// 消し切らないのは `unarchive` を選ぶ入口を残すため。集計にも数えない
+    /// （数だけ残ると「1 件あるのに見当たらない」状態になる）
+    #[test]
+    fn an_archived_row_leaves_the_normal_list_for_the_archived_section() {
+        for grouping in [Grouping::State, Grouping::Directory] {
+            let mut app = App {
+                term_size: (60, 40),
+                sidebar_width: 34,
+                grouping,
+                sessions: vec![
+                    named_session("a", "C:\\dev\\api", "visible"),
+                    crate::sessions::SessionRow {
+                        archived: true,
+                        ..named_session("b", "C:\\dev\\api", "hidden")
+                    },
+                ],
+                ..Default::default()
+            };
+            let texts = sidebar_texts(&mut app);
+            let at = |needle: &str| texts.iter().position(|t| t.contains(needle));
+            let archived_title = at(ARCHIVED_TITLE).expect("Archived 節が出ていない");
+            let hidden = at("hidden").expect("アーカイブした行がどこにも出ていない");
+            assert!(
+                hidden > archived_title,
+                "{grouping:?}: アーカイブした行が通常の一覧に残っている: {texts:?}"
+            );
+            assert!(
+                at("visible").is_some_and(|v| v < archived_title),
+                "{grouping:?}: 通常の行が Archived 節へ落ちている: {texts:?}"
+            );
+            // 集計はアーカイブを数えない（1 件だけが数に出る）
+            let counts = texts
+                .iter()
+                .find(|t| t.contains("awaiting input"))
+                .expect("集計行が無い")
+                .clone();
+            // （末尾はサイドバー幅で切られるので、数の出るところまでを見る）
+            assert!(
+                counts.starts_with("0 awaiting input · 0 working · 1"),
+                "{grouping:?}: アーカイブを集計に数えている: {counts:?}"
+            );
+        }
+    }
+
+    /// アーカイブだけのフォルダは見出しも出さない（登録済みなら登録リスト側から出る）。
+    /// 通常の一覧から隠す、という規則が見出しにも及ぶことの固定
+    #[test]
+    fn a_folder_with_only_archived_rows_gets_no_heading() {
+        let mut app = App {
+            term_size: (60, 40),
+            sidebar_width: 34,
+            grouping: Grouping::Directory,
+            sessions: vec![crate::sessions::SessionRow {
+                archived: true,
+                ..named_session("a", "C:\\dev\\gone", "hidden")
+            }],
+            ..Default::default()
+        };
+        let rows = render_sidebar(&mut app);
+        assert!(
+            !rows
+                .iter()
+                .any(|(action, _)| matches!(action, Some(RowAction::Project(_)))),
+            "アーカイブだけのフォルダに見出しが出ている: {rows:?}"
+        );
+        // 行そのものは Archived 節に残る（戻す入口）
+        assert!(rows.iter().any(|(_, t)| t.contains("hidden")));
+    }
+
+    /// 名前の変更中は**その行が入力欄に化ける**。名前の桁は通常の行と同じ位置から
+    /// 始まり（[`RENAME_PREFIX`] の 2 桁ぶん）、カーソルはその行の入力位置に立つ
+    #[test]
+    fn the_renamed_row_becomes_an_inline_input_with_the_cursor_on_it() {
+        use unicode_width::UnicodeWidthStr;
+        let mut field = crate::ui::text_field::TextField::default();
+        field.set_text("new name");
+        let mut app = App {
+            term_size: (60, 40),
+            sidebar_width: 34,
+            sessions: vec![named_session("s", "C:\\dev\\api", "old name")],
+            rename: Some(crate::app::Rename {
+                id: crate::sessions::SessionId::new("s"),
+                field,
+            }),
+            ..Default::default()
+        };
+        let (w, h) = app.term_size;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let mut cursor = None;
+        terminal
+            .draw(|frame| {
+                cursor = Some(draw(frame, &mut app));
+            })
+            .unwrap();
+        let cursor = cursor.expect("描画していない");
+        let buffer = terminal.backend().buffer().clone();
+
+        // 入力中の文字列が行に出て、確定前の名前は出ていない
+        let row = app
+            .sidebar_rows
+            .iter()
+            .position(|a| matches!(a, Some(RowAction::Open(_))))
+            .expect("セッション行が無い");
+        let y = row_y(row, app.sidebar_header_rows, app.sidebar_scroll);
+        let text: String = (1..app.sidebar_width - 1)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        assert!(text.contains("new name"), "入力中の文字列が行に出ていない: {text:?}");
+        assert!(!text.contains("old name"), "確定前の名前が残っている: {text:?}");
+        // カーソルはその行の、入力の末尾（行頭 2 桁 + 8 桁）に立つ
+        assert!(cursor.visible, "入力中なのにカーソルが見えない");
+        assert_eq!(
+            cursor.pos,
+            Position::new(
+                1 + RENAME_PREFIX.width() as u16 + "new name".width() as u16,
+                y
+            )
+        );
+    }
+
+    /// 下部バーの案内。**撤去した打鍵は載せない**（載っていれば嘘になる）。
+    /// 名前の入力中はその作法だけを出す
+    #[test]
+    fn the_sidebar_hint_only_mentions_keys_that_still_exist() {
+        let mut app = App {
+            term_size: (120, 30),
+            focus: Focus::Sidebar,
+            ..Default::default()
+        };
+        let bar = drawn_row(&mut app, 29);
+        assert!(bar.contains("Ctrl+Q quit"), "{bar:?}");
+        assert!(bar.contains("Alt+←→ focus"), "{bar:?}");
+        assert!(bar.contains("← menu"), "メニューの入口が案内に無い: {bar:?}");
+        assert!(!bar.contains("Ctrl+S"), "撤去した打鍵が案内に残っている: {bar:?}");
+        assert!(!bar.contains("Ctrl+X"), "撤去した打鍵が案内に残っている: {bar:?}");
+
+        app.sessions = vec![named_session("s", "C:\\dev\\api", "session")];
+        app.rename = Some(crate::app::Rename {
+            id: crate::sessions::SessionId::new("s"),
+            field: crate::ui::text_field::TextField::default(),
+        });
+        let bar = drawn_row(&mut app, 29);
+        assert!(bar.contains("Enter rename"), "{bar:?}");
+        assert!(bar.contains("Esc cancel"), "{bar:?}");
+    }
+
     /// inner が潰れてもペイン矩形の外（枠の列や端末外）へ出ない。
     /// 右ペインは Constraint::Min(1) なので幅 1 = inner 幅 0 が起こり得る
     #[test]
@@ -1792,8 +2146,8 @@ mod tests {
     }
 
     /// 未保管警告 `⚠` の表示幅は **1 桁**。既定幅（内側 32 桁）にアカウント行を
-    /// 収める前提がこの実測値に乗っているので固定する（`⟳` も 1 桁だが `☰` は
-    /// 2 桁 ＝ 判定は文字ごとに違うので実測しないと分からない）
+    /// 収める前提がこの実測値に乗っているので固定する（幅の判定は文字ごとに違い、
+    /// 中には端末によって変わる曖昧なものもある ＝ 実測しないと分からない）
     #[test]
     fn the_warning_mark_is_one_column_wide() {
         use unicode_width::UnicodeWidthStr;
