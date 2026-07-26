@@ -23,19 +23,31 @@ reopen one and it resumes from its transcript.
   grouping — the state grouping has no directory headings to show them on
 - **Foreground sessions you own** — a new session starts as
   `claude --session-id <uuid>` in the pane and reopening a row resumes it with
-  `claude -r`; `close` ends the process while the row stays (resume it any time) and
-  `delete` drops the row (your transcripts in `~/.claude/projects/` are never removed)
+  `claude -r`, or starts it fresh under the same UUID when the row has no transcript yet
+  (a session you closed before its first turn has no conversation to resume);
+  `close` ends the process while the row stays (resume it any time) and
+  `delete` drops the row (your transcripts in `~/.claude/projects/` are never removed).
+  Running `/resume` inside a pane moves that process to another conversation, and the
+  sidebar follows it: the row (and its name) become the session the pane is really running
 - **A menu per row** — clicking the `=` at the head of a session row, or pressing `Enter` with
-  the sidebar focused, opens `open` / `pin` / `mark as read` / `rename` / `close` / `archive` /
+  the sidebar focused, opens `open` / `pin` / `mark as read` / `rename` / `close` /
   `delete`. `open` is the same thing a click on the row body does (switch to the window, or
-  resume with `claude -r`), and it is how the keyboard opens a session. `close` is the only
+  resume it), and it is how the keyboard opens a session. `close` is the only
   entry that greys out, and only when no window is open.
-  Pinned rows sort to the top of their group; archived rows leave the normal list and
-  collect under an `Archived` section at the bottom (in either grouping), which is where
-  you `unarchive` them; `rename` turns the row itself into an input — `Enter` keeps the
-  name, `Esc` throws it away. **None of these operations gets its own shortcut key**: one
+  Pinned rows sort to the top of their group; `rename` turns the row itself into an input —
+  `Enter` keeps the name, `Esc` throws it away. There is no `archive`: `delete` only forgets
+  the row, so archiving would differ from it by nothing but having a way back.
+  **None of these operations gets its own shortcut key**: one
   entry point means one thing to read, and every key ccdesk does not reserve is a key
   claude Code still gets
+- **Names that match what claude shows** — a row is named after its transcript
+  (`custom-title` > `ai-title` > the last prompt), so `rename` writes the same
+  `custom-title` record `/rename` writes inside the session and either one shows up
+  in both places. Until the first turn creates the transcript, the name you typed is held
+  in `~/.ccdesk/sessions.json` and lands in the transcript as soon as it exists
+- **Unread rows** — a `●` right after the `=` marks a row that changed while you were not
+  looking at it (`mark as read` clears it, and so does opening the row). The column is
+  reserved either way, so names never shift sideways
 - **Live status** from `claude agents --json` (state changes reflect in ~2 s)
 - **Account line** in the sidebar footer, showing the signed-in Claude account, the same value
   `ccdesk doctor` prints. A login or logout that rewrites `~/.claude/.credentials.json` shows
@@ -49,8 +61,8 @@ reopen one and it resumes from its transcript.
   `~/.claude/.credentials.json` untouched. Both take the same lock file claude Code uses for
   token refresh, and the outgoing account's tokens are folded into the store under that lock,
   so a rotated refresh token is never lost. Since Windows claude re-reads the credentials file,
-  **live sessions move to the new account from their next message** — the menu says how many
-  (`N sessions will switch`). Until the signed-in account is stored the line is prefixed with
+  **live sessions move to the new account from their next message**.
+  Until the signed-in account is stored the line is prefixed with
   `⚠`: that is the reminder to register before your next `/login`, because
   `.credentials.json` only ever holds one account and the previous one is overwritten. Stored
   refresh tokens are single-use, so an account you have used elsewhere in the meantime can go
@@ -74,7 +86,8 @@ reopen one and it resumes from its transcript.
 - **Keyboard**: ccdesk reserves exactly two things — `Alt+←/→` pane focus and `Ctrl+Q`
   quit. **Everything else passes through to claude untouched**, including `Ctrl+S`, `Ctrl+X`
   and a bare `←`/`→`. With the sidebar focused there are only two keys: `↑↓` select — past
-  the bottom of the list they reach the account line in the footer — and `Enter` does
+  the bottom of the list they reach the account line in the footer, and one more step wraps
+  around to the top of the list (so `↑` on the first row reaches the account line) — and `Enter` does
   whatever the selected row does. That is a menu for session rows, project headings,
   `⊞ group` and the account line; the new-session screen for `+ new session`; the update
   for a version row that has one; and nothing at all for a version row that is up to date.

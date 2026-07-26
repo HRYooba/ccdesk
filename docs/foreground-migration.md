@@ -34,15 +34,15 @@ Claude Desktop も同じ構造（独自の JSON ストアを一覧の正本に�
 
 | 項目 | 決定 |
 |:--|:--|
-| 起動 | PTY で `claude --session-id <uuid> -n <title>`。`CLAUDE_CODE_CHILD_SESSION` / `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID` / `CLAUDECODE` / `CLAUDE_JOB_DIR` 等の継承環境変数を除去（継承すると transcript 保存が無効になる実測あり） |
+| 起動 | PTY で `claude --session-id <uuid> [prompt]`。**`-n <title>` は渡さない**（claude が `-n` の名前を transcript の `custom-title` として残すので、ccdesk が組んだ名前を渡すと表示名がそこで凍る）。`CLAUDE_CODE_CHILD_SESSION` / `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID` / `CLAUDECODE` / `CLAUDE_JOB_DIR` 等の継承環境変数を除去（継承すると transcript 保存が無効になる実測あり） |
 | 一覧の正本 | `~/.ccdesk/sessions.json` |
-| title | CLI 本体と同じ優先順: `customTitle` > `aiTitle` > `lastPrompt` > `firstPrompt`。ccdesk のリネームは customTitle の位置 |
+| title の正本 | **transcript**（`custom-title` > `ai-title` > `last-prompt`）。ccdesk のリネームもそこへ `custom-title` を追記する ＝ claude の `/rename` と同じ 1 箇所。ストアの `title` は表示用キャッシュ |
 | state | **hooks が主・`claude agents --json` の `status` が従**。どのイベントがどの state を意味するかは `src/hooks.rs` の `HOOK_EVENTS` が正本。**要約文は出さない**（Working / Needs input / Done / Stopped の 4 つだけ） |
-| 未読 | `updated_at > last_opened_at`。状態ラベルの前に `●` |
-| メニュー | ピン留め / 既読にする / 名前を変更 / 閉じる / アーカイブ / 削除 |
+| 未読 | `updated_at > last_opened_at`。行頭のメニュー記号の右に `●` |
+| メニュー | 開く / ピン留め / 既読にする / 名前を変更 / 閉じる / 削除 |
 | ショートカット | `Ctrl+S` `Ctrl+X` を撤去。予約は `Ctrl+Q` と `Alt+←→` のみ |
 | 削除の意味 | ccdesk の一覧から消すだけ。`~/.claude/projects/**/*.jsonl` は消さない |
-| 失うもの | ccdesk 終了で全セッション終了（行は残り `-r` で再開）/ 外部からの `claude attach` 不可 / PR番号による Ready for review |
+| 失うもの | ccdesk 終了で全セッション終了（行は残り再開できる）/ 外部からの `claude attach` 不可 / PR番号による Ready for review |
 
 **要約文を出さない**のは項目の削減ではなく、正本を 1 つにするための帰結:
 要約は state.json（内部形式）にしか無く、前景セッションはそれを書かない。
@@ -105,12 +105,12 @@ flowchart LR
 詳細な意味論は `src/sessions.rs` の `merge_sessions` の doc コメントが正本。
 
 **上限は設けない。** 登録プロジェクト（自動登録なので溢れる）と違い、行が増えるのは
-ユーザーがセッションを起こしたときだけで、減らす手段（アーカイブ・削除）もある。
+ユーザーがセッションを起こしたときだけで、減らす手段（削除）もある。
 上限で押し出すとユーザーが起こしたセッションが黙って消える。
 
 ## フェーズ
 
-移行は 4 段階に割る。各段階の終わりで `cargo build` / `cargo test` が通り、
+移行は段階に割る。各段階の終わりで `cargo build` / `cargo test` が通り、
 **アプリとして壊れていない**状態を保つ。
 
 ### フェーズ1: 一覧のストアを足す（この文書と同時に入る）
@@ -131,7 +131,7 @@ flowchart LR
 `claude attach` のクライアントではなく**セッションそのもの**になり、
 「窓を閉じる = プロセスを終わらせる」に変わった。
 
-- `Session::spawn` を前景起動へ（新規 `claude --session-id <uuid> -n <title> [prompt]` /
+- `Session::spawn` を前景起動へ（新規 `claude --session-id <uuid> [prompt]` /
   再開 `claude -r <session-id>`）。UUID は ccdesk が採番する（`uuid` crate）
 - 継承環境変数の除去（上表の一覧）。`env_clear` ではなく個別除去
   （`CommandBuilder::env_remove`）＝ PATH 等は残す
@@ -177,9 +177,8 @@ flowchart LR
   再開直後に前回の `SessionEnd` が残っていても「動いているのに Stopped」にならない
 - **title は transcript の末尾だけを読む。** `custom-title` / `ai-title` /
   `last-prompt` を拾い、優先順で選ぶ。先頭ユーザープロンプトは起動時に ccdesk が
-  渡したものなので transcript を読み直さない（行はすべて ccdesk が起こしている）。
-  **格下げはしない**（上位の候補が末尾から遠ざかっても名前が下位へ落ちない）
-- 未読（`updated_at > last_opened_at`）を状態ラベルの前の `●` として描画。
+  渡したものなので transcript を読み直さない（行はすべて ccdesk が起こしている）
+- 未読（`updated_at > last_opened_at`）を `●` として描画。
   既読は同じ幅の空白なので桁が動かない。既読になるのは**ペインを開いた時点**と、
   **ペインに出ている行が動いたとき**（見ている行に `●` が点かない）
 
@@ -195,9 +194,9 @@ flowchart LR
 どちらが正なのか読む側にも実装側にも分岐が生まれ、**予約キーの数だけ
 claude 本体のキーバインドが死ぬ**（`Ctrl+S` / `Ctrl+X` は実際に claude 側の打鍵）。
 
-- セッションのメニューを **`open` を先頭に置いた 7 項目**へ（`open` / `pin` /
-  `mark as read` / `rename` / `close` / `archive` / `delete`）。落ちるのは `close` だけで、
-  条件は「窓が開いていない」（他は停止中の行にも効く ＝ `open` は `claude -r` で再開する）。
+- セッションのメニューを **`open` を先頭に置いた 6 項目**へ（`open` / `pin` /
+  `mark as read` / `rename` / `close` / `delete`）。落ちるのは `close` だけで、
+  条件は「窓が開いていない」（他は停止中の行にも効く ＝ `open` は止まっている行を起こし直す）。
   `open` は行クリックと同じ `open_session` を通る ＝ 開く経路を 2 つ持たない
 - `Ctrl+S` `Ctrl+X` を撤去。**予約キーの判定を 1 つの純関数**
   （`app.rs` の `reserved_key`）へ集め、残る予約が `Ctrl+Q` と `Alt+←→` だけで
@@ -223,13 +222,9 @@ claude 本体のキーバインドが死ぬ**（`Ctrl+S` / `Ctrl+X` は実際に
   乗っていた（1 桁と解釈する端末では行全体がずれる）。ASCII なら常に 1 桁で、
   **桁の前提が 1 つ減る**。名前の開始位置は 1 桁左へ寄り、編集中の行頭
   （`ui::mod` の `RENAME_PREFIX`）も対で動く
-- `pinned` は**各グループ内の先頭**へ寄せる（安定ソートなので他の相対順は動かない）。
-  `archived` は通常の一覧から外し、**グルーピングに関係なく末尾の `Archived` 節**へ
-  集める。アーカイブは state でも cwd でもなく行そのものに付いた印なので、
-  directory 別でフォルダごとに区画を作ると「隠した」行がフォルダの数だけ散らばる。
-  一覧から消し切らないのは `unarchive` を選ぶ入口を残すため
-- `rename` は**その行がインライン入力に化ける**（別の入力欄を開かない）。確定した
-  名前は `TitleSource::Custom` ＝ あとから来る AI 生成の名前に踏まれない位置に入る。
+- `pinned` は**各グループ内の先頭**へ寄せる（安定ソートなので他の相対順は動かない）
+- `rename` は**その行がインライン入力に化ける**（別の入力欄を開かない）。
+  確定した名前の行き先は transcript の `custom-title`（フェーズ5）。
   入力の作法（挿入・削除・全角の桁）は新規セッション画面と同じ `ui::text_field`
 - **マウスで押せるものはキーボードでも押せる**に揃えた。サイドバー本体ではなく
   フッターに描かれるアカウント行も `↑↓` の行き先で、`Enter` はマウスと同じ
@@ -249,16 +244,69 @@ claude 本体のキーバインドが死ぬ**（`Ctrl+S` / `Ctrl+X` は実際に
   run ループのキー配りと同じ**にしてある。順序が別々だと案内と実際の受け手がずれる。
   一覧では選択行の `Enter` の語まで出すので、**下部バーはサイドバーを積んだ後に描く**
   （先に描くと材料が 1 フレーム古くなる）
-- 行への操作（ピン留め・アーカイブ・名前）は `updated_at` を進めるが**未読を作らない**。
+- 行への操作（ピン留め・名前）は `updated_at` を進めるが**未読を作らない**。
   未読は「見ていない間に新しいことが起きた」の意味なので、自分が触ったことで
   `●` が生えるのは嘘になる（`app.rs` の `edit_row`）
 - `delete` が消すのは行だけ。`~/.claude/projects/**/*.jsonl` は残す
   （`claude -r` の材料であり、claude 側の持ち物）
 
+### フェーズ5: 名前の正本を transcript へ寄せ、行と claude の実体を一致させる（済）
+
+**この段階の本質は「行が指しているもの」を claude 側の実体と一致させたこと。**
+名前・会話・プロセスの 3 つで、行と claude の記録がずれる経路を閉じた。
+
+- **アーカイブを廃止**（メニュー・`Archived` 節・`SessionRow.archived` ごと）。
+  ccdesk の `delete` は行を忘れるだけで transcript を消さないので、
+  **archive と delete の差は「戻す導線があるか」だけ**になる ＝ 節を 1 つ増やして
+  一覧を二分する価値が無い。メニューは 6 項目（`open` / `pin` / `mark as read` /
+  `rename` / `close` / `delete`）
+- **名前の正本を transcript の 1 箇所にした。** ccdesk の `rename` は
+  `custom-title` を 1 行追記し（claude の `/rename` と同じ形・同じ場所）、
+  読み直しは**格下げのガードも `Custom` の行の除外も持たない** ＝
+  セッションの中で `/rename` した結果もサイドバーへ出る。
+  ストアの `title` は表示用キャッシュ（transcript を読む前でも行に名前が出る）
+- **追記は claude が同じファイルへ書いている最中でも壊さない形にした**:
+  行 1 本を改行まで含めて 1 回の write で置き、末尾が改行で終わっていなければ
+  先に改行を足す。書けなくても ccdesk は落ちない（`error.log` へ記録して諦める）
+- **1 ターン目より前のリネームは持ち越す**（`title.rs` の `pending`）。
+  transcript は 1 ターン終わるまで作られないので、その間は追記できない。
+  自分でファイルを作るのは駄目（会話が無いのに `-r` で開ける形に見える）、
+  諦めるのも駄目（1 ターン目の `last-prompt` が名前を黙って上書きする）ので、
+  できた時点で載せる
+- **`-n <title>` を渡すのをやめた。** claude は `-n` の名前を `custom-title` として
+  transcript に残すので、ccdesk が組んだ名前（プロンプト無しなら `new session`）が
+  「ユーザーが付けた名前」の位置に入り、**表示名がそこで凍っていた**
+  （実データが両方 `new session` / `title_source: custom` になっていた原因）。
+  ついでに claude 側の AI 生成名も付かなくなっていた
+- **止まっている行の起こし方を transcript の有無で分けた**（`app.rs` の `relaunch`）。
+  1 ターンも会話していない行に `claude -r` を打つと `No conversation found` になるので、
+  transcript が無い行は**同じ UUID で新規として起こす** ＝ 行の identity は変わらない
+- **ペイン内の `/resume` にサイドバーが追従する。** `/resume` は claude の内部で
+  起きるので ccdesk は関与しないが、`~/.claude/sessions/<pid>.json`
+  （`claude agents --json` 経由）には**その pid の現在の `sessionId`** が載る。
+  自分の子の pid は ccdesk が知っているので、**pid → sessionId** で張り替える
+  （行が無ければ作り、名前は同じ周期の transcript 読みが入れる）。
+  張り替わったら次の起動で開く画面（`last_view`）もそちらへ移す ＝
+  終了して開き直したときに `/resume` 前の会話へ戻らない。
+  **判定は 1 箇所**（`app.rs` の `follow_session_switches` の比較）で、
+  行と `last_view` の更新はそこから呼ぶ `adopt_switched_session` に閉じる
+- 未読の `●` を**行頭のメニュー記号の右**へ移した。行を縦に流し読みするときに
+  印が 1 つの桁へ揃う（状態ラベルの前だと名前の長さで位置が毎行変わる）。
+  既読の桁は空白で確保するので**名前の開始桁は動かない**
+- サイドバーの `↑↓` は一覧とアカウント行を**巡回する**（末尾の次は先頭）。
+  端で止めると、アカウント行から一覧の先頭へ戻るために一覧全体を遡ることになる
+- アカウントメニューの「N sessions will switch」を撤去 ＝ **項目はすべて選んで動くもの**に
+  なった（切替の影響は押した後のアカウント行が示す）
+
+**受け入れたリスク**: `ai-title` が末尾の読み取り範囲から遠ざかった長い会話では、
+名前が `last-prompt` へ落ちる（格下げのガードを外した代償）。名前を固定したいときは
+`rename` で `custom-title` に置ける。また pid の追従は `claude` が中間プロセス越しに
+起動する環境（npm 版の `.cmd` シム等）では効かない ＝ 追従しないだけで壊れはしない。
+
 ## 失うもの（受け入れた代償）
 
 | 失うもの | 代替 |
 |:--|:--|
-| ccdesk を閉じると全セッションが終了する | 行は `sessions.json` に残り、`claude -r <session-id>` で再開できる |
+| ccdesk を閉じると全セッションが終了する | 行は `sessions.json` に残り、次の起動で起こし直せる（会話があれば `claude -r`、無ければ同じ UUID で新規） |
 | 外部のターミナルから `claude attach` で入れない | 前景セッションは ccdesk の子プロセスなので、操作は ccdesk から |
 | PR 番号による Ready for review 表示 | state.json（内部形式）の `children` にしか無い情報なので、正本を 1 つにする代償として落とす |
