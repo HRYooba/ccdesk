@@ -12,7 +12,9 @@ use tui_term::widget::PseudoTerminal;
 
 use ccdesk::dir_key;
 
-use crate::app::{active_unstored, App, Focus, Popup, RightView, RowAction, SelfUpdate};
+use crate::app::{
+    active_unstored, App, Focus, Popup, RightView, RowAction, Selection, SelfUpdate,
+};
 use crate::poll::{
     classify, foreground_state, AccountStatus, Bucket, Group, Grouping, StateView,
 };
@@ -539,6 +541,32 @@ impl FrameCursor {
     }
 }
 
+/// 下部バーの文脈セクション ＝ (見出し, 打鍵の案内)。
+/// **今この瞬間に打鍵が届く先で効くキーだけ**を出す（効かないキーを出すと嘘になる）。
+///
+/// 判断の順序は run ループのキー配りと同じ（フォーカス → 名前の入力 → メニュー →
+/// 一覧）。順序が別々だと、案内と実際の受け手がずれる。
+///
+/// `None` は新規セッション画面だけ ＝ 案内をペイン内に持つので下部バーへ重ねない
+fn context_hint(app: &App) -> Option<(&'static str, &'static str)> {
+    if app.focus == Focus::Terminal {
+        if matches!(app.right_view, RightView::New(_)) {
+            return None;
+        }
+        // ccdesk が取るのは予約キーだけ。残りは全部 claude が受ける
+        return Some(("terminal", "all keys pass through to claude"));
+    }
+    if app.rename.is_some() {
+        // 名前の入力中は入力の作法だけ（一覧の操作は全部この入力へ渡っている）
+        return Some(("rename", "Enter rename · Esc cancel"));
+    }
+    if app.popup.is_some() {
+        // メニューは開いている間すべてのキーを飲む ＝ 一覧のキーは出さない
+        return Some(("popup", "↑↓ select · Enter run · Esc close"));
+    }
+    Some(("sidebar", "↑↓ select · Enter/→ open · ← menu"))
+}
+
 pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // 最下行は横断のキーヒントバー
     let vert = Layout::default()
@@ -570,15 +598,12 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             Span::styled(" app:", Style::default().fg(MUTED_FG)),
             Span::raw(" Ctrl+Q quit · Alt+←→ focus"),
         ];
-        if app.focus == Focus::Sidebar {
-            hint_spans.push(Span::styled("  sidebar:", Style::default().fg(MUTED_FG)));
-            // 名前の入力中はその作法だけを出す（一覧の操作は全部そちらへ渡っている）。
-            // 二次操作はメニューにしかないので、打鍵の案内はこの 3 つで尽きる
-            hint_spans.push(Span::raw(if app.rename.is_some() {
-                " Enter rename · Esc cancel"
-            } else {
-                " ↑↓ select · Enter open · ← menu"
-            }));
+        if let Some((label, keys)) = context_hint(app) {
+            hint_spans.push(Span::styled(
+                format!("  {label}:"),
+                Style::default().fg(MUTED_FG),
+            ));
+            hint_spans.push(Span::raw(format!(" {keys}")));
         }
         // 起こした子がまだ端末を掴んでいないことを出す。**見出しメニューの
         // new session は右ペインの表示を変えない**ので、ここに出さないと無反応に見える。
@@ -776,14 +801,15 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
 
     // ---- 描画 ----
     let hovered = app.hovered_row;
-    let selected = app.selected_row;
+    // 一覧のハイライトが見るのは行の選択だけ（アカウント行はフッター側で描く）
+    let selected = app.selection.row();
     let mut items: Vec<ListItem> = Vec::new();
     let mut rows: Vec<Option<RowAction>> = Vec::new();
 
     let push_data_row =
         |items: &mut Vec<ListItem>, rows: &mut Vec<Option<RowAction>>, d: &RowData| {
             let cur = rows.len();
-            let highlighted = hovered == Some(cur) || selected == cur;
+            let highlighted = hovered == Some(cur) || selected == Some(cur);
             let mut line_style = Style::default();
             if highlighted {
                 line_style = line_style.bg(ui().hl_bg).fg(ui().emph);
@@ -841,7 +867,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     ) {
         let cur = rows.len();
         let mut style = style;
-        if action.is_some() && (hovered == Some(cur) || selected == cur) {
+        if action.is_some() && (hovered == Some(cur) || selected == Some(cur)) {
             style = style.bg(ui().hl_bg).fg(ui().emph);
         }
         items.push(ListItem::new(Line::from(text).style(style)));
@@ -851,7 +877,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // 新規セッション
     {
         let cur = rows.len();
-        let highlighted = hovered == Some(cur) || selected == cur;
+        let highlighted = hovered == Some(cur) || selected == Some(cur);
         let mut style = Style::default();
         if highlighted {
             style = style.bg(ui().hl_bg).fg(ui().emph);
@@ -867,7 +893,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // グルーピング切替（クリックで state ⇔ directory）
     {
         let cur = rows.len();
-        let highlighted = hovered == Some(cur) || selected == cur;
+        let highlighted = hovered == Some(cur) || selected == Some(cur);
         let mut style = Style::default().fg(ui().dim);
         if highlighted {
             style = style.bg(ui().hl_bg).fg(ui().emph);
@@ -946,7 +972,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 items.push(ListItem::new(Line::from("")));
                 rows.push(None);
                 let cur = rows.len();
-                let highlighted = hovered == Some(cur) || selected == cur;
+                let highlighted = hovered == Some(cur) || selected == Some(cur);
                 let mut style = Style::default().fg(ui().dim);
                 if highlighted {
                     style = style.bg(ui().hl_bg).fg(ui().emph);
@@ -995,27 +1021,33 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     let capacity = sl.capacity;
     app.sidebar_rows = rows;
     app.sidebar_header_rows = header_n;
-    // 行構成が変わって選択が浮いたら、最寄りのクリック可能行へ寄せる
-    if app
-        .sidebar_rows
-        .get(app.selected_row)
-        .map(|r| r.is_none())
-        .unwrap_or(true)
-    {
-        app.selected_row = app
+    // 選択が浮いたら（行構成が変わった / 狭くてフッターが消えた）先頭の
+    // クリック可能行へ寄せる。**押せない位置に選択を残さない**
+    let selection_lost = match app.selection {
+        Selection::Row(row) => app
             .sidebar_rows
-            .iter()
-            .position(|r| r.is_some())
-            .unwrap_or(0);
+            .get(row)
+            .map(|r| r.is_none())
+            .unwrap_or(true),
+        Selection::Account => !sl.footer_visible,
+    };
+    if selection_lost {
+        app.selection = Selection::Row(
+            app.sidebar_rows
+                .iter()
+                .position(|r| r.is_some())
+                .unwrap_or(0),
+        );
     }
 
     // ヘッダー行は固定表示。スクロールはその下（セッション一覧）にだけ効く。
     // ↑↓ 直後だけ選択行へ追従し、常に範囲内へクランプ
+    // （アカウント行はフッターに固定なのでスクロールに関係しない）
     let tail_capacity = capacity.saturating_sub(header_n);
     if app.sidebar_follow_sel {
         app.sidebar_follow_sel = false;
-        if app.selected_row >= header_n {
-            let sel_t = app.selected_row - header_n;
+        if let Some(row) = app.selection.row().filter(|row| *row >= header_n) {
+            let sel_t = row - header_n;
             if sel_t < app.sidebar_scroll {
                 app.sidebar_scroll = sel_t;
             } else if tail_capacity > 0 && sel_t >= app.sidebar_scroll + tail_capacity {
@@ -1079,13 +1111,18 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             Rect::new(fx, account_y - 1, fw, 1),
         );
         // アカウント行（表示名 · 組織名）。文面の判断は account_row に閉じる。
-        // **この行はクリックできる**（アカウントメニューの入口。当たり判定は
-        // handle_mouse 側が同じ `sidebar_layout` の account_y で持つ）
-        let (account, account_style) = account_row(
+        // **この行はクリックでもキーボードでも押せる**（アカウントメニューの入口。
+        // 当たり判定は handle_mouse 側が同じ `sidebar_layout` の account_y で持ち、
+        // キーボードの選択は [`Selection::Account`]）
+        let (account, mut account_style) = account_row(
             &app.footer.account,
             active_unstored(app),
             app.account_job.as_ref().map(|job| job.progress),
         );
+        // 選択中は一覧の行と同じ見え方にする（↓ で降りたとき選択が消えて見えない）
+        if app.selection == Selection::Account {
+            account_style = account_style.bg(ui().hl_bg).fg(ui().emph);
+        }
         frame.render_widget(
             ratatui::widgets::Paragraph::new(
                 Line::from(clip_to_width(&account, fw)).style(account_style),
@@ -1157,8 +1194,11 @@ fn draw_right_pane(frame: &mut Frame, pane: Rect, app: &mut App) -> FrameCursor 
     let blur_style = Style::default().fg(ui().dim);
     let terminal_focused = app.focus == Focus::Terminal;
     let starting = app.input_gate.is_some();
+    // Esc で戻れる先（セッションの窓）があるか。**借用の前に取る**（New 画面の
+    // 描画は right_view を可変で借りるため）
+    let can_leave = !app.windows.is_empty();
     if let RightView::New(state) = &mut app.right_view {
-        return draw_new_view(frame, pane, state, terminal_focused, starting);
+        return draw_new_view(frame, pane, state, terminal_focused, starting, can_leave);
     }
     if app.windows.is_empty() {
         frame.render_widget(
@@ -2128,6 +2168,78 @@ mod tests {
         let bar = drawn_row(&mut app, 29);
         assert!(bar.contains("Enter rename"), "{bar:?}");
         assert!(bar.contains("Esc cancel"), "{bar:?}");
+    }
+
+    /// 下部バーは**打鍵が届く先で効くキーだけ**を出す。受け手は 4 つ
+    /// （一覧 / メニュー / 名前の入力 / 端末）で、他所のキーを混ぜない。
+    /// `app:` の予約キーはどの状態でも出る（受け手に関係なく効く唯一の打鍵）
+    #[test]
+    fn the_bottom_bar_follows_whoever_receives_the_keys() {
+        let base = || App {
+            term_size: (120, 30),
+            focus: Focus::Sidebar,
+            sessions: vec![named_session("s", "C:\\dev\\api", "session")],
+            ..Default::default()
+        };
+        // 一覧: 開く（Enter / →）とメニュー（←）の両方を出す
+        let mut app = base();
+        let bar = drawn_row(&mut app, 29);
+        assert!(bar.contains("sidebar: ↑↓ select · Enter/→ open · ← menu"), "{bar:?}");
+
+        // メニュー表示中: 一覧のキーは全部このメニューが飲むので出さない
+        let mut app = App {
+            popup: Some(Popup {
+                kind: crate::app::PopupKind::Group,
+                anchor_y: 3,
+                selected: 0,
+            }),
+            ..base()
+        };
+        let bar = drawn_row(&mut app, 29);
+        assert!(bar.contains("popup: ↑↓ select · Enter run · Esc close"), "{bar:?}");
+        assert!(!bar.contains("menu"), "一覧のキーが残っている: {bar:?}");
+
+        // 名前の入力中: 入力の作法だけ
+        let mut app = App {
+            rename: Some(crate::app::Rename {
+                id: crate::sessions::SessionId::new("s"),
+                field: crate::ui::text_field::TextField::default(),
+            }),
+            ..base()
+        };
+        let bar = drawn_row(&mut app, 29);
+        assert!(bar.contains("rename: Enter rename · Esc cancel"), "{bar:?}");
+        assert!(!bar.contains("select"), "一覧のキーが残っている: {bar:?}");
+
+        // 端末: 予約キー以外は全部 claude が受ける
+        let mut app = App {
+            focus: Focus::Terminal,
+            ..base()
+        };
+        let bar = drawn_row(&mut app, 29);
+        assert!(bar.contains("terminal: all keys pass through to claude"), "{bar:?}");
+        assert!(!bar.contains("select"), "サイドバーのキーが残っている: {bar:?}");
+
+        // どの状態でも予約キーは出る（受け手に関係なく効く）
+        for focus in [Focus::Sidebar, Focus::Terminal] {
+            let mut app = App { focus, ..base() };
+            let bar = drawn_row(&mut app, 29);
+            assert!(bar.contains("Ctrl+Q quit · Alt+←→ focus"), "{focus:?}: {bar:?}");
+        }
+    }
+
+    /// 新規セッション画面は案内をペイン内に持つので、下部バーへは重ねない
+    #[test]
+    fn the_new_session_screen_keeps_its_hint_inside_the_pane() {
+        let mut app = App {
+            term_size: (120, 30),
+            focus: Focus::Terminal,
+            right_view: RightView::New(new_view::NewState::browse(".")),
+            ..Default::default()
+        };
+        let bar = drawn_row(&mut app, 29);
+        assert!(bar.contains("Ctrl+Q quit"), "{bar:?}");
+        assert!(!bar.contains("terminal:"), "下部バーに重ねている: {bar:?}");
     }
 
     /// inner が潰れてもペイン矩形の外（枠の列や端末外）へ出ない。

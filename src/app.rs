@@ -58,6 +58,35 @@ pub(crate) enum RowAction {
     UpdateClaude,  // claude 本体を更新（同じく版行）
 }
 
+/// サイドバーのキーボード選択位置。
+///
+/// **一覧の行とアカウント行を 1 つの型で表す**のが要点。アカウント行は
+/// フッター（一覧の外）に描かれるので `sidebar_rows` の index では指せず、
+/// かといって「選択行 index + アカウントを選んでいるか」の 2 つに分けると
+/// 排他であるはずの状態が両立し得る形になる。
+///
+/// 画面 y への写像は [`selected_row_y`] 1 箇所に閉じる
+/// （一覧の行は [`row_y`]、アカウント行は [`sidebar_layout`] の `account_y` ＝
+/// **どちらもマウスの当たり判定と同じ計算**）
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Selection {
+    /// 一覧の行（[`App::sidebar_rows`] の index）
+    Row(usize),
+    /// フッターのアカウント行
+    Account,
+}
+
+impl Selection {
+    /// 一覧の行なら index。**アカウント行は一覧の外なので `None`**
+    /// （行のハイライト・行の動作の引き当て・スクロール追従はこれを見る）
+    pub(crate) fn row(self) -> Option<usize> {
+        match self {
+            Self::Row(row) => Some(row),
+            Self::Account => None,
+        }
+    }
+}
+
 /// ccdesk 自身の更新の進行状態。**バックグラウンドスレッドが書き、UI が読む正本**。
 ///
 /// AtomicBool を並べずに 1 つの状態にしてあるのは、実行中・完了・失敗が排他で、
@@ -371,8 +400,8 @@ pub(crate) struct App {
     // （ホイールスクロールを選択位置へ引き戻さないための区別）
     pub(crate) sidebar_follow_sel: bool,
     pub(crate) hovered_row: Option<usize>,
-    // サイドバーフォーカス時のキーボード選択行（sidebar_rows の index）
-    pub(crate) selected_row: usize,
+    // サイドバーフォーカス時のキーボード選択位置（一覧の行 or フッターのアカウント行）
+    pub(crate) selection: Selection,
     pub(crate) dispatch_cwd: String,
     pub(crate) right_view: RightView,
     // サイドバー下部のアカウント・バージョン表示（バックグラウンド取得）
@@ -473,7 +502,7 @@ impl Default for App {
             sidebar_scroll: 0,
             sidebar_follow_sel: false,
             hovered_row: None,
-            selected_row: 0,
+            selection: Selection::Row(0),
             dispatch_cwd: String::new(),
             right_view: RightView::Sessions,
             footer: FooterInfo::default(),
@@ -996,27 +1025,33 @@ fn handle_sidebar_key(app: &mut App, key: &KeyEvent) {
         KeyCode::Down => move_selection(app, 1),
         // `←` = その行のメニュー（`→` / Enter の「開く」の対）
         KeyCode::Left => open_row_menu(app),
-        KeyCode::Enter | KeyCode::Right => {
-            match app.sidebar_rows.get(app.selected_row).cloned().flatten() {
-                Some(RowAction::New) => {
-                    app.open_new_view();
-                    app.set_focus(Focus::Terminal);
-                }
-                Some(RowAction::Open(id)) => {
-                    open_session(app, &id);
-                    app.set_focus(Focus::Terminal);
-                }
-                // 見出し行・グルーピング行は**開くものがメニュー**なので `←` と同じ
-                // （同じメニューを開く経路を 2 つ書かない）
-                Some(RowAction::Project(_)) | Some(RowAction::ToggleGroup) => {
-                    open_row_menu(app)
-                }
-                Some(RowAction::UpdateCcdesk) => start_ccdesk_update(app),
-                Some(RowAction::UpdateClaude) => start_claude_update(app),
-                None => {}
-            }
-        }
+        KeyCode::Enter | KeyCode::Right => open_selection(app),
         _ => {}
+    }
+}
+
+/// **`Enter` / `→` = 選択位置を開く。** 開くものがメニューしか無い位置
+/// （見出し行・グルーピング行・アカウント行）では [`open_row_menu`] と同じものが出る
+/// ＝ 同じメニューを開く経路を 2 つ書かない
+fn open_selection(app: &mut App) {
+    let Selection::Row(row) = app.selection else {
+        // アカウント行が持つのはメニューだけ
+        open_row_menu(app);
+        return;
+    };
+    match app.sidebar_rows.get(row).cloned().flatten() {
+        Some(RowAction::New) => {
+            app.open_new_view();
+            app.set_focus(Focus::Terminal);
+        }
+        Some(RowAction::Open(id)) => {
+            open_session(app, &id);
+            app.set_focus(Focus::Terminal);
+        }
+        Some(RowAction::Project(_)) | Some(RowAction::ToggleGroup) => open_row_menu(app),
+        Some(RowAction::UpdateCcdesk) => start_ccdesk_update(app),
+        Some(RowAction::UpdateClaude) => start_claude_update(app),
+        None => {}
     }
 }
 
@@ -1025,13 +1060,18 @@ fn handle_sidebar_key(app: &mut App, key: &KeyEvent) {
 ///
 /// **規則は行の種類で分けない**: メニューを持つ行なら同じものが開き、持たない行
 /// （`+ new session` / 版行 ＝ 押した瞬間に何かが起きる行）では何も起きない。
+/// フッターのアカウント行も同じ規則で扱う（例外を作らない）。
 /// 予約キー（[`reserved_key`]）には足さない ＝ 端末側にフォーカスがあれば
 /// `←` は今までどおり claude へ渡る（ペイン移動は `Alt+←` なので衝突しない）。
 ///
-/// 位置は行頭 `=` のクリックと同じ [`selected_row_y`]（開き方で場所が変わらない）
+/// 位置はクリックで開くときと同じ [`selected_row_y`]（開き方で場所が変わらない）
 fn open_row_menu(app: &mut App) {
     let anchor_y = selected_row_y(app);
-    match app.sidebar_rows.get(app.selected_row).cloned().flatten() {
+    let Selection::Row(row) = app.selection else {
+        open_account_popup(app, anchor_y);
+        return;
+    };
+    match app.sidebar_rows.get(row).cloned().flatten() {
         Some(RowAction::Open(id)) => open_session_popup(app, &id, anchor_y),
         Some(RowAction::Project(cwd)) => open_project_popup(app, cwd, anchor_y),
         Some(RowAction::ToggleGroup) => {
@@ -1431,15 +1471,15 @@ fn open_project_popup(app: &mut App, cwd: String, anchor_y: u16) {
     });
 }
 
-/// キーボード選択行の画面 y。**式そのものは描画側（[`row_y`]）が持つ**
-/// （行 index → 画面 y の対応が 2 つあると、メニューが行からずれて出る）。
-/// メニューの矩形はこの 1 つ下に出るので、Enter でメニューを開く行は全部これを使う
+/// キーボード選択位置の画面 y。**式そのものは描画側が持つ**（一覧の行は [`row_y`]、
+/// アカウント行は [`sidebar_layout`] の `account_y`）。位置の対応が 2 つあると
+/// メニューが行からずれて出るので、**キーボードもマウスもこの 1 つの計算に乗せる**。
+/// メニューの矩形はこの 1 つ下に出るので、Enter でメニューを開く位置は全部これを使う
 fn selected_row_y(app: &App) -> u16 {
-    row_y(
-        app.selected_row,
-        app.sidebar_header_rows,
-        app.sidebar_scroll,
-    )
+    match app.selection {
+        Selection::Row(row) => row_y(row, app.sidebar_header_rows, app.sidebar_scroll),
+        Selection::Account => sidebar_layout(app).account_y,
+    }
 }
 
 /// 指定フォルダ・プロンプトで前景セッションを 1 本起こす
@@ -1580,6 +1620,8 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             app.hovered_row = None; // 一覧の行ではないのでホバー対象にもしない
             if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
                 app.set_focus(Focus::Sidebar);
+                // 選択もここへ移す（キーボードで開いたときと同じ位置に居る）
+                app.selection = Selection::Account;
                 open_account_popup(app, mouse.row);
             }
             return Ok(false);
@@ -1603,7 +1645,7 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             // 押し間違いで名前が変わらない。確定は Enter だけ）
             app.rename = None;
             if action.is_some() {
-                app.selected_row = row;
+                app.selection = Selection::Row(row);
             }
             // 行頭の `=` クリック → コンテキストメニューを開く（記号 1 桁 +
             // 続く空白まで当たり判定にする ＝ 1 桁だけだと突きにくい）
@@ -2212,17 +2254,37 @@ fn remove_window(app: &mut App, idx: usize) {
     }
 }
 
-/// サイドバーの選択行を、クリック可能な行へ上下に移動する
+/// サイドバーの選択を、押して意味のある位置へ上下に移動する。
+///
+/// **一覧の下端の先はフッターのアカウント行**（マウスで押せる行はキーボードでも
+/// 届く）。描いていないフッターへは行かない ＝ 判断はマウスの当たり判定と同じ
+/// [`sidebar_layout`] の `footer_visible`
 fn move_selection(app: &mut App, dir: i32) {
     let len = app.sidebar_rows.len();
-    let mut row = app.selected_row as i32;
+    let mut row = match app.selection {
+        Selection::Row(row) => row as i32,
+        // アカウント行からは上へ戻るだけ（一覧の末尾の 1 つ先に居る扱い）
+        Selection::Account => {
+            if dir > 0 {
+                return;
+            }
+            len as i32
+        }
+    };
     loop {
         row += dir;
-        if row < 0 || row >= len as i32 {
+        if row >= len as i32 {
+            // 一覧を越えたらアカウント行へ（フッターが無ければ端で止まる）
+            if sidebar_layout(app).footer_visible {
+                app.selection = Selection::Account;
+            }
+            return;
+        }
+        if row < 0 {
             return; // 端で止まる
         }
         if app.sidebar_rows[row as usize].is_some() {
-            app.selected_row = row as usize;
+            app.selection = Selection::Row(row as usize);
             app.sidebar_follow_sel = true; // 次の draw で選択行が見えるようスクロール
             return;
         }
@@ -3012,7 +3074,7 @@ mod tests {
             for col in [0, 1, 2, 5, rightmost - 1, rightmost] {
                 handle_mouse(&mut app, &click(col, y)).unwrap();
                 assert_eq!(app.hovered_row, Some(row), "y={y} col={col}");
-                assert_eq!(app.selected_row, row, "y={y} col={col}");
+                assert_eq!(app.selection, Selection::Row(row), "y={y} col={col}");
                 assert_eq!(
                     app.sidebar_rows[row].as_ref(),
                     Some(&expected),
@@ -3036,7 +3098,11 @@ mod tests {
         let verb_end = app.sidebar_width - 2;
         handle_mouse(&mut app, &click(verb_end, 1)).unwrap();
         assert!(!app.dragging, "動詞の最終桁が幅変更のつかみ代になっている");
-        assert_eq!(app.selected_row, 0, "動詞のクリックが行に当たっていない");
+        assert_eq!(
+            app.selection,
+            Selection::Row(0),
+            "動詞のクリックが行に当たっていない"
+        );
         // つかみ代はその 1 つ外（右枠の列）から始まる = 境界がここにあることの固定
         let mut app = app_with_version_rows(34);
         handle_mouse(&mut app, &click(verb_end + 1, 1)).unwrap();
@@ -3048,12 +3114,16 @@ mod tests {
     #[test]
     fn an_open_menu_swallows_clicks_aimed_at_the_version_rows() {
         let mut app = app_with_version_rows(34);
-        app.selected_row = 3; // `+ new session`。動いたら分かる位置に置く
+        app.selection = Selection::Row(3); // `+ new session`。動いたら分かる位置に置く
         open(&mut app, PopupKind::Group, 3);
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
         assert!(rect.y > 2, "メニューが版行に被っていて外クリックにならない");
         handle_mouse(&mut app, &click(5, 1)).unwrap();
-        assert_eq!(app.selected_row, 3, "版行が選択されてしまっている");
+        assert_eq!(
+            app.selection,
+            Selection::Row(3),
+            "版行が選択されてしまっている"
+        );
         assert!(app.hovered_row.is_none(), "版行がホバー扱いになっている");
         assert!(app.popup.is_none(), "メニュー外クリックで閉じていない");
         assert_eq!(state_name(&app), "Idle", "更新が走ってしまっている");
@@ -3377,8 +3447,71 @@ mod tests {
             assert!(!app.dragging, "col={col} で幅変更ドラッグが始まっている");
         }
         assert_eq!(app.sidebar_width, 34, "サイドバー幅が動いている");
-        // 一覧の行やヘッダーの選択は動かさない（アカウント行は sidebar_rows の外）
+        // 選択はアカウント行へ移る（キーボードで開いたときと同じ位置に居る）
+        assert_eq!(app.selection, Selection::Account);
+        // 一覧の行のホバーにはしない（アカウント行は sidebar_rows の外）
         assert!(app.hovered_row.is_none());
+    }
+
+    /// 一覧の下端の先がアカウント行。**マウスで押せる行はキーボードでも届く**
+    #[test]
+    fn the_arrow_keys_reach_the_account_row_below_the_list() {
+        let active = Account::new("a@example.com", "taro");
+        let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
+        app.sidebar_rows = vec![Some(RowAction::New), None, Some(RowAction::ToggleGroup)];
+        app.sidebar_header_rows = 3;
+        app.selection = Selection::Row(0);
+
+        press(&mut app, KeyCode::Down); // 区切り線は飛ばす
+        assert_eq!(app.selection, Selection::Row(2));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selection, Selection::Account, "アカウント行へ届かない");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selection, Selection::Account, "アカウント行の先へ抜けた");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.selection, Selection::Row(2), "一覧へ戻れない");
+    }
+
+    /// **アカウント行はマウスとキーボードで同じ場所に同じメニューが開く。**
+    /// `Enter` / `→`（開く）も `←`（メニュー）も、この行が持つのはメニューだけなので
+    /// 同じものを出す
+    #[test]
+    fn the_account_menu_opens_the_same_way_from_the_mouse_and_the_keyboard() {
+        let active = Account::new("a@example.com", "taro");
+        let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
+        let sl = sidebar_layout(&app);
+        handle_mouse(&mut app, &click(3, sl.account_y)).unwrap();
+        let by_mouse = app.popup.take().expect("マウスでメニューが開いていない");
+
+        for code in [KeyCode::Enter, KeyCode::Right, KeyCode::Left] {
+            app.popup = None;
+            app.selection = Selection::Account;
+            press(&mut app, code);
+            let popup = app
+                .popup
+                .as_ref()
+                .unwrap_or_else(|| panic!("{code:?} でメニューが開いていない"));
+            assert_eq!(popup.kind, by_mouse.kind, "{code:?} で別のメニューが開いた");
+            assert_eq!(popup.anchor_y, sl.account_y, "{code:?} で開く位置が違う");
+        }
+    }
+
+    /// フッターが無い（狭い）端末ではアカウント行は描かれないので選択対象にもしない。
+    /// **押せない位置に選択を残さない**という一覧の行と同じ規則
+    #[test]
+    fn a_hidden_footer_keeps_the_account_row_out_of_the_selection() {
+        let active = Account::new("a@example.com", "taro");
+        let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
+        app.term_size = (60, 8); // 下部バー 1 行を引くと footer_visible が落ちる高さ
+        assert!(
+            !sidebar_layout(&app).footer_visible,
+            "フッターが消えている前提が崩れている"
+        );
+        app.sidebar_rows = vec![Some(RowAction::New)];
+        app.sidebar_header_rows = 1;
+        app.selection = Selection::Row(0);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selection, Selection::Row(0), "描いていない行を選んだ");
     }
 
     /// 一覧は供給元の保管一覧（[`crate::accounts::AccountStore::list`]）から作られ、
@@ -4696,10 +4829,10 @@ mod tests {
         app.sidebar_header_rows = 7;
         app.sidebar_scroll = 4;
         // ヘッダー内はスクロールの影響を受けない
-        app.selected_row = 2;
+        app.selection = Selection::Row(2);
         assert_eq!(selected_row_y(&app), 3);
         // ヘッダーより下はスクロール分を引く
-        app.selected_row = 10;
+        app.selection = Selection::Row(10);
         assert_eq!(selected_row_y(&app), 7);
         // 引きすぎても 0 未満にならない
         app.sidebar_scroll = 99;
@@ -4860,7 +4993,11 @@ mod tests {
         app.sidebar_rows.push(Some(RowAction::New));
         run_popup_action(&mut app, PopupAction::StartRename(SessionId::new("s")), 0);
         press(&mut app, KeyCode::Down);
-        assert_eq!(app.selected_row, 0, "編集中に裏の選択が動いている");
+        assert_eq!(
+            app.selection,
+            Selection::Row(0),
+            "編集中に裏の選択が動いている"
+        );
         assert!(app.rename.is_some(), "↑↓ で入力が閉じている");
     }
 
@@ -4882,7 +5019,7 @@ mod tests {
             (2, PopupKind::Group),
         ] {
             app.popup = None;
-            app.selected_row = row;
+            app.selection = Selection::Row(row);
             press(&mut app, KeyCode::Left);
             let popup = app
                 .popup
@@ -4906,7 +5043,7 @@ mod tests {
         ];
         app.sidebar_header_rows = 4;
         for row in 0..app.sidebar_rows.len() {
-            app.selected_row = row;
+            app.selection = Selection::Row(row);
             press(&mut app, KeyCode::Left);
             assert!(app.popup.is_none(), "row={row} でメニューが開いた");
             assert!(

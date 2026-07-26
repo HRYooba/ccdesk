@@ -12,7 +12,7 @@ use crate::ui::text_field::TextField;
 use crate::ui::{pane_fallback_pos, FrameCursor};
 
 /// New 画面のフォーカス対象フィールド
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum NewFocus {
     Prompt,  // 下部のプロンプト入力（初期フォーカス。Enter で起動）
     Browser, // フォルダ一覧（↑↓ で行移動・→← で潜る/上がる。Enter は選択行の実行）
@@ -545,14 +545,37 @@ fn list_rows_for_message(no_folder_rows: bool, list_height: u16) -> usize {
     }
 }
 
+/// ペイン内ヒント 1 行。**フォーカス中の欄で意味が変わるキーを出し分ける**
+/// （[`handle_new_view_key`] が正本）:
+///
+/// - `Enter`: Prompt = 起動 / Path = パスの適用 / Browser = 選択行の実行
+/// - `Esc`: Path = 編集の取り消し / それ以外 = セッション一覧へ戻る
+///
+/// `can_leave` ＝ 戻れる窓があるか。窓が 1 つも無いときは Esc が何もしないので
+/// **出さない**（効かないキーを案内しない）
+fn new_view_hint(focus: NewFocus, can_leave: bool) -> &'static str {
+    match focus {
+        NewFocus::Prompt if can_leave => "Tab: next field · Enter: start · Esc: back to sessions",
+        NewFocus::Prompt => "Tab: next field · Enter: start",
+        // Path の Esc は戻る先に関係なく編集の取り消し（一覧へは戻らない）
+        NewFocus::Path => "Tab: next field · Enter: apply path · Esc: cancel edit",
+        NewFocus::Browser if can_leave => {
+            "Tab: next field · ↑↓ select · Enter: run row · ←→ move · Esc: back to sessions"
+        }
+        NewFocus::Browser => "Tab: next field · ↑↓ select · Enter: run row · ←→ move",
+    }
+}
+
 /// 新規セッション画面の描画（フォルダブラウザ + 初回チャット入力）。
-/// starting = 起こした子がまだ端末を掴んでいない: プロンプト欄に進行中表示を出す
+/// starting = 起こした子がまだ端末を掴んでいない: プロンプト欄に進行中表示を出す。
+/// can_leave = Esc で戻れるセッションの窓があるか（[`new_view_hint`]）
 pub(crate) fn draw_new_view(
     frame: &mut Frame,
     area: Rect,
     state: &mut NewState,
     focused: bool,
     starting: bool,
+    can_leave: bool,
 ) -> FrameCursor {
     let border = if focused {
         Style::default().fg(FOCUS_BORDER)
@@ -747,13 +770,8 @@ pub(crate) fn draw_new_view(
         Rect::new(prompt_inner.x, layout.input_y, prompt_inner.width, 1),
     );
 
-    // ペイン内ヒント（下部バーの "new session:" セグメントはここへ移設して重複を避ける）。
-    // Enter の意味はフォーカスで変わる（Browser では選択行の実行）ので出し分ける
-    let hint = match state.focus {
-        NewFocus::Prompt => "Tab: next field · Enter: start",
-        NewFocus::Path => "Tab: next field · Enter: apply path",
-        NewFocus::Browser => "Tab: next field · ↑↓ select · Enter: run row · ←→ move",
-    };
+    // ペイン内ヒント（下部バーの "new session:" セグメントはここへ移設して重複を避ける）
+    let hint = new_view_hint(state.focus, can_leave);
     frame.render_widget(
         ratatui::widgets::Paragraph::new(
             Line::from(format!("{pad}{hint}")).style(Style::default().fg(ui().dim)),
@@ -1097,7 +1115,7 @@ mod tests {
                 .unwrap();
         terminal
             .draw(|frame| {
-                draw_new_view(frame, pane, &mut state, true, false);
+                draw_new_view(frame, pane, &mut state, true, false, false);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -1206,6 +1224,30 @@ mod tests {
                 state.entries, expected,
                 "text {text:?} で一覧が (cur_dir {:?}, filter {:?}) と不整合",
                 state.cur_dir, state.filter
+            );
+        }
+    }
+
+    /// ペイン内ヒントは**フォーカス中の欄で意味が変わる `Esc` を出し分ける**
+    /// （[`handle_new_view_key`] の分岐が正本）。戻る窓が無いときは Esc が
+    /// 何もしないので出さない
+    #[test]
+    fn the_pane_hint_spells_out_what_esc_means_in_the_focused_field() {
+        for focus in [NewFocus::Prompt, NewFocus::Browser] {
+            assert!(
+                new_view_hint(focus, true).ends_with("Esc: back to sessions"),
+                "{focus:?}: 一覧へ戻れることが読めない"
+            );
+            assert!(
+                !new_view_hint(focus, false).contains("Esc"),
+                "{focus:?}: 効かない Esc を案内している"
+            );
+        }
+        // Folder 欄の Esc は編集の取り消し（戻る窓の有無に関係なく効く）
+        for can_leave in [true, false] {
+            assert!(
+                new_view_hint(NewFocus::Path, can_leave).ends_with("Esc: cancel edit"),
+                "can_leave={can_leave}: Folder 欄の Esc の意味が違う"
             );
         }
     }

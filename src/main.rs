@@ -149,7 +149,7 @@ fn main() -> anyhow::Result<()> {
         sidebar_scroll: 0,
         sidebar_follow_sel: false,
         hovered_row: None,
-        selected_row: 0,
+        selection: app::Selection::Row(0),
         dispatch_cwd: window.dispatch_cwd,
         right_view: RightView::Sessions,
         footer,

@@ -39,7 +39,8 @@ reopen one and it resumes from its transcript.
 - **Account line** in the sidebar footer, showing the signed-in Claude account, the same value
   `ccdesk doctor` prints. A login or logout that rewrites `~/.claude/.credentials.json` shows
   up in ~1 s; where credentials live outside that file, only the ~60 s refresh applies
-- **Account switching** — **clicking anywhere on the account line** opens a menu of the accounts
+- **Account switching** — **clicking anywhere on the account line** (or selecting it with `↑↓`
+  past the bottom of the list and pressing `Enter`) opens a menu of the accounts
   ccdesk has stored (`●` marks the one you are signed in as) plus `register current`, and picking
   a stored account offers `switch` / `unregister`. Registering copies the current
   `claudeAiOauth` credentials into `~/.ccdesk/accounts.json` under your account's email;
@@ -71,9 +72,14 @@ reopen one and it resumes from its transcript.
   border to resize
 - **Keyboard**: ccdesk reserves exactly two things — `Alt+←/→` pane focus and `Ctrl+Q`
   quit. **Everything else passes through to claude untouched**, including `Ctrl+S` and
-  `Ctrl+X`. With the sidebar focused, `↑↓` select, `Enter`/`→` opens the selected row and
-  `←` opens its menu; on the new-session screen, `Tab` cycles fields and `Enter` runs the
-  selected folder-list row
+  `Ctrl+X`. With the sidebar focused, `↑↓` select — past the bottom of the list they reach
+  the account line in the footer — `Enter`/`→` opens the selected row and `←` opens its
+  menu; rows whose only action is a menu (project headings, `⊞ group`, the account line)
+  open the same menu either way. In an open menu, `↑↓` select, `Enter` runs and `Esc`
+  closes. On the new-session screen, `Tab` cycles fields, `Enter` runs the selected
+  folder-list row, and `Esc` cancels the path edit while the path field has focus and
+  otherwise returns to the session pane. **The bottom bar always names the keys that work
+  where your keystrokes are going**
 - **New-session screen** with a folder browser, editable path field (paste / drag & drop),
   and a first-prompt input. The list starts with a `+ start in <folder>` row, so you can
   launch a session in the folder you are browsing without typing a prompt first
