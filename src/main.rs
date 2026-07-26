@@ -136,7 +136,7 @@ fn main() -> anyhow::Result<()> {
         agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         sessions,
         hook_states,
-        titles: title::TitleWatcher::default(),
+        titles: title::Titles::default(),
         last_scan: std::time::Instant::now(),
         last_live_scan: std::time::Instant::now(),
         sidebar_width: window.sidebar_width,

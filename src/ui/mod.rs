@@ -26,8 +26,12 @@ use crate::theme::{
 };
 use crate::ui::new_view::draw_new_view;
 
-/// 未読マーカー（状態ラベルの前に出る）。**既読も同じ幅を取る**ので、
-/// 未読が付いたり消えたりしても状態ラベルの桁が動かない
+/// 未読マーカー（行頭のメニュー記号の右）。**既読も同じ幅を取る**ので、
+/// 未読が付いたり消えたりしても名前の開始桁が動かない。
+///
+/// **状態ラベルの前ではなく行頭に置く**のが判断: 未読は「この行に新しいことが
+/// あるか」の印なので、行を縦に流し読みするときに 1 つの桁に揃っている方が拾える
+/// （状態ラベルの前だと名前の長さで印の位置が毎行変わる）
 const UNREAD_MARK: &str = "● ";
 const READ_MARK: &str = "  ";
 
@@ -158,10 +162,6 @@ fn row_visible(row: usize, header_rows: usize, scroll: usize, tail_capacity: usi
 fn separator_text(inner_width: u16) -> String {
     "─".repeat(inner_width as usize)
 }
-
-/// アーカイブ済みの行を集める節の見出し。[`Group::title`] と同じ体裁で、
-/// **どちらのグルーピングでも末尾に 1 つだけ**出す（判断は draw のこの節の隣）
-const ARCHIVED_TITLE: &str = "Archived";
 
 /// 行頭のメニュー記号（クリックで二次操作のメニューが開く）。
 ///
@@ -746,15 +746,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         color: Color,
         label: String,
         is_active_window: bool,
-        /// 未読（[`crate::sessions::SessionRow::unread`]）＝ 状態ラベルの前に `●`
+        /// 未読（[`crate::sessions::SessionRow::unread`]）＝ 行頭のメニュー記号の右に `●`
         unread: bool,
         status_label: &'static str,
         age: String,
         bucket: Bucket,
         /// ピン留め（グループ内で先頭へ寄せる）
         pinned: bool,
-        /// アーカイブ済み（通常の並びから外し、末尾の [`ARCHIVED_TITLE`] へ回す）
-        archived: bool,
         /// 名前の変更中なら入力中の文字列。**行そのものが入力欄に化ける**
         /// （[`crate::app::Rename`]）ので、ここが Some の行は通常の描画をしない
         editing: Option<String>,
@@ -812,7 +810,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             age: fmt_age(age_secs),
             bucket: view.bucket,
             pinned: row.pinned,
-            archived: row.archived,
             editing: app
                 .rename
                 .as_ref()
@@ -820,13 +817,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 .map(|r| r.field.text.clone()),
         });
     }
-    // ヘッダー集計は表示行そのものから数える（分岐の複製をしない = 行数と必ず一致）。
-    // **アーカイブ済みは数えない**: 通常の一覧から外した行なので、数だけ残ると
-    // 「1 working」と出ているのにどこにも見当たらない状態になる
+    // ヘッダー集計は表示行そのものから数える（分岐の複製をしない = 行数と必ず一致）
     let mut awaiting = 0usize;
     let mut working = 0usize;
     let mut completed = 0usize;
-    for d in data.iter().filter(|d| !d.archived) {
+    for d in data.iter() {
         match d.bucket {
             Bucket::Awaiting => awaiting += 1,
             Bucket::Working => working += 1,
@@ -876,12 +871,12 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                     }),
                 ),
                 Span::raw(" "),
+                // 未読マーカー。既読も同じ幅なので**名前の開始桁は動かない**
+                Span::styled(unread_mark(d.unread), Style::default().fg(ui().emph)),
                 Span::styled(d.glyph, Style::default().fg(d.color)),
                 Span::raw(" "),
                 Span::styled(d.label.clone(), name_style),
                 Span::raw(" "),
-                // 未読マーカー。既読も同じ幅なので状態ラベルの桁は動かない
-                Span::styled(unread_mark(d.unread), Style::default().fg(ui().emph)),
                 Span::styled(d.status_label, Style::default().fg(d.color)),
             ];
             spans.push(Span::raw(" · "));
@@ -973,12 +968,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     match app.grouping {
         Grouping::State => {
             for group in [Group::NeedsInput, Group::Working, Group::Completed] {
-                // アーカイブ済みは通常のグループに出さない（末尾へ回す）
-                let members = ordered(
-                    data.iter()
-                        .filter(|d| !d.archived && d.group == group)
-                        .collect(),
-                );
+                let members = ordered(data.iter().filter(|d| d.group == group).collect());
                 if members.is_empty() {
                     continue;
                 }
@@ -995,14 +985,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         }
         Grouping::Directory => {
             // 見出しに出すフォルダと並びの決定は project_rows に閉じている。
-            // 選択・close・delete 等の操作では並び替えない。
-            // **アーカイブ済みの cwd は渡さない**: そのフォルダの行が全部アーカイブなら
-            // 見出しも出さない（登録済みフォルダなら登録リスト側から出る）
-            let cwds: Vec<&str> = data
-                .iter()
-                .filter(|d| !d.archived)
-                .map(|d| d.cwd.as_str())
-                .collect();
+            // 選択・close・delete 等の操作では並び替えない
+            let cwds: Vec<&str> = data.iter().map(|d| d.cwd.as_str()).collect();
             // セッション行の振り分けキーも**行ごとに 1 度だけ**作る（見出し × 行の
             // 総当たりになるので、突き合わせのたびに作ると描画 1 回で数千の String に
             // なる。見出し側のキーは project_rows が持っている）
@@ -1023,7 +1007,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 let members = ordered(
                     data.iter()
                         .zip(&data_keys)
-                        .filter(|(d, key)| !d.archived && **key == row.key)
+                        .filter(|(_, key)| **key == row.key)
                         .map(|(d, _)| d)
                         .collect(),
                 );
@@ -1033,26 +1017,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             }
         }
     }
-    // 末尾のアーカイブ節。**グルーピングに関係なくここへ出す**のが判断で、理由は
-    // アーカイブが state（行の状態）でも cwd（フォルダ）でもなく**行そのものに付いた
-    // 印**だから: state 別ならグループを 1 つ足すだけで済むが、directory 別では
-    // フォルダごとにアーカイブの区画を作ることになり、「隠した」はずの行が
-    // フォルダの数だけ散らばる。1 箇所に集めれば、どちらのグルーピングでも
-    // 「通常の一覧には出ない・戻す場所はここ 1 つ」という同じ規則で読める。
-    // 一覧から**消さない**のは、消すと `unarchive` を選ぶ入口が無くなるため
-    let archived = ordered(data.iter().filter(|d| d.archived).collect());
-    if !archived.is_empty() {
-        items.push(ListItem::new(Line::from("")));
-        rows.push(SidebarRow::Decoration);
-        items.push(ListItem::new(
-            Line::from(ARCHIVED_TITLE).style(Style::default().fg(ui().dim)),
-        ));
-        rows.push(SidebarRow::Decoration);
-        for d in archived {
-            push_data_row(&mut items, &mut rows, d);
-        }
-    }
-
     // 下部のフッター（区切り線 + アカウント行）を差し引いた行数が表示窓。
     // 溢れる分はスクロールで届く（ホイール / ↑↓ の選択追従）。
     // ジオメトリはクリック判定と同じ sidebar_layout を使う
@@ -1386,7 +1350,7 @@ mod tests {
     }
 
     /// **未読マーカーは既読と同じ幅を取る。** 幅が違うと、未読が付いたり消えたり
-    /// するたびに状態ラベルが横へずれる（行が変わったこと自体が読み取りにくくなる）
+    /// するたびに名前が横へずれる（行が変わったこと自体が読み取りにくくなる）
     #[test]
     fn the_unread_marker_and_its_empty_slot_are_the_same_width() {
         use unicode_width::UnicodeWidthStr;
@@ -1398,6 +1362,61 @@ mod tests {
             "unread and read marks differ in width: {UNREAD_MARK:?} / {READ_MARK:?}"
         );
         assert!(READ_MARK.trim().is_empty(), "a character is showing in the read slot");
+    }
+
+    /// **未読の印は行頭のメニュー記号の右**（状態ラベルの前ではない）で、
+    /// **名前の開始桁は未読／既読で動かない**。
+    ///
+    /// 比べるのは 2 本の行そのもの（未読 1 本・既読 1 本を同じフレームに描く）で、
+    /// 桁数を式で書き写さない ＝ 行の組み立てを変えたらここが落ちる。
+    /// 行頭が食う桁は [`MIN_SIDEBAR`] の下限の根拠でもあるので、同時に固定する
+    #[test]
+    fn the_unread_mark_sits_next_to_the_menu_mark_without_shifting_the_name() {
+        use crate::app::MIN_SIDEBAR;
+        use unicode_width::UnicodeWidthStr;
+        let mut app = App {
+            term_size: (60, 40),
+            sidebar_width: 34,
+            sessions: vec![
+                crate::sessions::SessionRow {
+                    // 見ていない間に動いた行（`updated_at > last_opened_at`）
+                    last_opened_at: 1_000,
+                    updated_at: 2_000,
+                    ..named_session("a", "C:\\dev\\api", "fresh-row")
+                },
+                named_session("b", "C:\\dev\\api", "seen-row"),
+            ],
+            ..Default::default()
+        };
+        let lines = session_lines(&mut app);
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} is not on any row: {lines:?}"))
+                .clone()
+        };
+        let (unread, read) = (at("fresh-row"), at("seen-row"));
+
+        // 行頭は `= ` の次が未読の桁（既読はそこが空白）
+        let head = format!("{MENU_MARK} ");
+        assert!(unread.starts_with(&format!("{head}{}", UNREAD_MARK.trim())), "{unread:?}");
+        assert!(read.starts_with(&format!("{head}{READ_MARK}")), "{read:?}");
+        // 名前の開始桁は 2 本で同じ（未読の桁が空白でも確保されている）
+        let name_col = |line: &str, name: &str| line[..line.find(name).unwrap()].width();
+        assert_eq!(
+            name_col(&unread, "fresh-row"),
+            name_col(&read, "seen-row"),
+            "the unread mark shifted the name column: {unread:?} / {read:?}"
+        );
+        // 行頭が食う桁 = メニュー記号 + 空白 + 未読の桁 + 状態アイコン + 空白
+        let head_cols = MENU_MARK.width() + 1 + UNREAD_MARK.width() + 1 + 1;
+        assert_eq!(name_col(&read, "seen-row"), head_cols, "the row head changed width");
+        // 一番狭いサイドバー（[`MIN_SIDEBAR`]）でも行頭 + 名前 1 桁は残る
+        assert!(
+            usize::from(MIN_SIDEBAR - 2) > head_cols,
+            "the narrowest sidebar no longer fits the row head ({head_cols} columns)"
+        );
     }
 
     /// **生きている行の状態は hook が主、`agents --json` が従。**
@@ -2028,7 +2047,7 @@ mod tests {
         );
     }
 
-    // ── ピン留め / アーカイブ / 名前の変更が一覧に効いていることの検証 ──────
+    // ── ピン留め / 名前の変更が一覧に効いていることの検証 ──────
     //
     // どれも「行が持っている値」→「画面に出る並び」の配線なので、
     // 実際に 1 フレーム描いて（[`render_sidebar`]）出た行そのものを見る
@@ -2086,38 +2105,35 @@ mod tests {
         }
     }
 
-    /// **アーカイブした行は通常の一覧から消え、末尾の `Archived` 節にだけ出る。**
-    /// 消し切らないのは `unarchive` を選ぶ入口を残すため。集計にも数えない
-    /// （数だけ残ると「1 件あるのに見当たらない」状態になる）
+    /// **一覧に隠し区画は無い。** アーカイブを廃止したので、行はどちらの
+    /// グルーピングでも通常の一覧に出て集計にも数えられる（`delete` が消すのは
+    /// 行だけなので、アーカイブとの差は「戻す導線があるか」しか残らず、
+    /// 節を 1 つ増やす価値が無かった）
     #[test]
-    fn an_archived_row_leaves_the_normal_list_for_the_archived_section() {
+    fn every_row_stays_in_the_normal_list_and_is_counted() {
         for grouping in [Grouping::State, Grouping::Directory] {
             let mut app = App {
                 term_size: (60, 40),
                 sidebar_width: 34,
                 grouping,
                 sessions: vec![
-                    named_session("a", "C:\\dev\\api", "visible"),
-                    crate::sessions::SessionRow {
-                        archived: true,
-                        ..named_session("b", "C:\\dev\\api", "hidden")
-                    },
+                    named_session("a", "C:\\dev\\api", "first row"),
+                    named_session("b", "C:\\dev\\api", "second row"),
                 ],
                 ..Default::default()
             };
             let texts = sidebar_texts(&mut app);
-            let at = |needle: &str| texts.iter().position(|t| t.contains(needle));
-            let archived_title = at(ARCHIVED_TITLE).expect("the Archived section is not showing");
-            let hidden = at("hidden").expect("the archived row is nowhere to be found");
             assert!(
-                hidden > archived_title,
-                "{grouping:?}: the archived row is still in the normal list: {texts:?}"
+                !texts.iter().any(|t| t.contains("Archived")),
+                "{grouping:?}: an Archived section came back: {texts:?}"
             );
-            assert!(
-                at("visible").is_some_and(|v| v < archived_title),
-                "{grouping:?}: a normal row fell into the Archived section: {texts:?}"
-            );
-            // 集計はアーカイブを数えない（1 件だけが数に出る）
+            for row in ["first row", "second row"] {
+                assert!(
+                    texts.iter().any(|t| t.contains(row)),
+                    "{grouping:?}: {row} is missing from the list: {texts:?}"
+                );
+            }
+            // 集計は一覧に出る行を全部数える（隠す行が無いので数と行数が一致する）
             let counts = texts
                 .iter()
                 .find(|t| t.contains("awaiting input"))
@@ -2125,35 +2141,10 @@ mod tests {
                 .clone();
             // （末尾はサイドバー幅で切られるので、数の出るところまでを見る）
             assert!(
-                counts.starts_with("0 awaiting input · 0 working · 1"),
-                "{grouping:?}: the archived row is counted in the summary: {counts:?}"
+                counts.starts_with("0 awaiting input · 0 working · 2"),
+                "{grouping:?}: not every row is counted: {counts:?}"
             );
         }
-    }
-
-    /// アーカイブだけのフォルダは見出しも出さない（登録済みなら登録リスト側から出る）。
-    /// 通常の一覧から隠す、という規則が見出しにも及ぶことの固定
-    #[test]
-    fn a_folder_with_only_archived_rows_gets_no_heading() {
-        let mut app = App {
-            term_size: (60, 40),
-            sidebar_width: 34,
-            grouping: Grouping::Directory,
-            sessions: vec![crate::sessions::SessionRow {
-                archived: true,
-                ..named_session("a", "C:\\dev\\gone", "hidden")
-            }],
-            ..Default::default()
-        };
-        let rows = render_sidebar(&mut app);
-        assert!(
-            !rows
-                .iter()
-                .any(|(row, _)| matches!(row.action(), Some(RowAction::Project(_)))),
-            "a heading is showing for an archive-only folder: {rows:?}"
-        );
-        // 行そのものは Archived 節に残る（戻す入口）
-        assert!(rows.iter().any(|(_, t)| t.contains("hidden")));
     }
 
     /// 名前の変更中は**その行が入力欄に化ける**。名前の桁は通常の行と同じ位置から

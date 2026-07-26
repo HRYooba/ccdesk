@@ -1,7 +1,7 @@
 //! 前景セッションの PTY。**この PTY がセッションそのもの**で、実体は ccdesk の
 //! 子プロセスになる（窓を閉じる = プロセスを終わらせる）。
 //!
-//! 起動は新規なら `claude --session-id <uuid> -n <title> [prompt]`、再開なら
+//! 起動は新規なら `claude --session-id <uuid> [prompt]`、再開なら
 //! `claude -r <session-id>`。渡した UUID がそのまま transcript の `sessionId` に
 //! なるので、一覧の行（[`crate::sessions::SessionRow`]）と claude 側の記録が
 //! 同じ鍵で結びつく。移行の全体像は `docs/foreground-migration.md`。
@@ -62,12 +62,13 @@ pub(crate) struct Session {
 }
 
 /// 起動の種類。**新規と再開でコマンドラインが違う**ことだけをここに持たせる
-/// （どちらを使うかを決めるのは呼び出し側 ＝ 行があるか）
+/// （どちらを使うかを決めるのは呼び出し側 ＝ transcript があるか）
 pub(crate) enum Launch<'a> {
-    /// 新規セッション。`title` は `-n`、`prompt` は最初のメッセージ（空なら渡さない）
-    New { title: &'a str, prompt: &'a str },
+    /// 新規セッション。`prompt` は最初のメッセージ（空なら渡さない）
+    New { prompt: &'a str },
     /// 既存セッションの再開（`claude -r`）。**cwd の一致が必須**（別 cwd からは
-    /// `No conversation found` になる ＝ 行が持つ cwd で開く）
+    /// `No conversation found` になる ＝ 行が持つ cwd で開く）。
+    /// **transcript が無い行には使えない**（会話が無いので `-r` が見つけられない）
     Resume,
 }
 
@@ -101,13 +102,14 @@ fn build_command(
         cmd.arg(path);
     }
     match launch {
-        Launch::New { title, prompt } => {
+        // **`-n <title>` は渡さない。** claude は `-n` で渡した名前を transcript の
+        // `custom-title` として残す（実測）ので、ccdesk が組んだ名前を渡すと
+        // 「ユーザーが付けた名前」の位置が埋まる ＝ 表示名がそこで凍る
+        // （プロンプト無しなら "new session" のまま・claude 側の AI 生成名も付かない）。
+        // 表示名は ccdesk 自身が行に持つので、渡す必要も無い
+        Launch::New { prompt } => {
             cmd.arg("--session-id");
             cmd.arg(session_id.as_str());
-            if !title.is_empty() {
-                cmd.arg("-n");
-                cmd.arg(title);
-            }
             // 空プロンプトは渡さない（"idle — プロンプト待ち" で始まる）
             if !prompt.is_empty() {
                 cmd.arg(prompt);
@@ -349,28 +351,25 @@ mod tests {
         SessionId::new("8a1c0f52-0b3e-4a6d-9f11-2c7d5e8b0a34")
     }
 
-    /// 新規は `--session-id <uuid> -n <title> [prompt]`。**空プロンプトは渡さない**
-    /// （渡すと空メッセージを送ったセッションになる）
+    /// 新規は `--session-id <uuid> [prompt]`。**空プロンプトは渡さない**
+    /// （渡すと空メッセージを送ったセッションになる）。
+    ///
+    /// **`-n <title>` は 1 つも渡さない**: claude は `-n` の名前を transcript の
+    /// `custom-title` として残すので、ccdesk が組んだ名前を渡すと表示名が
+    /// そこで凍る（`new session` のまま張り付く実害があった）
     #[test]
-    fn a_new_session_passes_its_uuid_title_and_prompt() {
+    fn a_new_session_passes_its_uuid_and_prompt_but_never_a_name() {
         let cmd = build_command(
             &id(),
             "C:\\dev\\app",
             Launch::New {
-                title: "fix login",
                 prompt: "fix login form validation",
             },
             None,
         );
         assert_eq!(
             argv(&cmd),
-            [
-                "--session-id",
-                id().as_str(),
-                "-n",
-                "fix login",
-                "fix login form validation",
-            ]
+            ["--session-id", id().as_str(), "fix login form validation"]
         );
         assert_eq!(
             cmd.get_cwd().map(|c| c.to_string_lossy().to_string()),
@@ -378,16 +377,14 @@ mod tests {
             "cwd is not passed through"
         );
 
-        let cmd = build_command(
-            &id(),
-            "C:\\dev\\app",
-            Launch::New {
-                title: "new session",
-                prompt: "",
-            },
-            None,
+        // プロンプト無しは UUID だけ（`claude --session-id <uuid>`）
+        let cmd = build_command(&id(), "C:\\dev\\app", Launch::New { prompt: "" }, None);
+        assert_eq!(argv(&cmd), ["--session-id", id().as_str()]);
+        assert!(
+            !argv(&cmd).contains(&"-n".to_string()),
+            "the name argument came back: {:?}",
+            argv(&cmd)
         );
-        assert_eq!(argv(&cmd), ["--session-id", id().as_str(), "-n", "new session"]);
     }
 
     /// 再開は `-r <session-id>` だけ（`--session-id` は新規採番の指定なので混ぜない）

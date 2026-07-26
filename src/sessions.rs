@@ -30,7 +30,6 @@ const CWD_KEY: &str = "cwd";
 const TITLE_KEY: &str = "title";
 const TITLE_SOURCE_KEY: &str = "title_source";
 const LAST_STATE_KEY: &str = "last_state";
-const ARCHIVED_KEY: &str = "archived";
 const PINNED_KEY: &str = "pinned";
 const LAST_OPENED_AT_KEY: &str = "last_opened_at";
 const CREATED_AT_KEY: &str = "created_at";
@@ -39,7 +38,7 @@ const UPDATED_AT_KEY: &str = "updated_at";
 /// 保管ファイルの read-modify-write を直列化するロックの待ち時間。
 ///
 /// **プロセス内 Mutex では足りない。** ccdesk は複数起動でき `sessions.json` は
-/// 共有なので、「インスタンス 1 のアーカイブ」と「インスタンス 2 の状態更新」が
+/// 共有なので、「インスタンス 1 のピン留め」と「インスタンス 2 の状態更新」が
 /// 重なると後着が前着を無かったことにする（[`merge_sessions`] が守る不変条件は、
 /// 読みと書きの間に他インスタンスの書き込みが挟まらないことが前提）。
 ///
@@ -85,10 +84,10 @@ impl std::fmt::Display for SessionId {
 /// 表示名がどこから来たか。
 ///
 /// **優先順は CLI 本体と同じ** `customTitle` > `aiTitle` > `lastPrompt` > `firstPrompt`
-/// で、ccdesk のリネームは `customTitle` の位置に入る（＝ ユーザーが付けた名前を
-/// あとから来る AI 生成の名前が踏まない）。正本は `docs/foreground-migration.md` の
-/// title の行。[`Self::Derived`] は上のどれでもない場合（cwd 等から組んだ名前・
-/// 読めなかった保存値）で、**未知の保存値もここへ倒す**
+/// で、ccdesk のリネームは `customTitle` の位置（＝ transcript の `custom-title` 行）に
+/// 入る。正本は `docs/foreground-migration.md` の title の行。[`Self::Derived`] は
+/// 上のどれでもない場合（cwd 等から組んだ名前・読めなかった保存値）で、
+/// **未知の保存値もここへ倒す**
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum TitleSource {
     /// ユーザーが付けた名前（ccdesk のリネーム）
@@ -117,23 +116,6 @@ impl TitleSource {
         }
     }
 
-    /// 優先順（**大きいほど優先**）。表示名を差し替えてよいかの判断に使う
-    /// （[`crate::app`] の `refresh_titles`）。
-    ///
-    /// **順位を数で持つ理由**: transcript から拾える候補は読んだ範囲によって
-    /// 変わる（上位の候補が末尾から遠ざかると見えなくなる）。順位を比べずに
-    /// 拾えたものへ差し替えると、`ai-title` の付いた行が turn ごとに
-    /// `last-prompt` へ落ちて名前がちらつく
-    pub(crate) fn rank(self) -> u8 {
-        match self {
-            Self::Custom => 4,
-            Self::Ai => 3,
-            Self::LastPrompt => 2,
-            Self::FirstPrompt => 1,
-            Self::Derived => 0,
-        }
-    }
-
     /// 保存表記からの復元。**未知の値は [`Self::Derived`]**（読みは寛容に:
     /// 手編集や将来の版が書いた値で起動を止めない）
     pub(crate) fn parse(text: &str) -> Self {
@@ -154,14 +136,15 @@ pub(crate) struct SessionRow {
     /// 行の identity（[`SessionId`]）
     pub(crate) session_id: SessionId,
     pub(crate) cwd: String,
-    /// 表示名
+    /// 表示名の**表示用キャッシュ**。正本は transcript（`custom-title` /
+    /// `ai-title` / `last-prompt`。[`crate::title`]）で、ここに置くのは
+    /// transcript を読む前（起動直後・1 ターン前）でも行に名前が出るようにするため
     pub(crate) title: String,
     /// `title` がどこから来たか（[`TitleSource`]）
     pub(crate) title_source: TitleSource,
     /// **最後に観測した** state。プロセスが死んでも消さない
     /// （消すと「終わった」のか「見えなくなった」のか行から読めなくなる）
     pub(crate) last_state: String,
-    pub(crate) archived: bool,
     pub(crate) pinned: bool,
     /// 未読判定用（ms）。`updated_at > last_opened_at` が未読
     pub(crate) last_opened_at: u64,
@@ -187,7 +170,6 @@ impl SessionRow {
             title: title.into(),
             title_source,
             last_state: String::new(),
-            archived: false,
             pinned: false,
             // 作った時点では未読にしない（作ったのはユーザー自身の操作）
             last_opened_at: now,
@@ -196,7 +178,7 @@ impl SessionRow {
         }
     }
 
-    /// 未読か（状態ラベルの前に `●` を出す判定）。
+    /// 未読か（行頭に `●` を出す判定）。
     ///
     /// **判定は行の意味論なのでここが持つ**: `updated_at` を進める側（[`crate::app`]
     /// の `touch`）・既読にする側（同 `mark_opened`）・描画（[`crate::ui`]）が
@@ -212,7 +194,6 @@ impl SessionRow {
             TITLE_KEY: self.title,
             TITLE_SOURCE_KEY: self.title_source.as_str(),
             LAST_STATE_KEY: self.last_state,
-            ARCHIVED_KEY: self.archived,
             PINNED_KEY: self.pinned,
             LAST_OPENED_AT_KEY: self.last_opened_at,
             CREATED_AT_KEY: self.created_at,
@@ -243,7 +224,6 @@ impl SessionRow {
             title: text(TITLE_KEY),
             title_source: TitleSource::parse(&text(TITLE_SOURCE_KEY)),
             last_state: text(LAST_STATE_KEY),
-            archived: flag(ARCHIVED_KEY),
             pinned: flag(PINNED_KEY),
             last_opened_at: ms(LAST_OPENED_AT_KEY),
             created_at: ms(CREATED_AT_KEY),
@@ -372,7 +352,7 @@ fn read_rows(path: &Path) -> Vec<SessionRow> {
 /// - `baseline` は「ディスクはこうなっている」とこのインスタンスが最後に判断した一覧。
 ///   `next` との差が**このインスタンスの操作**なので、消した / 知らないを区別できる
 /// - **両方に居る行は `updated_at` が新しい方**を採る。行の中身（title・状態・
-///   アーカイブ・既読）は最後に触った側が正しく、こちらの写しが古いなら
+///   ピン留め・既読）は最後に触った側が正しく、こちらの写しが古いなら
 ///   他インスタンスの変更を踏み潰してはいけない
 /// - `baseline` に居て `next` に居ない行は**このインスタンスが削除した**ので、
 ///   ディスクに残っていても落とす（削除がこのインスタンスの以降の書き込みで復活しない）
@@ -383,7 +363,7 @@ fn read_rows(path: &Path) -> Vec<SessionRow> {
 /// （＝ マージが入っても通常の 1 プロセス動作は何も変わらない）。
 ///
 /// **上限は設けない。** 登録プロジェクト（自動登録なので溢れる）と違い、行が増えるのは
-/// ユーザーがセッションを起こしたときだけで、減らす手段（アーカイブ・削除）もある。
+/// ユーザーがセッションを起こしたときだけで、減らす手段（削除）もある。
 /// 上限で押し出すと**ユーザーが起こしたセッションが黙って一覧から消える**
 ///
 /// **守れないこと**: 「削除した行が二度と復活しない」保証は無い。他インスタンスが
@@ -586,7 +566,6 @@ mod tests {
             1_700_000_000_000,
         );
         written.last_state = "blocked".to_string();
-        written.archived = true;
         written.pinned = true;
         written.last_opened_at = 1_700_000_000_500;
         written.updated_at = 1_700_000_001_000;
@@ -604,29 +583,34 @@ mod tests {
         assert_eq!(temp.store().list()[0].title_source, TitleSource::Derived);
     }
 
-    /// **表示名の優先順**（CLI 本体と同じ並び）。保存表記の読み書きと同じ表から
-    /// 出るので、片方だけ増えた状態にならない
+    /// 出どころの保存表記は**読みと書きが対**（片方だけ増えた状態にならない）。
+    ///
+    /// **優先順はここが持たない**: 正本は transcript から候補を選ぶ側
+    /// （[`crate::title`] の `CANDIDATES` の並び）1 箇所で、行はどこから来たかを
+    /// 覚えているだけ（順位を数でも持つと、同じ知識が 2 箇所になる）
     #[test]
-    fn title_sources_are_ordered_by_the_priority_of_their_origin() {
-        let order = [
+    fn title_sources_round_trip_through_their_stored_spelling() {
+        for source in [
             TitleSource::Derived,
             TitleSource::FirstPrompt,
             TitleSource::LastPrompt,
             TitleSource::Ai,
             TitleSource::Custom,
+        ] {
+            assert_eq!(TitleSource::parse(source.as_str()), source);
+        }
+        // 保存表記は互いに重ならない（別の出どころが同じ綴りにならない）
+        let spellings = [
+            TitleSource::Derived.as_str(),
+            TitleSource::FirstPrompt.as_str(),
+            TitleSource::LastPrompt.as_str(),
+            TitleSource::Ai.as_str(),
+            TitleSource::Custom.as_str(),
         ];
-        for pair in order.windows(2) {
-            assert!(
-                pair[0].rank() < pair[1].rank(),
-                "{:?} is prioritized over {:?}",
-                pair[0],
-                pair[1]
-            );
-        }
-        // 保存表記を往復しても順位は変わらない（読みと順位が別の表になっていない）
-        for source in order {
-            assert_eq!(TitleSource::parse(source.as_str()).rank(), source.rank());
-        }
+        let mut unique = spellings.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), spellings.len(), "two sources share one spelling");
     }
 
     /// 壊れた / 想定外の形でも読みは失敗しない（＝起動が止まらない）。
@@ -656,12 +640,12 @@ mod tests {
         // 型が違う項目は既定値として読む（行そのものは残す）
         std::fs::write(
             temp.path(),
-            r#"{"sessions":[{"session_id":"s","archived":"yes","updated_at":"soon"}]}"#,
+            r#"{"sessions":[{"session_id":"s","pinned":"yes","updated_at":"soon"}]}"#,
         )
         .unwrap();
         let rows = temp.store().list();
         assert_eq!(ids(&rows), ["s"], "dropped a row that has an identity");
-        assert!(!rows[0].archived);
+        assert!(!rows[0].pinned);
         assert_eq!(rows[0].updated_at, 0);
     }
 

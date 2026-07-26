@@ -759,7 +759,7 @@ mod tests {
             );
             assert!(session.cwd.starts_with("C:\\dev\\"), "cwd: {:?}", session.cwd);
             assert!(!session.unread(), "unread marker shows up in the demo");
-            assert!(!session.archived && !session.pinned);
+            assert!(!session.pinned);
         }
     }
 

@@ -24,8 +24,13 @@ pub(crate) struct AgentInfo {
     pub(crate) kind: String,
     /// 前景セッションが書くライブ状態（busy|idle|waiting|shell）
     pub(crate) status: String,
-    /// プロセス生存（文書化: 生存中のみ pid が載る）
-    pub(crate) has_pid: bool,
+    /// そのセッションを動かしているプロセス（文書化: 生存中のみ pid が載る）。
+    ///
+    /// **`sessionId` と対で読むのが要点**: ペインの中で `/resume` すると
+    /// 同じプロセスが別の `sessionId` に移るので、ccdesk が自分の子（pid は
+    /// 知っている）が今どのセッションを動かしているかを知る唯一の口になる
+    /// （[`crate::app`] の `live_session_of`）
+    pub(crate) pid: Option<u32>,
 }
 
 impl AgentInfo {
@@ -62,7 +67,11 @@ pub(crate) fn spawn_agents_poller(
                             session_id: s("sessionId"),
                             kind: s("kind"),
                             status: s("status"),
-                            has_pid: v.get("pid").is_some(),
+                            // 桁が u32 に収まらない値は pid として使わない
+                            pid: v
+                                .get("pid")
+                                .and_then(serde_json::Value::as_u64)
+                                .and_then(|pid| u32::try_from(pid).ok()),
                         }
                     })
                     .collect();
