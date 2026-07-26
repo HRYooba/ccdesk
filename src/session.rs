@@ -375,7 +375,7 @@ mod tests {
         assert_eq!(
             cmd.get_cwd().map(|c| c.to_string_lossy().to_string()),
             Some("C:\\dev\\app".to_string()),
-            "cwd を渡していない"
+            "cwd is not passed through"
         );
 
         let cmd = build_command(
@@ -433,12 +433,12 @@ mod tests {
             unsafe { std::env::remove_var(key) };
         }
         for key in INHERITED_MARKERS {
-            assert_eq!(cmd.get_env(key), None, "{key} が子へ継承される");
+            assert_eq!(cmd.get_env(key), None, "{key} is inherited by the child");
         }
         // 個別除去なので、通常の環境変数は落ちない（env_clear ではない）
         assert!(
             cmd.iter_full_env_as_str().any(|(k, _)| k.eq_ignore_ascii_case("PATH")),
-            "PATH まで落ちている（claude が起動できない）"
+            "PATH was dropped too — claude cannot start"
         );
     }
 }

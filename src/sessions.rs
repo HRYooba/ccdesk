@@ -484,18 +484,18 @@ mod tests {
     /// 逆に中身が違っても ID が同じなら同じ行（マージが同一視する単位）
     #[test]
     fn a_row_is_identified_by_its_session_id() {
-        let a = row("11111111-1111-4111-8111-111111111111", "同じ名前", 1);
+        let a = row("11111111-1111-4111-8111-111111111111", "same title", 1);
         let mut b = a.clone();
         b.session_id = SessionId::new("22222222-2222-4222-8222-222222222222");
-        assert_ne!(a, b, "ID が違うのに同じ行になっている");
+        assert_ne!(a, b, "became the same row despite different IDs");
         assert_eq!(a.session_id.as_str(), a.session_id.to_string());
 
-        let disk = [row("a", "ディスク側の名前", 2)];
-        let next = [row("a", "こちらの名前", 1)];
+        let disk = [row("a", "disk title", 2)];
+        let next = [row("a", "local title", 1)];
         assert_eq!(
             merge_sessions(&disk, &[], &next).len(),
             1,
-            "同じ ID の行が 2 つに割れている"
+            "same-ID row split into two"
         );
     }
 
@@ -510,24 +510,24 @@ mod tests {
             TitleSource::Derived,
             1_000,
         );
-        assert!(!row.unread(), "作った直後の行が未読になっている");
+        assert!(!row.unread(), "freshly created row is marked unread");
         row.updated_at = 1_001;
-        assert!(row.unread(), "変化した行が未読にならない");
+        assert!(row.unread(), "changed row did not become unread");
         row.last_opened_at = row.updated_at;
-        assert!(!row.unread(), "開いた後も未読のまま");
+        assert!(!row.unread(), "still unread after being opened");
     }
 
     /// **他インスタンスが起こしたセッションを消さない**（マージが要る理由そのもの）。
     /// ディスクにしか居ない行は自分が基準を取った後に作られたので、末尾へ回して残す
     #[test]
     fn merging_keeps_sessions_started_by_another_instance() {
-        let baseline = [row("shared", "共有", 1)];
-        let disk = [row("shared", "共有", 1), row("from-b", "B が起こした", 2)];
-        let next = [row("shared", "共有", 1), row("from-a", "A が起こした", 3)];
+        let baseline = [row("shared", "shared", 1)];
+        let disk = [row("shared", "shared", 1), row("from-b", "started by B", 2)];
+        let next = [row("shared", "shared", 1), row("from-a", "started by A", 3)];
         assert_eq!(
             ids(&merge_sessions(&disk, &baseline, &next)),
             ["shared", "from-a", "from-b"],
-            "他インスタンスのセッションが一覧から消えている"
+            "another instance's session is missing from the list"
         );
     }
 
@@ -544,16 +544,16 @@ mod tests {
     /// 更新した行を、こちらの古い写しで踏み潰さない（逆にこちらが新しければ残す）
     #[test]
     fn merging_takes_the_more_recently_updated_row() {
-        let baseline = [row("s", "元の名前", 1)];
-        let disk = [row("s", "B が変えた名前", 5)];
-        let next = [row("s", "元の名前", 1)];
+        let baseline = [row("s", "original title", 1)];
+        let disk = [row("s", "renamed by B", 5)];
+        let next = [row("s", "original title", 1)];
         let merged = merge_sessions(&disk, &baseline, &next);
-        assert_eq!(merged[0].title, "B が変えた名前", "他インスタンスの更新を踏み潰している");
+        assert_eq!(merged[0].title, "renamed by B", "clobbered another instance's update");
 
         // こちらの方が新しければこちらが残る（自分の操作が保存の往復で巻き戻らない）
-        let next = [row("s", "A が変えた名前", 9)];
+        let next = [row("s", "renamed by A", 9)];
         let merged = merge_sessions(&disk, &baseline, &next);
-        assert_eq!(merged[0].title, "A が変えた名前", "自分の変更が巻き戻っている");
+        assert_eq!(merged[0].title, "renamed by A", "own change got rolled back");
     }
 
     /// **削除した行は、このインスタンスの以降の書き込みでは復活しない。** baseline に
@@ -562,13 +562,13 @@ mod tests {
     /// マージの基準が要る理由）
     #[test]
     fn merging_keeps_a_deleted_row_out_of_this_instances_own_writes() {
-        let baseline = [row("keep", "残す", 1), row("dropped", "消した", 1)];
-        let disk = [row("keep", "残す", 1), row("dropped", "消した", 9)];
-        let next = [row("keep", "残す", 1)];
+        let baseline = [row("keep", "kept", 1), row("dropped", "deleted", 1)];
+        let disk = [row("keep", "kept", 1), row("dropped", "deleted", 9)];
+        let next = [row("keep", "kept", 1)];
         assert_eq!(
             ids(&merge_sessions(&disk, &baseline, &next)),
             ["keep"],
-            "削除した行が復活している（ディスク側が新しくても同じ）"
+            "deleted row came back (even though the disk side is newer)"
         );
     }
 
@@ -618,7 +618,7 @@ mod tests {
         for pair in order.windows(2) {
             assert!(
                 pair[0].rank() < pair[1].rank(),
-                "{:?} が {:?} より優先されている",
+                "{:?} is prioritized over {:?}",
                 pair[0],
                 pair[1]
             );
@@ -641,7 +641,7 @@ mod tests {
             ("not-object", Some("[1,2,3]")),
             ("no-key", Some(r#"{"other":1}"#)),
             ("not-array", Some(r#"{"sessions":"nope"}"#)),
-            ("no-id", Some(r#"{"sessions":[{"title":"名前だけ"},{"session_id":""}]}"#)),
+            ("no-id", Some(r#"{"sessions":[{"title":"title only"},{"session_id":""}]}"#)),
             ("wrong-types", Some(r#"{"sessions":[{"session_id":7,"title":[]}]}"#)),
         ];
         for (name, contents) in cases {
@@ -651,7 +651,7 @@ mod tests {
                     let _ = std::fs::remove_file(temp.path());
                 }
             }
-            assert!(temp.store().list().is_empty(), "{name} で空にならない");
+            assert!(temp.store().list().is_empty(), "did not become empty for {name}");
         }
         // 型が違う項目は既定値として読む（行そのものは残す）
         std::fs::write(
@@ -660,7 +660,7 @@ mod tests {
         )
         .unwrap();
         let rows = temp.store().list();
-        assert_eq!(ids(&rows), ["s"], "identity のある行を捨てている");
+        assert_eq!(ids(&rows), ["s"], "dropped a row that has an identity");
         assert!(!rows[0].archived);
         assert_eq!(rows[0].updated_at, 0);
     }
@@ -682,21 +682,21 @@ mod tests {
         let waited = started.elapsed();
         drop(held);
 
-        assert!(waited < Duration::from_secs(5), "待ちが有界でない: {waited:?}");
+        assert!(waited < Duration::from_secs(5), "wait was not bounded: {waited:?}");
         assert_eq!(
             std::fs::read(temp.path()).unwrap(),
             before,
-            "ロックを取れていないのに保管を書いている"
+            "wrote to the store despite not holding the lock"
         );
         assert_eq!(
             ids(&returned),
             ["a", "b"],
-            "書けなかったときはユーザーの一覧をそのまま返す（画面から巻き戻さない）"
+            "when the write fails, returns the user's list unchanged (does not roll back the screen)"
         );
 
         // 解放後は通常どおり書ける（＝ロックが理由で壊れているわけではない）
         assert_eq!(ids(&short.store(&[row("a", "A", 1), row("b", "B", 2)])), ["a", "b"]);
-        assert!(!store.store_lock().exists(), "保管ファイルのロックを残している");
+        assert!(!store.store_lock().exists(), "left the store file's lock behind");
     }
 
     /// **書けなかったら次のマージの基準を進めない。**
@@ -713,12 +713,12 @@ mod tests {
         // 書けない状態（別インスタンスが保管を書いている）で削除を保存する
         let held = Lock::acquire(&store.store_lock(), Duration::ZERO, LOCK_STALE).unwrap();
         let next = [row("q", "Q", 1)]; // P を削除した
-        assert_eq!(ids(&store.store(&next)), ["q"], "ユーザーの操作が画面から巻き戻っている");
+        assert_eq!(ids(&store.store(&next)), ["q"], "the user's action got rolled back from the screen");
         drop(held);
 
         // 次の保存は書ける。P は基準に居るので「このインスタンスが削除した」と読める
-        assert_eq!(ids(&store.store(&next)), ["q"], "削除した行が復活している");
-        assert_eq!(ids(&temp.store().list()), ["q"], "削除がディスクへ載っていない");
+        assert_eq!(ids(&store.store(&next)), ["q"], "deleted row came back");
+        assert_eq!(ids(&temp.store().list()), ["q"], "deletion did not land on disk");
     }
 
     /// **保存はディスクを落ち着かせる**（同じ状態で 2 度保存してもディスクが動かない）。
@@ -729,13 +729,13 @@ mod tests {
         let temp = TempStore::new("a_second_save_of_the_same_state_leaves_the_disk_unchanged");
         let store = temp.store();
         // 他インスタンスが起こしたセッションが既にディスクに居る状態
-        temp.store().store(&[row("from-b", "B が起こした", 5)]);
+        temp.store().store(&[row("from-b", "started by B", 5)]);
 
-        let first = store.store(&[row("mine", "自分の行", 1)]);
+        let first = store.store(&[row("mine", "mine", 1)]);
         assert_eq!(ids(&first), ["mine", "from-b"]);
         let second = store.store(&first);
-        assert_eq!(second, first, "保存するたび一覧が書き換わる");
-        assert_eq!(temp.store().list(), first, "ディスクに載った内容と戻り値が違う");
+        assert_eq!(second, first, "list gets rewritten on every save");
+        assert_eq!(temp.store().list(), first, "disk content differs from the returned value");
     }
 
     /// 書き込みは tmp → rename（[`write_json_atomically`]）。
@@ -752,7 +752,7 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|name| name.ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "書きかけの tmp が残っている: {leftovers:?}");
+        assert!(leftovers.is_empty(), "leftover partial tmp file remains: {leftovers:?}");
         // 置いてあるのは完全な JSON（rename で丸ごと差し替わっている）
         assert_eq!(ids(&temp.store().list()), ["a"]);
     }
@@ -784,8 +784,8 @@ mod tests {
 
         temp.store().cleanup_leftover_tmp();
 
-        assert!(!old.exists(), "古い tmp を回収していない");
-        assert!(fresh.exists(), "書いている最中かもしれない tmp を消している");
-        assert!(other.exists(), "無関係な tmp を消している");
+        assert!(!old.exists(), "did not reclaim the old tmp");
+        assert!(fresh.exists(), "removed a tmp that might still be in progress");
+        assert!(other.exists(), "removed an unrelated tmp");
     }
 }

@@ -1539,7 +1539,7 @@ fn start_foreground(app: &mut App, cwd: &str, prompt: &str) -> Launched {
         },
         settings.as_deref(),
     )
-    .map_err(|e| format!("セッションの起動に失敗: {e}"))?;
+    .map_err(|e| format!("failed to start session: {e}"))?;
     app.sessions.push(SessionRow::new(
         session_id.clone(),
         cwd,
@@ -2032,7 +2032,7 @@ fn open_account_popup(app: &mut App, anchor_y: u16) {
 /// 「今の持ち主」が分からないときの通知。**register も switch も同じ理由で止まる**
 /// （保管すべきトークンがあるかどうかが分からない）ので、文面も 1 つに保つ。
 /// 打つ手は「少し待ってからもう一度」＝ ポーラーが取得すれば通る
-const UNKNOWN_ACTIVE_NOTICE: &str = "ログイン中のアカウントが取得できていない";
+const UNKNOWN_ACTIVE_NOTICE: &str = "active account unknown · try again shortly";
 
 /// `register current`: 今ログイン中のアカウントを保管へ加える
 fn register_current(app: &mut App) {
@@ -2070,7 +2070,7 @@ fn switch_account(app: &mut App, email: &str) {
 
 /// 「既にそのアカウント」で切替が何もしなかったときの通知。
 /// **成功と同じ無反応にはしない**（メニューの `●` と同じ事実を言葉でも出す）
-const ALREADY_ACTIVE_NOTICE: &str = "既にこのアカウントを使っている";
+const ALREADY_ACTIVE_NOTICE: &str = "already using this account";
 
 /// 進行中のアカウント操作（[`apply_account`] が別スレッドへ逃がした要求）。
 ///
@@ -2090,7 +2090,7 @@ pub(crate) struct AccountJob {
 /// 見せない）。待ち行列にしないのは、前の操作が「今の持ち主」を変えるので、
 /// 並んだ要求は古い観測を材料に走ることになるため（[`ActiveAccount`]）。
 /// 取り直した観測で押し直す方が安全
-const ACCOUNT_BUSY_NOTICE: &str = "アカウント操作中 — 完了してからもう一度";
+const ACCOUNT_BUSY_NOTICE: &str = "account action running — try again once it finishes";
 
 /// 保管への変更を供給元へ流す。**別スレッドで走らせ、結果は run ループが
 /// 受けて反映する**（[`take_account_result`]）。
@@ -2138,7 +2138,7 @@ fn take_account_result(app: &mut App) -> bool {
         // 結果は永久に来ない。**進行中の印は降ろす**（降ろさないと行が永久に
         // `switching…` のままで、以降のアカウント操作も全て拒まれる）
         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-            Err(anyhow::anyhow!("実行スレッドが結果を返さずに終了した"))
+            Err(anyhow::anyhow!("worker thread ended without a result"))
         }
     };
     apply_account_result(app, result, job.what);
@@ -2162,7 +2162,7 @@ fn apply_account_result(app: &mut App, result: anyhow::Result<AccountChange>, wh
         // 何もしなかったことを伝える（無反応と成功を見分けられるようにする）
         Ok(AccountChange::AlreadyActive) => set_notice(app, ALREADY_ACTIVE_NOTICE.to_string()),
         Ok(AccountChange::StoreOnly) => refresh_accounts(app),
-        Err(e) => set_notice(app, format!("アカウントの{what}に失敗: {e}")),
+        Err(e) => set_notice(app, format!("failed to {what} account: {e}")),
     }
 }
 
@@ -2317,7 +2317,7 @@ fn start_ccdesk_update(app: &mut App) {
     std::thread::spawn(move || {
         let outcome = match crate::update::install(&tag) {
             Ok(_) => SelfUpdate::Done,
-            Err(e) => SelfUpdate::Failed(format!("ccdesk update 失敗: {e}")),
+            Err(e) => SelfUpdate::Failed(format!("ccdesk update failed: {e}")),
         };
         *shared
             .lock()
@@ -2397,7 +2397,7 @@ fn drop_input_while_starting(app: &mut App) -> bool {
     if app.input_gate.is_none() {
         return false;
     }
-    set_hint(app, "セッション起動中 — 打った文字は届いていない".to_string());
+    set_hint(app, "starting session — keys are not delivered yet".to_string());
     true
 }
 
@@ -2446,7 +2446,7 @@ fn expire_input_gate(app: &mut App) -> bool {
     // ハングしていることを伝える（下部バーと error.log の両方。ここは異常）
     set_notice(
         app,
-        "セッション起動が応答しない — 入力をサイドバーへ戻した".to_string(),
+        "session start is not responding — input moved back to the sidebar".to_string(),
     );
     true
 }
@@ -2485,7 +2485,7 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) {
             // 打鍵は捨てる（[`drop_input_while_starting`]）
             app.input_gate = Some(std::time::Instant::now());
         }
-        Err(e) => set_notice(app, format!("セッション {id} の再開に失敗: {e}")),
+        Err(e) => set_notice(app, format!("failed to resume session {id}: {e}")),
     }
 }
 
@@ -2546,7 +2546,7 @@ mod tests {
         while app.account_job.is_some() {
             assert!(
                 started.elapsed() < Duration::from_secs(10),
-                "アカウント操作が完了しない"
+                "account action did not finish in time"
             );
             if !take_account_result(app) {
                 std::thread::yield_now();
@@ -2603,7 +2603,7 @@ mod tests {
                 .map(|(_, enabled)| enabled)
                 .collect::<Vec<_>>(),
             [true, true, true, false, true, true],
-            "窓が無い行で close 以外が落ちている / close が押せてしまう"
+            "close must be the only entry disabled when there is no window"
         );
     }
 
@@ -2617,8 +2617,8 @@ mod tests {
             open: false,
         };
         let labels = labels(&marked, Grouping::State);
-        assert_eq!(labels[0], "unpin", "ピン留め済みの行に pin が出ている");
-        assert_eq!(labels[4], "unarchive", "アーカイブ済みの行に archive が出ている");
+        assert_eq!(labels[0], "unpin", "a pinned row must show unpin");
+        assert_eq!(labels[4], "unarchive", "an archived row must show unarchive");
     }
 
     /// 6 項目それぞれの動作は行 index から引く（ラベル文字列で分岐しない）
@@ -2632,7 +2632,7 @@ mod tests {
         assert_eq!(kind.action(3), Some(PopupAction::Close(id())));
         assert_eq!(kind.action(4), Some(PopupAction::ToggleArchive(id())));
         assert_eq!(kind.action(5), Some(PopupAction::Delete(id())));
-        assert_eq!(kind.action(6), None, "項目の無い index は何も起こさない");
+        assert_eq!(kind.action(6), None, "an index past the last entry must do nothing");
     }
 
     /// grouping メニューは現在の選択に ● を付け、各行はその grouping を指す
@@ -2669,7 +2669,7 @@ mod tests {
         app.sidebar_rows = vec![Some(RowAction::Open(SessionId::new("abc123")))];
         app.sidebar_header_rows = 1;
         handle_mouse(&mut app, &click(0, 1)).unwrap();
-        let popup = app.popup.as_ref().expect("メニューが開いていない");
+        let popup = app.popup.as_ref().expect("menu must be open");
         assert_eq!(
             popup.kind,
             PopupKind::Session {
@@ -2684,7 +2684,7 @@ mod tests {
             labels(&popup.kind, app.grouping),
             ["unpin", "mark as read", "rename", "close", "archive", "delete"]
         );
-        assert_eq!(popup.anchor_y, 1, "クリックした行の下に出る");
+        assert_eq!(popup.anchor_y, 1, "must open below the clicked row");
     }
 
     /// ⊞ group 行クリック → メニュー → 別の行を選ぶと grouping が切り替わる。
@@ -2698,12 +2698,12 @@ mod tests {
         assert_eq!(
             app.popup.as_ref().map(|p| &p.kind),
             Some(&PopupKind::Group),
-            "grouping メニューが開いていない"
+            "grouping menu must be open"
         );
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
         handle_mouse(&mut app, &click(rect.x + 1, rect.y + 2)).unwrap(); // 2 行目 = directory
         assert_eq!(app.grouping, Grouping::Directory);
-        assert!(app.popup.is_none(), "実行後は閉じる");
+        assert!(app.popup.is_none(), "must close after running the action");
     }
 
     /// 選択中の grouping をもう一度選んでも切り替わらない（トグルにならない）
@@ -2813,18 +2813,18 @@ mod tests {
         let parent = popup_rect(&app, app.popup.as_ref().unwrap());
         let selected_row = parent.y + 1 + 1; // 上枠 + 選択 index
         handle_popup_key(&mut app, KeyCode::Enter);
-        let popup = app.popup.as_ref().expect("2 階層目が開いていない");
+        let popup = app.popup.as_ref().expect("second level menu must be open");
         assert_eq!(
             popup.kind,
             PopupKind::AccountActions {
                 account: account("you@example.com", "id-b"),
             }
         );
-        assert_eq!(popup.selected, 0, "2 階層目の選択は先頭から");
+        assert_eq!(popup.selected, 0, "second level selection must start at the top");
         assert_eq!(
             popup_rect(&app, popup).y,
             selected_row,
-            "2 階層目が親の選択行に寄っていない"
+            "second level must anchor to the parent's selected row"
         );
     }
 
@@ -2840,16 +2840,16 @@ mod tests {
                 app.popup.as_ref().map(|p| &p.kind),
                 Some(PopupKind::AccountActions { .. })
             ),
-            "2 階層目が開いていない"
+            "second level menu must be open"
         );
         handle_popup_key(&mut app, KeyCode::Esc);
-        assert!(app.popup.is_none(), "Esc で一覧に戻っている");
+        assert!(app.popup.is_none(), "esc must return to the list");
 
         open(&mut app, accounts(), 5);
         handle_popup_key(&mut app, KeyCode::Enter);
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
         handle_mouse(&mut app, &click(rect.right() + 2, rect.bottom() + 2)).unwrap();
-        assert!(app.popup.is_none(), "外クリックで一覧に戻っている");
+        assert!(app.popup.is_none(), "an outside click must return to the list");
     }
 
     /// ↑↓ は項目数の範囲で止まる（端で溢れない）
@@ -2880,7 +2880,7 @@ mod tests {
         handle_popup_key(&mut app, KeyCode::Enter);
         assert!(
             app.popup.is_some(),
-            "実行できない項目でメニューが閉じている"
+            "menu must stay open for a disabled entry"
         );
     }
 
@@ -2899,12 +2899,12 @@ mod tests {
             handle_mouse(&mut app, &click(col, row)).unwrap();
             assert!(
                 app.popup.is_some(),
-                "枠 ({col},{row}) のクリックで閉じている"
+                "a border click at ({col},{row}) must not close the menu"
             );
             assert_eq!(
                 app.grouping,
                 Grouping::State,
-                "枠 ({col},{row}) のクリックで項目が発火した"
+                "a border click at ({col},{row}) must not run an entry"
             );
         }
     }
@@ -2926,7 +2926,7 @@ mod tests {
         assert_eq!(kind.width(Grouping::State), widest + POPUP_CHROME);
         assert!(
             kind.width(Grouping::State) > POPUP_MIN_WIDTH,
-            "床が最長項目を切っている"
+            "the floor must not clip the longest entry"
         );
     }
 
@@ -2942,7 +2942,10 @@ mod tests {
         );
         assert!(kind.width(Grouping::State) > PopupKind::Group.width(Grouping::State));
 
-        let wide_label = "大場 · 1→10, Inc.";
+        // 全角（表示幅 2）を含む入力である必要がある。日本語そのものは使えない
+        // （`tests/no_japanese_in_code.rs` の検査対象になるため）ので、
+        // 全角ラテン文字（U+FF21-U+FF5A）で幅 2 の性質だけを借りる
+        let wide_label = "ＯＢＡ · 1→10, Inc.";
         let wide = account_menu(vec![account(wide_label, "id-c")]);
         assert_eq!(
             wide.width(Grouping::State),
@@ -2950,7 +2953,7 @@ mod tests {
         );
         assert!(
             wide_label.width() > wide_label.chars().count(),
-            "全角の前提が崩れている"
+            "the fullwidth premise no longer holds"
         );
     }
 
@@ -2965,10 +2968,10 @@ mod tests {
             3,
         );
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
-        assert_eq!(rect.x, 1, "収まる限り左端はサイドバー内の x=1");
+        assert_eq!(rect.x, 1, "left edge must stay at sidebar x=1 while it fits");
         assert!(
             rect.right() > app.sidebar_width,
-            "サイドバーに収まってしまっている"
+            "must overflow the sidebar width"
         );
         assert!(rect.right() <= TERM.0);
     }
@@ -3002,11 +3005,11 @@ mod tests {
                         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
                         assert!(
                             rect.right() <= term_w.max(1) && rect.bottom() <= term_h.max(1),
-                            "端末 {term_w}x{term_h} / sidebar {sidebar_width} / anchor {anchor_y} で矩形 {rect:?} が外へ出る"
+                            "rect {rect:?} must stay inside the terminal for terminal {term_w}x{term_h} / sidebar {sidebar_width} / anchor {anchor_y}"
                         );
                         assert!(
                             rect.width >= 1 && rect.height >= 1,
-                            "矩形 {rect:?} が潰れている"
+                            "rect {rect:?} must not collapse to zero size"
                         );
                     }
                 }
@@ -3027,18 +3030,18 @@ mod tests {
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
         assert!(
             rect.right() > app.sidebar_width,
-            "境界線に被っている前提が崩れている"
+            "must overlap the resize border by the test's premise"
         );
         let border_col = app.sidebar_width;
         handle_mouse(&mut app, &click(border_col, rect.y + 1)).unwrap();
-        assert!(!app.dragging, "幅変更ドラッグが始まっている");
-        assert_eq!(app.sidebar_width, 12, "サイドバー幅が動いている");
+        assert!(!app.dragging, "must not start a resize drag");
+        assert_eq!(app.sidebar_width, 12, "sidebar width must not change");
         assert!(
             matches!(
                 app.popup.as_ref().map(|p| &p.kind),
                 Some(PopupKind::AccountActions { .. })
             ),
-            "被った列の項目が実行されていない"
+            "the overlapped column's entry must run"
         );
     }
 
@@ -3080,11 +3083,11 @@ mod tests {
                     Some(&expected),
                     "y={y} col={col}"
                 );
-                assert!(app.popup.is_none(), "更新行でメニューが開いた y={y} col={col}");
-                assert!(!app.dragging, "幅変更ドラッグが始まった y={y} col={col}");
+                assert!(app.popup.is_none(), "an update row must not open a menu y={y} col={col}");
+                assert!(!app.dragging, "must not start a resize drag y={y} col={col}");
             }
         }
-        assert_eq!(app.sidebar_width, 34, "サイドバー幅が動いている");
+        assert_eq!(app.sidebar_width, 34, "sidebar width must not change");
     }
 
     /// 版行の右端に置く動詞（`update` / `restart`）は内容の最右列で終わるので、
@@ -3097,16 +3100,16 @@ mod tests {
         // その最終桁の画面 x は 1 + (内側幅 - 1) = sidebar_width - 2
         let verb_end = app.sidebar_width - 2;
         handle_mouse(&mut app, &click(verb_end, 1)).unwrap();
-        assert!(!app.dragging, "動詞の最終桁が幅変更のつかみ代になっている");
+        assert!(!app.dragging, "the verb's last column must not be the resize grip");
         assert_eq!(
             app.selection,
             Selection::Row(0),
-            "動詞のクリックが行に当たっていない"
+            "clicking the verb must hit the row"
         );
         // つかみ代はその 1 つ外（右枠の列）から始まる = 境界がここにあることの固定
         let mut app = app_with_version_rows(34);
         handle_mouse(&mut app, &click(verb_end + 1, 1)).unwrap();
-        assert!(app.dragging, "境界線の列が幅変更にならない");
+        assert!(app.dragging, "the border column must start a resize");
     }
 
     /// メニュー表示中の版行クリックは**メニューが受ける**（誤爆しない）。
@@ -3117,16 +3120,16 @@ mod tests {
         app.selection = Selection::Row(3); // `+ new session`。動いたら分かる位置に置く
         open(&mut app, PopupKind::Group, 3);
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
-        assert!(rect.y > 2, "メニューが版行に被っていて外クリックにならない");
+        assert!(rect.y > 2, "the menu must overlap the version row so this isn't an outside click");
         handle_mouse(&mut app, &click(5, 1)).unwrap();
         assert_eq!(
             app.selection,
             Selection::Row(3),
-            "版行が選択されてしまっている"
+            "a version row must not become selected"
         );
-        assert!(app.hovered_row.is_none(), "版行がホバー扱いになっている");
-        assert!(app.popup.is_none(), "メニュー外クリックで閉じていない");
-        assert_eq!(state_name(&app), "Idle", "更新が走ってしまっている");
+        assert!(app.hovered_row.is_none(), "a version row must not be hovered");
+        assert!(app.popup.is_none(), "an outside click must close the menu");
+        assert_eq!(state_name(&app), "Idle", "the update must not run");
     }
 
     /// 更新の進行状態の名前（中身の文面ではなく「どの状態か」だけを見たい）
@@ -3339,8 +3342,8 @@ mod tests {
         fn apply_account(&self, action: AccountAction) -> anyhow::Result<AccountChange> {
             match &self.accounts {
                 AccountBackend::Absent => panic!(
-                    "アカウントを扱わない供給元へ変更要求が来た \
-                     （AccountBackend::Recording か ::Store を挿す）"
+                    "a change request reached a source that does not handle accounts \
+                     (use AccountBackend::Recording or ::Store instead)"
                 ),
                 AccountBackend::Recording {
                     stored,
@@ -3417,7 +3420,7 @@ mod tests {
     fn open_account_items(app: &App) -> &[AccountItem] {
         match app.popup.as_ref().map(|p| &p.kind) {
             Some(PopupKind::Account { accounts, .. }) => accounts,
-            other => panic!("アカウントメニューが開いていない: {other:?}"),
+            other => panic!("account menu must be open: {other:?}"),
         }
     }
 
@@ -3429,7 +3432,7 @@ mod tests {
         let active = Account::new("a@example.com", "taro");
         let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
         let sl = sidebar_layout(&app);
-        assert!(sl.footer_visible, "フッターが出ていない前提が崩れている");
+        assert!(sl.footer_visible, "the footer must be visible for this test's premise");
         // 内容の桁は x=1..=sidebar_width-2（枠の内側）。列 0 も行に当たる
         let rightmost = app.sidebar_width - 2;
         for col in [0, 1, 2, 5, rightmost - 1, rightmost] {
@@ -3438,15 +3441,15 @@ mod tests {
             let popup = app
                 .popup
                 .as_ref()
-                .unwrap_or_else(|| panic!("col={col} でメニューが開いていない"));
+                .unwrap_or_else(|| panic!("menu must be open at col={col}"));
             assert!(
                 matches!(popup.kind, PopupKind::Account { .. }),
-                "col={col} で別のメニューが開いた"
+                "a different menu must not open at col={col}"
             );
             assert_eq!(popup.anchor_y, sl.account_y, "col={col}");
-            assert!(!app.dragging, "col={col} で幅変更ドラッグが始まっている");
+            assert!(!app.dragging, "col={col} must not start a resize drag");
         }
-        assert_eq!(app.sidebar_width, 34, "サイドバー幅が動いている");
+        assert_eq!(app.sidebar_width, 34, "sidebar width must not change");
         // 選択はアカウント行へ移る（キーボードで開いたときと同じ位置に居る）
         assert_eq!(app.selection, Selection::Account);
         // 一覧の行のホバーにはしない（アカウント行は sidebar_rows の外）
@@ -3465,11 +3468,11 @@ mod tests {
         press(&mut app, KeyCode::Down); // 区切り線は飛ばす
         assert_eq!(app.selection, Selection::Row(2));
         press(&mut app, KeyCode::Down);
-        assert_eq!(app.selection, Selection::Account, "アカウント行へ届かない");
+        assert_eq!(app.selection, Selection::Account, "must reach the account row");
         press(&mut app, KeyCode::Down);
-        assert_eq!(app.selection, Selection::Account, "アカウント行の先へ抜けた");
+        assert_eq!(app.selection, Selection::Account, "must not go past the account row");
         press(&mut app, KeyCode::Up);
-        assert_eq!(app.selection, Selection::Row(2), "一覧へ戻れない");
+        assert_eq!(app.selection, Selection::Row(2), "must return to the list");
     }
 
     /// **アカウント行はマウスとキーボードで同じ場所に同じメニューが開く。**
@@ -3481,7 +3484,7 @@ mod tests {
         let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
         let sl = sidebar_layout(&app);
         handle_mouse(&mut app, &click(3, sl.account_y)).unwrap();
-        let by_mouse = app.popup.take().expect("マウスでメニューが開いていない");
+        let by_mouse = app.popup.take().expect("menu must be open from the mouse click");
 
         for code in [KeyCode::Enter, KeyCode::Right, KeyCode::Left] {
             app.popup = None;
@@ -3490,9 +3493,9 @@ mod tests {
             let popup = app
                 .popup
                 .as_ref()
-                .unwrap_or_else(|| panic!("{code:?} でメニューが開いていない"));
-            assert_eq!(popup.kind, by_mouse.kind, "{code:?} で別のメニューが開いた");
-            assert_eq!(popup.anchor_y, sl.account_y, "{code:?} で開く位置が違う");
+                .unwrap_or_else(|| panic!("menu must be open for {code:?}"));
+            assert_eq!(popup.kind, by_mouse.kind, "a different menu must not open for {code:?}");
+            assert_eq!(popup.anchor_y, sl.account_y, "{code:?} must open at the same position");
         }
     }
 
@@ -3505,13 +3508,13 @@ mod tests {
         app.term_size = (60, 8); // 下部バー 1 行を引くと footer_visible が落ちる高さ
         assert!(
             !sidebar_layout(&app).footer_visible,
-            "フッターが消えている前提が崩れている"
+            "the footer must be hidden for this test's premise"
         );
         app.sidebar_rows = vec![Some(RowAction::New)];
         app.sidebar_header_rows = 1;
         app.selection = Selection::Row(0);
         press(&mut app, KeyCode::Down);
-        assert_eq!(app.selection, Selection::Row(0), "描いていない行を選んだ");
+        assert_eq!(app.selection, Selection::Row(0), "must not select a row that is not drawn");
     }
 
     /// 一覧は供給元の保管一覧（[`crate::accounts::AccountStore::list`]）から作られ、
@@ -3528,7 +3531,7 @@ mod tests {
         assert_eq!(
             items.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
             ["a@example.com", "b@example.com"],
-            "id が email になっていない"
+            "id must be the email"
         );
         // **アクティブな 1 件だけに ● が付き**、他は同じ桁数の空白で桁を揃える
         assert_eq!(
@@ -3561,7 +3564,7 @@ mod tests {
                 .map(|a| a.label.as_str())
                 .collect::<Vec<_>>(),
             ["  ooba", "  ooba"],
-            "ラベルが同一という前提が崩れている"
+            "the labels must be identical for this test's premise"
         );
 
         // 2 行目（x-personal）を選んで 2 階層目 → switch
@@ -3587,7 +3590,7 @@ mod tests {
                     "other"
                 ))),
             }],
-            "クリックした行と別のアカウントが対象になっている"
+            "the target must be the clicked row's account, not another"
         );
     }
 
@@ -3631,7 +3634,7 @@ mod tests {
                 Recorded::Unregister("b@example.com".to_string()),
             ]
         );
-        assert!(app.notice.is_none(), "成功したのに通知が出ている");
+        assert!(app.notice.is_none(), "a successful action must not produce a notice");
     }
 
     /// 同じアカウントへの switch は「切替先 = アクティブ」の組で渡る。これが
@@ -3657,7 +3660,7 @@ mod tests {
                 outgoing: Outgoing::Known(ActiveAccount::unseen(active)),
             }]
         );
-        assert!(app.notice.is_none(), "no-op が失敗として扱われている");
+        assert!(app.notice.is_none(), "a no-op must not be treated as a failure");
     }
 
     /// 保管する対象が無い（未取得・未ログイン）ときの `register current` は、
@@ -3674,9 +3677,9 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_empty(),
-            "保管する対象が無いのに要求を出している"
+            "must not send a request when there is nothing to store"
         );
-        assert!(app.notice.is_some(), "無反応になっている");
+        assert!(app.notice.is_some(), "must not appear unresponsive");
     }
 
     /// 切替が失敗したら下部バーへ出す（**ドメインのエラー文をそのまま載せる**:
@@ -3693,11 +3696,11 @@ mod tests {
             0,
         );
         settle_account(&mut app);
-        let (msg, _) = app.notice.as_ref().expect("失敗が伝わっていない");
-        assert!(msg.contains("切替"), "どの操作が失敗したか分からない: {msg:?}");
+        let (msg, _) = app.notice.as_ref().expect("the failure must be reported");
+        assert!(msg.contains("switch"), "which action failed is unclear: {msg:?}");
         assert!(
             msg.contains("lock is held by another process"),
-            "ドメインのエラー文が落ちている: {msg:?}"
+            "the domain's error text is missing: {msg:?}"
         );
     }
 
@@ -3794,26 +3797,27 @@ mod tests {
         assert_eq!(
             active_email(&app),
             STORE_B,
-            "切替に成功したのにアカウント行が前の持ち主のまま（次の操作の材料が古い）"
+            "the account row must not keep the previous owner after a successful switch \
+             (the next action would use stale material)"
         );
 
         switch(&mut app, STORE_C);
 
-        assert_eq!(app.notice, None, "失敗している: {:?}", app.notice);
+        assert_eq!(app.notice, None, "failed: {:?}", app.notice);
         assert_eq!(
             stored(&store, STORE_A),
             Some(oauth("access-a2", "refresh-a2")),
-            "A の保管が B のトークンで潰れている（A は復旧不能）"
+            "A's stored tokens must not be overwritten by B's (A would be unrecoverable)"
         );
         assert_eq!(
             stored(&store, STORE_B),
             Some(oauth("access-b", "refresh-b")),
-            "出ていく B のトークンを巻き取れていない"
+            "B's tokens must be captured on the way out"
         );
         assert_eq!(
             home.read_credentials()["claudeAiOauth"],
             oauth("access-c", "refresh-c"),
-            "C へ切り替わっていない"
+            "must have switched to C"
         );
     }
 
@@ -3831,15 +3835,15 @@ mod tests {
         assert_eq!(
             stored(&store, STORE_A),
             Some(oauth("access-a2", "refresh-a2")),
-            "A の保管が B のトークンで潰れている"
+            "A's stored tokens must not be overwritten by B's"
         );
         assert_eq!(
             home.read_credentials()["claudeAiOauth"],
             oauth("access-b", "refresh-b"),
-            "現行トークンを古い写しで上書きしている"
+            "must not overwrite the current token with a stale copy"
         );
         // 何もしなかったことは伝える（無反応と成功を見分けられるようにする）
-        let (msg, _) = app.notice.as_ref().expect("no-op が無反応になっている");
+        let (msg, _) = app.notice.as_ref().expect("a no-op must not appear unresponsive");
         assert_eq!(msg, ALREADY_ACTIVE_NOTICE);
     }
 
@@ -3854,16 +3858,16 @@ mod tests {
         run_popup_action(&mut app, PopupAction::RegisterCurrent, 0);
         settle_account(&mut app);
 
-        assert_eq!(app.notice, None, "失敗している: {:?}", app.notice);
+        assert_eq!(app.notice, None, "failed: {:?}", app.notice);
         assert_eq!(
             stored(&store, STORE_A),
             Some(oauth("access-a2", "refresh-a2")),
-            "A の保管が B のトークンで潰れている"
+            "A's stored tokens must not be overwritten by B's"
         );
         assert_eq!(
             stored(&store, STORE_B),
             Some(oauth("access-b", "refresh-b")),
-            "今ログイン中のアカウントを保管できていない"
+            "must be able to store the currently logged in account"
         );
     }
 
@@ -3879,11 +3883,11 @@ mod tests {
         switch(&mut app, STORE_B);
         switch(&mut app, STORE_A);
 
-        assert_eq!(app.notice, None, "失敗している: {:?}", app.notice);
+        assert_eq!(app.notice, None, "failed: {:?}", app.notice);
         assert_eq!(
             home.read_credentials()["claudeAiOauth"],
             oauth("access-a2", "refresh-a2"),
-            "A へ戻れていない（黙って no-op になっている）"
+            "must switch back to A (silently became a no-op instead)"
         );
         assert_eq!(active_email(&app), STORE_A);
     }
@@ -3909,14 +3913,15 @@ mod tests {
         assert_eq!(
             home.read_credentials()["claudeAiOauth"],
             oauth("access-a2", "refresh-a2"),
-            "持ち主が分からないまま現行の認証情報を上書きしている（A のローテート済み refreshToken が失われる）"
+            "must not overwrite the current credentials while the owner is unknown \
+             (A's rotated refresh token would be lost)"
         );
         assert_eq!(
             stored(&store, STORE_A),
             Some(oauth("access-a", "refresh-a")),
-            "保管が動いている（巻き取れないまま切替が進んでいる）"
+            "the stored account must not change (switch must not proceed without capture)"
         );
-        assert!(app.notice.is_some(), "拒否した理由が伝わっていない");
+        assert!(app.notice.is_some(), "the reason for the refusal must be reported");
     }
 
     /// **「まだ観測できていない」と「主張が無い」は別物。** 巻き取る対象が無いと
@@ -3932,21 +3937,21 @@ mod tests {
 
         switch(&mut app, STORE_B);
 
-        assert_eq!(app.notice, None, "失敗している: {:?}", app.notice);
+        assert_eq!(app.notice, None, "failed: {:?}", app.notice);
         assert_eq!(
             home.read_credentials()["claudeAiOauth"],
             oauth("access-b", "refresh-b"),
-            "巻き取る対象が無いのに切替が止まっている"
+            "must not block a switch when there is nothing to capture"
         );
 
         // 未ログイン（誰も持ち主でないと観測できている）も同じ
         app.footer.account = AccountStatus::LoggedOut;
         switch(&mut app, STORE_C);
-        assert_eq!(app.notice, None, "失敗している: {:?}", app.notice);
+        assert_eq!(app.notice, None, "failed: {:?}", app.notice);
         assert_eq!(
             home.read_credentials()["claudeAiOauth"],
             oauth("access-c", "refresh-c"),
-            "未ログインからの切替が止まっている"
+            "must not block a switch from being logged out"
         );
     }
 
@@ -3970,36 +3975,36 @@ mod tests {
         let blocked = started.elapsed();
         assert!(
             blocked < Duration::from_millis(500),
-            "UI スレッドがロックを待っている（{blocked:?}）"
+            "the UI thread must not wait on the lock ({blocked:?})"
         );
 
         // 進行中であることが行に出る（進行表示が無いと固まったように見える）
         assert_eq!(
             app.account_job.as_ref().map(|job| job.progress),
             Some("switching…"),
-            "進行中がアカウント行に出ない"
+            "the account row must show that it is in progress"
         );
         // 2 つ目の要求は受けない（多重実行の防止）。**黙って捨てない**
         press_switch(&mut app, STORE_C);
-        let (msg, _) = app.notice.as_ref().expect("落としたことが伝わっていない");
-        assert!(msg.contains("アカウント操作中"), "何が起きたか分からない: {msg:?}");
-        assert!(!take_account_result(&mut app), "終わっていないのに取り込んでいる");
+        let (msg, _) = app.notice.as_ref().expect("dropping the request must be reported");
+        assert!(msg.contains("account action running"), "what happened is unclear: {msg:?}");
+        assert!(!take_account_result(&mut app), "must not adopt a result before it finishes");
 
         // claude がロックを離せば完了し、結果がアカウント行と保管一覧へ入る
         drop(held);
         settle_account(&mut app);
-        assert_eq!(active_email(&app), STORE_B, "アカウント行が結果を反映していない");
+        assert_eq!(active_email(&app), STORE_B, "the account row must reflect the result");
         assert_eq!(
             home.read_credentials()["claudeAiOauth"],
             oauth("access-b", "refresh-b"),
-            "切替が行われていない"
+            "the switch must have happened"
         );
         assert_eq!(
             stored(&store, STORE_A),
             Some(oauth("access-a2", "refresh-a2")),
-            "出ていく A のトークンを巻き取れていない"
+            "A's outgoing tokens must be captured"
         );
-        assert_eq!(app.accounts.len(), 3, "保管一覧を取り直していない");
+        assert_eq!(app.accounts.len(), 3, "must refetch the stored account list");
     }
 
     /// **逃がしても「いつの観測か」は守られる。**
@@ -4021,22 +4026,22 @@ mod tests {
         drop(held);
         settle_account(&mut app);
 
-        let (msg, _) = app.notice.as_ref().expect("古い観測で切替が通っている");
+        let (msg, _) = app.notice.as_ref().expect("a switch must not proceed on a stale observation");
         assert!(
             msg.contains("changed since ccdesk last checked"),
-            "観測の古さが理由として出ていない: {msg:?}"
+            "the staleness reason is missing: {msg:?}"
         );
         assert_eq!(
             home.read_credentials()["claudeAiOauth"],
             oauth("access-elsewhere", "refresh-elsewhere"),
-            "誰の認証情報か分からないまま上書きしている"
+            "must not overwrite credentials without knowing whose they are"
         );
         // 巻き取りも起きていない ＝ 登録したときの写しのまま（`access-a2` は
         // 保管へ入っていない。切替が成功したときだけ巻き取られる値）
         assert_eq!(
             stored(&store, STORE_A),
             Some(oauth("access-a", "refresh-a")),
-            "諦めたのに A の保管を書き換えている"
+            "A's stored tokens must not change after giving up"
         );
     }
 
@@ -4060,7 +4065,7 @@ mod tests {
                 ("3 sessions will switch".to_string(), false),
             ]
         );
-        assert_eq!(kind.action(2), None, "注記行が動作を持っている");
+        assert_eq!(kind.action(2), None, "the note row must not have an action");
         // 選んでも実行されない（メニューも閉じない）
         let mut app = test_app(34, TERM);
         open(&mut app, kind, 3);
@@ -4068,7 +4073,7 @@ mod tests {
         handle_popup_key(&mut app, KeyCode::Down);
         assert_eq!(app.popup.as_ref().unwrap().selected, 2);
         handle_popup_key(&mut app, KeyCode::Enter);
-        assert!(app.popup.is_some(), "注記行の Enter でメニューが閉じている");
+        assert!(app.popup.is_some(), "Enter on the note row must not close the menu");
     }
 
     /// 注記の本数は**プロセスが生きているセッション**の数（`agents --json` の
@@ -4121,7 +4126,7 @@ mod tests {
             assert_eq!(
                 state_name(&app),
                 name,
-                "済んだ / 走っている更新を再実行している"
+                "must not re-run an update that is finished or running"
             );
         }
     }
@@ -4166,7 +4171,7 @@ mod tests {
                 ("new session".to_string(), true),
                 ("remove project".to_string(), false),
             ],
-            "セッションが残っているのに remove project が選べる"
+            "remove project must not be selectable while sessions remain"
         );
     }
 
@@ -4181,7 +4186,7 @@ mod tests {
         assert_eq!(
             app.projects,
             ["C:\\dev\\api"],
-            "無効な remove project が実行された"
+            "a disabled remove project ran anyway"
         );
     }
 
@@ -4193,11 +4198,11 @@ mod tests {
         app.sidebar_rows = vec![Some(RowAction::Project("C:\\dev\\api".to_string()))];
         app.sidebar_header_rows = 1;
         handle_mouse(&mut app, &click(5, 1)).unwrap();
-        let popup = app.popup.as_ref().expect("メニューが開いていない");
+        let popup = app.popup.as_ref().expect("no menu opened");
         assert_eq!(popup.kind, project("C:\\dev\\api", false));
-        assert_eq!(popup.anchor_y, 1, "クリックした行の下に出る");
-        assert!(app.focus == Focus::Sidebar, "フォーカスが右ペインへ移った");
-        assert!(app.sessions.is_empty(), "クリックでセッションが起動している");
+        assert_eq!(popup.anchor_y, 1, "the menu is not anchored below the clicked row");
+        assert!(app.focus == Focus::Sidebar, "focus moved to the right pane");
+        assert!(app.sessions.is_empty(), "the click started a session");
     }
 
     /// メニューを開く時点でセッションの有無を写す。**同名の末端ディレクトリが別パスに
@@ -4215,14 +4220,14 @@ mod tests {
         assert_eq!(
             app.popup.as_ref().unwrap().kind,
             project("C:\\dev\\api", false),
-            "同名末端のフォルダのセッションを拾っている"
+            "picked up sessions from another folder with the same leaf name"
         );
         // 大小・末尾の区切り違いは同じフォルダとして拾う
         open_project_popup(&mut app, "c:\\work\\api\\".to_string(), 3);
         assert_eq!(
             app.popup.as_ref().unwrap().kind,
             project("c:\\work\\api\\", true),
-            "大小違いのセッションを取りこぼしている"
+            "missed a session whose path differs only in case"
         );
     }
 
@@ -4250,16 +4255,16 @@ mod tests {
         for i in 0..PROJECTS_LIMIT + 1 {
             register_project(&mut app, &format!("C:\\dev\\p{i}"));
         }
-        assert_eq!(app.projects.len(), PROJECTS_LIMIT, "上限を超えて積まれている");
+        assert_eq!(app.projects.len(), PROJECTS_LIMIT, "stacked beyond the limit");
         assert_eq!(
             app.projects.first().map(String::as_str),
             Some("C:\\dev\\p1"),
-            "最古の登録が落ちていない"
+            "the oldest registration was not dropped"
         );
         assert_eq!(
             app.projects.last().map(String::as_str),
             Some(format!("C:\\dev\\p{PROJECTS_LIMIT}").as_str()),
-            "最新の登録が入っていない"
+            "the newest registration is missing"
         );
     }
 
@@ -4275,20 +4280,20 @@ mod tests {
         // 最初に登録したフォルダを使い直す ＝ 最近使った側へ動く
         register_project(&mut app, "C:\\dev\\p0");
         register_project(&mut app, "C:\\dev\\new");
-        assert_eq!(app.projects.len(), PROJECTS_LIMIT, "上限を超えて積まれている");
+        assert_eq!(app.projects.len(), PROJECTS_LIMIT, "stacked beyond the limit");
         assert!(
             app.projects.iter().any(|p| p == "C:\\dev\\p0"),
-            "使い直したフォルダが落ちた"
+            "a folder that was reused got evicted"
         );
         // 代わりに落ちるのは「最も長く使っていない」p1（p0 は使い直した時点で末尾へ動く）
         assert!(
             !app.projects.iter().any(|p| p == "C:\\dev\\p1"),
-            "上限を超えたのに最も長く使っていない登録が残っている"
+            "the least recently used registration survived the eviction"
         );
         assert_eq!(
             app.projects.last().map(String::as_str),
             Some("C:\\dev\\new"),
-            "最後に使ったフォルダが末尾に来ていない"
+            "the most recently used folder is not last"
         );
     }
 
@@ -4330,11 +4335,11 @@ mod tests {
         assert_eq!(
             app.projects,
             disk_projects(&app),
-            "保存された一覧を取り込んでいない ＝ 画面とディスクがずれている"
+            "the persisted list was not taken up — the screen and the disk disagree"
         );
         assert!(
             app.projects.iter().any(|p| p == "C:\\dev\\from-b"),
-            "他インスタンスの登録が自分の一覧に入っていない"
+            "a registration from another instance is missing from our list"
         );
     }
 
@@ -4350,12 +4355,12 @@ mod tests {
         assert_eq!(
             disk_projects(&app).last().map(String::as_str),
             Some("C:\\dev\\fresh"),
-            "他インスタンスの登録が最後に使った位置へ積み直されている"
+            "a registration from another instance was re-appended as the most recent"
         );
         assert_eq!(
             app.projects,
             ["C:\\dev\\mine", "C:\\dev\\from-b", "C:\\dev\\fresh"],
-            "取り込んだ登録が最近使った順に並んでいない"
+            "the taken-up registrations are not in least-to-most-recently-used order"
         );
     }
 
@@ -4386,7 +4391,7 @@ mod tests {
         open(&mut app, project("C:\\work\\api", false), 5);
         handle_popup_key(&mut app, KeyCode::Down);
         handle_popup_key(&mut app, KeyCode::Enter);
-        assert!(app.popup.is_none(), "実行後もメニューが開いている");
+        assert!(app.popup.is_none(), "the menu is still open after the action ran");
         assert_eq!(app.projects, ["C:\\dev\\api"]);
     }
 
@@ -4398,9 +4403,9 @@ mod tests {
         let mut app = test_app(34, TERM);
         app.right_view = RightView::New(NewState::browse(&dir));
         start_new_session(&mut app).unwrap();
-        assert_eq!(app.projects, std::slice::from_ref(&dir), "起動したフォルダが登録されない");
+        assert_eq!(app.projects, std::slice::from_ref(&dir), "the launched folder was not registered");
         assert_eq!(app.dispatch_cwd, dir);
-        assert!(app.sessions.is_empty(), "撮影用データで claude を起動している");
+        assert!(app.sessions.is_empty(), "the test source started a real claude");
     }
 
     /// **自動登録の経路 2: 見出しメニューの new session。** 経路 1 と同じ
@@ -4410,7 +4415,7 @@ mod tests {
         let mut app = test_app(34, TERM);
         open(&mut app, project("C:\\dev\\api", false), 5);
         handle_popup_key(&mut app, KeyCode::Enter); // 先頭 = new session
-        assert!(app.popup.is_none(), "実行後もメニューが開いている");
+        assert!(app.popup.is_none(), "the menu is still open after the action ran");
         assert_eq!(app.projects, ["C:\\dev\\api"]);
         assert_eq!(app.dispatch_cwd, "C:\\dev\\api");
     }
@@ -4427,7 +4432,7 @@ mod tests {
         handle_popup_key(&mut app, KeyCode::Enter); // 先頭 = new session
         assert!(
             app.focus == Focus::Terminal,
-            "起動したのにキー入力がサイドバーに残る"
+            "keys still go to the sidebar after a launch"
         );
     }
 
@@ -4444,14 +4449,14 @@ mod tests {
         app.input_gate = Some(std::time::Instant::now());
         assert!(
             drop_input_while_starting(&mut app),
-            "起動処理中の入力がそのまま PTY へ流れる"
+            "input typed while a session is starting flows straight to the PTY"
         );
-        assert!(app.notice.is_some(), "捨てたことが伝わっていない");
+        assert!(app.notice.is_some(), "dropping the input was not reported");
         // 子が端末を掴めば素通しに戻る（門番が残り続けるとタイプできない画面になる）
         app.input_gate = None;
         assert!(
             !drop_input_while_starting(&mut app),
-            "起動が終わっても入力が捨てられる"
+            "input is still dropped after the launch finished"
         );
     }
 
@@ -4466,7 +4471,7 @@ mod tests {
         apply_launch(&mut app, "C:\\dev\\api".to_string(), Ok(None));
         assert!(
             !drop_input_while_starting(&mut app),
-            "起動が終わったのに入力が捨てられる"
+            "input is dropped even though the launch is done"
         );
     }
 
@@ -4489,27 +4494,30 @@ mod tests {
         app.set_focus(Focus::Terminal); // dispatch_session と同じ状態
 
         // 期限内は門番が効いている（有界 ＝ 即座に降りる、ではない）
-        assert!(!expire_input_gate(&mut app), "期限前に門番が降りている");
+        assert!(!expire_input_gate(&mut app), "the gate lifted before its deadline");
         assert!(
             drop_input_while_starting(&mut app),
-            "起動処理中の入力がそのまま PTY へ流れる"
+            "input typed while a session is starting flows straight to the PTY"
         );
 
         // 期限ぶん前に起こした状態（時刻を注入して待たずに検査する）
         app.input_gate = Some(instant_ago(INPUT_GATE_LIMIT));
-        assert!(expire_input_gate(&mut app), "期限を過ぎても門番が降りない");
+        assert!(expire_input_gate(&mut app), "the gate does not lift past its deadline");
         assert!(
             !drop_input_while_starting(&mut app),
-            "応答しない起動で入力が永久に死んでいる"
+            "a hung launch kills input forever"
         );
         assert!(
             app.focus == Focus::Sidebar,
-            "門番だけ降ろして打ち先を戻していない（打った文字が古いセッションへ流れる）"
+            "the gate lifted without moving focus back — typing would flow to the previous session"
         );
-        let (msg, _) = app.notice.as_ref().expect("応答しないことが伝わっていない");
-        assert!(msg.contains("応答しない"), "何が起きたか分からない: {msg:?}");
+        let (msg, _) = app.notice.as_ref().expect("the hang was not reported");
+        assert!(
+            msg.contains("not responding"),
+            "the notice does not say what happened: {msg:?}"
+        );
         // 2 度目は何もしない（毎周通知を出し直さない）
-        assert!(!expire_input_gate(&mut app), "降りた門番をもう一度降ろしている");
+        assert!(!expire_input_gate(&mut app), "an already lifted gate was lifted again");
     }
 
     /// **起動に失敗したときも、打った文字は直前まで見ていたセッションへ届かない。**
@@ -4527,15 +4535,15 @@ mod tests {
         apply_launch(
             &mut app,
             "C:\\dev\\api".to_string(),
-            Err("セッションの起動に失敗".to_string()),
+            Err("session launch failed".to_string()),
         );
         assert!(
             !drop_input_while_starting(&mut app),
-            "失敗したのに入力が捨てられ続ける"
+            "input is still dropped after the launch failed"
         );
         assert!(
             app.focus == Focus::Sidebar,
-            "門番だけ降ろして打ち先を戻していない（打った文字が古いセッションへ流れる）"
+            "the gate lifted without moving focus back — typing would flow to the previous session"
         );
     }
 
@@ -4555,16 +4563,16 @@ mod tests {
         app.set_focus(Focus::Terminal);
         assert!(
             !app.showing(&id),
-            "宛先が居ない状態になっていない（テストの前提が崩れている）"
+            "the destination window is open — the premise of this test broke"
         );
         lift_input_gate(&mut app, Some(&id));
         assert!(
             !drop_input_while_starting(&mut app),
-            "門番が降りたのに入力が捨てられ続ける"
+            "input is still dropped after the gate lifted"
         );
         assert!(
             app.focus == Focus::Sidebar,
-            "門番だけ降りて打ち先が端末に残っている"
+            "the gate lifted but focus stayed on the terminal"
         );
     }
 
@@ -4578,17 +4586,17 @@ mod tests {
         apply_launch(
             &mut app,
             "C:\\dev\\api".to_string(),
-            Err("セッションの起動に失敗".to_string()),
+            Err("session launch failed".to_string()),
         );
-        assert!(app.projects.is_empty(), "起動に失敗したフォルダが登録された");
-        assert!(app.notice.is_some(), "失敗が伝わっていない");
+        assert!(app.projects.is_empty(), "a folder whose launch failed was registered");
+        assert!(app.notice.is_some(), "the failure was not reported");
         // 成否の判定は Result 1 つ。`Ok(None)` は「起動を試していない」＝ 失敗では
         // ないので記録する（セッションを起こさない撮影用の供給元がこの形）
         apply_launch(&mut app, "C:\\dev\\web".to_string(), Ok(None));
         assert_eq!(
             app.projects,
             ["C:\\dev\\web"],
-            "起動結果の反映で登録されない ＝ 登録の判断が起動前に残っている"
+            "applying the launch result registers nothing — the decision still happens before the launch"
         );
     }
 
@@ -4618,13 +4626,13 @@ mod tests {
             .collect();
         assert!(
             drawn.contains("new session"),
-            "ラベルが右ペインに割られている: {drawn:?}"
+            "the label is chopped by the right pane: {drawn:?}"
         );
         // そのはみ出した列のクリックが、描かれている項目どおりに効く
         let col = rect.right() - 2;
-        assert!(col >= MIN_SIDEBAR, "はみ出した列を突いていない: {col}");
+        assert!(col >= MIN_SIDEBAR, "this column is not past the sidebar: {col}");
         handle_mouse(&mut app, &click(col, rect.y + 1)).unwrap();
-        assert_eq!(app.dispatch_cwd, "C:\\dev\\api", "描かれた項目が動いていない");
+        assert_eq!(app.dispatch_cwd, "C:\\dev\\api", "the item that was drawn did not run");
     }
 
     /// 登録・解除は撮影用の供給元では永続化されない ＝ **テストが開発者の
@@ -4638,7 +4646,7 @@ mod tests {
         assert_eq!(
             ccdesk::load_state_list("projects"),
             before,
-            "テストが実ユーザーの state.json を書き換えている"
+            "the test rewrote the real user's state.json"
         );
     }
 
@@ -4683,7 +4691,7 @@ mod tests {
         assert_eq!(app.projects.len(), PROJECTS_LIMIT);
         assert!(
             app.projects.iter().all(|p| p.starts_with("C:\\dev\\p")),
-            "登録済みのフォルダが埋め戻しで押し出された: {:?}",
+            "backfilling evicted a registered folder: {:?}",
             app.projects
         );
     }
@@ -4705,15 +4713,15 @@ mod tests {
             })
             .collect();
         backfill_projects(&mut app);
-        assert_eq!(app.projects.len(), PROJECTS_LIMIT, "上限を超えて積まれている");
+        assert_eq!(app.projects.len(), PROJECTS_LIMIT, "stacked beyond the limit");
         assert_eq!(
             app.projects.last().map(String::as_str),
             Some("C:\\dev\\j0"),
-            "最新のセッションのフォルダが最近使った側に来ていない"
+            "the newest session's folder is not on the most recently used end"
         );
         assert!(
             !app.projects.iter().any(|p| p == &format!("C:\\dev\\j{PROJECTS_LIMIT}")),
-            "上限を超えた古いセッションのフォルダが入っている"
+            "a folder from a session past the limit got in"
         );
     }
 
@@ -4736,7 +4744,7 @@ mod tests {
         assert_eq!(
             rows_dropped_while_open(&[], &mine, &open),
             [&mine[0]],
-            "窓が開いている行を落としている"
+            "a row whose window is open was dropped"
         );
         // 窓を持たない行は戻さない（他インスタンスの削除を復活させない）
         assert!(
@@ -4761,7 +4769,7 @@ mod tests {
         app.sessions
             .iter()
             .find(|r| r.session_id.as_str() == id)
-            .expect("行が消えている")
+            .expect("the row is gone")
     }
 
     /// **hook が書いた state は行へ載り、行は未読になる。**
@@ -4773,20 +4781,20 @@ mod tests {
     fn a_hook_state_lands_on_the_row_and_marks_it_unread() {
         let rows = [session_row("s", "C:\\dev\\api", 1), session_row("t", "C:\\dev\\web", 1)];
         let mut app = app_with_hooks(&rows, HookStates::from_pairs([("s", "done")]));
-        assert!(!row_of(&app, "s").unread(), "作った直後の行が未読になっている");
+        assert!(!row_of(&app, "s").unread(), "a freshly created row is already unread");
 
         adopt_hook_states(&mut app);
         assert_eq!(row_of(&app, "s").last_state, "done");
-        assert!(row_of(&app, "s").unread(), "状態が変わった行が未読にならない");
+        assert!(row_of(&app, "s").unread(), "a row whose state changed is not unread");
         assert_eq!(app.hook_states.get(&SessionId::new("s")), Some("done"));
         // hook の無い行は触らない（`agents --json` の従経路で表示される）
         assert_eq!(row_of(&app, "t").last_state, "");
-        assert!(!row_of(&app, "t").unread(), "hook の来ていない行を未読にしている");
+        assert!(!row_of(&app, "t").unread(), "a row with no hook was marked unread");
 
         // 同じ state をもう一度受けても行は動かない（未読が延々と点き直さない）
         let before = row_of(&app, "s").clone();
         adopt_hook_states(&mut app);
-        assert_eq!(row_of(&app, "s"), &before, "同じ state で行が書き換わっている");
+        assert_eq!(row_of(&app, "s"), &before, "the row changed for the very same state");
     }
 
     /// **ペインを開いた時点で既読になる**（開き方は問わない ＝ [`open_session`] の
@@ -4800,11 +4808,11 @@ mod tests {
 
         mark_opened(&mut app, &SessionId::new("s"));
         let row = row_of(&app, "s");
-        assert!(!row.unread(), "開いても未読のまま");
-        assert!(row.last_opened_at >= row.updated_at, "既読の時刻が更新より前");
+        assert!(!row.unread(), "still unread after being opened");
+        assert!(row.last_opened_at >= row.updated_at, "the read timestamp is older than the update");
 
-        mark_opened(&mut app, &SessionId::new("消えた行"));
-        assert_eq!(app.sessions.len(), 1, "知らない行で一覧が動いた");
+        mark_opened(&mut app, &SessionId::new("gone-row"));
+        assert_eq!(app.sessions.len(), 1, "an unknown row changed the list");
     }
 
     /// **ペインに出ている行は未読にしない。** 未読が答えるのは「見ていない間に
@@ -4813,11 +4821,11 @@ mod tests {
     fn a_change_on_the_shown_row_does_not_make_it_unread() {
         let mut row = session_row("s", "C:\\dev\\api", 1);
         touch(&mut row, false);
-        assert!(row.unread(), "見ていない行が未読にならない");
+        assert!(row.unread(), "a row nobody is looking at is not unread");
 
         let mut row = session_row("s", "C:\\dev\\api", 1);
         touch(&mut row, true);
-        assert!(!row.unread(), "見ている行が未読になっている");
+        assert!(!row.unread(), "the row on screen was marked unread");
         assert_eq!(row.last_opened_at, row.updated_at);
     }
 
@@ -4856,7 +4864,7 @@ mod tests {
     }
 
     fn only_row(app: &App) -> &SessionRow {
-        app.sessions.first().expect("行が消えている")
+        app.sessions.first().expect("the row is gone")
     }
 
     /// ピン留めとアーカイブは入切する（同じ項目をもう一度選べば戻る）
@@ -4864,17 +4872,17 @@ mod tests {
     fn the_menu_toggles_pin_and_archive_on_the_row() {
         let mut app = app_with_row("s");
         let id = SessionId::new("s");
-        assert!(!only_row(&app).pinned && !only_row(&app).archived, "初期状態が立っている");
+        assert!(!only_row(&app).pinned && !only_row(&app).archived, "the flags are already set to begin with");
 
         run_popup_action(&mut app, PopupAction::TogglePin(id.clone()), 0);
         run_popup_action(&mut app, PopupAction::ToggleArchive(id.clone()), 0);
-        assert!(only_row(&app).pinned && only_row(&app).archived, "1 度目で立たない");
+        assert!(only_row(&app).pinned && only_row(&app).archived, "the first pick does not set the flag");
 
         run_popup_action(&mut app, PopupAction::TogglePin(id.clone()), 0);
         run_popup_action(&mut app, PopupAction::ToggleArchive(id), 0);
         assert!(
             !only_row(&app).pinned && !only_row(&app).archived,
-            "2 度目で戻らない"
+            "the second pick does not clear the flag"
         );
     }
 
@@ -4888,23 +4896,23 @@ mod tests {
         // 未読の行（応答が届いたのにまだ開いていない）
         app.sessions[0].last_opened_at = 1_000;
         app.sessions[0].updated_at = 2_000;
-        assert!(only_row(&app).unread(), "前提（未読）が崩れている");
+        assert!(only_row(&app).unread(), "the premise (an unread row) broke");
 
         run_popup_action(&mut app, PopupAction::TogglePin(id.clone()), 0);
-        assert!(only_row(&app).unread(), "ピン留めで未読が消えている");
+        assert!(only_row(&app).unread(), "pinning cleared unread");
         run_popup_action(&mut app, PopupAction::ToggleArchive(id.clone()), 0);
-        assert!(only_row(&app).unread(), "アーカイブで未読が消えている");
+        assert!(only_row(&app).unread(), "archiving cleared unread");
 
         run_popup_action(&mut app, PopupAction::MarkRead(id.clone()), 0);
-        assert!(!only_row(&app).unread(), "既読にしても未読のまま");
+        assert!(!only_row(&app).unread(), "still unread after mark as read");
 
         // 既読の行を触っても未読は生えない（`updated_at` はマージのために進む）
         let before = only_row(&app).updated_at;
         run_popup_action(&mut app, PopupAction::TogglePin(id), 0);
-        assert!(!only_row(&app).unread(), "自分の操作で未読が生えている");
+        assert!(!only_row(&app).unread(), "our own edit created an unread mark");
         assert!(
             only_row(&app).updated_at >= before,
-            "マージの後勝ち判定の材料が進んでいない"
+            "the last-write-wins input for merging did not advance"
         );
     }
 
@@ -4926,8 +4934,8 @@ mod tests {
         let mut app = app_with_row(id);
         run_popup_action(&mut app, PopupAction::Delete(SessionId::new(id)), 0);
 
-        assert!(app.sessions.is_empty(), "行が一覧から消えていない");
-        assert!(transcript.exists(), "削除が transcript まで消している");
+        assert!(app.sessions.is_empty(), "the row is still in the list");
+        assert!(transcript.exists(), "deleting the row removed its transcript too");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4937,20 +4945,31 @@ mod tests {
     fn renaming_writes_a_custom_title_when_the_input_is_confirmed() {
         let mut app = app_with_row("s");
         run_popup_action(&mut app, PopupAction::StartRename(SessionId::new("s")), 0);
-        let field = &app.rename.as_ref().expect("入力が始まっていない").field;
-        assert_eq!(field.text, "session", "今の名前が初期値になっていない");
+        let field = &app.rename.as_ref().expect("the inline input did not start").field;
+        assert_eq!(field.text, "session", "the current name is not the initial value");
 
         for _ in 0..field.text.chars().count() {
             press(&mut app, KeyCode::Backspace);
         }
-        for c in "支払いの型".chars() {
+        // 打ち込むのは ASCII 外の文字。`KeyCode::Char` を 1 文字ずつ送っても
+        // マルチバイトの名前がそのまま行へ載ることを併せて固定する。源を ASCII に
+        // 保つためエスケープで書く（意味は「支払いの型」相当の 5 文字）
+        let typed = "\u{652f}\u{6255}\u{3044}\u{306e}\u{578b}";
+        for c in typed.chars() {
             press(&mut app, KeyCode::Char(c));
         }
-        assert_eq!(only_row(&app).title, "session", "確定前に行が書き換わっている");
+        assert_eq!(
+            only_row(&app).title,
+            "session",
+            "the row changed before the input was confirmed"
+        );
 
         press(&mut app, KeyCode::Enter);
-        assert!(app.rename.is_none(), "確定しても入力が残っている");
-        assert_eq!(only_row(&app).title, "支払いの型");
+        assert!(
+            app.rename.is_none(),
+            "the input is still open after being confirmed"
+        );
+        assert_eq!(only_row(&app).title, typed);
         assert_eq!(only_row(&app).title_source, TitleSource::Custom);
     }
 
@@ -4966,7 +4985,7 @@ mod tests {
 
         start(&mut app);
         press(&mut app, KeyCode::Esc);
-        assert!(app.rename.is_none(), "Esc で閉じていない");
+        assert!(app.rename.is_none(), "Esc did not close the input");
         assert_eq!(only_row(&app).title, "session");
 
         // 空白だけの名前は付けない（行から名前が消えるとどれか指せなくなる）
@@ -4976,12 +4995,12 @@ mod tests {
         }
         press(&mut app, KeyCode::Enter);
         assert!(app.rename.is_none());
-        assert_eq!(only_row(&app).title, "session", "空の名前が入った");
+        assert_eq!(only_row(&app).title, "session", "an empty name was written to the row");
 
         // 入力欄はサイドバーの行そのものなので、フォーカスが離れたら畳む
         start(&mut app);
         app.set_focus(Focus::Terminal);
-        assert!(app.rename.is_none(), "見えない入力欄が残っている");
+        assert!(app.rename.is_none(), "an invisible input is still open");
         assert_eq!(only_row(&app).title, "session");
         assert_eq!(only_row(&app).title_source, TitleSource::Derived);
     }
@@ -4996,9 +5015,9 @@ mod tests {
         assert_eq!(
             app.selection,
             Selection::Row(0),
-            "編集中に裏の選択が動いている"
+            "the selection behind the input moved while editing"
         );
-        assert!(app.rename.is_some(), "↑↓ で入力が閉じている");
+        assert!(app.rename.is_some(), "↑↓ closed the input");
     }
 
     /// **`←` はどの行でも「その行のメニュー」。** 種類ごとに別のキーを覚えさせない
@@ -5024,7 +5043,7 @@ mod tests {
             let popup = app
                 .popup
                 .as_ref()
-                .unwrap_or_else(|| panic!("row={row} でメニューが開いていない"));
+                .unwrap_or_else(|| panic!("row={row}: no menu opened"));
             assert_eq!(popup.kind, expected, "row={row}");
             // 位置は行頭 `=` のクリックと同じ規則（開き方で場所が変わらない）
             assert_eq!(popup.anchor_y, selected_row_y(&app), "row={row}");
@@ -5045,10 +5064,10 @@ mod tests {
         for row in 0..app.sidebar_rows.len() {
             app.selection = Selection::Row(row);
             press(&mut app, KeyCode::Left);
-            assert!(app.popup.is_none(), "row={row} でメニューが開いた");
+            assert!(app.popup.is_none(), "row={row}: a menu opened");
             assert!(
                 matches!(app.right_view, RightView::Sessions),
-                "row={row} で右ペインが切り替わった"
+                "row={row}: the right pane switched"
             );
         }
     }
@@ -5059,12 +5078,12 @@ mod tests {
     #[test]
     fn the_left_key_is_not_reserved_and_still_reaches_claude() {
         let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
-        assert_eq!(reserved_key(&left), None, "← を予約している");
+        assert_eq!(reserved_key(&left), None, "← is reserved");
         let parser = ccdesk::new_parser(24, 80, 0);
         assert_eq!(
             encode_key(&left, &parser),
             b"\x1b[D",
-            "← が claude へカーソルキーとして渡らない"
+            "← does not reach claude as a cursor key"
         );
     }
 
@@ -5075,11 +5094,11 @@ mod tests {
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
         let parser = ccdesk::new_parser(24, 80, 0);
         for (c, byte) in [('s', 0x13u8), ('x', 0x18)] {
-            assert_eq!(reserved_key(&ctrl(c)), None, "Ctrl+{c} をまだ予約している");
+            assert_eq!(reserved_key(&ctrl(c)), None, "Ctrl+{c} is still reserved");
             assert_eq!(
                 encode_key(&ctrl(c), &parser),
                 [byte],
-                "Ctrl+{c} が claude へ渡らない"
+                "Ctrl+{c} does not reach claude"
             );
         }
     }
@@ -5107,7 +5126,7 @@ mod tests {
             KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
         ] {
-            assert_eq!(reserved_key(&key), None, "{key:?} を予約している");
+            assert_eq!(reserved_key(&key), None, "{key:?} is reserved");
         }
     }
 
@@ -5125,9 +5144,9 @@ mod tests {
         assert_eq!(
             app.grouping,
             Grouping::State,
-            "Ctrl+S がグルーピングを切り替えている"
+            "Ctrl+S still toggles the grouping"
         );
-        assert_eq!(app.sessions.len(), 1, "Ctrl+X が行を消している");
-        assert!(app.popup.is_none(), "撤去した打鍵でメニューが開いている");
+        assert_eq!(app.sessions.len(), 1, "Ctrl+X still deletes the row");
+        assert!(app.popup.is_none(), "a removed shortcut opened a menu");
     }
 }

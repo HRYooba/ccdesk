@@ -697,7 +697,7 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn read_credentials(&self) -> Value {
-            read_json(&self.paths().credentials).expect("認証情報ファイルが読めない")
+            read_json(&self.paths().credentials).expect("failed to read credentials file")
         }
     }
 
@@ -772,11 +772,11 @@ pub(crate) mod tests {
         assert_eq!(
             after[OAUTH_KEY],
             oauth("access-a", "refresh-a"),
-            "保管した claudeAiOauth が復元されていない"
+            "stored claudeAiOauth was not restored"
         );
         assert_eq!(
             after["mcpOAuth"], with_b["mcpOAuth"],
-            "mcpOAuth が保たれていない（MCP の認証が壊れる）"
+            "mcpOAuth was not preserved (breaks MCP auth)"
         );
     }
 
@@ -802,7 +802,7 @@ pub(crate) mod tests {
         assert_eq!(
             after.as_object().unwrap().len(),
             future.as_object().unwrap().len(),
-            "トップレベルのキーが増減している"
+            "top-level key count changed"
         );
     }
 
@@ -815,7 +815,7 @@ pub(crate) mod tests {
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
         store.register(&home.active(EMAIL_A, "taro")).unwrap();
 
-        let stored = stored_oauth(&store, EMAIL_A).expect("保管されていない");
+        let stored = stored_oauth(&store, EMAIL_A).expect("not stored");
         assert_eq!(stored, oauth("access-a", "refresh-a"));
         assert!(stored.get("mcpOAuth").is_none());
     }
@@ -883,7 +883,7 @@ pub(crate) mod tests {
         assert_eq!(
             std::fs::read(home.paths().credentials).unwrap(),
             before,
-            "登録解除で現行の認証情報が変わっている（ログインを外してしまっている）"
+            "unregister changed the current credentials (logged the user out)"
         );
         // 二重の登録解除は成功扱い（目的は既に達成されている）
         store.unregister(EMAIL_A).unwrap();
@@ -903,7 +903,7 @@ pub(crate) mod tests {
 
         assert!(
             !home.paths().usage_cache.exists(),
-            "usage.json が残っている（前アカウントの残量を表示してしまう）"
+            "usage.json still exists (would show the previous account's remaining usage)"
         );
     }
 
@@ -943,7 +943,7 @@ pub(crate) mod tests {
         assert_eq!(
             stored_oauth(&store, EMAIL_A),
             Some(oauth("access-a3", "refresh-a3")),
-            "上書き直前のトークンを取り込めていない（A へ戻れなくなる）"
+            "did not capture the token right before overwriting (A becomes unreachable)"
         );
         assert_eq!(
             home.read_credentials()[OAUTH_KEY],
@@ -985,17 +985,17 @@ pub(crate) mod tests {
                 .switch_to(EMAIL_A, &Outgoing::Known(home.active(EMAIL_A, "taro")))
                 .unwrap(),
             AccountChange::AlreadyActive,
-            "何もしていないのに切替として返している"
+            "reported as switched even though nothing changed"
         );
 
         assert_eq!(
             home.read_credentials()[OAUTH_KEY],
             oauth("access-a4", "refresh-a4"),
-            "現行トークンを古い写しで上書きしている（ログインが壊れる）"
+            "overwrote the current token with a stale copy (breaks the login)"
         );
         assert!(
             home.paths().usage_cache.exists(),
-            "アカウントは変わっていないのに使用率キャッシュを消している"
+            "cleared the usage cache even though the account did not change"
         );
     }
 
@@ -1025,7 +1025,7 @@ pub(crate) mod tests {
         assert_eq!(
             std::fs::read_to_string(home.paths().credentials).unwrap(),
             "{ this is not json",
-            "壊れたファイルを上書きしている（mcpOAuth を失う経路）"
+            "overwrote the broken file (a path that loses mcpOAuth)"
         );
     }
 
@@ -1059,19 +1059,19 @@ pub(crate) mod tests {
             .unwrap();
         assert!(
             std::fs::read_to_string(home.paths().credentials).is_err(),
-            "テストの前提が崩れている（読めてしまっている）"
+            "test precondition broken (the file was readable)"
         );
         let result = store.switch_to(EMAIL_A, &Outgoing::NobodyLoggedIn);
         drop(held);
 
         assert!(
             result.is_err(),
-            "読めなかっただけのファイルを未ログイン扱いで差し替えている"
+            "treated an unreadable file as logged-out and replaced it"
         );
         assert_eq!(
             std::fs::read(home.paths().credentials).unwrap(),
             before,
-            "読めないファイルを上書きしている（mcpOAuth と未知のキーを失う経路）"
+            "overwrote an unreadable file (a path that loses mcpOAuth and unknown keys)"
         );
     }
 
@@ -1088,13 +1088,13 @@ pub(crate) mod tests {
         home.write_credentials(&credentials_doc("access-a2", "refresh-a2"));
         assert!(
             store.sync_active(&home.active(EMAIL_A, "taro")).unwrap(),
-            "追従していない"
+            "did not follow"
         );
 
         assert_eq!(
             stored_oauth(&store, EMAIL_A),
             Some(oauth("access-a2", "refresh-a2")),
-            "保管が古いトークンのまま（切替で復元できなくなる）"
+            "store still has the old token (switching would no longer restore it)"
         );
     }
 
@@ -1123,15 +1123,15 @@ pub(crate) mod tests {
         let waited = started.elapsed();
         drop(held);
 
-        assert!(result.is_err(), "取れないロックで書けたことになっている");
+        assert!(result.is_err(), "wrote despite failing to take the lock");
         assert!(
             waited < STORE_LOCK_WAIT / 2,
-            "保管ロックを待っている（{waited:?}）＝ ポーラーが 1 ティックあたりその分止まる"
+            "waited for the store lock ({waited:?}) = the poller would stall by that much every tick"
         );
         assert_eq!(
             std::fs::read(home.paths().store).unwrap(),
             stored_before,
-            "ロックを取れていないのに保管を書いている"
+            "wrote the store despite not holding the lock"
         );
     }
 
@@ -1168,7 +1168,7 @@ pub(crate) mod tests {
         assert!(store.list().is_empty());
         assert!(
             !home.paths().store.exists(),
-            "未登録なのに保管ファイルを作っている"
+            "created the store file despite being unregistered"
         );
     }
 
@@ -1186,7 +1186,7 @@ pub(crate) mod tests {
         assert_eq!(
             stored_oauth(&store, EMAIL_A),
             Some(oauth("access-a", "refresh-a")),
-            "読めなかった値で保管を壊している"
+            "corrupted the store with the unreadable value"
         );
     }
 
@@ -1206,16 +1206,16 @@ pub(crate) mod tests {
 
         let short = home.store_with_short_wait();
         let started = Instant::now();
-        assert!(short.switch_to(EMAIL_A, &Outgoing::NobodyLoggedIn).is_err(), "ロックを取らずに書いている");
+        assert!(short.switch_to(EMAIL_A, &Outgoing::NobodyLoggedIn).is_err(), "wrote without taking the lock");
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "待ちが有界でない: {:?}",
+            "wait is not bounded: {:?}",
             started.elapsed()
         );
         assert_eq!(
             std::fs::read(home.paths().credentials).unwrap(),
             before,
-            "取れなかったのに書いている（壊れた状態を残している）"
+            "wrote despite failing to acquire (leaves a broken state)"
         );
         // 登録も同じ（現行の認証情報をロック下で読む）
         assert!(short.register(&home.active(EMAIL_B, "hanako")).is_err());
@@ -1235,10 +1235,10 @@ pub(crate) mod tests {
         let store = home.store();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
         store.register(&home.active(EMAIL_A, "taro")).unwrap();
-        assert!(!home.paths().lock.exists(), "登録がロックを残している");
+        assert!(!home.paths().lock.exists(), "register left the lock behind");
 
         store.switch_to(EMAIL_A, &Outgoing::NobodyLoggedIn).unwrap();
-        assert!(!home.paths().lock.exists(), "切替がロックを残している");
+        assert!(!home.paths().lock.exists(), "switch left the lock behind");
     }
 
     /// **切替は「新しい持ち主」を返す。** 自分が書いた値なので確定しており、
@@ -1260,7 +1260,7 @@ pub(crate) mod tests {
         assert_eq!(
             change,
             AccountChange::Switched(home.active(EMAIL_B, "hanako")),
-            "切替後の持ち主が確定値で返っていない"
+            "the post-switch owner was not returned as the settled value"
         );
     }
 
@@ -1287,21 +1287,21 @@ pub(crate) mod tests {
 
         let err = store
             .switch_to(EMAIL_B, &Outgoing::Known(stale.clone()))
-            .expect_err("古い観測のまま切替が通っている");
+            .expect_err("switch succeeded despite a stale observation");
 
         assert!(
             err.to_string().contains("try again"),
-            "やり直せることが伝わらない: {err}"
+            "does not convey that retrying would work: {err}"
         );
         assert_eq!(
             stored_oauth(&store, EMAIL_A),
             Some(oauth("access-a", "refresh-a")),
-            "A の保管が B のトークンで潰れている（A は復旧不能）"
+            "A's stored entry was clobbered by B's token (A is unrecoverable)"
         );
         assert_eq!(
             home.read_credentials()[OAUTH_KEY],
             oauth("access-b2", "refresh-b2"),
-            "確認できていないのに現行の認証情報を書き換えている"
+            "rewrote the current credentials without confirming ownership"
         );
     }
 
@@ -1319,12 +1319,12 @@ pub(crate) mod tests {
 
         assert!(
             store.register(&stale).is_err(),
-            "古い観測のまま登録が通っている"
+            "register succeeded despite a stale observation"
         );
         assert_eq!(
             stored_oauth(&store, EMAIL_A),
             Some(oauth("access-a", "refresh-a")),
-            "A の保管が B のトークンで潰れている"
+            "A's stored entry was clobbered by B's token"
         );
     }
 
@@ -1345,12 +1345,12 @@ pub(crate) mod tests {
 
         assert!(
             !store.sync_active(&stale).unwrap(),
-            "古い観測のまま追従更新している"
+            "synced despite a stale observation"
         );
         assert_eq!(
             stored_oauth(&store, EMAIL_A),
             Some(oauth("access-a", "refresh-a")),
-            "A の保管が B のトークンで潰れている"
+            "A's stored entry was clobbered by B's token"
         );
     }
 
@@ -1374,27 +1374,27 @@ pub(crate) mod tests {
         let held = Lock::acquire(&home.paths().store_lock(), Duration::ZERO, LOCK_STALE).unwrap();
         let short = home.store_with_short_wait();
 
-        assert!(short.register(&home.active(EMAIL_B, "hanako")).is_err(), "登録");
-        assert!(short.unregister(EMAIL_A).is_err(), "登録解除");
-        assert!(short.sync_active(&home.active(EMAIL_B, "hanako")).is_err(), "追従更新");
+        assert!(short.register(&home.active(EMAIL_B, "hanako")).is_err(), "register");
+        assert!(short.unregister(EMAIL_A).is_err(), "unregister");
+        assert!(short.sync_active(&home.active(EMAIL_B, "hanako")).is_err(), "sync");
         // 切替は「出ていく側の巻き取り」で保管へ書くので、そこで諦める。
         // **現行の認証情報も書き換えない**（巻き取れないまま上書きするとログインが飛ぶ）
         assert!(
             short
                 .switch_to(EMAIL_A, &Outgoing::Known(home.active(EMAIL_B, "hanako")))
                 .is_err(),
-            "切替の巻き取り"
+            "switch's capture of the outgoing account"
         );
 
         assert_eq!(
             std::fs::read(home.paths().store).unwrap(),
             store_before,
-            "ロックを取れていないのに保管を書いている"
+            "wrote the store despite not holding the lock"
         );
         assert_eq!(
             std::fs::read(home.paths().credentials).unwrap(),
             credentials_before,
-            "巻き取れないまま現行の認証情報を上書きしている"
+            "overwrote the current credentials without capturing the outgoing account"
         );
 
         drop(held);
@@ -1403,7 +1403,7 @@ pub(crate) mod tests {
         assert_eq!(short.list(), vec![Account::new(EMAIL_B, "hanako")]);
         assert!(
             !home.paths().store_lock().exists(),
-            "保管ファイルのロックを残している"
+            "left the store file's lock behind"
         );
     }
 
@@ -1431,11 +1431,11 @@ pub(crate) mod tests {
 
         let err = store
             .switch_to(EMAIL_A, &Outgoing::NobodyLoggedIn)
-            .expect_err("戻せない写しで切り替えている");
+            .expect_err("switched using a copy that cannot be restored");
 
         assert!(
             err.to_string().contains(REFRESH_TOKEN_KEY),
-            "何が足りないか分からない: {err}"
+            "does not say what is missing: {err}"
         );
         assert_eq!(std::fs::read(home.paths().credentials).unwrap(), before);
         // 未知のキーが増えた将来の写しは通す（キー集合を固定しない）
@@ -1477,9 +1477,9 @@ pub(crate) mod tests {
 
         home.store().cleanup_leftover_tmp();
 
-        assert!(!old.exists(), "古い tmp を回収していない（トークンが残る）");
-        assert!(fresh.exists(), "書いている最中かもしれない tmp を消している");
-        assert!(other.exists(), "無関係な tmp を消している");
+        assert!(!old.exists(), "did not reclaim the old tmp file (leaves a token behind)");
+        assert!(fresh.exists(), "deleted a tmp file that might still be being written");
+        assert!(other.exists(), "deleted an unrelated tmp file");
     }
 
     /// 認証情報ファイルの指紋: 書き換えと消滅を検出できる。
@@ -1489,7 +1489,7 @@ pub(crate) mod tests {
     fn the_credentials_fingerprint_detects_writes_and_deletion() {
         let home = TempHome::new("the_credentials_fingerprint_detects_writes_and_deletion");
         let path = home.paths().credentials;
-        assert_eq!(credentials_fingerprint(&path), None, "無いファイルは None");
+        assert_eq!(credentials_fingerprint(&path), None, "a missing file should be None");
 
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
         let first = credentials_fingerprint(&path);
@@ -1498,7 +1498,7 @@ pub(crate) mod tests {
         // 長さが変わればサイズで検出できる（時刻の刻みに依存しない）
         home.write_credentials(&credentials_doc("access-a-longer", "refresh-a-longer"));
         let second = credentials_fingerprint(&path);
-        assert_ne!(second, first, "サイズの変化を検出できていない");
+        assert_ne!(second, first, "did not detect the size change");
 
         // 同じ長さでも刻みを跨げば mtime で検出できる（トークン入れ替えがこの形）
         wait_for_a_new_mtime();
@@ -1506,10 +1506,10 @@ pub(crate) mod tests {
         assert_ne!(
             credentials_fingerprint(&path),
             second,
-            "同サイズの書き換えを検出できていない"
+            "did not detect a same-size rewrite"
         );
 
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(credentials_fingerprint(&path), None, "消滅を検出できていない");
+        assert_eq!(credentials_fingerprint(&path), None, "did not detect deletion");
     }
 }

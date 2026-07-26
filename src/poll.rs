@@ -793,18 +793,18 @@ mod tests {
     fn keeps_the_email_as_the_stable_identity() {
         let AccountStatus::LoggedIn(active) = parse_account(PERSONAL, Some((EMAIL, "alice")))
         else {
-            panic!("ログイン済みとして解釈されていない");
+            panic!("not interpreted as logged in");
         };
         assert_eq!(active.account.email, EMAIL);
         assert_eq!(
             active.account.label, "alice",
-            "ラベルの生成規則が変わっている"
+            "label generation rule changed"
         );
 
         // 組織名が出るケースでも email はそのまま
         let AccountStatus::LoggedIn(active) = parse_account(&auth_json("Acme, Inc.", None), None)
         else {
-            panic!("ログイン済みとして解釈されていない");
+            panic!("not interpreted as logged in");
         };
         assert_eq!(active.account.email, EMAIL);
     }
@@ -831,10 +831,10 @@ mod tests {
     /// 落とした出力＝プラン不明でも、組織名が email 由来なら出さない
     #[test]
     fn suppresses_email_derived_org_name_without_subscription_type() {
-        // 接尾辞の表記が変わっても email 前方一致で落とす
+        // 接尾辞の表記が変わっても（訳語・別綴りでも）email 前方一致で落とす
         for org in [
             PERSONAL_ORG,
-            "taro@example.com のオーガナイゼーション",
+            "taro@example.com's Workspace",
             "taro@example.com",
         ] {
             assert_eq!(
@@ -944,7 +944,7 @@ mod tests {
         assert_eq!(
             parse_account(PERSONAL, Some(("hanako@example.com", "hanako"))),
             logged_in("taro"),
-            "email が一致しないプロフィールを使ってしまっている"
+            "a profile whose email does not match is being used"
         );
     }
 
@@ -1055,13 +1055,13 @@ mod tests {
         const FALLBACK: u64 = ACCOUNT_FALLBACK_SECS;
         assert!(
             refetch_due(FALLBACK, FALLBACK, false, false),
-            "周期フォールバック"
+            "periodic fallback"
         );
-        assert!(refetch_due(0, FALLBACK, true, false), "認証ファイルの変化");
-        assert!(refetch_due(0, FALLBACK, false, true), "明示要求");
+        assert!(refetch_due(0, FALLBACK, true, false), "auth file changed");
+        assert!(refetch_due(0, FALLBACK, false, true), "explicit request");
         assert!(
             !refetch_due(FALLBACK - 1, FALLBACK, false, false),
-            "契機が無い"
+            "no trigger"
         );
     }
 
@@ -1092,14 +1092,14 @@ mod tests {
                 account.clone()
             }),
             Some(account.clone()),
-            "失敗後の再試行がフォールバック（60s）まで来ていない"
+            "a retry after a failed fetch waits for the whole 60s fallback"
         );
 
         // 成功した後は通常の周期に戻す（短周期で claude を叩き続けない）
         state.age = ACCOUNT_RETRY_SECS;
         assert_eq!(
             account_step(&mut state, &account, false, || None, |_| panic!(
-                "成功後も短周期で再取得している"
+                "still refetching on the short retry interval after a success"
             )),
             None
         );
@@ -1134,7 +1134,7 @@ mod tests {
         assert_eq!(
             second,
             Some(new),
-            "取得中に入ったログインを次の周で拾えていない"
+            "a login that landed during the fetch is not picked up on the next cycle"
         );
     }
 
@@ -1165,7 +1165,7 @@ mod tests {
                 Account::new(EMAIL, "taro"),
                 fp_of(1)
             ))),
-            "取得後の指紋で日付を付けている"
+            "the account is dated with the fingerprint read after the fetch"
         );
     }
 
@@ -1189,10 +1189,10 @@ mod tests {
         std::fs::remove_dir_all(&store_dir).unwrap();
 
         for _ in 0..3 {
-            assert!(auth.fingerprint().is_some(), "認証情報の指紋が読めていない");
+            assert!(auth.fingerprint().is_some(), "the credentials fingerprint cannot be read");
             assert!(
                 !store_dir.exists(),
-                "指紋を読むだけでディレクトリを作っている（毎秒 create_dir_all が走る）"
+                "reading the fingerprint alone creates the directory — create_dir_all would run every second"
             );
         }
     }

@@ -129,18 +129,22 @@ pub(crate) enum AccountAction {
 }
 
 impl AccountAction {
-    /// この要求を指す語（下部バーの「アカウントの…に失敗」）。
+    /// この要求を指す語（下部バーの `failed to {what} account`）。
     /// **呼び出し口で文字列を添えない**のが要点で、要求とその語彙を
-    /// 同じ型の隣に置くと、要求を足したときに語を決めるのを忘れられない
+    /// 同じ型の隣に置くと、要求を足したときに語を決めるのを忘れられない。
+    ///
+    /// 英語なのは [`Self::progress`] と同じ理由で、これが画面に出る語だから
+    /// （下部バーの通知は `error.log` にも残るので `ccdesk logs` にも出る）。
+    /// 他の表示（`not logged in · run /login` / `updating…`）に揃える
     pub(crate) fn what(&self) -> &'static str {
         match self {
-            Self::Register(_) => "登録",
-            Self::Switch { .. } => "切替",
-            Self::Unregister(_) => "登録解除",
+            Self::Register(_) => "register",
+            Self::Switch { .. } => "switch",
+            Self::Unregister(_) => "unregister",
         }
     }
 
-    /// 実行中にアカウント行へ出す語（版行の `updating…` と同じ方鑑）。
+    /// 実行中にアカウント行へ出す語（版行の `updating…` と同じ方針）。
     /// 英語なのはこれが行の表示で、他の行の語彙
     /// （`not logged in · run /login` / `updating…`）に揃えるため
     pub(crate) fn progress(&self) -> &'static str {
@@ -722,10 +726,10 @@ mod tests {
         assert_eq!(DemoSource.footer().current, "2.1.220");
         assert!(
             DemoSource.footer().latest.is_none(),
-            "撮影で更新マーカーを出さない"
+            "demo does not show an update marker"
         );
 
-        let usage = DemoSource.usage().expect("使用率ゲージは常に出す");
+        let usage = DemoSource.usage().expect("usage gauge is always present");
         assert_eq!(usage.five.map(|(pct, _)| pct), Some(34.0));
         assert_eq!(usage.seven.map(|(pct, _)| pct), Some(58.0));
         assert!(!usage.stale);
@@ -750,11 +754,11 @@ mod tests {
         for session in &sessions {
             assert!(
                 session.session_id.as_str().starts_with("demo0000-"),
-                "実セッションらしい ID: {}",
+                "looks like a real session ID: {}",
                 session.session_id
             );
             assert!(session.cwd.starts_with("C:\\dev\\"), "cwd: {:?}", session.cwd);
-            assert!(!session.unread(), "撮影に未読マーカーが写る");
+            assert!(!session.unread(), "unread marker shows up in the demo");
             assert!(!session.archived && !session.pinned);
         }
     }
@@ -777,14 +781,14 @@ mod tests {
         assert_eq!(
             DemoSource.store_sessions(&asked),
             asked,
-            "demo が渡した一覧と違うものを返している"
+            "demo returned a different list than what was passed"
         );
         let after = crate::sessions::SessionStore::detect()
             .map(|store| store.list())
             .unwrap_or_default();
         assert!(
             !after.iter().any(|row| row.session_id == asked[0].session_id),
-            "demo が sessions.json へ書いている"
+            "demo wrote to sessions.json"
         );
     }
 
@@ -795,10 +799,10 @@ mod tests {
     fn demo_window_state_does_not_come_from_disk() {
         let window = DemoSource.window_state();
         assert_eq!(window.sidebar_width, DEMO_SIDEBAR_WIDTH);
-        assert!(window.last_view.is_none(), "撮影は new session 画面から");
+        assert!(window.last_view.is_none(), "demo always starts from the new session screen");
         assert_eq!(window.dispatch_cwd, DEMO_CWD);
         assert_eq!(window.grouping, Grouping::State);
-        assert_eq!(window.projects, DEMO_PROJECTS, "登録プロジェクトも固定値");
+        assert_eq!(window.projects, DEMO_PROJECTS, "registered projects are fixed too");
     }
 
     /// 撮影用の登録プロジェクトは実パスを含まず、demo セッションのフォルダを
@@ -808,13 +812,13 @@ mod tests {
     fn demo_projects_cover_every_demo_session_folder_plus_an_empty_one() {
         let projects = DemoSource.window_state().projects;
         for path in &projects {
-            assert!(path.starts_with("C:\\dev\\"), "実パスらしい登録: {path:?}");
+            assert!(path.starts_with("C:\\dev\\"), "looks like a real path registration: {path:?}");
         }
         let sessions = DemoSource.sessions();
         for session in &sessions {
             assert!(
                 projects.contains(&session.cwd),
-                "セッションのあるフォルダが未登録: {:?}",
+                "folder with a session is not registered: {:?}",
                 session.cwd
             );
         }
@@ -825,7 +829,7 @@ mod tests {
         assert_eq!(
             empty.len(),
             1,
-            "セッション 0 本の登録フォルダがちょうど 1 件でない: {empty:?}"
+            "not exactly one registered folder with zero sessions: {empty:?}"
         );
     }
 
@@ -839,12 +843,12 @@ mod tests {
         assert_eq!(
             DemoSource.store_projects(&asked),
             asked,
-            "demo が渡した一覧と違うものを返している"
+            "demo returned a different list than what was passed"
         );
         assert_eq!(
             load_state_list("projects"),
             before,
-            "demo が projects を書き換えている"
+            "demo overwrote projects"
         );
     }
 
@@ -865,14 +869,14 @@ mod tests {
         assert_eq!(
             merge_projects(&disk, &baseline, &next),
             ["C:\\dev\\shared", "C:\\dev\\from-a", "C:\\dev\\from-b"],
-            "他インスタンスの登録が消えている"
+            "another instance's registration is missing"
         );
         // 表記違いは同じフォルダなので二重にしない（同一判定は same_dir 1 箇所）
         let disk = paths(&["c:/dev/shared/", "C:\\DEV\\from-a"]);
         assert_eq!(
             merge_projects(&disk, &baseline, &next),
             next,
-            "表記違いのフォルダが二重に積まれている"
+            "differently-written folder path got duplicated"
         );
     }
 
@@ -910,12 +914,12 @@ mod tests {
         let next: Vec<String> = (0..PROJECTS_LIMIT).map(|i| format!("C:\\dev\\p{i}")).collect();
         let disk = paths(&["C:\\dev\\from-b"]);
         let merged = merge_projects(&disk, &baseline, &next);
-        assert_eq!(merged.len(), PROJECTS_LIMIT, "上限を超えて積まれている");
+        assert_eq!(merged.len(), PROJECTS_LIMIT, "exceeded the limit");
         assert_eq!(merged.first().map(String::as_str), Some("C:\\dev\\p1"));
         assert_eq!(
             merged.last().map(String::as_str),
             Some("C:\\dev\\from-b"),
-            "他インスタンスの登録が追い出されている"
+            "another instance's registration got evicted"
         );
     }
 
@@ -932,11 +936,11 @@ mod tests {
         let mut disk = paths(&["C:\\dev\\mine", "C:\\dev\\from-b"]);
         let first = persist_projects(&mut baseline, &mine, write_to(&mut disk, true));
         assert_eq!(first, ["C:\\dev\\mine", "C:\\dev\\from-b"]);
-        assert_eq!(baseline, first, "基準が実際に書いた内容になっていない");
-        assert_eq!(disk, first, "ディスクに載った内容と戻り値が違う");
+        assert_eq!(baseline, first, "baseline does not match what was actually written");
+        assert_eq!(disk, first, "disk content differs from the returned value");
         // 2 度目: ディスクも自分の一覧も 1 度目に書いた内容（呼び手が取り込んだ後）
         let second = persist_projects(&mut baseline, &first, write_to(&mut disk, true));
-        assert_eq!(second, first, "保存するたびディスクが書き換わる");
+        assert_eq!(second, first, "disk gets rewritten on every save");
     }
 
     /// メモリ上のディスクへの保存 1 回分（[`persist_projects`] の `persist`）。
@@ -972,15 +976,15 @@ mod tests {
         assert_eq!(
             baseline,
             ["C:\\dev\\p", "C:\\dev\\q"],
-            "書けていないのに「こう書いた」と記録している"
+            "recording \"this was written\" even though it wasn't"
         );
-        assert_eq!(disk, ["C:\\dev\\p", "C:\\dev\\q"], "書けない前提が崩れている");
-        assert_eq!(returned, next, "ユーザーの操作が画面から巻き戻っている");
+        assert_eq!(disk, ["C:\\dev\\p", "C:\\dev\\q"], "the can't-write precondition no longer holds");
+        assert_eq!(returned, next, "the user's action got rolled back from the screen");
 
         // 次の保存は書ける。P は基準に居るので「このインスタンスが外した」と読める
         let written = persist_projects(&mut baseline, &next, write_to(&mut disk, true));
-        assert_eq!(written, next, "削除したフォルダが復活している");
-        assert_eq!(disk, next, "削除がディスクへ載っていない");
+        assert_eq!(written, next, "deleted folder came back");
+        assert_eq!(disk, next, "deletion did not land on disk");
     }
 
     /// このテストしか書き得ない番人の値。**「実ファイルが変わっていないこと」を
@@ -1012,12 +1016,12 @@ mod tests {
         assert_ne!(
             load_state("last_view").as_deref(),
             Some(view.as_str()),
-            "demo が state.json（last_view）を書き換えている"
+            "demo overwrote state.json (last_view)"
         );
         assert_ne!(
             load_state("last_folder").as_deref(),
             Some(folder.as_str()),
-            "demo が state.json（last_folder）を書き換えている"
+            "demo overwrote state.json (last_folder)"
         );
     }
 
@@ -1046,7 +1050,7 @@ mod tests {
             let need = prefix + session.title.width() + 2 + view.label.width();
             assert!(
                 need <= inner,
-                "{:?} + {:?} に {need} 桁必要（内側 {inner} 桁）",
+                "{:?} + {:?} needs {need} cols (inner is {inner} cols)",
                 session.title,
                 view.label
             );
@@ -1056,13 +1060,13 @@ mod tests {
         assert_eq!((awaiting, working, completed), (1, 0, 5));
         assert!(
             DEMO_HEADER.width() <= inner,
-            "集計ヘッダー行が切れる（{} 桁 / 内側 {inner} 桁）",
+            "summary header row gets truncated ({} cols / inner {inner} cols)",
             DEMO_HEADER.width()
         );
         // 右ペインを削らないよう、必要以上に広げない（余りは 2 桁まで）
         assert!(
             inner - widest <= 2,
-            "サイドバーが必要幅より広い（必要 {widest} 桁 / 内側 {inner} 桁）"
+            "sidebar is wider than necessary (needs {widest} cols / inner {inner} cols)"
         );
     }
 
@@ -1079,11 +1083,11 @@ mod tests {
             ]
         );
         let AccountStatus::LoggedIn(active) = DemoSource.footer().account else {
-            panic!("撮影用のフッターがログイン済みでない");
+            panic!("demo footer is not logged in");
         };
         assert!(
             accounts.iter().any(|a| a.email == active.account.email),
-            "アクティブアカウントが保管一覧に無い（撮影に ⚠ が写る）"
+            "active account missing from the stored list (⚠ would show up in the demo)"
         );
         // 並びは AccountStore::list と同じ email 昇順（撮り直しで順序が動かない）
         let mut sorted = accounts.clone();
@@ -1114,7 +1118,7 @@ mod tests {
             },
             AccountAction::Unregister(email.clone()),
         ] {
-            DemoSource.apply_account(action).expect("撮影で失敗を出さない");
+            DemoSource.apply_account(action).expect("demo does not fail");
         }
         // 読むのはドメイン API 経由（email とラベルだけ。トークンは手元に取らない）
         let stored = AccountStore::detect()
@@ -1122,7 +1126,7 @@ mod tests {
             .unwrap_or_default();
         assert!(
             !stored.iter().any(|a| a.email == email),
-            "demo が保管ファイルへ書いている"
+            "demo wrote to the account store file"
         );
     }
 
@@ -1163,7 +1167,7 @@ mod tests {
         assert_eq!(
             home.read_credentials()["claudeAiOauth"],
             oauth("access-t", "refresh-t"),
-            "切替先の認証情報が復元されていない"
+            "switch target's credentials were not restored"
         );
 
         // unregister: 一覧から消えるが、ログイン（現行の認証情報）は残る
@@ -1172,7 +1176,7 @@ mod tests {
         assert_eq!(
             home.read_credentials()["claudeAiOauth"],
             oauth("access-t", "refresh-t"),
-            "登録解除がログインを外している"
+            "unregistering also logged the account out"
         );
     }
 
@@ -1203,13 +1207,13 @@ mod tests {
             )
             .unwrap(),
             AccountChange::AlreadyActive,
-            "何もしていないのに切替として返している"
+            "returned as a switch even though nothing changed"
         );
 
         assert_eq!(
             std::fs::read(home.paths().credentials).unwrap(),
             before,
-            "現行の認証情報を古い写しで上書きしている（今のログインが壊れる）"
+            "overwrote the current credentials with a stale copy (breaks the active login)"
         );
     }
 }

@@ -303,17 +303,17 @@ mod tests {
     fn every_injected_event_is_understood_by_the_receiver() {
         let document = settings_document("C:/bin/ccdesk.exe", false);
         let hooks = document.get("hooks").and_then(Value::as_object).unwrap();
-        assert_eq!(hooks.len(), HOOK_EVENTS.len(), "注入した口の数が表と違う");
+        assert_eq!(hooks.len(), HOOK_EVENTS.len(), "number of injected hooks differs from the table");
         for (event, state) in HOOK_EVENTS {
             let command = hooks[event][0]["hooks"][0]["command"].as_str().unwrap();
             assert_eq!(
                 command,
                 format!("\"C:/bin/ccdesk.exe\" hook {event}"),
-                "{event} の呼び出し形が違う"
+                "{event} has a different invocation shape"
             );
-            assert_eq!(state_of(event), Some(state), "{event} を受け口が知らない");
+            assert_eq!(state_of(event), Some(state), "the receiver doesn't know {event}");
         }
-        assert_eq!(state_of("PreToolUse"), None, "登録していない口を受けている");
+        assert_eq!(state_of("PreToolUse"), None, "received an unregistered hook");
     }
 
     /// **道具ごとに飛ぶイベントは登録しない**（hook は毎回 ccdesk を 1 プロセス
@@ -323,7 +323,7 @@ mod tests {
         for event in ["PreToolUse", "PostToolUse", "PreCompact", "SubagentStop"] {
             assert!(
                 !HOOK_EVENTS.iter().any(|(name, _)| *name == event),
-                "{event} は turn 単位ではない"
+                "{event} is not turn-level"
             );
         }
     }
@@ -333,11 +333,11 @@ mod tests {
     #[test]
     fn hooks_are_always_injected_and_the_status_line_is_opt_in() {
         let off = settings_document("C:/bin/ccdesk.exe", false);
-        assert!(off.get("hooks").is_some(), "hook が注入されていない");
-        assert!(off.get("statusLine").is_none(), "opt-in でないのに statusLine を注入している");
+        assert!(off.get("hooks").is_some(), "hooks were not injected");
+        assert!(off.get("statusLine").is_none(), "injected statusLine even though not opt-in");
 
         let on = settings_document("C:/bin/ccdesk.exe", true);
-        assert_eq!(on.get("hooks"), off.get("hooks"), "opt-in で hook の形が変わっている");
+        assert_eq!(on.get("hooks"), off.get("hooks"), "hook shape changed under opt-in");
         assert_eq!(
             on["statusLine"]["command"].as_str(),
             Some("\"C:/bin/ccdesk.exe\" statusline-hook")
@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn a_recorded_state_reaches_the_reader() {
         let temp = TempStore::new("a_recorded_state_reaches_the_reader");
-        assert_eq!(states_at(&temp.path()), HookStates::default(), "無いファイルで空にならない");
+        assert_eq!(states_at(&temp.path()), HookStates::default(), "not empty for a missing file");
 
         record(&temp.path(), &id("s-1"), "working", 1_000);
         record(&temp.path(), &id("s-2"), "blocked", 1_000);
@@ -361,8 +361,8 @@ mod tests {
         record(&temp.path(), &id("s-1"), "done", 2_000);
         let states = states_at(&temp.path());
         assert_eq!(states.get(&id("s-1")), Some("done"));
-        assert_eq!(states.get(&id("s-2")), Some("blocked"), "他のセッションを巻き込んでいる");
-        assert_eq!(states.get(&id("s-3")), None, "知らないセッションに答えている");
+        assert_eq!(states.get(&id("s-2")), Some("blocked"), "affected another session");
+        assert_eq!(states.get(&id("s-3")), None, "answered for an unknown session");
     }
 
     /// **古い項目は書くたびに落ちる**（1 セッション 1 項目で永久に積もらない）。
@@ -377,8 +377,8 @@ mod tests {
         // old は keep をちょうど過ぎた時点で落ちる
         record(&temp.path(), &id("now"), "blocked", keep + 1);
         let states = states_at(&temp.path());
-        assert_eq!(states.get(&id("old")), None, "保つ期間を過ぎた項目が残っている");
-        assert_eq!(states.get(&id("fresh")), Some("working"), "期間内の項目を落としている");
+        assert_eq!(states.get(&id("old")), None, "an entry past the keep window remains");
+        assert_eq!(states.get(&id("fresh")), Some("working"), "dropped an entry still within the window");
         assert_eq!(states.get(&id("now")), Some("blocked"));
     }
 
@@ -399,7 +399,7 @@ mod tests {
         ];
         for (name, text) in cases {
             std::fs::write(temp.path(), text).unwrap();
-            assert_eq!(states_at(&temp.path()), HookStates::default(), "{name} で空にならない");
+            assert_eq!(states_at(&temp.path()), HookStates::default(), "not empty for {name}");
         }
         // 時刻が無い / 型違いでも state は読む（既定 0 ＝ 次の書き込みで落ちる）
         std::fs::write(temp.path(), r#"{"states":{"s":{"state":"done","at":"soon"}}}"#).unwrap();
@@ -422,7 +422,7 @@ mod tests {
             r#"{"session_id":7}"#,
             r#"{"sessionId":"camel-case-is-not-the-hook-shape"}"#,
         ] {
-            assert_eq!(session_id_of(broken), None, "{broken:?} から ID を作っている");
+            assert_eq!(session_id_of(broken), None, "built an ID from {broken:?}");
         }
     }
 
@@ -438,8 +438,8 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|name| name.ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "書きかけの tmp が残っている: {leftovers:?}");
-        assert!(!lock_path_for(&temp.path()).exists(), "ロックを残している");
+        assert!(leftovers.is_empty(), "a partial tmp file remains: {leftovers:?}");
+        assert!(!lock_path_for(&temp.path()).exists(), "left a lock behind");
     }
 
     /// **ロックが取れなければ書かずに諦める**（セッションを待たせない）。
@@ -456,8 +456,8 @@ mod tests {
         let waited = started.elapsed();
         drop(held);
 
-        assert!(waited < Duration::from_secs(5), "待ちが有界でない: {waited:?}");
-        assert_eq!(std::fs::read(temp.path()).unwrap(), before, "取れていないのに書いている");
+        assert!(waited < Duration::from_secs(5), "wait was not bounded: {waited:?}");
+        assert_eq!(std::fs::read(temp.path()).unwrap(), before, "wrote even though the lock wasn't acquired");
         // 解放後は通常どおり載る（ロックが理由で壊れているわけではない）
         record(&temp.path(), &id("s"), "done", 2_000);
         assert_eq!(states_at(&temp.path()).get(&id("s")), Some("done"));

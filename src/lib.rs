@@ -830,7 +830,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("state.json");
         match contents {
-            Some(text) => std::fs::write(&path, text).expect("テスト用ファイルが書けない"),
+            Some(text) => std::fs::write(&path, text).expect("failed to write test file"),
             None => {
                 let _ = std::fs::remove_file(&path);
             }
@@ -856,15 +856,15 @@ mod tests {
             let path = temp_json(name, contents);
             assert!(
                 kv_load_list(Some(path.clone()), "projects").is_empty(),
-                "{name} で配列読みが空にならない"
+                "{name}: list read was not empty"
             );
             // 単値読みも同じ寛容さ。旧形式（文字列が入っていた頃）だけは値として読めるので
             // ケースを分ける（ケース名で例外を作ると何を保証しているのか読めなくなる）
             let single = kv_load(Some(path), "projects");
             if name == "legacy-string" {
-                assert_eq!(single.as_deref(), Some("C:\\dev\\a"), "旧形式の単値が読めない");
+                assert_eq!(single.as_deref(), Some("C:\\dev\\a"), "legacy single value not readable");
             } else {
-                assert!(single.is_none(), "{name} で単値読みが None にならない");
+                assert!(single.is_none(), "{name}: single-value read was not None");
             }
         }
         // 配列の中に文字列と非文字列が混ざっていたら、文字列だけを拾う
@@ -881,7 +881,7 @@ mod tests {
         let write = |p: &std::path::PathBuf, values: &[String]| {
             assert!(
                 kv_update_list(some(p), "projects", |_| values.to_vec()),
-                "書けたと報告されていない"
+                "did not report success"
             );
         };
         kv_save(some(&path), "sidebar_width", "33");
@@ -895,7 +895,7 @@ mod tests {
         assert_eq!(
             kv_load(some(&path), "sidebar_width").as_deref(),
             Some("33"),
-            "配列の書き込みが他のキーを消している"
+            "writing the array erased other keys"
         );
         // オブジェクトでないファイルは作り直す（壊れた state.json で保存が死なない）
         let broken = temp_json("write-over-broken", Some("[1,2,3]"));
@@ -917,8 +917,8 @@ mod tests {
             next.push("C:\\dev\\mine".to_string());
             next
         });
-        assert!(wrote, "書けたと報告されていない");
-        assert_eq!(seen, ["C:\\dev\\disk"], "ディスク上の値が渡っていない");
+        assert!(wrote, "did not report success");
+        assert_eq!(seen, ["C:\\dev\\disk"], "value on disk was not passed through");
         assert_eq!(
             kv_load_list(some(), "projects"),
             ["C:\\dev\\disk", "C:\\dev\\mine"]
@@ -931,9 +931,9 @@ mod tests {
                 seen_legacy = disk;
                 Vec::new()
             }),
-            "書けたと報告されていない"
+            "did not report success"
         );
-        assert!(seen_legacy.is_empty(), "旧形式の単値が一覧として渡っている");
+        assert!(seen_legacy.is_empty(), "legacy single value was passed through as a list");
     }
 
     /// **書けなかったことを黙って飲まない。** tmp 書き込み / rename は失敗しうる
@@ -952,9 +952,9 @@ mod tests {
             !kv_update_list(Some(blocked.clone()), "projects", |_| vec![
                 "C:\\dev\\a".to_string()
             ]),
-            "書けていないのに成功と報告している"
+            "reported success despite failing to write"
         );
-        assert!(blocked.is_dir(), "書けない前提が崩れている");
+        assert!(blocked.is_dir(), "the write-failure precondition is broken");
         // 置き場所そのものが分からないとき（ホームが取れない）も同じ
         assert!(!kv_update_list(None, "projects", |_| Vec::new()));
         // 書きかけの tmp を残さない（次の読み手が中途の JSON を拾わない）。
@@ -969,7 +969,7 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|name| name.ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "tmp が残っている: {leftovers:?}");
+        assert!(leftovers.is_empty(), "tmp files left behind: {leftovers:?}");
     }
 
     /// **他インスタンスの書きかけ tmp と名前を共有しない。**
@@ -1005,12 +1005,12 @@ mod tests {
 
         assert!(
             wrote,
-            "他インスタンスの tmp と名前を共有していて自分の保存が通らない"
+            "sharing tmp name with another instance blocked our own save"
         );
         assert_eq!(
             kv_load_list(Some(path), "projects"),
             ["C:\\dev\\mine"],
-            "成功を返したのに自分の内容がディスクに乗っていない"
+            "reported success but our content did not land on disk"
         );
     }
 
@@ -1035,15 +1035,15 @@ mod tests {
         });
         let waited = started.elapsed();
 
-        assert!(!wrote, "他インスタンスが書いている間に書けたことになっている");
+        assert!(!wrote, "wrote while another instance was writing");
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,
-            "他インスタンスの書き込みと交差してディスクを動かしている"
+            "changed the disk by crossing with another instance's write"
         );
         assert!(
             waited < KV_LOCK_WAIT * 2,
-            "UI スレッドが待ち続けている（{waited:?}）"
+            "UI thread kept waiting ({waited:?})"
         );
 
         // 解放後は通常どおり書けて、**その内容がディスクに乗る**
@@ -1051,10 +1051,10 @@ mod tests {
         drop(held);
         assert!(
             kv_update_list(Some(path.clone()), "projects", |disk| {
-                assert_eq!(disk, ["C:\\dev\\disk"], "ロックの下で読んだ値が古い");
+                assert_eq!(disk, ["C:\\dev\\disk"], "value read under the lock is stale");
                 vec!["C:\\dev\\mine".to_string()]
             }),
-            "解放後も書けない"
+            "cannot write even after release"
         );
         assert_eq!(kv_load_list(Some(path), "projects"), ["C:\\dev\\mine"]);
     }
@@ -1080,10 +1080,10 @@ mod tests {
 
         let started = Instant::now();
         let mine = Lock::acquire(&path, Duration::from_secs(5), LOCK_STALE)
-            .expect("解放されたのに取れていない");
+            .expect("failed to acquire even after release");
         assert!(
             started.elapsed() >= Duration::from_millis(150),
-            "保持中に取れてしまっている: {:?}",
+            "acquired while still held: {:?}",
             started.elapsed()
         );
         drop(mine);
@@ -1114,13 +1114,13 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_ne!(mtime_of(), mine_mtime, "奪取を作れていない（前提が崩れている）");
+        assert_ne!(mtime_of(), mine_mtime, "could not create a takeover (precondition broken)");
 
         drop(mine);
 
         assert!(
             path.exists(),
-            "奪われた後の Drop が他者のロックを消している（claude のトークン更新を無防備にする）"
+            "Drop after being taken over deleted another holder's lock (leaves claude's token update unprotected)"
         );
     }
 
@@ -1135,13 +1135,13 @@ mod tests {
         let started = Instant::now();
         assert!(Lock::acquire(&path, Duration::from_millis(50), LOCK_STALE).is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(path.exists(), "諦めたのに他者のロックを消している");
+        assert!(path.exists(), "deleted another holder's lock despite giving up");
 
         // mtime が閾値より古ければ奪える
         let stolen = Lock::acquire(&path, Duration::ZERO, Duration::ZERO)
-            .expect("stale ロックを奪えていない");
+            .expect("failed to steal a stale lock");
         drop(stolen);
-        assert!(!path.exists(), "解放されていない");
+        assert!(!path.exists(), "not released");
     }
 
     /// ロックが取れなかったときのエラーは **打つ手まで言う**。
@@ -1154,16 +1154,16 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
 
         let err = Lock::acquire(&path, Duration::from_millis(20), LOCK_STALE)
-            .expect_err("取れてしまっている")
+            .expect_err("acquired despite being held")
             .to_string();
 
         assert!(
             err.contains(&path.display().to_string()),
-            "どのロックか分からない: {err}"
+            "does not say which lock: {err}"
         );
         assert!(
             err.contains("empty directory") && err.contains("deleted"),
-            "打つ手（消してよいこと）が書かれていない: {err}"
+            "does not say what to do (that it's safe to delete): {err}"
         );
     }
 
@@ -1179,7 +1179,7 @@ mod tests {
             ("C:/dev/api", "c:\\DEV\\api\\"),
             ("C:\\", "c:/"),
         ] {
-            assert!(same_dir(a, b), "{a:?} と {b:?} が同じフォルダにならない");
+            assert!(same_dir(a, b), "{a:?} and {b:?} should be the same folder");
         }
         // 別フォルダは別。末端名が同じでも親が違えば別（見出しが混ざってはいけない）
         for (a, b) in [
@@ -1187,7 +1187,7 @@ mod tests {
             ("C:\\work\\api", "C:\\dev\\api"),
             ("C:\\dev\\api", ""),
         ] {
-            assert!(!same_dir(a, b), "{a:?} と {b:?} が同じフォルダ扱いになった");
+            assert!(!same_dir(a, b), "{a:?} and {b:?} were treated as the same folder");
         }
     }
 
@@ -1196,8 +1196,8 @@ mod tests {
     #[test]
     fn same_dir_keeps_the_drive_root_separator() {
         assert_eq!(dir_key("C:\\"), "c:\\");
-        assert_eq!(dir_key("C:/"), "c:\\", "区切りの種類はキーに残さない");
-        assert!(!same_dir("C:\\", "C:"), "ドライブ直下とドライブ指定を同一視している");
+        assert_eq!(dir_key("C:/"), "c:\\", "separator style should not remain in the key");
+        assert!(!same_dir("C:\\", "C:"), "treated the drive root and the drive designation as the same");
         // 末尾を落として空になる入力でも panic せず、そのまま比較キーになる
         assert_eq!(dir_key("\\"), "\\");
         assert_eq!(dir_key("/"), "\\");
@@ -1211,11 +1211,11 @@ mod tests {
     #[test]
     fn same_dir_collapses_repeated_root_separators() {
         assert_eq!(dir_key("C:\\\\"), "c:\\");
-        assert!(same_dir("C:\\", "C:\\\\"), "重複区切りのドライブ直下が別扱いになった");
-        assert!(same_dir("C:\\\\", "c://"), "区切りの種類と個数が混ざると別扱いになる");
-        assert!(same_dir("\\\\", "\\"), "ルートの重複区切りが別扱いになった");
+        assert!(same_dir("C:\\", "C:\\\\"), "duplicated-separator drive root was treated as different");
+        assert!(same_dir("C:\\\\", "c://"), "mixing separator style and count was treated as different");
+        assert!(same_dir("\\\\", "\\"), "duplicated root separators were treated as different");
         // 区切りが元から無い `C:` はドライブ指定なので、丸めた結果と同一視しない
-        assert!(!same_dir("C:", "C:\\\\"), "ドライブ指定がドライブ直下と同一視された");
+        assert!(!same_dir("C:", "C:\\\\"), "drive designation was treated as the same as the drive root");
         // 末端まであるパスは従来どおり（重複区切りは落ちる）
         assert_eq!(dir_key("C:\\dev\\api\\\\"), "c:\\dev\\api");
     }
@@ -1228,11 +1228,11 @@ mod tests {
     fn same_dir_collapses_repeated_separators_inside_the_path() {
         assert_eq!(dir_key("C:\\dev\\\\api"), "c:\\dev\\api");
         assert_eq!(dir_key("C:\\\\dev\\api"), "c:\\dev\\api");
-        assert!(same_dir("C:\\dev\\\\api", "C:\\dev\\api"), "内部の重複区切りが別扱いになった");
-        assert!(same_dir("C://dev///api//", "c:\\dev\\api"), "区切りの種類と個数が混ざると別扱いになる");
+        assert!(same_dir("C:\\dev\\\\api", "C:\\dev\\api"), "duplicated separators inside the path were treated as different");
+        assert!(same_dir("C://dev///api//", "c:\\dev\\api"), "mixing separator style and count was treated as different");
         // 畳むのは区切りだけ。区切りを消して階層を潰したりはしない
-        assert!(!same_dir("C:\\dev\\\\api", "C:\\api"), "重複区切りの畳み込みで親が消えた");
-        assert!(!same_dir("C:\\dev\\\\api", "C:\\devapi"), "区切りごと消えている");
+        assert!(!same_dir("C:\\dev\\\\api", "C:\\api"), "collapsing duplicated separators erased the parent");
+        assert!(!same_dir("C:\\dev\\\\api", "C:\\devapi"), "the separator itself disappeared");
         // ルートの丸めは変えない（区切り 1 個を残す / 区切りが元から無い
         // ドライブ指定は別物のまま ＝ 内部を畳んでも同じ判断になる）
         assert_eq!(dir_key("C://"), "c:\\");
@@ -1246,14 +1246,14 @@ mod tests {
     #[test]
     fn same_dir_keeps_the_unc_prefix() {
         assert_eq!(dir_key("\\\\server\\share"), "\\\\server\\share");
-        assert_eq!(dir_key("//server/share/"), "\\\\server\\share", "区切りの種類と末尾は揃える");
+        assert_eq!(dir_key("//server/share/"), "\\\\server\\share", "separator style and trailing separator are normalized");
         assert!(
             !same_dir("\\\\server\\share", "\\server\\share"),
-            "UNC がローカルのパスと同一視された"
+            "UNC path was treated as the same as a local path"
         );
-        assert!(same_dir("\\\\server\\share\\", "//SERVER/share"), "同じ UNC パスが別扱いになった");
+        assert!(same_dir("\\\\server\\share\\", "//SERVER/share"), "the same UNC path was treated as different");
         // 先頭より後ろの重複は畳む（UNC でも「同じフォルダか」の判断は 1 つ）
-        assert!(same_dir("\\\\server\\\\share", "\\\\server\\share"), "UNC の内部の重複区切りが残った");
+        assert!(same_dir("\\\\server\\\\share", "\\\\server\\share"), "duplicated separators inside the UNC path remained");
         // サーバー名が続かない `\\` は UNC の記号として働かないので、ルートとして丸める
         // （既存の `same_dir("\\\\", "\\")` と同じ判断）
         assert_eq!(dir_key("\\\\"), "\\");

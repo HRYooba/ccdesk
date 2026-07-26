@@ -801,7 +801,7 @@ mod tests {
             let cursor = new_view_cursor(pane, focus, 0, 0, true);
             assert!(
                 contains(pane, cursor.pos),
-                "focus 切替で pos {:?} がペイン外",
+                "pos {:?} is outside the pane after a focus switch",
                 cursor.pos
             );
         }
@@ -818,7 +818,7 @@ mod tests {
                     let cursor = new_view_cursor(pane, focus, cursor_x, cursor_x, true);
                     assert!(
                         contains(pane, cursor.pos),
-                        "幅 {width} / cursor_x {cursor_x} で pos {:?} がペイン外",
+                        "width {width} / cursor_x {cursor_x}: pos {:?} is outside the pane",
                         cursor.pos
                     );
                 }
@@ -852,12 +852,12 @@ mod tests {
                         assert_eq!(
                             cursor.pos,
                             Position::new(pane.x, pane.y),
-                            "{w}x{h} でペイン原点に落ちていない"
+                            "{w}x{h} did not fall back to the pane origin"
                         );
                     } else {
                         assert!(
                             contains(pane, cursor.pos),
-                            "{w}x{h} で pos {:?} がペイン外",
+                            "{w}x{h}: pos {:?} is outside the pane",
                             cursor.pos
                         );
                     }
@@ -879,7 +879,7 @@ mod tests {
         for focus in FOCUSES {
             let cursor = new_view_cursor(pane, focus, 0, 0, false);
             assert!(!cursor.visible);
-            assert!(contains(pane, cursor.pos), "非表示でも位置は確定させる");
+            assert!(contains(pane, cursor.pos), "the position must be set even while hidden");
         }
     }
 
@@ -1038,7 +1038,7 @@ mod tests {
         assert!(state.selected_is_launch());
         assert!(
             !state.click_activates(0),
-            "作り直し直後の起動ボタンが 1 クリックで起動する"
+            "the launch button right after a rebuild fires on a single click"
         );
 
         // 起動ボタン行を明示的にクリック（1 回目）した後は次のクリックで起動する
@@ -1059,14 +1059,14 @@ mod tests {
         assert!(!state.selection_from_rebuild);
         state.path.set_text(&root.join("sub").to_string_lossy());
         state.refresh_from_input();
-        assert!(state.selection_from_rebuild, "フィルタでの作り直し");
+        assert!(state.selection_from_rebuild, "rebuild triggered by the filter");
         assert!(!state.click_activates(state.dir_idx));
 
         // 実在パス全体を入れた作り直し
         state.select(1);
         state.path.set_text(&root.join("sub_b").to_string_lossy());
         state.refresh_from_input();
-        assert!(state.selection_from_rebuild, "パス確定での作り直し");
+        assert!(state.selection_from_rebuild, "rebuild triggered by committing the path");
 
         // set_dir（→ / Enter での移動もここを通る）
         state.select(0);
@@ -1075,9 +1075,9 @@ mod tests {
 
         // 明示操作で倒れる
         state.select_next();
-        assert!(!state.selection_from_rebuild, "↓ / ホイール下");
+        assert!(!state.selection_from_rebuild, "down arrow / wheel down");
         state.select_prev();
-        assert!(!state.selection_from_rebuild, "↑ / ホイール上");
+        assert!(!state.selection_from_rebuild, "up arrow / wheel up");
     }
 
     /// 0 件メッセージ用の 1 行を確保する。list_height == 1（layout.ok の下限）では
@@ -1089,7 +1089,7 @@ mod tests {
         assert_eq!(
             list_rows_for_message(true, 1),
             0,
-            "1 行しか無いならメッセージを優先する"
+            "with only 1 row available, the message wins"
         );
         assert_eq!(list_rows_for_message(true, 5), 4);
         assert_eq!(list_rows_for_message(true, 0), 0);
@@ -1125,7 +1125,7 @@ mod tests {
             .collect();
         assert!(
             text.contains("no matching folders"),
-            "0 件の理由が描画されていない: {text:?}"
+            "the reason for zero results is not rendered: {text:?}"
         );
     }
 
@@ -1156,7 +1156,7 @@ mod tests {
                 BrowseRow::Dir("sub_a".into()),
                 BrowseRow::Dir("sub_b".into()),
             ],
-            "cur_dir と一致しているのに一覧が絞り込み後のまま"
+            "the listing is still filtered even though the text matches cur_dir"
         );
         assert!(!state.no_folder_rows());
     }
@@ -1222,7 +1222,7 @@ mod tests {
             }
             assert_eq!(
                 state.entries, expected,
-                "text {text:?} で一覧が (cur_dir {:?}, filter {:?}) と不整合",
+                "text {text:?}: entries do not match (cur_dir {:?}, filter {:?})",
                 state.cur_dir, state.filter
             );
         }
@@ -1236,18 +1236,18 @@ mod tests {
         for focus in [NewFocus::Prompt, NewFocus::Browser] {
             assert!(
                 new_view_hint(focus, true).ends_with("Esc: back to sessions"),
-                "{focus:?}: 一覧へ戻れることが読めない"
+                "{focus:?}: cannot tell that Esc returns to the session list"
             );
             assert!(
                 !new_view_hint(focus, false).contains("Esc"),
-                "{focus:?}: 効かない Esc を案内している"
+                "{focus:?}: hints an Esc that does nothing"
             );
         }
         // Folder 欄の Esc は編集の取り消し（戻る窓の有無に関係なく効く）
         for can_leave in [true, false] {
             assert!(
                 new_view_hint(NewFocus::Path, can_leave).ends_with("Esc: cancel edit"),
-                "can_leave={can_leave}: Folder 欄の Esc の意味が違う"
+                "can_leave={can_leave}: Esc means something different in the Folder field"
             );
         }
     }
@@ -1267,7 +1267,7 @@ mod tests {
         state.cancel_path_edit();
         assert_eq!(state.path.text, root);
         assert_eq!(state.cur_dir, root);
-        assert!(!state.no_folder_rows(), "Esc 後も一覧が絞り込み後のまま");
+        assert!(!state.no_folder_rows(), "the listing is still filtered even after Esc");
     }
 
     /// 一覧の入力 `(cur_dir, filter)` が変わらない打鍵（Folder 欄での ←→ 等）では

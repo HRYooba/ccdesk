@@ -245,12 +245,14 @@ mod tests {
         let exact = "a".repeat(TITLE_LEN);
         assert_eq!(title_text(&exact), exact);
         assert_eq!(title_text(&"a".repeat(TITLE_LEN + 10)).chars().count(), TITLE_LEN);
-        assert_eq!(title_text(&"あ".repeat(TITLE_LEN + 10)).chars().count(), TITLE_LEN);
+        // 日本語ではなく全角ラテンを使う（マルチバイト文字であることを検証したいだけで、
+        // tests/no_japanese_in_code.rs のチェック対象を避けるため）
+        assert_eq!(title_text(&"Ａ".repeat(TITLE_LEN + 10)).chars().count(), TITLE_LEN);
         // 切れ目に空白が来ても、詰めた空白で桁が溢れない
         let words = "ab ".repeat(TITLE_LEN);
         let folded = title_text(&words);
-        assert!(folded.chars().count() <= TITLE_LEN, "桁が溢れている: {folded:?}");
-        assert!(!folded.ends_with(' '), "末尾に空白が残っている: {folded:?}");
+        assert!(folded.chars().count() <= TITLE_LEN, "width overflowed: {folded:?}");
+        assert!(!folded.ends_with(' '), "trailing whitespace remains: {folded:?}");
     }
 
     /// **ディレクトリ名は cwd の英数字以外をすべて `-` にしたもの**（claude 本体の規則）
@@ -262,7 +264,9 @@ mod tests {
         );
         // 区切り・記号・非 ASCII はすべて 1 文字 1 つの `-` になる
         assert_eq!(project_dir_name("/home/me/my.app"), "-home-me-my-app");
-        assert_eq!(project_dir_name("C:\\開発\\app"), "C-----app");
+        // 日本語ではなく全角ラテンを使う（非 ASCII であることを検証したいだけで、
+        // tests/no_japanese_in_code.rs のチェック対象を避けるため）
+        assert_eq!(project_dir_name("C:\\ＡＢ\\app"), "C-----app");
         assert_eq!(project_dir_name(""), "");
     }
 
@@ -273,13 +277,13 @@ mod tests {
         let long = format!("C:\\{}", "a".repeat(DIR_NAME_LIMIT));
         let encoded = format!("C--{}", "a".repeat(DIR_NAME_LIMIT));
         let name = project_dir_name(&long);
-        assert!(name.len() > DIR_NAME_LIMIT, "畳めていない: {}", name.len());
+        assert!(name.len() > DIR_NAME_LIMIT, "not folded: {}", name.len());
         let (head, hash) = name.split_at(DIR_NAME_LIMIT);
-        assert_eq!(head, &encoded[..DIR_NAME_LIMIT], "先頭 200 文字が置換後と違う");
-        assert!(hash.starts_with('-'), "区切りが無い: {hash:?}");
+        assert_eq!(head, &encoded[..DIR_NAME_LIMIT], "head 200 chars differ from the replaced string");
+        assert!(hash.starts_with('-'), "missing separator: {hash:?}");
         assert!(
             hash[1..].bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
-            "base36 でない: {hash:?}"
+            "not base36: {hash:?}"
         );
 
         // 上限ちょうどまでは畳まない（境界で名前が変わらない）
@@ -306,26 +310,26 @@ mod tests {
     /// **優先順どおりに選ぶ**（上位が居れば下位は見ない）
     #[test]
     fn the_title_follows_the_priority_of_its_sources() {
-        let custom = line("custom-title", "customTitle", "手で付けた名前");
-        let ai = line("ai-title", "aiTitle", "AI が付けた名前");
-        let prompt = line("last-prompt", "lastPrompt", "最後のプロンプト");
+        let custom = line("custom-title", "customTitle", "hand-written title");
+        let ai = line("ai-title", "aiTitle", "ai-written title");
+        let prompt = line("last-prompt", "lastPrompt", "last prompt");
         let all = format!("{prompt}\n{ai}\n{custom}\n");
         assert_eq!(
             pick_title(&all),
-            Some(("手で付けた名前".to_string(), TitleSource::Custom))
+            Some(("hand-written title".to_string(), TitleSource::Custom))
         );
         assert_eq!(
             pick_title(&format!("{prompt}\n{ai}\n")),
-            Some(("AI が付けた名前".to_string(), TitleSource::Ai))
+            Some(("ai-written title".to_string(), TitleSource::Ai))
         );
         assert_eq!(
             pick_title(&prompt),
-            Some(("最後のプロンプト".to_string(), TitleSource::LastPrompt))
+            Some(("last prompt".to_string(), TitleSource::LastPrompt))
         );
         // **順序ではなく優先順で決まる**（上位が先に書かれていても上位が勝つ）
         assert_eq!(
             pick_title(&format!("{custom}\n{ai}\n{prompt}\n")),
-            Some(("手で付けた名前".to_string(), TitleSource::Custom))
+            Some(("hand-written title".to_string(), TitleSource::Custom))
         );
     }
 
@@ -333,13 +337,13 @@ mod tests {
     #[test]
     fn the_last_occurrence_of_each_source_wins() {
         let tail = [
-            line("ai-title", "aiTitle", "古い名前"),
-            line("ai-title", "aiTitle", "新しい名前"),
+            line("ai-title", "aiTitle", "old name"),
+            line("ai-title", "aiTitle", "new name"),
         ]
         .join("\n");
         assert_eq!(
             pick_title(&tail),
-            Some(("新しい名前".to_string(), TitleSource::Ai))
+            Some(("new name".to_string(), TitleSource::Ai))
         );
     }
 
@@ -347,9 +351,9 @@ mod tests {
     /// 内部形式なので、形が変わっても title が下位へ落ちるだけで済ませる）
     #[test]
     fn broken_and_unknown_lines_fall_back_instead_of_failing() {
-        let ai = line("ai-title", "aiTitle", "AI が付けた名前");
+        let ai = line("ai-title", "aiTitle", "ai-written title");
         let tail = [
-            "{\"type\":\"ai-title\",\"aiTitle\":\"途中で切れた",
+            "{\"type\":\"ai-title\",\"aiTitle\":\"cut off partway",
             "not json at all",
             "",
             r#"{"type":"assistant","message":{}}"#,
@@ -361,11 +365,11 @@ mod tests {
         .join("\n");
         assert_eq!(
             pick_title(&tail),
-            Some(("AI が付けた名前".to_string(), TitleSource::Ai))
+            Some(("ai-written title".to_string(), TitleSource::Ai))
         );
         // 拾えるものが 1 つも無ければ None（呼び手は起動時に決めた名前を保つ）
         for tail in ["", "not json", r#"{"type":"user","message":{}}"#] {
-            assert_eq!(pick_title(tail), None, "{tail:?} から名前を作っている");
+            assert_eq!(pick_title(tail), None, "built a title out of {tail:?}");
         }
     }
 
@@ -379,22 +383,22 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.jsonl");
-        let ai = line("ai-title", "aiTitle", "末尾の名前");
-        std::fs::write(&path, format!("{}\n{ai}\n", line("ai-title", "aiTitle", "先頭の名前")))
+        let ai = line("ai-title", "aiTitle", "tail name");
+        std::fs::write(&path, format!("{}\n{ai}\n", line("ai-title", "aiTitle", "head name")))
             .unwrap();
 
         // 全部読めば先頭も見える（が、最後に現れた方を採る）
         assert_eq!(
             pick_title(&read_tail(&path, 4096).unwrap()),
-            Some(("末尾の名前".to_string(), TitleSource::Ai))
+            Some(("tail name".to_string(), TitleSource::Ai))
         );
         // 末尾だけを読むと先頭の行は（壊れているので）落ちる。
         // 最後の行 + その手前の改行だけが入る量にする
         let tail = read_tail(&path, ai.len() as u64 + 2).unwrap();
-        assert!(!tail.contains("先頭の名前"), "壊れた先頭行を残している: {tail:?}");
+        assert!(!tail.contains("head name"), "kept the broken head line: {tail:?}");
         assert_eq!(
             pick_title(&tail),
-            Some(("末尾の名前".to_string(), TitleSource::Ai))
+            Some(("tail name".to_string(), TitleSource::Ai))
         );
         // 1 行も完結しない量しか読めなければ、拾える候補は無い
         assert_eq!(pick_title(&read_tail(&path, 3).unwrap()), None);

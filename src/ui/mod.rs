@@ -1313,7 +1313,7 @@ mod tests {
             let pane = Rect::new(x, y, w, h);
             let pos = pane_fallback_pos(pane);
             assert_eq!(pos, Position::new(x, y));
-            assert!(contains(pane, pos), "pane {pane:?} で pos {pos:?} が外");
+            assert!(contains(pane, pos), "pane {pane:?}: pos {pos:?} is outside");
         }
     }
 
@@ -1329,13 +1329,13 @@ mod tests {
     #[test]
     fn the_row_head_marks_are_one_column_wide() {
         use unicode_width::UnicodeWidthStr;
-        assert_eq!(UPDATE_MARK.width(), 1, "⟳ が 1 桁でない");
-        assert_eq!(MENU_MARK.width(), 1, "メニュー記号が 1 桁でない");
-        assert!(MENU_MARK.is_ascii(), "幅の曖昧な記号に戻っている");
+        assert_eq!(UPDATE_MARK.width(), 1, "⟳ is not 1 column wide");
+        assert_eq!(MENU_MARK.width(), 1, "the menu mark is not 1 column wide");
+        assert!(MENU_MARK.is_ascii(), "reverted to an ambiguous-width mark");
         assert_eq!(
             RENAME_PREFIX,
             format!("{MENU_MARK} "),
-            "編集中の行頭が通常の行とずれている"
+            "the renaming row head is out of step with a normal row"
         );
         assert_eq!(RENAME_PREFIX.width(), 2);
     }
@@ -1350,9 +1350,9 @@ mod tests {
         assert_eq!(
             UNREAD_MARK.width(),
             READ_MARK.width(),
-            "未読と既読で桁が違う: {UNREAD_MARK:?} / {READ_MARK:?}"
+            "unread and read marks differ in width: {UNREAD_MARK:?} / {READ_MARK:?}"
         );
-        assert!(READ_MARK.trim().is_empty(), "既読の位置に文字が出ている");
+        assert!(READ_MARK.trim().is_empty(), "a character is showing in the read slot");
     }
 
     /// **生きている行の状態は hook が主、`agents --json` が従。**
@@ -1393,7 +1393,7 @@ mod tests {
         let label = |last_state| row_state(false, last_state, Some("working"), "busy", None).label;
         assert_eq!(label("done"), "Done");
         assert_eq!(label("stopped"), "Stopped");
-        assert_eq!(label(""), "Stopped", "観測していない行が動いているように見える");
+        assert_eq!(label(""), "Stopped", "a never-observed row looks like it is running");
         // 死んでいる行はアイコンの形も生死を表す（✻ ではなく ∙）
         assert!(!row_state(false, "done", None, "", None).alive);
         assert!(row_state(true, "", Some("done"), "", None).alive);
@@ -1410,16 +1410,16 @@ mod tests {
             (UpdateState::Restart, UpdateState::Running),
         ] {
             let rows = version_rows(ccdesk, "2.1.220", claude, DEFAULT_INNER);
-            assert_eq!(rows.len(), 3, "版行 2 本 + 区切り線 1 本のはず");
+            assert_eq!(rows.len(), 3, "expected 2 version rows + 1 separator");
             assert!(rows[0].0.contains(env!("CARGO_PKG_VERSION")), "{:?}", rows[0].0);
             assert!(rows[1].0.contains("claude v2.1.220"), "{:?}", rows[1].0);
             assert_eq!(rows[2].0, separator_text(DEFAULT_INNER));
-            assert!(rows[2].2.is_none(), "区切り線はクリック不可");
+            assert!(rows[2].2.is_none(), "the separator must not be clickable");
         }
         // 版が未取得なら番号を出さない（誤情報を出さない）
         let rows = version_rows(UpdateState::Current, "", UpdateState::Current, DEFAULT_INNER);
         assert!(rows[1].0.contains("claude"), "{:?}", rows[1].0);
-        assert!(!rows[1].0.contains(" v"), "版が無いのに v を出している: {:?}", rows[1].0);
+        assert!(!rows[1].0.contains(" v"), "showing a v with no version: {:?}", rows[1].0);
     }
 
     /// 4 状態の文面。左端がマーカー桁、右端が動詞で、**新版の番号は出さない**
@@ -1437,7 +1437,7 @@ mod tests {
         ] {
             let text = row(state);
             assert!(text.starts_with(UPDATE_MARK), "{text:?}");
-            assert!(text.ends_with(verb), "{text:?} が {verb:?} で終わっていない");
+            assert!(text.ends_with(verb), "{text:?} does not end with {verb:?}");
             assert!(text.contains("ccdesk v0.5.0"), "{text:?}");
         }
     }
@@ -1449,18 +1449,18 @@ mod tests {
         use unicode_width::UnicodeWidthStr;
         // 名前の前にある部分の表示幅（マーカー桁 + 区切りの空白）
         let name_col = |text: &str| {
-            let at = text.find("ccdesk").expect("名前が無い");
+            let at = text.find("ccdesk").expect("name is missing");
             text[..at].width()
         };
         let base = name_col(&version_row("ccdesk", "0.5.0", UpdateState::Current, DEFAULT_INNER));
-        assert_eq!(base, 2, "マーカー 1 桁 + 空白 1 桁のはず");
+        assert_eq!(base, 2, "expected 1 marker column + 1 space column");
         for state in [
             UpdateState::Available,
             UpdateState::Running,
             UpdateState::Restart,
         ] {
             let text = version_row("ccdesk", "0.5.0", state, DEFAULT_INNER);
-            assert_eq!(name_col(&text), base, "{state:?} で名前の桁がずれた: {text:?}");
+            assert_eq!(name_col(&text), base, "{state:?} shifted the name column: {text:?}");
         }
     }
 
@@ -1501,7 +1501,7 @@ mod tests {
                     let text = version_row(name, version, state, DEFAULT_INNER);
                     assert!(
                         text.width() <= DEFAULT_INNER as usize,
-                        "既定幅に収まらない: {text:?}（{} 桁 / 内側 {DEFAULT_INNER} 桁）",
+                        "does not fit the default width: {text:?} ({} columns / inner {DEFAULT_INNER} columns)",
                         text.width()
                     );
                 }
@@ -1514,9 +1514,11 @@ mod tests {
     #[test]
     fn clip_to_width_counts_display_columns_not_characters() {
         use unicode_width::UnicodeWidthStr;
-        // 全角 5 文字 = 10 桁。7 桁で切れば 3 文字（6 桁）まで
-        let wide = "山田太郎田";
-        assert_eq!(clip_to_width(wide, 7), "山田太");
+        // 全角（East Asian Wide）5 文字 = 10 桁。7 桁で切れば 3 文字（6 桁）まで。
+        // 日本語ではなく全角ラテン文字を使うのは、ここで要るのは「全角幅（幅 2）」という
+        // 性質だけで、日本語そのものは tests/no_japanese_in_code.rs の検査対象になるため
+        let wide = "ＡＢＣＤＥ";
+        assert_eq!(clip_to_width(wide, 7), "ＡＢＣ");
         assert_eq!(clip_to_width(wide, 7).width(), 6);
         // 半角はそのまま桁数で切れる
         assert_eq!(clip_to_width("ooba · 1→10, Inc.", 6), "ooba ·");
@@ -1567,17 +1569,17 @@ mod tests {
 
         assert!(
             row(sl.account_y).contains("you · Acme, Inc."),
-            "アカウント行にラベルが出ていない: {:?}",
+            "the account row has no label: {:?}",
             row(sl.account_y)
         );
         assert!(
             !row(sl.account_y).contains('@'),
-            "email を行に出している: {:?}",
+            "the row shows the email: {:?}",
             row(sl.account_y)
         );
         assert!(
             row(sl.account_y - 1).contains('─'),
-            "アカウント行の 1 つ上が区切り線になっていない: {:?}",
+            "the row above the account row is not a separator: {:?}",
             row(sl.account_y - 1)
         );
     }
@@ -1712,11 +1714,11 @@ mod tests {
                 ("api".to_string(), "C:\\dev\\api".to_string()),
                 ("api".to_string(), "C:\\work\\api".to_string()),
             ],
-            "同名末端がフルパス順で並んでいない"
+            "same-named leaves are not sorted by full path"
         );
         // 入力順を入れ替えても並びは同じ
         let flipped = ["C:\\dev\\api".to_string(), "C:\\work\\api".to_string()];
-        assert_eq!(heading_pairs(&flipped, &[]), rows, "入力順で並びが変わった");
+        assert_eq!(heading_pairs(&flipped, &[]), rows, "order changed with input order");
     }
 
     /// 見出しは末端ディレクトリ名だけ。**`+` は出さない**（行の動作はメニューを開くことで、
@@ -1725,9 +1727,9 @@ mod tests {
     fn project_headings_carry_no_plus_hint() {
         let rows = heading_pairs(&["C:\\dev\\api".to_string()], &["C:\\dev\\web"]);
         for (heading, cwd) in &rows {
-            assert!(!heading.contains('+'), "見出しに + が残っている: {heading:?}");
-            assert_eq!(heading.trim(), heading, "見出しに余分な空白がある: {heading:?}");
-            assert!(cwd.starts_with("C:\\"), "対象がフルパスでない: {cwd:?}");
+            assert!(!heading.contains('+'), "a + is left in the heading: {heading:?}");
+            assert_eq!(heading.trim(), heading, "the heading has extra whitespace: {heading:?}");
+            assert!(cwd.starts_with("C:\\"), "the target is not a full path: {cwd:?}");
         }
         assert_eq!(rows[0], ("api".to_string(), "C:\\dev\\api".to_string()));
     }
@@ -1756,11 +1758,11 @@ mod tests {
             let (dir_keys, leaves) = key_calls(|| {
                 let rows = project_rows(&projects, &cwds);
                 // 表記違いは同じフォルダなので見出しは n 本（重複排除も効いている）
-                assert_eq!(rows.len(), n, "n={n} で見出しの数が合わない");
+                assert_eq!(rows.len(), n, "n={n}: heading count does not match");
             });
             // 入力 2n 本ぶんだけ ＝ 線形。2 乗なら n=50 で 1 万回を超える
-            assert_eq!(dir_keys, 2 * n, "n={n} で dir_key の回数が入力数を超えた");
-            assert_eq!(leaves, 2 * n, "n={n} で末端名の取り出しが入力数を超えた");
+            assert_eq!(dir_keys, 2 * n, "n={n}: dir_key was called more than the input count");
+            assert_eq!(leaves, 2 * n, "n={n}: leaf-name extraction exceeded the input count");
         }
     }
 
@@ -1786,12 +1788,12 @@ mod tests {
                     .iter()
                     .filter(|(action, _)| matches!(action, Some(RowAction::Project(_))))
                     .count();
-                assert_eq!(headings, n, "n={n} で見出しの数が合わない");
+                assert_eq!(headings, n, "n={n}: heading count does not match");
             });
             // project_rows へ渡るのは登録 n + セッション行 n で、
             // セッション行の振り分けキーがさらに n。末端名は project_rows のぶんだけ
-            assert_eq!(dir_keys, 3 * n, "n={n} で dir_key の回数が入力数に比例していない");
-            assert_eq!(leaves, 2 * n, "n={n} で末端名の取り出しが入力数に比例していない");
+            assert_eq!(dir_keys, 3 * n, "n={n}: dir_key calls are not proportional to the input count");
+            assert_eq!(leaves, 2 * n, "n={n}: leaf-name extraction is not proportional to the input count");
         }
     }
 
@@ -1843,7 +1845,7 @@ mod tests {
                 ("mango".to_string(), "C:\\dev\\mango".to_string()),
                 ("Zebra".to_string(), "C:\\dev\\Zebra".to_string()),
             ],
-            "表記違いを混ぜた一覧の中身か並びが変わった"
+            "content or order changed when notation variants were mixed together"
         );
     }
 
@@ -1853,15 +1855,15 @@ mod tests {
     fn render_sidebar(app: &mut App) -> Vec<(Option<RowAction>, String)> {
         let (w, h) = app.term_size;
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("端末が作れない");
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("failed to create terminal");
         terminal.draw(|frame| {
             draw(frame, app);
         })
-        .expect("描画に失敗");
+        .expect("draw failed");
         let buffer = terminal.backend().buffer().clone();
         // 固定ヘッダーの下はスクロール分ずれるが、このテストは行数が窓に収まる
         // 前提なので scroll = 0（描画側がクランプ済み）
-        assert_eq!(app.sidebar_scroll, 0, "テストの前提（スクロール無し）が崩れている");
+        assert_eq!(app.sidebar_scroll, 0, "test precondition (no scroll) broke down");
         app.sidebar_rows
             .iter()
             .enumerate()
@@ -1893,21 +1895,21 @@ mod tests {
             .find(|(action, _)| {
                 matches!(action, Some(RowAction::Project(cwd)) if cwd == "C:\\dev\\empty-project")
             })
-            .expect("登録フォルダの見出しが描かれていない");
-        assert_eq!(heading.1, "empty-project", "見出しの文字列が末端名だけでない");
-        assert!(!heading.1.contains('+'), "見出しに + が残っている: {:?}", heading.1);
+            .expect("the registered project's heading was not drawn");
+        assert_eq!(heading.1, "empty-project", "the heading text is not just the leaf name");
+        assert!(!heading.1.contains('+'), "a + is left in the heading: {:?}", heading.1);
         // **見出しだけを出す**（「no sessions」等の説明行を挟まない）。セッションが
         // 0 本なので、この見出しがサイドバー最後の行になる
         let idx = rows.iter().position(|(_, t)| t == "empty-project").unwrap();
         assert_eq!(
             idx + 1,
             rows.len(),
-            "見出しの下に行が積まれている: {:?}",
+            "rows are stacked below the heading: {:?}",
             &rows[idx + 1..]
         );
         assert!(
             !rows.iter().any(|(_, t)| t.contains("no session")),
-            "セッション 0 本の説明行が出ている"
+            "a zero-sessions explanation row is showing"
         );
     }
 
@@ -1934,15 +1936,15 @@ mod tests {
         assert_eq!(
             headings,
             ["api", "docs", "infra", "shop-app"],
-            "撮影用データの見出しの並びが変わった"
+            "the heading order of the demo data changed"
         );
         // infra は demo セッションを持たないフォルダ。見出しの直後は空行 or 次の見出しで、
         // セッション行は付かない（＝ 0 本でも見出しだけが残る）
         let infra = rows.iter().position(|(_, t)| t == "infra").unwrap();
-        assert_eq!(rows[infra + 1].1, "", "infra の下にセッション行が出ている");
+        assert_eq!(rows[infra + 1].1, "", "a session row is showing under infra");
         assert!(
             matches!(&rows[infra + 2].0, Some(RowAction::Project(cwd)) if cwd.ends_with("shop-app")),
-            "空のフォルダの次が別の見出しになっていない"
+            "the row after the empty folder is not another heading"
         );
     }
 
@@ -1960,7 +1962,7 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|(action, text)| action == &Some(RowAction::New) && text == "+ new session"),
-            "+ new session 行が消えている"
+            "the + new session row is gone"
         );
     }
 
@@ -2014,7 +2016,7 @@ mod tests {
                 ..Default::default()
             };
             let lines = session_lines(&mut app);
-            assert_eq!(lines.len(), 3, "{grouping:?} で行が欠けている");
+            assert_eq!(lines.len(), 3, "{grouping:?}: a row is missing");
             assert!(lines[0].contains("pinned"), "{grouping:?}: {lines:?}");
             // 残りは元の並びのまま（ピン留めが並べ替えの規則を増やしていない）
             assert!(lines[1].contains("first"), "{grouping:?}: {lines:?}");
@@ -2043,26 +2045,26 @@ mod tests {
             };
             let texts = sidebar_texts(&mut app);
             let at = |needle: &str| texts.iter().position(|t| t.contains(needle));
-            let archived_title = at(ARCHIVED_TITLE).expect("Archived 節が出ていない");
-            let hidden = at("hidden").expect("アーカイブした行がどこにも出ていない");
+            let archived_title = at(ARCHIVED_TITLE).expect("the Archived section is not showing");
+            let hidden = at("hidden").expect("the archived row is nowhere to be found");
             assert!(
                 hidden > archived_title,
-                "{grouping:?}: アーカイブした行が通常の一覧に残っている: {texts:?}"
+                "{grouping:?}: the archived row is still in the normal list: {texts:?}"
             );
             assert!(
                 at("visible").is_some_and(|v| v < archived_title),
-                "{grouping:?}: 通常の行が Archived 節へ落ちている: {texts:?}"
+                "{grouping:?}: a normal row fell into the Archived section: {texts:?}"
             );
             // 集計はアーカイブを数えない（1 件だけが数に出る）
             let counts = texts
                 .iter()
                 .find(|t| t.contains("awaiting input"))
-                .expect("集計行が無い")
+                .expect("the summary row is missing")
                 .clone();
             // （末尾はサイドバー幅で切られるので、数の出るところまでを見る）
             assert!(
                 counts.starts_with("0 awaiting input · 0 working · 1"),
-                "{grouping:?}: アーカイブを集計に数えている: {counts:?}"
+                "{grouping:?}: the archived row is counted in the summary: {counts:?}"
             );
         }
     }
@@ -2086,7 +2088,7 @@ mod tests {
             !rows
                 .iter()
                 .any(|(action, _)| matches!(action, Some(RowAction::Project(_)))),
-            "アーカイブだけのフォルダに見出しが出ている: {rows:?}"
+            "a heading is showing for an archive-only folder: {rows:?}"
         );
         // 行そのものは Archived 節に残る（戻す入口）
         assert!(rows.iter().any(|(_, t)| t.contains("hidden")));
@@ -2118,7 +2120,7 @@ mod tests {
                 cursor = Some(draw(frame, &mut app));
             })
             .unwrap();
-        let cursor = cursor.expect("描画していない");
+        let cursor = cursor.expect("did not draw");
         let buffer = terminal.backend().buffer().clone();
 
         // 入力中の文字列が行に出て、確定前の名前は出ていない
@@ -2126,15 +2128,15 @@ mod tests {
             .sidebar_rows
             .iter()
             .position(|a| matches!(a, Some(RowAction::Open(_))))
-            .expect("セッション行が無い");
+            .expect("no session row");
         let y = row_y(row, app.sidebar_header_rows, app.sidebar_scroll);
         let text: String = (1..app.sidebar_width - 1)
             .map(|x| buffer[(x, y)].symbol())
             .collect();
-        assert!(text.contains("new name"), "入力中の文字列が行に出ていない: {text:?}");
-        assert!(!text.contains("old name"), "確定前の名前が残っている: {text:?}");
+        assert!(text.contains("new name"), "the text being typed is not on the row: {text:?}");
+        assert!(!text.contains("old name"), "the old name is still on the row before the rename is committed: {text:?}");
         // カーソルはその行の、入力の末尾（行頭 2 桁 + 8 桁）に立つ
-        assert!(cursor.visible, "入力中なのにカーソルが見えない");
+        assert!(cursor.visible, "the cursor is hidden while a name is being typed");
         assert_eq!(
             cursor.pos,
             Position::new(
@@ -2156,9 +2158,9 @@ mod tests {
         let bar = drawn_row(&mut app, 29);
         assert!(bar.contains("Ctrl+Q quit"), "{bar:?}");
         assert!(bar.contains("Alt+←→ focus"), "{bar:?}");
-        assert!(bar.contains("← menu"), "メニューの入口が案内に無い: {bar:?}");
-        assert!(!bar.contains("Ctrl+S"), "撤去した打鍵が案内に残っている: {bar:?}");
-        assert!(!bar.contains("Ctrl+X"), "撤去した打鍵が案内に残っている: {bar:?}");
+        assert!(bar.contains("← menu"), "the hint does not say how to open the menu: {bar:?}");
+        assert!(!bar.contains("Ctrl+S"), "the hint still lists a key that was removed: {bar:?}");
+        assert!(!bar.contains("Ctrl+X"), "the hint still lists a key that was removed: {bar:?}");
 
         app.sessions = vec![named_session("s", "C:\\dev\\api", "session")];
         app.rename = Some(crate::app::Rename {
@@ -2197,7 +2199,7 @@ mod tests {
         };
         let bar = drawn_row(&mut app, 29);
         assert!(bar.contains("popup: ↑↓ select · Enter run · Esc close"), "{bar:?}");
-        assert!(!bar.contains("menu"), "一覧のキーが残っている: {bar:?}");
+        assert!(!bar.contains("menu"), "the list keys are still listed: {bar:?}");
 
         // 名前の入力中: 入力の作法だけ
         let mut app = App {
@@ -2209,7 +2211,7 @@ mod tests {
         };
         let bar = drawn_row(&mut app, 29);
         assert!(bar.contains("rename: Enter rename · Esc cancel"), "{bar:?}");
-        assert!(!bar.contains("select"), "一覧のキーが残っている: {bar:?}");
+        assert!(!bar.contains("select"), "the list keys are still listed: {bar:?}");
 
         // 端末: 予約キー以外は全部 claude が受ける
         let mut app = App {
@@ -2218,7 +2220,7 @@ mod tests {
         };
         let bar = drawn_row(&mut app, 29);
         assert!(bar.contains("terminal: all keys pass through to claude"), "{bar:?}");
-        assert!(!bar.contains("select"), "サイドバーのキーが残っている: {bar:?}");
+        assert!(!bar.contains("select"), "the sidebar keys are still listed: {bar:?}");
 
         // どの状態でも予約キーは出る（受け手に関係なく効く）
         for focus in [Focus::Sidebar, Focus::Terminal] {
@@ -2239,7 +2241,7 @@ mod tests {
         };
         let bar = drawn_row(&mut app, 29);
         assert!(bar.contains("Ctrl+Q quit"), "{bar:?}");
-        assert!(!bar.contains("terminal:"), "下部バーに重ねている: {bar:?}");
+        assert!(!bar.contains("terminal:"), "the pane hint is repeated on the bottom bar: {bar:?}");
     }
 
     /// inner が潰れてもペイン矩形の外（枠の列や端末外）へ出ない。
@@ -2252,7 +2254,7 @@ mod tests {
             let pos = terminal_cursor_pos(pane, inner, 5, 5);
             assert!(
                 contains(pane, pos),
-                "pane {pane:?} / inner {inner:?} で pos {pos:?} がペイン外"
+                "pos {pos:?} is outside the pane for pane {pane:?} / inner {inner:?}"
             );
         }
     }
@@ -2263,11 +2265,11 @@ mod tests {
     #[test]
     fn the_warning_mark_is_one_column_wide() {
         use unicode_width::UnicodeWidthStr;
-        assert_eq!(WARN_MARK.width(), 1, "⚠ が 1 桁でない");
+        assert_eq!(WARN_MARK.width(), 1, "WARN_MARK is not 1 column wide");
         assert_eq!(
             WARN_MARK.chars().count(),
             1,
-            "異体字セレクタが混ざっている（絵文字表示になると 2 桁になる）"
+            "a variation selector slipped in — emoji presentation makes it 2 columns wide"
         );
     }
 
@@ -2290,7 +2292,7 @@ mod tests {
         assert_eq!(
             row_text(&logged_in, false),
             "you · Acme, Inc.",
-            "保管済みなのに警告が出ている"
+            "a stored account still shows the warning"
         );
         // 未取得は空行のまま（誤情報を出さない）。未ログインは行そのものが警告なので
         // ⚠ は前置しない ＝ ⚠ は「未保管」だけを意味する
@@ -2311,8 +2313,8 @@ mod tests {
             "you",
         )));
         let (text, _) = account_row(&active, true, Some("switching…"));
-        assert_eq!(text, "switching…", "進行中が行に出ていない");
-        assert!(!text.contains(WARN_MARK), "確定していない値に ⚠ を付けている");
+        assert_eq!(text, "switching…", "the running action is not shown on the row");
+        assert!(!text.contains(WARN_MARK), "a value that is not settled yet is marked with ⚠");
     }
 
     /// 未ログインの行は **再ログインの手順まで出す**。保管トークンの期限切れも
@@ -2321,11 +2323,11 @@ mod tests {
     fn account_row_prompts_a_login_when_logged_out() {
         let (text, style) = account_row(&AccountStatus::LoggedOut, false, None);
         assert!(text.contains("not logged in"), "{text:?}");
-        assert!(text.contains("/login"), "再ログインの手順が無い: {text:?}");
+        assert!(text.contains("/login"), "the row does not say how to log back in: {text:?}");
         assert_eq!(
             style,
             Style::default().fg(C_ATTENTION),
-            "要対応の行が注意色になっていない"
+            "a row that needs action is not in the attention color"
         );
     }
 
@@ -2335,8 +2337,11 @@ mod tests {
     fn account_row_fits_the_default_sidebar_width() {
         use crate::accounts::{Account, ActiveAccount};
         use unicode_width::UnicodeWidthStr;
-        // README・撮影データに出る実寸のラベルと、全角を含むラベル
-        for label in ["ooba · 1→10, Inc.", "you · Acme, Inc.", "大場 · 1→10, Inc."] {
+        // README・撮影データに出る実寸のラベルと、表示幅 2 の文字（全角）を含む
+        // ラベル。`⚠ ` の 2 桁が乗っても切れないことを見たいので幅 2 の文字が要る。
+        // 源を ASCII に保つため \u エスケープで書く（表示幅 4 桁の 2 文字）
+        let wide = format!("{} · 1→10, Inc.", "\u{5927}\u{5834}");
+        for label in ["ooba · 1→10, Inc.", "you · Acme, Inc.", wide.as_str()] {
             let status =
                 AccountStatus::LoggedIn(ActiveAccount::unseen(Account::new("you@example.com", label)));
             for unstored in [false, true] {
@@ -2344,7 +2349,7 @@ mod tests {
                 assert_eq!(
                     clip_to_width(&text, DEFAULT_INNER),
                     text,
-                    "既定幅で切られる: {text:?}（{} 桁 / 内側 {DEFAULT_INNER} 桁）",
+                    "clipped at the default width: {text:?} ({} cols / inner {DEFAULT_INNER} cols)",
                     text.width()
                 );
             }
@@ -2353,7 +2358,7 @@ mod tests {
         assert_eq!(
             clip_to_width(LOGGED_OUT_ROW, DEFAULT_INNER),
             LOGGED_OUT_ROW,
-            "{} 桁 / 内側 {DEFAULT_INNER} 桁",
+            "{} cols / inner {DEFAULT_INNER} cols",
             LOGGED_OUT_ROW.width()
         );
     }
@@ -2393,16 +2398,16 @@ mod tests {
         let unstored = drawn(Vec::new());
         assert!(
             unstored.contains(WARN_MARK) && unstored.contains("you · Acme, Inc."),
-            "未保管の警告が出ていない: {unstored:?}"
+            "an unstored active account is not warned about: {unstored:?}"
         );
         // 別アカウントだけが保管されていても、アクティブな 1 件が未保管なら警告する
         let other = drawn(vec![Account::new("other@example.com", "other")]);
-        assert!(other.contains(WARN_MARK), "別 email の保管で消えている: {other:?}");
+        assert!(other.contains(WARN_MARK), "storing a different email cleared the warning: {other:?}");
         // アクティブなアカウントを保管したら消える
         let stored = drawn(vec![active.clone()]);
         assert!(
             !stored.contains(WARN_MARK) && stored.contains("you · Acme, Inc."),
-            "保管済みなのに警告が残っている: {stored:?}"
+            "the warning is still there after the active account was stored: {stored:?}"
         );
     }
 
@@ -2410,11 +2415,11 @@ mod tests {
     fn drawn_row(app: &mut App, y: u16) -> String {
         let (w, h) = app.term_size;
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("端末が作れない");
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("test terminal");
         terminal.draw(|frame| {
             draw(frame, app);
         })
-        .expect("描画に失敗");
+        .expect("draw");
         let buffer = terminal.backend().buffer();
         (0..w).map(|x| buffer[(x, y)].symbol()).collect()
     }
@@ -2431,7 +2436,7 @@ mod tests {
         };
         // 下部バーは最下行
         let bar = drawn_row(&mut app, 29);
-        assert!(bar.contains("starting session…"), "起動中の表示が無い: {bar:?}");
+        assert!(bar.contains("starting session…"), "the bottom bar does not say a session is starting: {bar:?}");
     }
 
     /// **サイドバーより広いメニューは右ペインに被せて全部読ませる**（[`popup_rect`] の
@@ -2456,24 +2461,24 @@ mod tests {
             }),
             ..Default::default()
         };
-        let rect = popup_rect(&app, app.popup.as_ref().expect("メニューが無い"));
+        let rect = popup_rect(&app, app.popup.as_ref().expect("a menu is open"));
         assert!(
             rect.right() > MIN_SIDEBAR,
-            "前提（メニューがサイドバーより広い）が崩れている: {rect:?}"
+            "the premise broke — the menu is no longer wider than the sidebar: {rect:?}"
         );
         let (w, h) = app.term_size;
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("端末が作れない");
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("test terminal");
         terminal.draw(|frame| {
             draw(frame, &mut app);
         })
-        .expect("描画に失敗");
+        .expect("draw");
         let buffer = terminal.backend().buffer().clone();
         // 矩形の列だけを読む（クリック判定が見るのと同じ範囲）
         let row = |y: u16| -> String {
             (rect.x..rect.right()).map(|x| buffer[(x, y)].symbol()).collect()
         };
-        assert_eq!(row(rect.y + 1), "│ new session   │", "1 行目が割られている");
-        assert_eq!(row(rect.y + 2), "│ remove project│", "2 行目が割られている");
+        assert_eq!(row(rect.y + 1), "│ new session   │", "row 1 is overwritten by the right pane");
+        assert_eq!(row(rect.y + 2), "│ remove project│", "row 2 is overwritten by the right pane");
     }
 }
