@@ -354,6 +354,50 @@ fn lock_age(path: &Path) -> Option<Duration> {
 /// claude と共有するロックの待ち（[`LOCK_WAIT`]）より短くてよい
 const STORE_LOCK_WAIT: Duration = Duration::from_secs(2);
 
+/// 保管への 1 件書き込み（[`AccountStore::upsert`]）の要求元。
+///
+/// **書き込みの流儀（待つか・在否を再確認するか）を要求元から導く**ための型。
+/// bool を 2 つ渡す形にすると呼び出し口ごとに組み合わせを選び直すことになり、
+/// 「追従更新なのに待つ」のような食い違いが黙って入る（実際にそうなっていた）。
+/// 要求元は 3 つで固定なので、対応表をここ 1 箇所に持つ
+#[derive(Clone, Copy)]
+enum Upsert {
+    /// 登録（[`AccountStore::register`]）。保管に無ければ作る
+    Register,
+    /// 切替時の巻き取り（[`AccountStore::switch_to`]）
+    Capture,
+    /// 追従更新（[`AccountStore::sync_active`]）
+    FollowUp,
+}
+
+impl Upsert {
+    /// 保管ロックの待ち時間。
+    ///
+    /// **追従更新は待ってはいけない。** `sync_active` は 1 秒周期のフッターポーラーから
+    /// 繰り返し呼ばれるので、別インスタンスが保管を書いている間に [`STORE_LOCK_WAIT`]
+    /// ぶん待つと 1 ティックあたりその分止まり、アカウント行と版行の更新が遅れる
+    /// （あちらが claude 側のロックを `Duration::ZERO` で取っているのと同じ判断。
+    /// 取り逃しても認証ファイルの変化と周期フォールバックで次の機会が来る）。
+    ///
+    /// **巻き取りは待つ。** ユーザーが押した切替の一部で、取り逃すと使い捨ての
+    /// refreshToken を落として**そのアカウントへ戻れなくなる** ＝ 次の機会が無い
+    fn store_lock_wait(self, store: &AccountStore) -> Duration {
+        match self {
+            Self::Register | Self::Capture => store.store_lock_wait,
+            Self::FollowUp => Duration::ZERO,
+        }
+    }
+
+    /// 保管に無いアカウントには何もしないか。**明示登録するまで認証情報を
+    /// コピーしない**という規則で、登録そのもの以外はすべてこちら
+    fn only_if_present(self) -> bool {
+        match self {
+            Self::Register => false,
+            Self::Capture | Self::FollowUp => true,
+        }
+    }
+}
+
 /// 起動時に回収する `.tmp` の古さ（[`AccountStore::cleanup_leftover_tmp`]）。
 /// 書いている最中の別インスタンスの tmp を消さないため、十分に古いものだけを消す
 const TMP_KEEP: Duration = Duration::from_secs(3600);
@@ -414,7 +458,7 @@ impl AccountStore {
         let Some(oauth) = read_oauth(&self.paths.credentials) else {
             return Ok(false);
         };
-        self.upsert(account, &oauth, true)
+        self.upsert(account, &oauth, Upsert::FollowUp)
     }
 
     /// 保管ファイルに載っているか
@@ -453,21 +497,19 @@ impl AccountStore {
                 self.paths.credentials.display()
             )
         })?;
-        self.upsert(&active.account, &oauth, false)?;
+        self.upsert(&active.account, &oauth, Upsert::Register)?;
         Ok(())
     }
 
-    /// 保管ファイルへ 1 件書く。`only_if_present` は追従更新用
-    /// （ロックの下で在否を再確認するので、直前の登録解除と競合しない）
-    fn upsert(
-        &self,
-        account: &Account,
-        oauth: &Value,
-        only_if_present: bool,
-    ) -> anyhow::Result<bool> {
-        let _guard = self.lock_store()?;
+    /// 保管ファイルへ 1 件書く。
+    ///
+    /// **要求元（[`Upsert`]）で流儀が変わる**のが要点で、待ち時間と在否の再確認は
+    /// どちらも「ユーザーが押した操作か、ポーラー契機の追従更新か」で決まる。
+    /// 2 つの引数に割ると片方だけ渡し忘れる形ができるので 1 つの型で受ける
+    fn upsert(&self, account: &Account, oauth: &Value, kind: Upsert) -> anyhow::Result<bool> {
+        let _guard = self.lock_store(kind.store_lock_wait(self))?;
         let mut accounts = read_accounts(&self.paths.store);
-        if only_if_present && !accounts.contains_key(&account.email) {
+        if kind.only_if_present() && !accounts.contains_key(&account.email) {
             return Ok(false);
         }
         accounts.insert(
@@ -480,13 +522,10 @@ impl AccountStore {
 
     /// 保管ファイルの read-modify-write を守るロック。**書き手 4 つ（登録・切替の
     /// 巻き取り・追従更新・登録解除）が全てこれを通る**ことが不変条件で、
-    /// 1 つでも外れると多重起動で書き込みが消える（[`STORE_LOCK_WAIT`]）
-    fn lock_store(&self) -> anyhow::Result<Lock> {
-        Lock::acquire(
-            &self.paths.store_lock(),
-            self.store_lock_wait,
-            self.lock_stale,
-        )
+    /// 1 つでも外れると多重起動で書き込みが消える。
+    /// 待ちは要求元が決める（[`Upsert::store_lock_wait`] / [`STORE_LOCK_WAIT`]）
+    fn lock_store(&self, wait: Duration) -> anyhow::Result<Lock> {
+        Lock::acquire(&self.paths.store_lock(), wait, self.lock_stale)
     }
 
     /// 起動時の掃除: [`write_json_atomically`] が rename する前にプロセスが死ぬと、
@@ -583,7 +622,7 @@ impl AccountStore {
     /// 登録解除: 保管を消すだけ。**ログイン自体は外さない**
     /// （現行の `.credentials.json` には触らない）
     pub(crate) fn unregister(&self, email: &str) -> anyhow::Result<()> {
-        let _guard = self.lock_store()?;
+        let _guard = self.lock_store(self.store_lock_wait)?;
         let mut accounts = read_accounts(&self.paths.store);
         if accounts.remove(email).is_none() {
             return Ok(()); // 既に無い＝目的は達成されている
@@ -644,9 +683,9 @@ impl AccountStore {
         if let Some(capture) = capture
             && let Some(oauth) = current.get(OAUTH_KEY).filter(|o| usable_oauth(o)).cloned()
         {
-            // 未登録のアカウントには何もしない（`only_if_present`）。
+            // 未登録のアカウントには何もしない（[`Upsert::only_if_present`]）。
             // 明示登録するまで認証情報をコピーしない規則は切替でも同じ
-            self.upsert(capture, &oauth, true)?;
+            self.upsert(capture, &oauth, Upsert::Capture)?;
         }
         current[OAUTH_KEY] = stored;
         write_json_atomically(&self.paths.credentials, &current)?;
@@ -1277,6 +1316,43 @@ pub(crate) mod tests {
             stored_oauth(&store, EMAIL_A),
             Some(oauth("access-a2", "refresh-a2")),
             "保管が古いトークンのまま（切替で復元できなくなる）"
+        );
+    }
+
+    /// **追従更新は保管ロックでも待たない。**
+    ///
+    /// `sync_active` は claude 側のロックを `Duration::ZERO` で取る（ポーラーから
+    /// 繰り返し呼ばれるので待てない）のに、続く保管ロックだけ
+    /// [`STORE_LOCK_WAIT`] ぶん待っていた ＝ 別インスタンスが保管を書いている間、
+    /// 1 秒周期のフッターポーラーが**1 ティックあたり最大 2 秒**止まり、
+    /// アカウント行と版行の更新が遅れる。
+    ///
+    /// **待ち時間を詰めていないストア**（実運用と同じ [`STORE_LOCK_WAIT`]）で計るのが
+    /// 要点で、詰めると「待たない」ことを見られない
+    #[test]
+    fn sync_does_not_wait_for_the_store_lock() {
+        let home = TempHome::new("sync_does_not_wait_for_the_store_lock");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+        let stored_before = std::fs::read(home.paths().store).unwrap();
+
+        // 別インスタンスが保管を書いている状態
+        let held = Lock::acquire(&home.paths().store_lock(), Duration::ZERO, LOCK_STALE).unwrap();
+        let started = Instant::now();
+        let result = store.sync_active(&home.active(EMAIL_A, "taro"));
+        let waited = started.elapsed();
+        drop(held);
+
+        assert!(result.is_err(), "取れないロックで書けたことになっている");
+        assert!(
+            waited < STORE_LOCK_WAIT / 2,
+            "保管ロックを待っている（{waited:?}）＝ ポーラーが 1 ティックあたりその分止まる"
+        );
+        assert_eq!(
+            std::fs::read(home.paths().store).unwrap(),
+            stored_before,
+            "ロックを取れていないのに保管を書いている"
         );
     }
 
