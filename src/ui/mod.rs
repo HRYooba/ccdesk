@@ -113,14 +113,24 @@ fn separator_text(inner_width: u16) -> String {
 /// **どちらのグルーピングでも末尾に 1 つだけ**出す（判断は draw のこの節の隣）
 const ARCHIVED_TITLE: &str = "Archived";
 
-/// 名前の変更中の行の先頭。**通常の行と同じ `☰ ` から始める**ので、
-/// 編集に入っても名前の桁が横へ動かない（表示幅 3 桁 ＝ `☰` が 2 桁 + 空白 1 桁。
-/// カーソル位置の計算がこの実測値に乗っているのでテストで固定する）
-const RENAME_PREFIX: &str = "☰ ";
+/// 行頭のメニュー記号（クリックで二次操作のメニューが開く）。
+///
+/// **ASCII を選んだのは桁の曖昧さを消すため。** 以前使っていたハンバーガー記号
+/// （U+2630）は East Asian Ambiguous ＝ 幅の判定が端末とフォント設定で
+/// 1 桁にも 2 桁にもなる。
+/// ccdesk は 2 桁と実測して桁を数えていたので、1 桁と解釈する端末では
+/// **行全体が横へずれる**。`=` なら常に 1 桁で、前提そのものが消える
+const MENU_MARK: &str = "=";
 
-/// 更新マーカー。**表示幅は実測 1 桁**（U+27F3 / unicode-width 0.2.2 で `1`。
-/// East Asian Ambiguous で 2 桁を占める `☰` とは違う）。1 桁だと分かっているので、
-/// 更新が無い行はスペース 1 個で同じ桁を確保できる
+/// 名前の変更中の行の先頭。**通常の行と同じ「記号 + 空白」から始める**ので、
+/// 編集に入っても名前の桁が横へ動かない（[`MENU_MARK`] と対であることと
+/// 表示幅 2 桁であることはテストで固定する ＝ カーソル位置がこれに乗っている）
+const RENAME_PREFIX: &str = "= ";
+
+/// 更新マーカー。**表示幅は実測 1 桁**（U+27F3 / unicode-width 0.2.2 で `1`）。
+/// 1 桁だと分かっているので、更新が無い行はスペース 1 個で同じ桁を確保できる。
+/// 記号の幅は文字ごとに違い、しかも曖昧なものがある（[`MENU_MARK`] の判断）ので、
+/// 桁の前提に乗せる記号は実測してテストで固定する
 const UPDATE_MARK: &str = "⟳";
 
 /// バージョン行の更新状態。マーカー桁と右端の動詞はこれだけで決まる。
@@ -516,11 +526,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         if app.focus == Focus::Sidebar {
             hint_spans.push(Span::styled("  sidebar:", Style::default().fg(MUTED_FG)));
             // 名前の入力中はその作法だけを出す（一覧の操作は全部そちらへ渡っている）。
-            // 二次操作は ☰ のメニューにしかないので、打鍵の案内はこの 3 つで尽きる
+            // 二次操作はメニューにしかないので、打鍵の案内はこの 3 つで尽きる
             hint_spans.push(Span::raw(if app.rename.is_some() {
                 " Enter rename · Esc cancel"
             } else {
-                " ↑↓ select · Enter open · ☰ menu"
+                " ↑↓ select · Enter open · ← menu"
             }));
         }
         // 起こした子がまだ端末を掴んでいないことを出す。**見出しメニューの
@@ -749,7 +759,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             };
             let mut spans = vec![
                 Span::styled(
-                    "☰",
+                    MENU_MARK,
                     Style::default().fg(if highlighted {
                         ui().emph
                     } else {
@@ -1222,14 +1232,24 @@ mod tests {
     /// 既定のサイドバー幅（34 桁）の内側。版行の幅の予算はこの桁数
     const DEFAULT_INNER: u16 = 32;
 
-    /// 更新マーカーの表示幅は 1 桁。**この 1 という実測値に設計が乗っている**:
-    /// 更新が無い行はスペース 1 個でマーカー桁を確保しており、2 桁なら桁がずれる。
-    /// `☰` が 2 桁を占めるのと対照（unicode-width の判定は文字ごとに違う）
+    /// 行頭に置く記号の表示幅は 1 桁。**この 1 という実測値に設計が乗っている**:
+    /// 更新が無い版行はスペース 1 個でマーカー桁を確保しており、2 桁なら桁がずれる。
+    ///
+    /// メニュー記号が ASCII なのはこの前提を測らずに済ませるため
+    /// （U+2630 は East Asian Ambiguous で、端末によって 1 桁にも 2 桁にもなる）。
+    /// 名前の変更中の行頭はその記号と対で、通常の行と同じ桁から名前が始まる
     #[test]
-    fn the_update_marker_is_one_column_wide() {
+    fn the_row_head_marks_are_one_column_wide() {
         use unicode_width::UnicodeWidthStr;
         assert_eq!(UPDATE_MARK.width(), 1, "⟳ が 1 桁でない");
-        assert_eq!("☰".width(), 2, "☰ は 2 桁（⟳ と同じ扱いにはできない）");
+        assert_eq!(MENU_MARK.width(), 1, "メニュー記号が 1 桁でない");
+        assert!(MENU_MARK.is_ascii(), "幅の曖昧な記号に戻っている");
+        assert_eq!(
+            RENAME_PREFIX,
+            format!("{MENU_MARK} "),
+            "編集中の行頭が通常の行とずれている"
+        );
+        assert_eq!(RENAME_PREFIX.width(), 2);
     }
 
     /// 更新の有無で行構成が変わらない（固定ヘッダー行数もマーカー桁の位置も動かない）。
@@ -1813,7 +1833,7 @@ mod tests {
         )
     }
 
-    /// セッション行（`☰` で始まる行）の表示文字列だけを、描かれた順に取り出す
+    /// セッション行（[`MENU_MARK`] で始まる行）の表示文字列だけを、描かれた順に取り出す
     fn session_lines(app: &mut App) -> Vec<String> {
         render_sidebar(app)
             .into_iter()
@@ -1926,12 +1946,10 @@ mod tests {
     }
 
     /// 名前の変更中は**その行が入力欄に化ける**。名前の桁は通常の行と同じ位置から
-    /// 始まり（`☰ ` の 3 桁ぶん）、カーソルはその行の入力位置に立つ
+    /// 始まり（[`RENAME_PREFIX`] の 2 桁ぶん）、カーソルはその行の入力位置に立つ
     #[test]
     fn the_renamed_row_becomes_an_inline_input_with_the_cursor_on_it() {
         use unicode_width::UnicodeWidthStr;
-        assert_eq!(RENAME_PREFIX.width(), 3, "行頭の桁数の前提が崩れている");
-
         let mut field = crate::ui::text_field::TextField::default();
         field.set_text("new name");
         let mut app = App {
@@ -1968,9 +1986,15 @@ mod tests {
             .collect();
         assert!(text.contains("new name"), "入力中の文字列が行に出ていない: {text:?}");
         assert!(!text.contains("old name"), "確定前の名前が残っている: {text:?}");
-        // カーソルはその行の、入力の末尾（`☰ ` + 8 桁）に立つ
+        // カーソルはその行の、入力の末尾（行頭 2 桁 + 8 桁）に立つ
         assert!(cursor.visible, "入力中なのにカーソルが見えない");
-        assert_eq!(cursor.pos, Position::new(1 + 3 + "new name".width() as u16, y));
+        assert_eq!(
+            cursor.pos,
+            Position::new(
+                1 + RENAME_PREFIX.width() as u16 + "new name".width() as u16,
+                y
+            )
+        );
     }
 
     /// 下部バーの案内。**撤去した打鍵は載せない**（載っていれば嘘になる）。
@@ -1985,11 +2009,7 @@ mod tests {
         let bar = drawn_row(&mut app, 29);
         assert!(bar.contains("Ctrl+Q quit"), "{bar:?}");
         assert!(bar.contains("Alt+←→ focus"), "{bar:?}");
-        // `☰` は 2 桁ぶんのセルを占めるので、記号と語を分けて見る
-        assert!(
-            bar.contains('☰') && bar.contains("menu"),
-            "メニューの入口が案内に無い: {bar:?}"
-        );
+        assert!(bar.contains("← menu"), "メニューの入口が案内に無い: {bar:?}");
         assert!(!bar.contains("Ctrl+S"), "撤去した打鍵が案内に残っている: {bar:?}");
         assert!(!bar.contains("Ctrl+X"), "撤去した打鍵が案内に残っている: {bar:?}");
 
@@ -2019,8 +2039,8 @@ mod tests {
     }
 
     /// 未保管警告 `⚠` の表示幅は **1 桁**。既定幅（内側 32 桁）にアカウント行を
-    /// 収める前提がこの実測値に乗っているので固定する（`⟳` も 1 桁だが `☰` は
-    /// 2 桁 ＝ 判定は文字ごとに違うので実測しないと分からない）
+    /// 収める前提がこの実測値に乗っているので固定する（幅の判定は文字ごとに違い、
+    /// 中には端末によって変わる曖昧なものもある ＝ 実測しないと分からない）
     #[test]
     fn the_warning_mark_is_one_column_wide() {
         use unicode_width::UnicodeWidthStr;

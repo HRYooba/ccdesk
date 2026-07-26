@@ -304,7 +304,7 @@ fn switch_notice(sessions: usize) -> Option<String> {
     }
 }
 
-/// ☰ / group 行クリックで開くコンテキストメニューの開き状態。
+/// 行頭の `=` / group 行クリックで開くコンテキストメニューの開き状態。
 /// 2 階層目は**階層を積まずに開き直す**（Esc・外クリックは常に全閉。戻り先を持たない）
 pub(crate) struct Popup {
     pub(crate) kind: PopupKind,
@@ -993,27 +993,22 @@ fn handle_sidebar_key(app: &mut App, key: &KeyEvent) {
     match key.code {
         KeyCode::Up => move_selection(app, -1),
         KeyCode::Down => move_selection(app, 1),
+        // `←` = その行のメニュー（`→` / Enter の「開く」の対）
+        KeyCode::Left => open_row_menu(app),
         KeyCode::Enter | KeyCode::Right => {
             match app.sidebar_rows.get(app.selected_row).cloned().flatten() {
                 Some(RowAction::New) => {
                     app.open_new_view();
                     app.set_focus(Focus::Terminal);
                 }
-                Some(RowAction::ToggleGroup) => {
-                    app.popup = Some(Popup {
-                        kind: PopupKind::Group,
-                        anchor_y: selected_row_y(app),
-                        selected: 0,
-                    });
-                }
-                // 見出し行はメニューを開くだけ（セッションは起動しない）
-                Some(RowAction::Project(cwd)) => {
-                    let y = selected_row_y(app);
-                    open_project_popup(app, cwd, y);
-                }
                 Some(RowAction::Open(id)) => {
                     open_session(app, &id);
                     app.set_focus(Focus::Terminal);
+                }
+                // 見出し行・グルーピング行は**開くものがメニュー**なので `←` と同じ
+                // （同じメニューを開く経路を 2 つ書かない）
+                Some(RowAction::Project(_)) | Some(RowAction::ToggleGroup) => {
+                    open_row_menu(app)
                 }
                 Some(RowAction::UpdateCcdesk) => start_ccdesk_update(app),
                 Some(RowAction::UpdateClaude) => start_claude_update(app),
@@ -1021,6 +1016,32 @@ fn handle_sidebar_key(app: &mut App, key: &KeyEvent) {
             }
         }
         _ => {}
+    }
+}
+
+/// **`←` = 選択行のメニュー。** キーボードからも二次操作へ入れるようにする
+/// （メニューが唯一の入口なので、行頭 `=` のクリックしか無いと操作が手に届かない）。
+///
+/// **規則は行の種類で分けない**: メニューを持つ行なら同じものが開き、持たない行
+/// （`+ new session` / 版行 ＝ 押した瞬間に何かが起きる行）では何も起きない。
+/// 予約キー（[`reserved_key`]）には足さない ＝ 端末側にフォーカスがあれば
+/// `←` は今までどおり claude へ渡る（ペイン移動は `Alt+←` なので衝突しない）。
+///
+/// 位置は行頭 `=` のクリックと同じ [`selected_row_y`]（開き方で場所が変わらない）
+fn open_row_menu(app: &mut App) {
+    let anchor_y = selected_row_y(app);
+    match app.sidebar_rows.get(app.selected_row).cloned().flatten() {
+        Some(RowAction::Open(id)) => open_session_popup(app, &id, anchor_y),
+        Some(RowAction::Project(cwd)) => open_project_popup(app, cwd, anchor_y),
+        Some(RowAction::ToggleGroup) => {
+            app.popup = Some(Popup {
+                kind: PopupKind::Group,
+                anchor_y,
+                selected: 0,
+            })
+        }
+        // メニューを持たない行と、行の無い位置
+        Some(RowAction::New | RowAction::UpdateCcdesk | RowAction::UpdateClaude) | None => {}
     }
 }
 
@@ -1511,7 +1532,8 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             if action.is_some() {
                 app.selected_row = row;
             }
-            // 行頭の ☰ クリック → コンテキストメニューを開く
+            // 行頭の `=` クリック → コンテキストメニューを開く（記号 1 桁 +
+            // 続く空白まで当たり判定にする ＝ 1 桁だけだと突きにくい）
             if let Some(RowAction::Open(id)) = &action
                 && mouse.column <= 2 {
                     open_session_popup(app, &id.clone(), mouse.row);
@@ -1644,7 +1666,7 @@ fn session_open(app: &mut App, id: &SessionId) -> bool {
         .any(|w| &w.session_id == id && w.alive())
 }
 
-/// セッション行のメニューを開く（行頭の ☰ クリック）。
+/// セッション行のメニューを開く（行頭の `=` クリック / `←`）。
 /// 項目の見た目に効く 3 つ（ピン留め・アーカイブ・窓の有無）は開いた時点の写し
 fn open_session_popup(app: &mut App, id: &SessionId, anchor_y: u16) {
     let open = session_open(app, id);
@@ -2498,7 +2520,7 @@ mod tests {
         assert_eq!(PopupKind::Group.action(2), None);
     }
 
-    /// セッション行の ☰ クリックでメニューが開く（**二次操作の唯一の入口**）。
+    /// セッション行の行頭 `=` クリックでメニューが開く（二次操作の入口）。
     /// 開いた時点の行の状態（ピン留め・アーカイブ・窓の有無）が写る
     #[test]
     fn clicking_the_hamburger_opens_the_session_menu() {
@@ -2897,8 +2919,8 @@ mod tests {
         app
     }
 
-    /// 版行は**行全体が当たる**。列 0（`☰` の桁）から内容の最右列まで、どこを
-    /// 押しても同じ行に解決する（更新行に ☰ メニューは無いので列 0 も行に当たる）。
+    /// 版行は**行全体が当たる**。列 0（一覧行なら `=` の桁）から内容の最右列まで、
+    /// どこを押しても同じ行に解決する（更新行にメニューは無いので列 0 も行に当たる）。
     ///
     /// 更新の実行そのものは副作用（ダウンロード / `claude update` 起動）なので、
     /// 判定の到達点は「クリックがどの行に解決したか」で見る。ディスパッチが読むのと
@@ -3234,7 +3256,7 @@ mod tests {
         }
     }
 
-    /// アカウント行は**行全体が当たる**。列 0（一覧行なら ☰ の桁）から内容の
+    /// アカウント行は**行全体が当たる**。列 0（一覧行なら `=` の桁）から内容の
     /// 最右列まで、どこを押してもアカウントメニューが開く。
     /// 当たり判定は描画と同じ [`sidebar_layout`] の `account_y`
     #[test]
@@ -4674,6 +4696,73 @@ mod tests {
         assert!(app.rename.is_some(), "↑↓ で入力が閉じている");
     }
 
+    /// **`←` はどの行でも「その行のメニュー」。** 種類ごとに別のキーを覚えさせない
+    /// （`→` / Enter の「開く」の対として 1 本の規則にする）
+    #[test]
+    fn the_left_key_opens_the_menu_of_whatever_row_is_selected() {
+        let mut app = app_with_row("s");
+        app.sidebar_rows = vec![
+            Some(RowAction::Open(SessionId::new("s"))),
+            Some(RowAction::Project("C:\\dev\\api".to_string())),
+            Some(RowAction::ToggleGroup),
+        ];
+        app.sidebar_header_rows = 3;
+        for (row, expected) in [
+            (0usize, session("s", false)),
+            // 行 "s" の cwd がこのフォルダ ＝ セッションが残っている見出し
+            (1, project("C:\\dev\\api", true)),
+            (2, PopupKind::Group),
+        ] {
+            app.popup = None;
+            app.selected_row = row;
+            press(&mut app, KeyCode::Left);
+            let popup = app
+                .popup
+                .as_ref()
+                .unwrap_or_else(|| panic!("row={row} でメニューが開いていない"));
+            assert_eq!(popup.kind, expected, "row={row}");
+            // 位置は行頭 `=` のクリックと同じ規則（開き方で場所が変わらない）
+            assert_eq!(popup.anchor_y, selected_row_y(&app), "row={row}");
+        }
+    }
+
+    /// メニューを持たない行（押した瞬間に何かが起きる行）では `←` は無反応
+    #[test]
+    fn the_left_key_does_nothing_on_rows_without_a_menu() {
+        let mut app = test_app(34, TERM);
+        app.sidebar_rows = vec![
+            Some(RowAction::UpdateCcdesk),
+            Some(RowAction::UpdateClaude),
+            None, // 区切り線
+            Some(RowAction::New),
+        ];
+        app.sidebar_header_rows = 4;
+        for row in 0..app.sidebar_rows.len() {
+            app.selected_row = row;
+            press(&mut app, KeyCode::Left);
+            assert!(app.popup.is_none(), "row={row} でメニューが開いた");
+            assert!(
+                matches!(app.right_view, RightView::Sessions),
+                "row={row} で右ペインが切り替わった"
+            );
+        }
+    }
+
+    /// **`←` はサイドバーの中だけの話。** 予約キーではないので、端末側に
+    /// フォーカスがあれば今までどおりカーソルキーとして claude へ渡る
+    /// （ペインの移動は `Alt+←` なので衝突しない）
+    #[test]
+    fn the_left_key_is_not_reserved_and_still_reaches_claude() {
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(reserved_key(&left), None, "← を予約している");
+        let parser = ccdesk::new_parser(24, 80, 0);
+        assert_eq!(
+            encode_key(&left, &parser),
+            b"\x1b[D",
+            "← が claude へカーソルキーとして渡らない"
+        );
+    }
+
     /// **撤去した打鍵は claude のものへ戻った。** 予約キーに載っていないので
     /// run ループは PTY へ流す（流れるバイト列も固定する）
     #[test]
@@ -4718,7 +4807,7 @@ mod tests {
     }
 
     /// サイドバーにフォーカスがあっても、撤去した打鍵はもう何も起こさない
-    /// （グルーピングは ⊞ group のメニュー、stop→delete は ☰ のメニューへ移った）
+    /// （グルーピングは ⊞ group のメニュー、stop→delete は行のメニューへ移った）
     #[test]
     fn the_sidebar_no_longer_answers_the_removed_shortcuts() {
         let mut app = app_with_row("s");

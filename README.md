@@ -25,14 +25,16 @@ reopen one and it resumes from its transcript.
   `claude --session-id <uuid>` in the pane and reopening a row resumes it with
   `claude -r`; `close` ends the process while the row stays (resume it any time) and
   `delete` drops the row (your transcripts in `~/.claude/projects/` are never removed)
-- **A menu per row** — clicking the `☰` at the head of a session row opens
-  `pin` / `mark as read` / `rename` / `close` / `archive` / `delete`. `close` is the only
-  entry that greys out, and only when no window is open. Pinned rows sort to the top of
-  their group; archived rows leave the normal list and collect under an `Archived` section
-  at the bottom (in either grouping), which is where you `unarchive` them; `rename` turns
-  the row itself into an input — `Enter` keeps the name, `Esc` throws it away. **These
-  operations have no shortcut keys on purpose**: one entry point means one thing to read,
-  and every key ccdesk does not reserve is a key claude Code still gets
+- **A menu per row** — clicking the `=` at the head of a session row, or pressing `←` with
+  the sidebar focused, opens `pin` / `mark as read` / `rename` / `close` / `archive` /
+  `delete`. `close` is the only entry that greys out, and only when no window is open.
+  Pinned rows sort to the top of their group; archived rows leave the normal list and
+  collect under an `Archived` section at the bottom (in either grouping), which is where
+  you `unarchive` them; `rename` turns the row itself into an input — `Enter` keeps the
+  name, `Esc` throws it away. **None of these operations gets its own shortcut key**: one
+  entry point means one thing to read, and every key ccdesk does not reserve is a key
+  claude Code still gets. `←` is not reserved either — it only means "menu" while the
+  sidebar has focus
 - **Live status** from `claude agents --json` (state changes reflect in ~2 s)
 - **Account line** in the sidebar footer, showing the signed-in Claude account, the same value
   `ccdesk doctor` prints. A login or logout that rewrites `~/.claude/.credentials.json` shows
@@ -64,12 +66,14 @@ reopen one and it resumes from its transcript.
   per launch (no polling), and the download is verified by SHA-256 before anything is replaced
   (the same install path as `ccdesk update`). A native `claude` install also auto-updates in
   the background by default, so the claude row may clear itself without you doing anything
-- **Mouse-first**: click to switch/focus, ☰ menu for what you can do to a row, `⊞ group`
-  row to switch grouping, account line for account switching, drag the border to resize
+- **Mouse-first**: click to switch/focus, the `=` at the head of a row for what you can do
+  to it, `⊞ group` row to switch grouping, account line for account switching, drag the
+  border to resize
 - **Keyboard**: ccdesk reserves exactly two things — `Alt+←/→` pane focus and `Ctrl+Q`
   quit. **Everything else passes through to claude untouched**, including `Ctrl+S` and
-  `Ctrl+X`. With the sidebar focused, `↑↓` select and `Enter` opens the selected row; on
-  the new-session screen, `Tab` cycles fields and `Enter` runs the selected folder-list row
+  `Ctrl+X`. With the sidebar focused, `↑↓` select, `Enter`/`→` opens the selected row and
+  `←` opens its menu; on the new-session screen, `Tab` cycles fields and `Enter` runs the
+  selected folder-list row
 - **New-session screen** with a folder browser, editable path field (paste / drag & drop),
   and a first-prompt input. The list starts with a `+ start in <folder>` row, so you can
   launch a session in the folder you are browsing without typing a prompt first

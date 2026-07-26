@@ -47,12 +47,12 @@ const DEFAULT_SIDEBAR_WIDTH: u16 = 34;
 /// 幅が変わると同じ画像が撮れない。実測で 26 桁の保存値が拾われ、
 /// セッション名が全部切れた画像になっていた）。
 ///
-/// 内側（枠の中）に収めたいものは 2 つ。桁数はセルの表示幅で数える
-/// （`☰` は East Asian Ambiguous で 2 桁を占めるため、文字数では足りない）:
+/// 内側（枠の中）に収めたいものは 2 つ。桁数は文字数ではなくセルの表示幅で数える
+/// （状態のグリフや区切りの記号は 1 文字が 1 桁とは限らない）:
 ///
-/// 1. セッション行 `☰ ␣ <グリフ> ␣ <名前>␣␣<状態>`。前置きが 5 桁で、
+/// 1. セッション行 `= ␣ <グリフ> ␣ <名前>␣␣<状態>`。前置きが 4 桁で、
 ///    [`demo_jobs`] の最長は "add dark mode toggle"(20) + "Needs input"(11)
-///    ＝ 5 + 20 + 2 + 11 = 38 桁
+///    ＝ 4 + 20 + 2 + 11 = 37 桁
 /// 2. 集計ヘッダー行 `1 awaiting input · 0 working · 5 completed` ＝ 42 桁。
 ///    語の途中で切れると画像が壊れて見えるので、こちらが実際の下限になる
 ///
@@ -1006,7 +1006,7 @@ mod tests {
     }
 
     /// 撮影用サイドバー幅の根拠を固定する。demo データを増やしたらここで落ちる。
-    /// 幅は文字数ではなく表示幅で数える（`☰` は 2 桁を占める）
+    /// 幅は文字数ではなく表示幅で数える
     #[test]
     fn demo_sidebar_width_fits_the_sidebar_rows() {
         use unicode_width::UnicodeWidthStr;
@@ -1015,9 +1015,9 @@ mod tests {
         const DEMO_HEADER: &str = "1 awaiting input · 0 working · 5 completed";
 
         let inner = usize::from(DEMO_SIDEBAR_WIDTH - 2);
-        // 名前より前の固定部分 `☰ ␣ <グリフ> ␣`。撮影はセッションを起こさないので
+        // 名前より前の固定部分 `= ␣ <グリフ> ␣`。撮影はセッションを起こさないので
         // 生きた PTY は無く、グリフは常に停止形（∙）
-        let prefix = "☰ ∙ ".width();
+        let prefix = "= ∙ ".width();
         let mut widest = DEMO_HEADER.width();
         let (mut awaiting, mut working, mut completed) = (0, 0, 0);
         for session in demo_sessions() {
