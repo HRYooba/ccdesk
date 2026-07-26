@@ -10,7 +10,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
@@ -153,6 +152,16 @@ impl Paths {
             usage_cache: ccdesk::usage_cache_path()?,
         })
     }
+
+    /// 保管ファイル用の advisory lock（`~/.ccdesk/accounts.json.lock`）。
+    ///
+    /// **claude のロックを借りない。** `~/.claude.lock` が守る対象は認証情報ファイルで、
+    /// 保管ファイルの read-modify-write をそれで直列化するのは意味論がズレるうえ、
+    /// ccdesk 同士の競合が claude のトークン更新を待たせることになる。
+    /// 導出は claude と同じ [`lock_path_for`]（ロック名の規則を 2 通り持たない）
+    fn store_lock(&self) -> PathBuf {
+        lock_path_for(&self.store)
+    }
 }
 
 /// proper-lockfile のロック名は `<target>.lock`（拡張子の置換ではなく **付加**）。
@@ -227,6 +236,11 @@ struct Lock {
 impl Lock {
     /// `wait` まで待って取る。`stale` より古いロックは奪う
     fn acquire(path: &Path, wait: Duration, stale: Duration) -> anyhow::Result<Self> {
+        // ロックの置き場所が無いと mkdir は必ず失敗する。保管ファイル用のロックは
+        // 初回起動（`~/.ccdesk` がまだ無い）で実際にこの状況になる
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         let deadline = Instant::now() + wait;
         let mut steals = 0;
         loop {
@@ -285,16 +299,24 @@ fn lock_age(path: &Path) -> Option<Duration> {
     lock_mtime(path)?.elapsed().ok()
 }
 
-/// 保管ファイルの read-modify-write を直列化するプロセス内ロック。
-/// UI スレッドの登録操作とポーラーの追従更新が同時に走るため、
-/// これが無いと片方の書き込みが消える
-static STORE_LOCK: Mutex<()> = Mutex::new(());
+/// 保管ファイルの read-modify-write を直列化するロックの待ち時間。
+///
+/// **プロセス内 Mutex では足りない。** ccdesk は複数起動でき保管ファイルは共有なので、
+/// 「インスタンス 1 の登録解除」と「インスタンス 2 の追従更新」が重なると後着が
+/// 前着を無かったことにする（外したアカウントが復活する / 新しい refreshToken が
+/// 落ちて保管が死んだ値へ巻き戻る）。ロックの実体はディレクトリなので同一プロセス内でも
+/// 排他になり、これ 1 つで両方の直列化が足りる。
+///
+/// 守る区間は小さなファイル 1 本の読み書きだけ（ネットワークも子プロセスも無い）なので、
+/// claude と共有するロックの待ち（[`LOCK_WAIT`]）より短くてよい
+const STORE_LOCK_WAIT: Duration = Duration::from_secs(2);
 
 /// アカウント保管ストア。保管先とロックの位置は [`Paths`] で注入する
 pub(crate) struct AccountStore {
     paths: Paths,
     lock_wait: Duration,
     lock_stale: Duration,
+    store_lock_wait: Duration,
 }
 
 impl AccountStore {
@@ -303,6 +325,7 @@ impl AccountStore {
             paths,
             lock_wait: LOCK_WAIT,
             lock_stale: LOCK_STALE,
+            store_lock_wait: STORE_LOCK_WAIT,
         }
     }
 
@@ -386,14 +409,14 @@ impl AccountStore {
     }
 
     /// 保管ファイルへ 1 件書く。`only_if_present` は追従更新用
-    /// （プロセス内ロックの下で在否を再確認するので、直前の登録解除と競合しない）
+    /// （ロックの下で在否を再確認するので、直前の登録解除と競合しない）
     fn upsert(
         &self,
         account: &Account,
         oauth: &Value,
         only_if_present: bool,
     ) -> anyhow::Result<bool> {
-        let _guard = STORE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _guard = self.lock_store()?;
         let mut accounts = read_accounts(&self.paths.store);
         if only_if_present && !accounts.contains_key(&account.email) {
             return Ok(false);
@@ -404,6 +427,17 @@ impl AccountStore {
         );
         write_json_atomically(&self.paths.store, &json!({ ACCOUNTS_KEY: accounts }))?;
         Ok(true)
+    }
+
+    /// 保管ファイルの read-modify-write を守るロック。**書き手 4 つ（登録・切替の
+    /// 巻き取り・追従更新・登録解除）が全てこれを通る**ことが不変条件で、
+    /// 1 つでも外れると多重起動で書き込みが消える（[`STORE_LOCK_WAIT`]）
+    fn lock_store(&self) -> anyhow::Result<Lock> {
+        Lock::acquire(
+            &self.paths.store_lock(),
+            self.store_lock_wait,
+            self.lock_stale,
+        )
     }
 
 }
@@ -448,7 +482,7 @@ impl AccountStore {
     /// 登録解除: 保管を消すだけ。**ログイン自体は外さない**
     /// （現行の `.credentials.json` には触らない）
     pub(crate) fn unregister(&self, email: &str) -> anyhow::Result<()> {
-        let _guard = STORE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _guard = self.lock_store()?;
         let mut accounts = read_accounts(&self.paths.store);
         if accounts.remove(email).is_none() {
             return Ok(()); // 既に無い＝目的は達成されている
@@ -665,6 +699,7 @@ pub(crate) mod tests {
         pub(crate) fn store_with_short_wait(&self) -> AccountStore {
             let mut store = self.store();
             store.lock_wait = Duration::from_millis(50);
+            store.store_lock_wait = Duration::from_millis(50);
             store
         }
 
@@ -1341,6 +1376,59 @@ pub(crate) mod tests {
             stored_oauth(&store, EMAIL_A),
             Some(oauth("access-a", "refresh-a")),
             "A の保管が B のトークンで潰れている"
+        );
+    }
+
+    /// **保管の read-modify-write は 4 つの書き手すべてが同じロックを通る。**
+    /// 1 つでも外れると多重起動で書き込みが消える: `unregister` が外れていると、
+    /// 「インスタンス 1 が A を登録解除」と「インスタンス 2 が B を追従更新」が
+    /// 重なったとき、後着が前着を無かったことにする（外した A が復活する /
+    /// 新しい refreshToken が落ちて保管が死んだ値へ巻き戻る）
+    #[test]
+    fn every_writer_of_the_store_takes_the_store_lock() {
+        let home = TempHome::new("every_writer_of_the_store_takes_the_store_lock");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+        home.write_credentials(&credentials_doc("access-b", "refresh-b"));
+        store.register(&home.active(EMAIL_B, "hanako")).unwrap();
+        let store_before = std::fs::read(home.paths().store).unwrap();
+        let credentials_before = std::fs::read(home.paths().credentials).unwrap();
+
+        // 別インスタンス相当の保持者（保管ファイル用のロック。claude のものではない）
+        let held = Lock::acquire(&home.paths().store_lock(), Duration::ZERO, LOCK_STALE).unwrap();
+        let short = home.store_with_short_wait();
+
+        assert!(short.register(&home.active(EMAIL_B, "hanako")).is_err(), "登録");
+        assert!(short.unregister(EMAIL_A).is_err(), "登録解除");
+        assert!(short.sync_active(&home.active(EMAIL_B, "hanako")).is_err(), "追従更新");
+        // 切替は「出ていく側の巻き取り」で保管へ書くので、そこで諦める。
+        // **現行の認証情報も書き換えない**（巻き取れないまま上書きするとログインが飛ぶ）
+        assert!(
+            short
+                .switch_to(EMAIL_A, Some(&home.active(EMAIL_B, "hanako")))
+                .is_err(),
+            "切替の巻き取り"
+        );
+
+        assert_eq!(
+            std::fs::read(home.paths().store).unwrap(),
+            store_before,
+            "ロックを取れていないのに保管を書いている"
+        );
+        assert_eq!(
+            std::fs::read(home.paths().credentials).unwrap(),
+            credentials_before,
+            "巻き取れないまま現行の認証情報を上書きしている"
+        );
+
+        drop(held);
+        // 解放後は通常どおり書ける（＝ロックが理由で壊れているわけではない）
+        short.unregister(EMAIL_A).unwrap();
+        assert_eq!(short.list(), vec![Account::new(EMAIL_B, "hanako")]);
+        assert!(
+            !home.paths().store_lock().exists(),
+            "保管ファイルのロックを残している"
         );
     }
 
