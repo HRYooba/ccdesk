@@ -33,32 +33,35 @@ reopen one and it resumes from its transcript.
   and the pid that is running it, so the row (and its name) become the session the pane is
   really running without waiting for the next poll
 - **A menu per row** — clicking the `=` at the **right end** of a session row, or pressing
-  `Enter` with the sidebar focused, opens `open` / `pin` / `mark as read` / `rename` / `stop` /
-  `close`. `open` is the same thing a click on the row body does (switch to the window, or
-  resume it), and it is how the keyboard opens a session. `stop` is the only
-  entry that greys out, and only when no window is open (there is no process to end).
+  `Enter` with the sidebar focused, opens `open` / `pin` / `mark as read` / `stop` /
+  `close`, and the menu drops down from the mark you clicked. `open` is the same thing a
+  click on the row body does (switch to the window, or resume it), and it is how the keyboard
+  opens a session. `stop` is the only entry that greys out, and only when no window is open
+  (there is no process to end).
   `pin` moves the row into a `pinned` section at the top of the list — the same section in
   either grouping, and it is not drawn at all while nothing is pinned, so pinning shows up as
-  where the row is rather than as one more glyph on it. `rename` turns the row itself into an
-  input — `Enter` keeps the name, `Esc` throws it away. There is no `archive`: `close` only
+  where the row is rather than as one more glyph on it. There is no `archive`: `close` only
   forgets the row, so archiving would differ from it by nothing but having a way back.
   **None of these operations gets its own shortcut key**: one
   entry point means one thing to read, and every key ccdesk does not reserve is a key
   claude Code still gets
 - **Names that match what claude shows** — a row is named after its transcript
-  (`custom-title` > `ai-title` > the last prompt), the same record `/rename` writes
-  inside the session. On a running session `rename` types `/rename <name>` into the pane for
-  you, so claude updates both its own header and the transcript — nothing else can change the
-  name claude is showing. On a stopped session (or while you have half-typed text waiting in
-  the prompt, which ccdesk will not throw away) the name is appended to the transcript
-  instead and claude picks it up the next time you open the row. The transcript is read whole
+  (`custom-title` > `ai-title` > the last prompt), and **that name is never copied into
+  ccdesk's own files**: it is derived every time the sidebar is drawn, so whatever claude
+  shows is what the row shows. To change a name, type `/rename` in the pane — ccdesk has no
+  rename of its own, because both ways of adding one (typing into the pane for you, or
+  writing the transcript itself) depend on claude's private shapes and break silently.
+  **ccdesk never writes to claude's files at all.** The transcript is read whole
   the first time and only where it grew after that, so a rename you made early in a long
-  conversation shows the same name the `/resume` picker does. Until the first turn creates
-  the transcript, the name you typed is held in `~/.ccdesk/sessions.json` and lands in the
-  transcript as soon as it exists
+  conversation shows the same name the `/resume` picker does. A session that moved into a
+  git worktree keeps its name too: its transcript moves with it, and ccdesk looks through
+  the worktrees of the row's folder to find it (the same range `claude -r` searches).
+  Until the first turn creates a transcript there is nothing to read, so the row reads
+  `new session`
 - **A row's age** — the `· 12s` at the right of a row is how long the row has looked the way
-  it does, i.e. the time since its state or name last actually changed. Clicking around the
-  list, focusing a pane or claude redrawing itself does not reset it
+  it does, i.e. the time since its state last actually changed. Clicking around the
+  list, focusing a pane, claude renaming the conversation or redrawing itself does not
+  reset it
 - **Unread rows** — a `●` in the second column marks a row that changed while you were not
   looking at it (`mark as read` clears it, and so does opening the row). The column is
   reserved either way, so names never shift sideways

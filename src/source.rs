@@ -27,7 +27,8 @@ use crate::poll::{
     read_usage, spawn_agents_poller, spawn_ccdesk_version_check, spawn_footer_poller,
     AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo,
 };
-use crate::sessions::{SessionId, SessionRow, SessionStore, TitleSource};
+use crate::sessions::{SessionId, SessionRow, SessionStore};
+use crate::title::Titles;
 
 /// 登録プロジェクト（ディレクトリ）の保持上限。
 ///
@@ -229,6 +230,12 @@ pub(crate) trait DataSource: Send + Sync {
 
     /// バックグラウンド取得の開始。**demo は 1 本も起こさない**
     fn spawn_pollers(&self, sinks: PollSinks);
+
+    /// 表示名の供給元。**行は名前を持たない**（正本は transcript）ので、
+    /// 名前を導く側をここで選ぶ: live は transcript を読み、撮影用は固定表を返す
+    /// （メソッドである以上コンパイラが demo 側の実装も要求する ＝
+    /// 撮影に実セッションの名前が漏れない）
+    fn titles(&self) -> Titles;
 
     /// 保管済みアカウントの一覧（アカウント行のメニューに並べる中身と、
     /// 「今のアカウントが保管されているか」＝ ⚠ の判定の両方がこれを見る）
@@ -539,6 +546,10 @@ impl DataSource for LiveSource {
         spawn_ccdesk_version_check(sinks.ccdesk_latest, sinks.ccdesk_latest_dirty);
     }
 
+    fn titles(&self) -> Titles {
+        Titles::default()
+    }
+
     fn accounts(&self) -> Vec<Account> {
         // ホームが取れない環境（[`AccountStore::detect`] が None）は保管 0 件と同じ扱い。
         // 一覧が空でも `register current` だけのメニューとして成立する
@@ -548,8 +559,13 @@ impl DataSource for LiveSource {
     }
 
     fn apply_account(&self, action: AccountAction) -> anyhow::Result<AccountChange> {
+        // **ユーザーが押した操作にだけ持ち主の再判定を付ける**
+        // （[`AccountStore::with_owner_check`]）。動いている claude はトークンを
+        // 更新し続けるので、ファイルが動いたことだけを理由に中止すると
+        // 切替が毎回弾かれる
         let store = AccountStore::detect()
-            .ok_or_else(|| anyhow!("could not locate the home directory for the account store"))?;
+            .ok_or_else(|| anyhow!("could not locate the home directory for the account store"))?
+            .with_owner_check(Arc::new(crate::poll::current_owner));
         apply_account_action(&store, action)
     }
 }
@@ -623,6 +639,11 @@ impl DataSource for DemoSource {
         // ファイル監視のスレッドは 1 本も起こさない
     }
 
+    fn titles(&self) -> Titles {
+        // 撮影は transcript も `~/.claude` も読まない（固定表だけを返す）
+        Titles::fixed(demo_rows().into_iter().map(|(row, name)| (row.session_id, name)).collect())
+    }
+
     fn accounts(&self) -> Vec<Account> {
         demo_accounts()
     }
@@ -645,6 +666,15 @@ impl DataSource for DemoSource {
 /// **どの行も生きた PTY を持たない**（撮影はセッションを起こさない）ので、
 /// 状態は `last_state` から決まる ＝ ここに書いた state がそのまま画面に出る
 fn demo_sessions() -> Vec<SessionRow> {
+    demo_rows()
+        .into_iter()
+        .map(|(row, _)| row)
+        .collect()
+}
+
+/// 撮影用の行と、その行に出す表示名。**名前は行が持たない**
+/// （正本は transcript）ので、撮影は [`Titles::fixed`] へ渡す表として持つ
+fn demo_rows() -> Vec<(SessionRow, String)> {
     let rows: [(&str, &str, &str); 6] = [
         ("fix login form validation", "working", "C:\\dev\\shop-app"),
         ("add dark mode toggle", "blocked", "C:\\dev\\shop-app"),
@@ -659,18 +689,16 @@ fn demo_sessions() -> Vec<SessionRow> {
         .map(|(i, (title, state, cwd))| {
             let minutes = (i as u64 + 1) * 7;
             let updated = now.saturating_sub(minutes * 60_000);
-            SessionRow {
-                last_state: (*state).to_string(),
-                updated_at: updated,
-                ..SessionRow::new(
-                    // 架空の UUID（実セッションの ID を出さない）
-                    SessionId::new(format!("demo0000-0000-4000-8000-{:012}", i + 1)),
-                    *cwd,
-                    *title,
-                    TitleSource::Ai,
-                    updated,
-                )
-            }
+            // 架空の UUID（実セッションの ID を出さない）
+            let id = SessionId::new(format!("demo0000-0000-4000-8000-{:012}", i + 1));
+            (
+                SessionRow {
+                    last_state: (*state).to_string(),
+                    updated_at: updated,
+                    ..SessionRow::new(id, *cwd, updated)
+                },
+                (*title).to_string(),
+            )
         })
         .collect()
 }
@@ -755,8 +783,9 @@ mod tests {
     #[test]
     fn demo_sessions_are_fixed_fake_rows() {
         let sessions = DemoSource.sessions();
+        let titles = DemoSource.titles();
         assert_eq!(
-            sessions.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
+            sessions.iter().map(|s| titles.of(s)).collect::<Vec<_>>(),
             [
                 "fix login form validation",
                 "add dark mode toggle",
@@ -789,8 +818,6 @@ mod tests {
         let asked = vec![crate::sessions::SessionRow::new(
             crate::sessions::SessionId::new(write_sentinel("session")),
             "C:\\demo-must-not-write",
-            "demo",
-            crate::sessions::TitleSource::Derived,
             0,
         )];
         assert_eq!(
@@ -1055,18 +1082,18 @@ mod tests {
         let prefix = "= ∙ ".width();
         let mut widest = DEMO_HEADER.width();
         let (mut awaiting, mut working, mut completed) = (0, 0, 0);
-        for session in demo_sessions() {
+        for (session, title) in demo_rows() {
             let view = classify(&session.last_state, false);
             match view.bucket {
                 Bucket::Awaiting => awaiting += 1,
                 Bucket::Working => working += 1,
                 Bucket::Completed => completed += 1,
             }
-            let need = prefix + session.title.width() + 2 + view.label.width();
+            let need = prefix + title.width() + 2 + view.label.width();
             assert!(
                 need <= inner,
                 "{:?} + {:?} needs {need} cols (inner is {inner} cols)",
-                session.title,
+                title,
                 view.label
             );
             widest = widest.max(need);

@@ -15,11 +15,10 @@ use crate::hooks::HookStates;
 use crate::keys::{encode_key, forward_mouse};
 use crate::poll::{AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo};
 use crate::session::{Launch, Session};
-use crate::sessions::{SessionId, SessionRow, TitleSource};
+use crate::sessions::{SessionId, SessionRow};
 use crate::source::{AccountAction, DataSource, PollSinks, WindowItem, PROJECTS_LIMIT};
-use crate::title::{title_text, Titles, UNTITLED};
+use crate::title::Titles;
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
-use crate::ui::text_field::TextField;
 use crate::ui::{draw, menu_zone, popup_rect, row_at, row_y, sidebar_layout};
 
 /// サイドバー幅の下限（ドラッグで詰められる限界）。
@@ -212,8 +211,6 @@ enum PopupAction {
     TogglePin(SessionId),
     /// 未読を消す（`last_opened_at` を今にする）
     MarkRead(SessionId),
-    /// 行の上でインライン入力を始める（確定は [`commit_rename`]）
-    StartRename(SessionId),
     /// セッションを止める ＝ 子プロセスを終わらせる。**行は残す**（`open` で再開できる）
     Stop(SessionId),
     /// 一覧から行を外す（transcript は消さない ＝ 会話ログは残る）
@@ -265,7 +262,6 @@ impl PopupKind {
                 ("open".to_string(), true),
                 (if *pinned { "unpin" } else { "pin" }.to_string(), true),
                 ("mark as read".to_string(), true),
-                ("rename".to_string(), true),
                 ("stop".to_string(), *open),
                 ("close".to_string(), true),
             ],
@@ -320,9 +316,8 @@ impl PopupKind {
                 0 => Some(PopupAction::OpenSession(id.clone())),
                 1 => Some(PopupAction::TogglePin(id.clone())),
                 2 => Some(PopupAction::MarkRead(id.clone())),
-                3 => Some(PopupAction::StartRename(id.clone())),
-                4 => Some(PopupAction::Stop(id.clone())),
-                5 => Some(PopupAction::Close(id.clone())),
+                3 => Some(PopupAction::Stop(id.clone())),
+                4 => Some(PopupAction::Close(id.clone())),
                 _ => None,
             },
             PopupKind::Group => match index {
@@ -359,20 +354,6 @@ pub(crate) struct Popup {
     pub(crate) kind: PopupKind,
     pub(crate) anchor_y: u16, // 開いた元の画面行（矩形はこの 1 つ下に出る）
     pub(crate) selected: usize,
-}
-
-/// 名前の変更中の状態（メニューの `rename` で始まり、Enter で確定 / Esc で取り消し）。
-///
-/// **入力欄を別の場所に開かず、その行そのものをインライン入力に化けさせる**:
-/// 名前は行の中身なので、直す場所と見える場所が違うと「どれを直しているのか」を
-/// 対応づける手間が増える。行の identity（[`SessionId`]）で結ぶので、
-/// 編集中に一覧の並びが変わっても（2 秒毎の読み直し・状態の変化）追従する。
-///
-/// 打った内容は**確定するまで行に入らない**（[`commit_rename`] が 1 度だけ書く）。
-/// 打鍵のたびに保存すると、共有ファイルへの書き込みが 1 文字ごとに走る
-pub(crate) struct Rename {
-    pub(crate) id: SessionId,
-    pub(crate) field: TextField,
 }
 
 /// 右ペインの表示内容
@@ -471,9 +452,6 @@ pub(crate) struct App {
     // 以降ここを通る限り「今 demo か」を問う必要が無い。
     // **`Arc` なのはアカウント操作を別スレッドへ渡すため**（[`AccountJob`]）
     pub(crate) source: Arc<dyn DataSource>,
-    // 名前の変更中（メニューの `rename`）。Some の間はその行がインライン入力に化け、
-    // サイドバーのキーは全部この入力が受ける（[`handle_rename_key`]）
-    pub(crate) rename: Option<Rename>,
     // 起動した子がまだ端末を掴んでいない間だけ Some（起こした時刻）。
     // 降ろす契機は「子が最初の出力を出した」（run ループ）と期限切れ
     // （[`expire_input_gate`]）の 2 つで、**降ろすのは [`lift_input_gate`] だけ**
@@ -555,7 +533,6 @@ impl Default for App {
             // テストが開発者の設定を踏まない
             account_job: None,
             source: Arc::new(crate::source::DemoSource),
-            rename: None,
             input_gate: None,
             notice: None,
             grouping: Grouping::State,
@@ -626,11 +603,6 @@ impl App {
         if focus == Focus::Sidebar {
             self.last_scan = instant_ago(SCAN_INTERVAL);
             self.last_live_scan = instant_ago(LIVE_SCAN_INTERVAL);
-        } else {
-            // 名前の入力はサイドバーの行そのものなので、フォーカスが離れたら取り消す。
-            // **残すと入力欄が見えないまま打鍵を待つ状態**になり、次にサイドバーへ
-            // 戻ったとき ↑↓ が効かない理由が画面から読めない
-            self.rename = None;
         }
     }
 
@@ -786,9 +758,9 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             adopt_hook_states(app);
             // ペインの中で `/resume` された窓を新しいセッションの行へ張り替える。
             // **名前の読み直しの前**に置く: 張り替えで作った行の表示名は
-            // transcript から来るので、同じ周期の refresh_titles が拾う
+            // transcript から来るので、同じ周期の refresh_transcripts が拾う
             follow_session_switches(app);
-            refresh_titles(app);
+            refresh_transcripts(app);
             app.last_scan = std::time::Instant::now();
             force_draw = true; // 並びが変わったら即描画（表示と行データのずれを残さない）
         }
@@ -1045,14 +1017,10 @@ fn reserved_key(key: &KeyEvent) -> Option<Reserved> {
 /// こちらにあるときだけで、端末側にフォーカスがあれば同じキーは PTY へ行く
 /// （[`reserved_key`] に載っていないキーは横取りされない）。
 ///
-/// 受け手の優先順は 名前の入力 → メニュー → 一覧。前の 2 つは開いている間
+/// 受け手の優先順は メニュー → 一覧。メニューは開いている間
 /// **すべてのキーを飲む**（開いたまま裏の一覧が動くと、見えているものと
 /// 効くものがずれる）
 fn handle_sidebar_key(app: &mut App, key: &KeyEvent) {
-    if app.rename.is_some() {
-        handle_rename_key(app, key);
-        return;
-    }
     if app.popup.is_some() {
         handle_popup_key(app, key.code);
         return;
@@ -1153,108 +1121,6 @@ fn open_row_menu(app: &mut App) {
     }
 }
 
-/// 名前の入力中のキー（Enter = 確定 / Esc = 取り消し / それ以外は入力欄が受ける）。
-///
-/// 入力欄が受けないキー（↑↓ など）は**何もしない**: 編集中に裏の選択が動くと、
-/// 確定した瞬間に別の行を見ていることになる
-fn handle_rename_key(app: &mut App, key: &KeyEvent) {
-    match key.code {
-        KeyCode::Enter => commit_rename(app),
-        KeyCode::Esc => app.rename = None,
-        _ => {
-            if let Some(rename) = app.rename.as_mut() {
-                rename.field.handle_key(key);
-            }
-        }
-    }
-}
-
-/// 名前の変更を確定する。**空白だけの名前は付けない**（行から名前が消えると
-/// どのセッションか指せなくなる）ので、その場合は変更せずに閉じる。
-///
-/// **名前を付ける先は 1 箇所 ＝ transcript の `custom-title`**（claude の `/rename` と
-/// 同じ場所。名前の正本を 2 つに割らない）だが、**そこへ誰が書くかは
-/// 動いているかで分ける**（分岐はここ 1 箇所）:
-///
-/// - **動いている**（窓が開いている）→ **PTY へ `/rename <名前>` を送り、claude 自身に
-///   書かせる**。ccdesk が transcript へ書いても claude は自分の transcript を
-///   監視していないので、**ペインの中の表示名（青い名前）が変わらない**（`new session`
-///   のまま残る）。claude に打たせれば表示名と `custom-title` の両方が同時に更新され、
-///   ユーザーが手で `/rename` を打ったときと同じ結果になる
-/// - **止まっている** → 送り先が無いので [`crate::title::Titles::set_custom`] で
-///   transcript へ追記する。次に `open` したとき claude がそれを読んで表示名にする
-///
-/// 行の `title` にはどちらの経路でも同じ値を置く（transcript を読む前でも名前が
-/// 出るようにするための表示用キャッシュ）
-fn commit_rename(app: &mut App) {
-    let Some(rename) = app.rename.take() else {
-        return;
-    };
-    // **PTY へ生で送るので 1 行へ畳んでから使う**（[`title_text`] が改行・制御文字を
-    // 落として桁で切る ＝ 名前の作り方を transcript 由来の名前と 1 つに揃える)
-    let title = title_text(&rename.field.text);
-    if title.is_empty() {
-        return;
-    }
-    // 窓の観測（生きているか・入力欄が空か）はここで 1 度だけ取る。
-    // 届け先の判断そのものは [`rename_to`]（純関数）が持つ
-    let window = app
-        .windows
-        .iter_mut()
-        .find(|w| w.session_id == rename.id)
-        .map(|w| (w.alive(), w.input_line_is_empty()));
-    match rename_to(window) {
-        RenameTo::Session => {
-            if let Some(window) = app.windows.iter_mut().find(|w| w.session_id == rename.id) {
-                window.send_line(&format!("/rename {title}"));
-            }
-        }
-        RenameTo::Transcript => {
-            let mut titles = std::mem::take(&mut app.titles);
-            if let Some(row) = app.sessions.iter().find(|r| r.session_id == rename.id) {
-                titles.set_custom(row, &title);
-            }
-            app.titles = titles;
-        }
-    }
-    edit_row(app, &rename.id, Unread::Keep, |row| {
-        row.title = title;
-        row.title_source = TitleSource::Custom;
-    });
-}
-
-/// 名前の届け先（[`commit_rename`] の分岐）
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum RenameTo {
-    /// 動いているセッションへ `/rename <名前>` を打つ ＝ **claude が
-    /// 表示名（ペイン内の名前）と `custom-title` の両方を直す**
-    Session,
-    /// ccdesk が transcript へ `custom-title` を追記する
-    Transcript,
-}
-
-/// 名前をどこへ届けるか。**材料は「窓があるか」「生きているか」「入力欄が空か」の
-/// 3 つだけ**なので純関数にしてある（PTY を起こさずに検査できる）。
-/// `window` は窓がある場合の (生きているか, 入力欄が空か)。
-///
-/// **`Session` に倒すのは全部そろったときだけ**で、残りはすべて transcript 側:
-///
-/// - 窓が無い（止まっている）＝ 送り先が無い
-/// - 子プロセスが死んでいる ＝ 送っても誰も読まない
-/// - **入力欄が空と言えない**（打ちかけがある・応答生成中・許可待ち。判断は
-///   [`crate::session::Session::input_line_is_empty`]）
-///
-/// **打ちかけの文字は消さない**のがこの分岐の一番の理由: 行頭までクリアしてから
-/// 送れば必ず通せるが、それはユーザーが打って**まだ送っていない**文字を黙って
-/// 捨てることになる（取り返せない）。倒した先でも名前は一覧に即座に付き、
-/// ペイン内の表示名は次に開いたときに揃う
-fn rename_to(window: Option<(bool, bool)>) -> RenameTo {
-    match window {
-        Some((true, true)) => RenameTo::Session,
-        _ => RenameTo::Transcript,
-    }
-}
-
 /// New 画面からの起動。**セッションの実体は ccdesk の子プロセス**になり、
 /// ccdesk を閉じると終わる（行は `sessions.json` に残り `claude -r` で再開できる）
 pub(crate) fn start_new_session(app: &mut App) -> anyhow::Result<()> {
@@ -1343,15 +1209,6 @@ fn refresh_sessions(app: &mut App) {
     if !dropped.is_empty() {
         app.sessions.extend(dropped);
         save_sessions(app);
-    }
-    // 読み直しで行が消えた（他インスタンスの close）なら名前の入力も畳む。
-    // 直す対象が無いまま入力欄だけが残ると、確定しても何も起きない打鍵になる
-    if app
-        .rename
-        .as_ref()
-        .is_some_and(|r| !app.sessions.iter().any(|row| row.session_id == r.id))
-    {
-        app.rename = None;
     }
 }
 
@@ -1449,30 +1306,19 @@ fn follow_session_switches(app: &mut App) {
             continue;
         };
         let previous = std::mem::replace(&mut window.session_id, next.clone());
-        // 窓の見出しも新しいセッションの名前になる（張り替えた行から取る）
-        let title = adopt_switched_session(app, &previous, &next, index == app.active);
-        if let Some(window) = app.windows.get_mut(index) {
-            window.name = title;
-        }
+        adopt_switched_session(app, &previous, &next, index == app.active);
     }
 }
 
-/// 張り替え先の行を用意し、その表示名を返す（[`follow_session_switches`] だけが呼ぶ）。
+/// 張り替え先の行を用意する（[`follow_session_switches`] だけが呼ぶ）。
 ///
 /// **窓に触らないので単体で検査できる**（PTY を起こさずに、行の作成・`last_view` の
 /// 保存を確かめられる）。`shown` は「その窓が今ペインに出ているか」＝
 /// `last_view` を書き換えてよいかの判断。
 ///
 /// 行が無ければ作る（`/resume` で選べる会話は ccdesk の一覧に無いこともある）。
-/// 名前は入れずに作るのが要点で、**transcript から拾うのは
-/// [`refresh_titles`] の仕事**（同じ周期の中でこの直後に走る ＝ 名前の決め方を
-/// 2 箇所に持たない）
-fn adopt_switched_session(
-    app: &mut App,
-    previous: &SessionId,
-    next: &SessionId,
-    shown: bool,
-) -> String {
+/// **名前は行が持たない**ので、作った行の表示名は次の描画で transcript から導かれる
+fn adopt_switched_session(app: &mut App, previous: &SessionId, next: &SessionId, shown: bool) {
     let cwd = app
         .sessions
         .iter()
@@ -1480,13 +1326,7 @@ fn adopt_switched_session(
         .map(|row| row.cwd.clone())
         .unwrap_or_default();
     if !app.sessions.iter().any(|row| &row.session_id == next) {
-        app.sessions.push(SessionRow::new(
-            next.clone(),
-            cwd,
-            UNTITLED,
-            TitleSource::Derived,
-            now_ms(),
-        ));
+        app.sessions.push(SessionRow::new(next.clone(), cwd, now_ms()));
         save_sessions(app);
     }
     // **次回起動で開く画面もこの窓の新しいセッションにする。** 保存は
@@ -1504,11 +1344,6 @@ fn adopt_switched_session(
     });
     // 開いている窓の行は既読（今まさに見ている会話）
     mark_opened(app, next);
-    app.sessions
-        .iter()
-        .find(|row| &row.session_id == next)
-        .map(|row| row.title.clone())
-        .unwrap_or_default()
 }
 
 /// 行の状態を書き換えて保存する（行が無ければ何もしない）。
@@ -1587,35 +1422,22 @@ fn window_launched_at(app: &App, id: &SessionId) -> Option<u64> {
         .map(|w| w.started_at)
 }
 
-/// transcript から表示名を拾い直す（優先順と読み方は [`crate::title`]）。
+/// transcript を解決し直し、増えたぶんを走査する（読み方は [`crate::title`]）。
 ///
-/// **transcript が名前の正本なので、拾えた値は無条件に採る。** 行の `title` は
-/// 表示用のキャッシュで、`Custom`（ユーザーが付けた名前）も transcript の
-/// `custom-title` に載っている ＝ 読み直しても同じ値が返る。だから
-/// 「格下げしない」ガードも「`Custom` の行を触らない」除外も持たない
-/// （持つと、セッションの中で `/rename` した結果がサイドバーへ出ない）。
+/// **行に書き戻すのは transcript の場所だけ。** 表示名は行が持たず、描画のたびに
+/// [`Titles::of`] が導く ＝ 名前が変わっても `updated_at` は動かない
+/// （動かしていた頃は、claude が名前を付け直すたびに行の経過時間が 0s へ戻った）。
 ///
-/// **受け入れた代償**: `ai-title` が末尾の読み取り範囲（`TAIL_BYTES`）から
-/// 遠ざかった長い会話では、名前が `last-prompt` へ落ちる。transcript が正本である
-/// ことと引き換えで、名前を固定したいならリネームで `custom-title` に置ける
-fn refresh_titles(app: &mut App) {
-    let shown = app.shown_session().cloned();
+/// **保存するのは解決が動いた周だけ。** 解決結果は再起動後も使う値なので
+/// `sessions.json` に載せるが、`updated_at` は進めない（行の中身が変わったわけでは
+/// なく、同じ会話の在り処が分かっただけ）
+fn refresh_transcripts(app: &mut App) {
     let mut titles = std::mem::take(&mut app.titles);
-    // 1 ターン前のリネームで持ち越した `custom-title` を載せに行く。
-    // **読む前に書く**ので、載った値はこの周の読み直しでそのまま確認される
-    titles.flush(&app.sessions);
     let mut changed = false;
     for row in &mut app.sessions {
-        let Some((title, source)) = titles.poll(row) else {
-            continue;
-        };
-        if row.title == title && row.title_source == source {
-            continue;
-        }
-        row.title = title;
-        row.title_source = source;
-        touch(row, shown.as_ref() == Some(&row.session_id));
-        changed = true;
+        let before = row.transcript.clone();
+        titles.refresh(row);
+        changed |= row.transcript != before;
     }
     app.titles = titles;
     if changed {
@@ -1824,20 +1646,11 @@ fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
 /// **行を足すのは起動できてから**（起動できなかったセッションを一覧に残さない）
 fn start_foreground(app: &mut App, cwd: &str, prompt: &str) -> Launched {
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-    // 起動時に渡すプロンプトは、そのセッションの**先頭ユーザープロンプト**そのもの。
-    // transcript を読み直さずに優先順の最下段を満たせる（[`crate::title`]）
-    let title = title_text(prompt);
-    let (title, title_source) = if title.is_empty() {
-        (UNTITLED.to_string(), TitleSource::Derived)
-    } else {
-        (title, TitleSource::FirstPrompt)
-    };
     // state を取る hook と、使用率表示（opt-in）の statusline を注入する
     let settings = crate::hooks::inject_settings(app.usage_display);
     let (rows, cols) = app.pane_size();
     let window = Session::spawn(
         &session_id,
-        &title,
         cwd,
         rows,
         cols,
@@ -1845,13 +1658,10 @@ fn start_foreground(app: &mut App, cwd: &str, prompt: &str) -> Launched {
         settings.as_deref(),
     )
     .map_err(|e| format!("failed to start session: {e}"))?;
-    app.sessions.push(SessionRow::new(
-        session_id.clone(),
-        cwd,
-        title,
-        title_source,
-        now_ms(),
-    ));
+    // **名前は入れない。** 1 ターン目が終わるまで transcript は無いので、
+    // それまでこの行は [`UNTITLED`] で出る（起動プロンプトの写しを行へ置くと、
+    // 正本が 2 つになって同じ問題が戻る）
+    app.sessions.push(SessionRow::new(session_id.clone(), cwd, now_ms()));
     save_sessions(app);
     app.windows.push(window);
     app.show_session(app.windows.len() - 1);
@@ -1991,9 +1801,6 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             // サイドバー内クリックはサイドバーへフォーカス。
             // 行クリックは右ペインの内容だけ切り替える（フォーカス移動は右ペインクリック or Enter）
             app.set_focus(Focus::Sidebar);
-            // 名前の入力中に他所を押したら取り消す（クリックでは確定させない ＝
-            // 押し間違いで名前が変わらない。確定は Enter だけ）
-            app.rename = None;
             if hit.as_ref().is_some_and(SidebarRow::selectable) {
                 app.selection = SidebarPos::Row(row);
             }
@@ -2225,7 +2032,6 @@ fn run_popup_action(app: &mut App, action: PopupAction, anchor_y: u16) {
             edit_row(app, &id, Unread::Keep, |row| row.pinned = !row.pinned)
         }
         PopupAction::MarkRead(id) => edit_row(app, &id, Unread::Clear, |_| {}),
-        PopupAction::StartRename(id) => start_rename(app, &id),
         PopupAction::Stop(id) => menu_stop(app, &id),
         PopupAction::Close(id) => menu_close(app, &id),
         PopupAction::SetGrouping(next) => {
@@ -2517,22 +2323,6 @@ fn toggle_grouping(app: &mut App) {
     app.source.save_window(WindowItem::Grouping(app.grouping));
 }
 
-/// メニュー: rename（行の上でインライン入力を始める）。
-/// 初期値は今の名前（`docs/foreground-migration.md` の title の優先順で決まった値）。
-/// 行が無ければ始めない（メニューを開いたまま他インスタンスが消した場合）
-fn start_rename(app: &mut App, id: &SessionId) {
-    let Some(row) = app.sessions.iter().find(|r| &r.session_id == id) else {
-        return;
-    };
-    let mut field = TextField::default();
-    // カーソルは末尾（付け足す方が多い）。全部消したいなら Backspace が続く
-    field.set_text(&row.title);
-    app.rename = Some(Rename {
-        id: id.clone(),
-        field,
-    });
-}
-
 /// メニュー: stop（セッションのプロセスを終わらせる）。
 ///
 /// **行は残す。** 前景セッションは ccdesk の子なので、止める ＝ プロセスが
@@ -2580,9 +2370,6 @@ fn menu_close(app: &mut App, id: &SessionId) {
         save_sessions(app);
     }
     // 消した行の名前を編集中だったら畳む（行が無いのに入力欄だけ残らない）
-    if app.rename.as_ref().is_some_and(|r| &r.id == id) {
-        app.rename = None;
-    }
 }
 
 /// 指定セッションのウィンドウを閉じる（＝ 子プロセスを終わらせる）。
@@ -2812,35 +2599,41 @@ fn expire_input_gate(app: &mut App) -> bool {
     true
 }
 
-/// 止まっている行の起こし直し方。**判断材料は transcript があるか 1 つだけ**
-/// （[`crate::title::Titles::has_transcript`]）なので、副作用を持たずに検査できる。
+/// 止まっている行の起こし直し方と、**その起動先の cwd**。
 ///
-/// - ある ＝ 会話がある → `claude -r <uuid>` で再開する
-/// - ない ＝ 起こしただけで 1 ターンも終わっていない → **同じ UUID で新規として起こす**
-///   （`claude -r` は会話を見つけられず `No conversation found` になる・実測）
+/// 判断材料は 1 つ ＝ **`claude -r` が会話を見つけられる cwd があるか**
+/// （[`crate::title::Titles::resume_cwd`]）。副作用を持たないので単体で検査できる。
 ///
-/// 新規側でプロンプトを渡さないのは、起動時のプロンプトは最初の 1 回で使い切って
-/// いるため（二度目に送ると同じ指示が 2 回走る）
-fn relaunch(titles: &crate::title::Titles, row: &SessionRow) -> Launch<'static> {
-    if titles.has_transcript(row) {
-        Launch::Resume
-    } else {
-        Launch::New { prompt: "" }
+/// - ある → その cwd で `claude -r <uuid>` を打つ
+/// - ない → **同じ UUID で新規として起こす**（行の cwd で）。会話が無い行
+///   （起こしただけで 1 ターンも終わっていない）と、会話はあるがその作業ツリーが
+///   消えている行の両方がここへ来る。どちらも `claude -r` は
+///   `No conversation found` になる（実測）
+///
+/// **cwd を返すのが要点**: セッションは走行中に git worktree へ移れて、移った先の
+/// 会話は行の cwd から `claude -r` を打っても見つからない
+/// （`/resume` のピッカーに出ないのと同じ範囲の話）
+fn relaunch<'a>(
+    titles: &crate::title::Titles,
+    row: &'a SessionRow,
+) -> (Launch<'static>, std::borrow::Cow<'a, str>) {
+    match titles.resume_cwd(row) {
+        Some(cwd) => (Launch::Resume, std::borrow::Cow::Owned(cwd)),
+        None => (
+            Launch::New { prompt: "" },
+            std::borrow::Cow::Borrowed(row.cwd.as_str()),
+        ),
     }
 }
 
 /// 一覧の行を開く: ウィンドウが開いていれば切替、無ければ起こし直す
-/// （起こし方は [`relaunch`] が決める）。
+/// （起こし方と起動先は [`relaunch`] が決める）。
 ///
-/// **起こし方は transcript があるかで分かれる**（[`crate::title::Titles::has_transcript`]）:
-/// 前景セッションは 1 ターン終わるまで transcript を作らないので、起こした直後に
-/// `close` した行へ `claude -r` を打つと `No conversation found` になる（実測）。
-/// transcript が無い行は**同じ UUID で新規として起こす**（`--session-id` ＝
-/// 行の identity が変わらないので、履歴が生まれたときにこの行の transcript になる）。
+/// 新規側でプロンプトを渡さないのは、起動時のプロンプトは最初の 1 回で使い切って
+/// いるため（二度目に送ると同じ指示が 2 回走る）。`--session-id` を渡すので
+/// **行の identity は変わらず**、履歴が生まれたときにこの行の transcript になる。
 ///
-/// **再開は行が持つ cwd で行う**（`claude -r` は cwd の一致が必須で、別 cwd からは
-/// `No conversation found` になる・実測）。失敗（cwd 消失等）は握りつぶさず
-/// 下部バーへ通知する
+/// 失敗（cwd 消失等）は握りつぶさず下部バーへ通知する
 pub(crate) fn open_session(app: &mut App, id: &SessionId) {
     // **ペインを開いた時点が既読の契機**（切替も再開も同じ ＝ ここ 1 箇所で済む）
     mark_opened(app, id);
@@ -2851,11 +2644,11 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) {
     let Some(row) = app.sessions.iter().find(|r| &r.session_id == id) else {
         return; // 再読み込みで消えた行（クリックと削除の競合）は何もしない
     };
-    let (title, cwd) = (row.title.clone(), row.cwd.clone());
-    let launch = relaunch(&app.titles, row);
+    let (launch, cwd) = relaunch(&app.titles, row);
+    let cwd = cwd.into_owned();
     let settings = crate::hooks::inject_settings(app.usage_display);
     let (rows, cols) = app.pane_size();
-    match Session::spawn(id, &title, &cwd, rows, cols, launch, settings.as_deref()) {
+    match Session::spawn(id, &cwd, rows, cols, launch, settings.as_deref()) {
         Ok(window) => {
             app.windows.push(window);
             app.show_session(app.windows.len() - 1);
@@ -2964,7 +2757,7 @@ mod tests {
         }
     }
 
-    /// **メニューは 6 項目で、先頭が `open`。** 落ちるのは `stop` だけで、それは
+    /// **メニューは 5 項目で、先頭が `open`。** 落ちるのは `stop` だけで、それは
     /// 窓が開いていない行 ＝ 止めるプロセスが無いから（他の 5 つは停止中の行にも効く ＝
     /// `open` は止まっている行を `claude -r` で再開する）。
     ///
@@ -2980,7 +2773,6 @@ mod tests {
                 ("open".to_string(), true),
                 ("pin".to_string(), true),
                 ("mark as read".to_string(), true),
-                ("rename".to_string(), true),
                 ("stop".to_string(), true),
                 ("close".to_string(), true),
             ]
@@ -2991,7 +2783,7 @@ mod tests {
                 .into_iter()
                 .map(|(_, enabled)| enabled)
                 .collect::<Vec<_>>(),
-            [true, true, true, true, false, true],
+            [true, true, true, false, true],
             "stop must be the only entry disabled when there is no window"
         );
         // アーカイブと「削除」の語はどちらの状態でも出さない
@@ -3020,7 +2812,7 @@ mod tests {
         assert!(!labels.contains(&"pin".to_string()), "both states are listed: {labels:?}");
     }
 
-    /// 6 項目それぞれの動作は行 index から引く（ラベル文字列で分岐しない）
+    /// 5 項目それぞれの動作は行 index から引く（ラベル文字列で分岐しない）
     #[test]
     fn session_menu_maps_each_row_index_to_its_action() {
         let kind = session("abc123", true);
@@ -3028,10 +2820,9 @@ mod tests {
         assert_eq!(kind.action(0), Some(PopupAction::OpenSession(id())));
         assert_eq!(kind.action(1), Some(PopupAction::TogglePin(id())));
         assert_eq!(kind.action(2), Some(PopupAction::MarkRead(id())));
-        assert_eq!(kind.action(3), Some(PopupAction::StartRename(id())));
-        assert_eq!(kind.action(4), Some(PopupAction::Stop(id())));
-        assert_eq!(kind.action(5), Some(PopupAction::Close(id())));
-        assert_eq!(kind.action(6), None, "an index past the last entry must do nothing");
+        assert_eq!(kind.action(3), Some(PopupAction::Stop(id())));
+        assert_eq!(kind.action(4), Some(PopupAction::Close(id())));
+        assert_eq!(kind.action(5), None, "an index past the last entry must do nothing");
     }
 
     /// grouping メニューは現在の選択に ● を付け、各行はその grouping を指す
@@ -3081,7 +2872,7 @@ mod tests {
         );
         assert_eq!(
             labels(&popup.kind, app.grouping),
-            ["open", "unpin", "mark as read", "rename", "stop", "close"]
+            ["open", "unpin", "mark as read", "stop", "close"]
         );
         assert_eq!(popup.anchor_y, 1, "must open below the clicked row");
     }
@@ -3420,6 +3211,28 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// **メニューは押した記号の位置から出る。**
+    ///
+    /// 実機では「行末の `=` を押すと画面の反対側からメニューが出る」形で出た:
+    /// 記号を右端へ移したのに矩形の左端が x=1 固定のままだった。
+    /// 当たり判定（[`menu_zone`]）と同じ規則から導くので、幅を変えても付いてくる
+    #[test]
+    fn a_menu_opens_from_the_mark_that_was_clicked() {
+        for sidebar_width in [20u16, 26, 34, 60] {
+            let mut app = test_app(sidebar_width, TERM);
+            open(&mut app, session("s1", false), 3);
+            let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+            let mark_right = *menu_zone(sidebar_cols(&app)).end();
+            assert_eq!(
+                rect.right() - 1,
+                mark_right,
+                "the menu is not aligned with the mark for sidebar {sidebar_width}: {rect:?}"
+            );
+            assert!(rect.x >= 1, "the menu ran over the sidebar border: {rect:?}");
+            assert_eq!(rect.y, 4, "the menu must open below the row that was clicked");
         }
     }
 
@@ -3954,6 +3767,11 @@ mod tests {
 
         fn store_sessions(&self, next: &[SessionRow]) -> Vec<SessionRow> {
             next.to_vec()
+        }
+
+        // 表示名は transcript から導くが、この供給元は transcript を持たない
+        fn titles(&self) -> Titles {
+            Titles::fixed(std::collections::HashMap::new())
         }
 
         // 実ファイル（`~/.ccdesk/hook-states.json`）は読まない
@@ -4936,13 +4754,7 @@ mod tests {
     fn session_row(id: &str, cwd: &str, updated_at: u64) -> SessionRow {
         SessionRow {
             updated_at,
-            ..SessionRow::new(
-                SessionId::new(id),
-                cwd,
-                "session",
-                TitleSource::Derived,
-                updated_at,
-            )
+            ..SessionRow::new(SessionId::new(id), cwd, updated_at)
         }
     }
 
@@ -4959,83 +4771,81 @@ mod tests {
     ///
     /// 前景セッションは 1 ターン終わるまで transcript を作らないので、起こして
     /// すぐ `close` した行を `open` すると `No conversation found` になっていた。
-    /// transcript の有無で起こし方を分けることの固定
+    /// **起動先の cwd も一緒に決まる**（会話が在る作業ツリーで打つ）
     #[test]
     fn a_row_with_no_transcript_is_started_fresh_instead_of_resumed() {
         let temp =
             crate::title::tests::TempProjects::new("a_row_with_no_transcript_is_started_fresh");
-        let titles = temp.titles();
-        let row = session_row("s", "C:\\dev\\api", 1);
+        let mut titles = temp.titles();
+        let mut row = session_row("s", "C:\\dev\\api", 1);
+        let (launch, cwd) = relaunch(&titles, &row);
         assert!(
-            matches!(relaunch(&titles, &row), Launch::New { prompt } if prompt.is_empty()),
+            matches!(launch, Launch::New { prompt } if prompt.is_empty()),
             "a row with no conversation must not be resumed with -r"
         );
+        assert_eq!(cwd, row.cwd, "a fresh start must use the row's own cwd");
         // 1 ターン終わって transcript ができたら再開になる
         titles.write_transcript(&row, "{\"type\":\"user\"}\n");
+        titles.refresh(&mut row);
+        let (launch, cwd) = relaunch(&titles, &row);
         assert!(
-            matches!(relaunch(&titles, &row), Launch::Resume),
+            matches!(launch, Launch::Resume),
             "a row that has a conversation must be resumed"
         );
+        assert_eq!(cwd, row.cwd);
     }
 
-    /// **リネームは transcript へ書き、ストアの `title` は表示用の写しになる。**
-    /// 書き先が claude の `/rename` と同じ 1 箇所なので、名前の正本が割れない
-    #[test]
-    fn a_rename_writes_the_transcript_and_caches_the_name_on_the_row() {
-        let temp = crate::title::tests::TempProjects::new("a_rename_writes_the_transcript");
-        let mut app = app_with_row("s");
-        app.titles = temp.titles();
-        // 1 ターン終わっている行（transcript がある）
-        app.titles
-            .write_transcript(&app.sessions[0].clone(), "{\"type\":\"user\"}\n");
-
-        app.rename = Some(Rename {
-            id: SessionId::new("s"),
-            field: {
-                let mut field = TextField::default();
-                field.set_text("  hand-written name  ");
-                field
-            },
-        });
-        commit_rename(&mut app);
-
-        assert_eq!(only_row(&app).title, "hand-written name", "the row's cache was not updated");
-        assert_eq!(only_row(&app).title_source, TitleSource::Custom);
-        // transcript から読み直しても同じ値（＝ 正本に載った）
-        let mut titles = temp.titles();
-        assert_eq!(
-            titles.poll(&app.sessions[0]),
-            Some(("hand-written name".to_string(), TitleSource::Custom)),
-            "the rename is not in the transcript"
-        );
-    }
-
-    /// **セッションの中で `/rename` した結果もサイドバーへ出る。**
+    /// **セッションの中で `/rename` した結果がそのままサイドバーへ出る。**
     ///
-    /// 名前の正本は transcript 1 箇所なので、行が `Custom`（ccdesk で付けた名前）でも
-    /// 読み直した値を採る ＝ 「格下げしないガード」も「`Custom` の行は触らない」除外も
-    /// 持たない。仕込む行は**実測した transcript の形そのまま**（claude が書く形に
-    /// 追従できているかを見たいので、こちら側の組み立てを通さない）
+    /// 名前の正本は transcript 1 箇所で、行は名前を持たない ＝ 「格下げしない
+    /// ガード」も「`Custom` の行は触らない」除外も要らない。仕込む行は
+    /// **実測した transcript の形そのまま**（claude が書く形に追従できているかを
+    /// 見たいので、こちら側の組み立てを通さない）
     #[test]
     fn a_rename_inside_the_session_reaches_the_row() {
         let temp = crate::title::tests::TempProjects::new("a_rename_inside_the_session");
         let mut app = app_with_row("s");
         app.titles = temp.titles();
-        app.sessions[0].title = "named in ccdesk".to_string();
-        app.sessions[0].title_source = TitleSource::Custom;
+        // 名前が付く前（材料が無い）
+        refresh_transcripts(&mut app);
+        assert_eq!(app.titles.of(only_row(&app)), crate::title::UNTITLED);
         app.titles.write_transcript(
             &app.sessions[0].clone(),
-            "{\"type\":\"custom-title\",\"customTitle\":\"renamed in the session\",\"sessionId\":\"s\"}\n",
+            "{\"type\":\"custom-title\",\"customTitle\":\"renamed in the session\",\"sessionId\":\"s\"}
+",
         );
 
-        refresh_titles(&mut app);
+        refresh_transcripts(&mut app);
 
         assert_eq!(
-            only_row(&app).title,
+            app.titles.of(only_row(&app)),
             "renamed in the session",
             "the name given inside the session did not reach the row"
         );
-        assert_eq!(only_row(&app).title_source, TitleSource::Custom);
+    }
+
+    /// **名前が変わっても行の `updated_at` は動かない。** 動かしていた頃は、
+    /// claude が名前を付け直すたびに行の経過時間が 0s へ戻っていた
+    /// （表示名を行に保存していたことの直接の害）
+    #[test]
+    fn a_new_name_does_not_disturb_the_row_timestamps() {
+        let temp = crate::title::tests::TempProjects::new("a_new_name_does_not_disturb");
+        let mut app = app_with_row("s");
+        app.titles = temp.titles();
+        app.sessions[0].updated_at = 1_234;
+        app.sessions[0].last_opened_at = 1_234;
+        app.titles.write_transcript(
+            &app.sessions[0].clone(),
+            "{\"type\":\"ai-title\",\"aiTitle\":\"a generated name\"}
+",
+        );
+
+        refresh_transcripts(&mut app);
+
+        assert_eq!(app.titles.of(only_row(&app)), "a generated name");
+        assert_eq!(only_row(&app).updated_at, 1_234, "the name moved updated_at");
+        assert_eq!(only_row(&app).last_opened_at, 1_234, "the name marked the row unread");
+        assert!(!only_row(&app).unread());
     }
 
     /// **hook が何か書いたら周期を待たずに一覧を読み直す。**
@@ -6023,20 +5833,6 @@ mod tests {
         run_popup_action(&mut app, PopupAction::MarkRead(id.clone()), 0);
         assert_eq!(only_row(&app).updated_at, 2_000, "a second mark as read reset the age");
 
-        // 同じ名前で確定しても動かない（名前も出どころも変わっていない）。窓が無い行なので
-        // 届け先は transcript 側だが、1 ターンも会話していないので何も書かれない
-        app.sessions[0].title_source = TitleSource::Custom;
-        app.rename = Some(Rename {
-            id: id.clone(),
-            field: {
-                let mut field = TextField::default();
-                field.set_text(&only_row(&app).title);
-                field
-            },
-        });
-        commit_rename(&mut app);
-        assert_eq!(only_row(&app).updated_at, 2_000, "renaming to the same name reset the age");
-
         // 中身が変わる操作は進める（マージの後勝ち判定の材料なので必ず進む）
         run_popup_action(&mut app, PopupAction::TogglePin(id), 0);
         assert!(only_row(&app).updated_at > 2_000, "a real change did not advance the age");
@@ -6051,23 +5847,6 @@ mod tests {
         run_popup_action(&mut app, PopupAction::Stop(SessionId::new("s")), 0);
         assert_eq!(app.sessions.len(), 1, "stop removed the row from the list");
         assert_eq!(only_row(&app).last_state, "stopped");
-    }
-
-    /// **名前の届け先は「動いている窓があり、その入力欄が空か」だけで決まる。**
-    ///
-    /// 動いているセッションへ送るのは、ccdesk が transcript へ書いても
-    /// **claude は自分の transcript を監視していない**ためペイン内の表示名が
-    /// 変わらないから。送れない条件のどれも**打ちかけを消さずに** transcript 側へ倒れる
-    #[test]
-    fn a_rename_goes_to_the_pty_only_when_the_input_line_is_free() {
-        assert_eq!(rename_to(Some((true, true))), RenameTo::Session);
-        // 打ちかけがある（消さずに transcript へ倒す）
-        assert_eq!(rename_to(Some((true, false))), RenameTo::Transcript);
-        // 子が死んでいる（送っても誰も読まない）
-        assert_eq!(rename_to(Some((false, true))), RenameTo::Transcript);
-        assert_eq!(rename_to(Some((false, false))), RenameTo::Transcript);
-        // 窓が無い（止まっている行）＝ 送り先が無い
-        assert_eq!(rename_to(None), RenameTo::Transcript);
     }
 
     /// **`close` は ccdesk の一覧からだけ外す。** transcript
@@ -6092,87 +5871,6 @@ mod tests {
         assert!(app.sessions.is_empty(), "the row is still in the list");
         assert!(transcript.exists(), "closing the row removed its transcript too");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// rename はその行のインライン入力で始まり、**Enter で初めて行に入る**。
-    /// ユーザーが付けた名前は `custom`（あとから来る AI 生成の名前に踏まれない）
-    #[test]
-    fn renaming_writes_a_custom_title_when_the_input_is_confirmed() {
-        let mut app = app_with_row("s");
-        run_popup_action(&mut app, PopupAction::StartRename(SessionId::new("s")), 0);
-        let field = &app.rename.as_ref().expect("the inline input did not start").field;
-        assert_eq!(field.text, "session", "the current name is not the initial value");
-
-        for _ in 0..field.text.chars().count() {
-            press(&mut app, KeyCode::Backspace);
-        }
-        // 打ち込むのは ASCII 外の文字。`KeyCode::Char` を 1 文字ずつ送っても
-        // マルチバイトの名前がそのまま行へ載ることを併せて固定する。源を ASCII に
-        // 保つためエスケープで書く（意味は「支払いの型」相当の 5 文字）
-        let typed = "\u{652f}\u{6255}\u{3044}\u{306e}\u{578b}";
-        for c in typed.chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        assert_eq!(
-            only_row(&app).title,
-            "session",
-            "the row changed before the input was confirmed"
-        );
-
-        press(&mut app, KeyCode::Enter);
-        assert!(
-            app.rename.is_none(),
-            "the input is still open after being confirmed"
-        );
-        assert_eq!(only_row(&app).title, typed);
-        assert_eq!(only_row(&app).title_source, TitleSource::Custom);
-    }
-
-    /// 取り消す道が 3 つある（Esc / 空にして確定 / フォーカスが離れる）。
-    /// **どれも行を書き換えない**（押し間違いで名前が変わらない）
-    #[test]
-    fn renaming_can_be_abandoned_without_touching_the_row() {
-        let start = |app: &mut App| {
-            run_popup_action(app, PopupAction::StartRename(SessionId::new("s")), 0);
-            press(app, KeyCode::Char('!'));
-        };
-        let mut app = app_with_row("s");
-
-        start(&mut app);
-        press(&mut app, KeyCode::Esc);
-        assert!(app.rename.is_none(), "Esc did not close the input");
-        assert_eq!(only_row(&app).title, "session");
-
-        // 空白だけの名前は付けない（行から名前が消えるとどれか指せなくなる）
-        start(&mut app);
-        for _ in 0..20 {
-            press(&mut app, KeyCode::Backspace);
-        }
-        press(&mut app, KeyCode::Enter);
-        assert!(app.rename.is_none());
-        assert_eq!(only_row(&app).title, "session", "an empty name was written to the row");
-
-        // 入力欄はサイドバーの行そのものなので、フォーカスが離れたら畳む
-        start(&mut app);
-        app.set_focus(Focus::Terminal);
-        assert!(app.rename.is_none(), "an invisible input is still open");
-        assert_eq!(only_row(&app).title, "session");
-        assert_eq!(only_row(&app).title_source, TitleSource::Derived);
-    }
-
-    /// 入力中は一覧のキー操作を全部飲む（確定した瞬間に別の行を見ていない）
-    #[test]
-    fn the_rename_input_swallows_the_list_keys() {
-        let mut app = app_with_row("s");
-        app.sidebar_rows.push(SidebarRow::Action(RowAction::New));
-        run_popup_action(&mut app, PopupAction::StartRename(SessionId::new("s")), 0);
-        press(&mut app, KeyCode::Down);
-        assert_eq!(
-            app.selection,
-            SidebarPos::Row(0),
-            "the selection behind the input moved while editing"
-        );
-        assert!(app.rename.is_some(), "↑↓ closed the input");
     }
 
     /// **`Enter` はメニューを持つ行ではその行のメニュー。** セッション行も同じで、

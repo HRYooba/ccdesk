@@ -559,9 +559,6 @@ struct RowData {
     bucket: Bucket,
     /// ピン留め（[`PINNED_TITLE`] の節へ移す）
     pinned: bool,
-    /// 名前の変更中なら入力中の文字列。**行そのものが入力欄に化ける**
-    /// （[`crate::app::Rename`]）ので、ここが Some の行は通常の描画をしない
-    editing: Option<String>,
 }
 
 /// セッション行 1 本の見た目。**行の組み立てはここ 1 箇所**なので、
@@ -581,13 +578,6 @@ fn session_row_line(d: &RowData, look: Look, inner_width: u16) -> Line<'static> 
         Span::styled(d.glyph, Style::default().fg(d.color)),
         Span::raw(" "),
     ];
-    // 名前の変更中は行そのものが入力欄。**行頭は通常の行と同じものを描く**ので
-    // 名前の桁が編集の出入りで動かない
-    if let Some(text) = &d.editing {
-        let mut spans = head;
-        spans.push(Span::raw(text.clone()));
-        return Line::from(spans).style(Style::default().bg(ui().hl_bg).fg(ui().emph));
-    }
     let name_style = if look.open {
         Style::default().fg(ui().emph).add_modifier(Modifier::BOLD)
     } else {
@@ -689,8 +679,15 @@ fn account_row(status: &AccountStatus, unstored: bool, pending: Option<&str>) ->
 
 /// モーダルの矩形。描画とクリック判定で同じ計算を共有する。
 ///
+/// **横の位置は記号（[`MENU_MARK`]）から導く。** メニューを開く入口は行末の `=` で、
+/// 当たり判定も描画も [`menu_zone`] という 1 つの規則を見ているので、矩形もそこから
+/// 決める（記号の右端に矩形の右端を合わせる ＝ 押した場所から下へ開く）。
+/// 記号を右端へ移したのに左端 x=1 固定のままだった頃は、画面の反対側から
+/// メニューが出ていた。
+///
 /// 幅は内容が決める（[`crate::app::PopupKind::width`]）ので、サイドバーより広い
-/// メニューは右ペインに被る。アカウント表示名や email を切って読めなくするより、
+/// メニューは記号に右端を合わせると左へはみ出す ＝ そのときは左端で止めて
+/// **右ペインへ被せる**。アカウント表示名や email を切って読めなくするより、
 /// 被せて全部読ませる方を選んだ。**この意図は描画順に依存する**（[`draw`] が
 /// 右ペインの後にメニューを描く）: 逆順にすると被った列が右ペインに塗り潰され、
 /// クリック判定だけがここの矩形に残る ＝ 見えない場所のクリックが効く不具合になる。
@@ -703,8 +700,12 @@ pub(crate) fn popup_rect(app: &App, popup: &Popup) -> Rect {
     let (term_w, term_h) = (app.term_size.0.max(1), app.term_size.1.max(1));
     let width = popup.kind.width(app.grouping).min(term_w);
     let height = entries.len().saturating_add(2).min(term_h as usize) as u16;
-    // 左端はサイドバー内の x=1 固定。端末に収まらないときだけ左へ寄せる
-    let x = 1u16.min(term_w - width);
+    // 記号の右端に矩形の右端を合わせる。収まらなければサイドバー内の x=1 まで
+    // 左へ寄せ、それでも広ければ右ペインへ食い込ませる（端末の外へは出さない）
+    let max_x = term_w - width;
+    let min_x = 1u16.min(max_x);
+    let mark_right = *menu_zone(crate::app::sidebar_cols(app)).end();
+    let x = mark_right.saturating_add(1).saturating_sub(width).clamp(min_x, max_x);
     let y = popup.anchor_y.saturating_add(1).min(term_h - height);
     Rect::new(x, y, width, height)
 }
@@ -756,10 +757,6 @@ fn context_hint(app: &App) -> Option<(&'static str, String)> {
         }
         // ccdesk が取るのは予約キーだけ。残りは全部 claude が受ける
         return Some(("terminal", "all keys pass through to claude".to_string()));
-    }
-    if app.rename.is_some() {
-        // 名前の入力中は入力の作法だけ（一覧の操作は全部この入力へ渡っている）
-        return Some(("rename", "Enter rename · Esc cancel".to_string()));
     }
     if app.popup.is_some() {
         // メニューは開いている間すべてのキーを飲む ＝ 一覧のキーは出さない
@@ -969,7 +966,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             cwd: row.cwd.clone(),
             glyph: glyph_of(&view),
             color: view.color,
-            label: row.title.clone(),
+            label: app.titles.of(row),
             is_active_window: window.is_some_and(|(i, _)| i == active)
                 && matches!(app.right_view, RightView::Sessions),
             unread: row.unread(),
@@ -977,11 +974,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             age: fmt_age(age_secs),
             bucket: view.bucket,
             pinned: row.pinned,
-            editing: app
-                .rename
-                .as_ref()
-                .filter(|r| r.id == row.session_id)
-                .map(|r| r.field.text.clone()),
         });
     }
     // ヘッダー集計は表示行そのものから数える（分岐の複製をしない = 行数と必ず一致）
@@ -1204,23 +1196,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     ));
     frame.render_widget(list, chunks[0]);
 
-    // 名前の変更中はカーソルを編集位置へ置く。**行が表示窓から出ていれば置かない**
-    // （スクロールで見えていない行の位置へカーソルだけが飛ぶと、IME の変換窓が
-    // 無関係な場所に開く。判断は描画の絞り込みと同じ [`row_visible`]）
-    let rename_cursor = app.rename.as_ref().and_then(|rename| {
-        let row = row_of_session(&app.sidebar_rows, &rename.id)?;
-        row_visible(row, header_n, scroll, tail_capacity).then(|| {
-            // 入力欄は通常の行と同じ行頭の後ろから始まる（[`HEAD_COLS`]）
-            let x = chunks[0].x + 1 + HEAD_COLS as u16;
-            FrameCursor::shown_at(Position::new(
-                // 入力が枠を越えたらカーソルは内側の右端で止める（枠の外へ出さない）
-                x.saturating_add(rename.field.cursor_x())
-                    .min(chunks[0].x + chunks[0].width.saturating_sub(2)),
-                row_y(row, header_n, scroll),
-            ))
-        })
-    });
-
     // ---- サイドバー下部フッター: 区切り線 / アカウント行 ----
     // claude の更新行はここには無い（上部の版行に集約した）
     if sl.footer_visible {
@@ -1272,8 +1247,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // 「見えているものが効く」が回復する
     let cursor = draw_right_pane(frame, chunks[1], app);
     draw_popup(frame, app);
-    // 名前の入力中はそこが打鍵の宛先なので、右ペインのカーソルより優先する
-    rename_cursor.unwrap_or(cursor)
+    cursor
 }
 
 /// **ペインが指すセッションの行へ選択を寄せる。**
@@ -1287,14 +1261,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
 /// `/resume` による張り替え）が、どれも最後は「ペインが指すセッション」に
 /// 集まるので、経路ごとに選択を動かす処理を足さなくていい。
 ///
-/// **名前の入力中は動かさない**（確定の宛先である行から選択が離れると、
-/// 何を編集しているのかが画面から読めなくなる）。行がまだ積まれていない周期
-/// （一覧の読み直しが追いついていない）も見送り、次のフレームで揃える。
+/// 行がまだ積まれていない周期（一覧の読み直しが追いついていない）は見送り、
+/// 次のフレームで揃える。
 ///
 /// `shown` は今ペインが指しているセッション（[`App::shown_session`]）。引数で
 /// 受けるのは**窓（PTY）を起こさずに追従の規則そのものを検査できる**ようにするため
 fn follow_pane(app: &mut App, shown: Option<SessionId>) {
-    if shown == app.pane_shown || app.rename.is_some() {
+    if shown == app.pane_shown {
         return;
     }
     let Some(id) = &shown else {
@@ -1377,11 +1350,17 @@ fn draw_right_pane(frame: &mut Frame, pane: Rect, app: &mut App) -> FrameCursor 
         return FrameCursor::hidden_at(pane_fallback_pos(pane));
     }
     let window = &app.windows[app.active];
+    // ペインの見出しもサイドバーと同じ導出（名前の正本は transcript 1 つ）
+    let title = app
+        .sessions
+        .iter()
+        .find(|row| row.session_id == window.session_id)
+        .map_or_else(|| crate::title::UNTITLED.to_string(), |row| app.titles.of(row));
     let parser = window.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let screen = parser.screen();
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(window.name.clone())
+        .title(title)
         .border_style(if app.focus == Focus::Terminal {
             focus_style
         } else {
@@ -1543,6 +1522,7 @@ mod tests {
             term_size: (60, 40),
             sidebar_width: 34,
             sessions: vec![named_session("a", "C:\\dev\\api", "some-session")],
+            titles: fixed_titles(),
             ..Default::default()
         };
         let line = session_lines(&mut app)
@@ -1584,6 +1564,7 @@ mod tests {
                 },
                 named_session("b", "C:\\dev\\api", "seen-row"),
             ],
+            titles: fixed_titles(),
             ..Default::default()
         };
         let lines = session_lines(&mut app);
@@ -2095,8 +2076,6 @@ mod tests {
         crate::sessions::SessionRow::new(
             crate::sessions::SessionId::new(format!("s-{cwd}")),
             cwd,
-            "session",
-            crate::sessions::TitleSource::Derived,
             0,
         )
     }
@@ -2257,15 +2236,28 @@ mod tests {
     // どれも「行が持っている値」→「画面に出る並び」の配線なので、
     // 実際に 1 フレーム描いて（[`render_sidebar`]）出た行そのものを見る
 
-    /// 名前つきのセッション行 1 本
+    /// 名前つきのセッション行 1 本（**名前は行が持たない**ので、表示名は
+    /// 撮影用と同じ固定表（[`crate::title::Titles::fixed`]）で与える）
     fn named_session(id: &str, cwd: &str, title: &str) -> crate::sessions::SessionRow {
-        crate::sessions::SessionRow::new(
-            crate::sessions::SessionId::new(id),
-            cwd,
-            title,
-            crate::sessions::TitleSource::Derived,
-            0,
-        )
+        NAMES.with(|names| {
+            names
+                .borrow_mut()
+                .insert(crate::sessions::SessionId::new(id), title.to_string())
+        });
+        crate::sessions::SessionRow::new(crate::sessions::SessionId::new(id), cwd, 0)
+    }
+
+    thread_local! {
+        /// [`named_session`] が積んだ「行 → 表示名」。テストの [`App`] は
+        /// [`fixed_titles`] でこれを読む（本番と同じ [`Titles::of`] を通る）
+        static NAMES: std::cell::RefCell<
+            std::collections::HashMap<crate::sessions::SessionId, String>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+
+    /// [`named_session`] で積んだ名前を返す [`Titles`]（transcript は読まない）
+    fn fixed_titles() -> crate::title::Titles {
+        crate::title::Titles::fixed(NAMES.with(|names| names.borrow().clone()))
     }
 
     /// セッション行（[`MENU_MARK`] で始まる行）の表示文字列だけを、描かれた順に取り出す
@@ -2298,6 +2290,7 @@ mod tests {
             term_size: (120, 40),
             sidebar_width: 34,
             sessions: vec![aged(12, "a", "fresh"), aged(3 * 60, "b", "older")],
+            titles: fixed_titles(),
             ..Default::default()
         };
         let lines = session_lines(&mut app);
@@ -2327,6 +2320,7 @@ mod tests {
                 last_state: "stopped".to_string(),
                 ..named_session("s", "C:\\dev\\api", "stopped-row")
             }],
+            titles: fixed_titles(),
             ..Default::default()
         };
         let texts = sidebar_texts(&mut app);
@@ -2397,7 +2391,6 @@ mod tests {
             age: "3m".to_string(),
             bucket: Bucket::Completed,
             pinned: false,
-            editing: None,
         }
     }
 
@@ -2482,6 +2475,7 @@ mod tests {
                 named_session("b", "C:\\dev\\api", "row-b"),
                 named_session("c", "C:\\dev\\api", "row-c"),
             ],
+            titles: fixed_titles(),
             ..Default::default()
         }
     }
@@ -2523,31 +2517,6 @@ mod tests {
         );
     }
 
-    /// **名前の入力中は追従しない**（確定の宛先である行から選択が離れると、
-    /// 何を編集しているのかが画面から読めなくなる）。入力が終われば揃う
-    #[test]
-    fn the_selection_does_not_follow_while_a_name_is_being_typed() {
-        let mut app = follow_fixture();
-        let _ = sidebar_texts(&mut app);
-        app.selection = SidebarPos::Row(row_index(&app, "a"));
-        app.rename = Some(crate::app::Rename {
-            id: SessionId::new("a"),
-            field: {
-                let mut field = crate::ui::text_field::TextField::default();
-                field.set_text("new name");
-                field
-            },
-        });
-        let before = app.selection;
-        follow_pane(&mut app, Some(SessionId::new("c")));
-        assert_eq!(app.selection, before, "the selection moved out from under the editor");
-
-        // 入力を終えたら次のフレームで揃う（見送りであって取りこぼしではない）
-        app.rename = None;
-        follow_pane(&mut app, Some(SessionId::new("c")));
-        assert_eq!(app.selection, SidebarPos::Row(row_index(&app, "c")));
-    }
-
     /// **ペインがセッションを出していない（新規セッション画面）なら揃える先が無い。**
     /// 戻ってきたときにまた揃う
     #[test]
@@ -2578,6 +2547,7 @@ mod tests {
                     ..named_session("c", "C:\\dev\\api", "chosen")
                 },
             ],
+            titles: fixed_titles(),
             ..Default::default()
         }
     }
@@ -2709,6 +2679,7 @@ mod tests {
                     named_session("a", "C:\\dev\\api", "first row"),
                     named_session("b", "C:\\dev\\api", "second row"),
                 ],
+                titles: fixed_titles(),
                 ..Default::default()
             };
             let texts = sidebar_texts(&mut app);
@@ -2736,58 +2707,7 @@ mod tests {
         }
     }
 
-    /// 名前の変更中は**その行が入力欄に化ける**。名前の桁は通常の行と同じ位置から
-    /// 始まり（[`RENAME_PREFIX`] の 2 桁ぶん）、カーソルはその行の入力位置に立つ
-    #[test]
-    fn the_renamed_row_becomes_an_inline_input_with_the_cursor_on_it() {
-        use unicode_width::UnicodeWidthStr;
-        let mut field = crate::ui::text_field::TextField::default();
-        field.set_text("new name");
-        let mut app = App {
-            term_size: (60, 40),
-            sidebar_width: 34,
-            sessions: vec![named_session("s", "C:\\dev\\api", "old name")],
-            rename: Some(crate::app::Rename {
-                id: crate::sessions::SessionId::new("s"),
-                field,
-            }),
-            ..Default::default()
-        };
-        let (w, h) = app.term_size;
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-        let mut cursor = None;
-        terminal
-            .draw(|frame| {
-                cursor = Some(draw(frame, &mut app));
-            })
-            .unwrap();
-        let cursor = cursor.expect("did not draw");
-        let buffer = terminal.backend().buffer().clone();
-
-        // 入力中の文字列が行に出て、確定前の名前は出ていない
-        let row = app
-            .sidebar_rows
-            .iter()
-            .position(|row| matches!(row.action(), Some(RowAction::Open(_))))
-            .expect("no session row");
-        let y = row_y(row, app.sidebar_header_rows, app.sidebar_scroll);
-        let text: String = (1..app.sidebar_width - 1)
-            .map(|x| buffer[(x, y)].symbol())
-            .collect();
-        assert!(text.contains("new name"), "the text being typed is not on the row: {text:?}");
-        assert!(!text.contains("old name"), "the old name is still on the row before the rename is committed: {text:?}");
-        // カーソルはその行の、入力の末尾に立つ（入力欄は通常の行と同じ
-        // 行頭 [`HEAD_COLS`] の後ろから始まる ＝ 編集の出入りで桁が動かない）
-        assert!(cursor.visible, "the cursor is hidden while a name is being typed");
-        assert_eq!(
-            cursor.pos,
-            Position::new(1 + HEAD_COLS as u16 + "new name".width() as u16, y)
-        );
-    }
-
-    /// 下部バーの案内。**撤去した打鍵は載せない**（載っていれば嘘になる）。
-    /// 名前の入力中はその作法だけを出す
+    /// 下部バーの案内。**撤去した打鍵は載せない**（載っていれば嘘になる）
     #[test]
     fn the_sidebar_hint_only_mentions_keys_that_still_exist() {
         let mut app = App {
@@ -2806,18 +2726,10 @@ mod tests {
         assert!(!bar.contains("Ctrl+S"), "the hint still lists a key that was removed: {bar:?}");
         assert!(!bar.contains("Ctrl+X"), "the hint still lists a key that was removed: {bar:?}");
 
-        app.sessions = vec![named_session("s", "C:\\dev\\api", "session")];
-        app.rename = Some(crate::app::Rename {
-            id: crate::sessions::SessionId::new("s"),
-            field: crate::ui::text_field::TextField::default(),
-        });
-        let bar = drawn_row(&mut app, 29);
-        assert!(bar.contains("Enter rename"), "{bar:?}");
-        assert!(bar.contains("Esc cancel"), "{bar:?}");
     }
 
-    /// 下部バーは**打鍵が届く先で効くキーだけ**を出す。受け手は 4 つ
-    /// （一覧 / メニュー / 名前の入力 / 端末）で、他所のキーを混ぜない。
+    /// 下部バーは**打鍵が届く先で効くキーだけ**を出す。受け手は 3 つ
+    /// （一覧 / メニュー / 端末）で、他所のキーを混ぜない。
     /// `app:` の予約キーはどの状態でも出る（受け手に関係なく効く唯一の打鍵）
     #[test]
     fn the_bottom_bar_follows_whoever_receives_the_keys() {
@@ -2825,6 +2737,7 @@ mod tests {
             term_size: (120, 30),
             focus: Focus::Sidebar,
             sessions: vec![named_session("s", "C:\\dev\\api", "session")],
+            titles: fixed_titles(),
             ..Default::default()
         };
         // 一覧: `↑↓` と、選択行の `Enter` が何をするか（既定の選択は先頭の版行）
@@ -2844,18 +2757,6 @@ mod tests {
         let bar = drawn_row(&mut app, 29);
         assert!(bar.contains("popup: ↑↓ select · Enter run · Esc close"), "{bar:?}");
         assert!(!bar.contains("menu"), "the list keys are still listed: {bar:?}");
-
-        // 名前の入力中: 入力の作法だけ
-        let mut app = App {
-            rename: Some(crate::app::Rename {
-                id: crate::sessions::SessionId::new("s"),
-                field: crate::ui::text_field::TextField::default(),
-            }),
-            ..base()
-        };
-        let bar = drawn_row(&mut app, 29);
-        assert!(bar.contains("rename: Enter rename · Esc cancel"), "{bar:?}");
-        assert!(!bar.contains("select"), "the list keys are still listed: {bar:?}");
 
         // 端末: 予約キー以外は全部 claude が受ける
         let mut app = App {

@@ -14,7 +14,9 @@ use ccdesk::{load_setting, log_error};
 
 mod accounts;
 mod app;
+mod claude_format;
 mod cli;
+mod git;
 mod hooks;
 mod keys;
 mod poll;
@@ -33,6 +35,10 @@ use source::{DataSource, DemoSource, LiveSource};
 use theme::HOST_COLORS;
 
 fn main() -> anyhow::Result<()> {
+    // **エラーログの出力先を決めるのはここだけ。** 決めていないプロセス（＝ テスト）
+    // では `log_error` は何も書かない ＝ `cargo test` がユーザーの
+    // `~/.ccdesk/error.log` を汚さない（[`ccdesk::enable_error_log`]）
+    ccdesk::enable_error_log();
     let mut demo = false;
     // フラグ/サブコマンドは TUI 起動前に処理
     match std::env::args().nth(1).as_deref() {
@@ -138,7 +144,7 @@ fn main() -> anyhow::Result<()> {
         hook_states,
         // 起動時の見え方を先に控える（run ループの 1 周目が「変わった」と誤解しない）
         hook_stamp: source.hook_stamp(),
-        titles: title::Titles::default(),
+        titles: source.titles(),
         last_scan: std::time::Instant::now(),
         last_live_scan: std::time::Instant::now(),
         // 保存値はそのまま持つ（画面に出す桁数は端末幅から導くので丸めない ＝
@@ -171,7 +177,6 @@ fn main() -> anyhow::Result<()> {
         usage_display,
         usage: None,
         last_usage_read: instant_ago(Duration::from_secs(60)),
-        rename: None,
         account_job: None,
         input_gate: None,
         notice: None,

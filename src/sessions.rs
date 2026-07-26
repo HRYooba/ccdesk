@@ -27,8 +27,7 @@ const SESSIONS_KEY: &str = "sessions";
 /// 行 1 件のキー。**読みと書きで同じ定数を使う**（片側だけ直した状態を作らない）
 const ID_KEY: &str = "session_id";
 const CWD_KEY: &str = "cwd";
-const TITLE_KEY: &str = "title";
-const TITLE_SOURCE_KEY: &str = "title_source";
+const TRANSCRIPT_KEY: &str = "transcript";
 const LAST_STATE_KEY: &str = "last_state";
 const PINNED_KEY: &str = "pinned";
 const LAST_OPENED_AT_KEY: &str = "last_opened_at";
@@ -81,67 +80,23 @@ impl std::fmt::Display for SessionId {
     }
 }
 
-/// 表示名がどこから来たか。
-///
-/// **優先順は CLI 本体と同じ** `customTitle` > `aiTitle` > `lastPrompt` > `firstPrompt`
-/// で、ccdesk のリネームは `customTitle` の位置（＝ transcript の `custom-title` 行）に
-/// 入る。正本は `docs/foreground-migration.md` の title の行。[`Self::Derived`] は
-/// 上のどれでもない場合（cwd 等から組んだ名前・読めなかった保存値）で、
-/// **未知の保存値もここへ倒す**
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum TitleSource {
-    /// ユーザーが付けた名前（ccdesk のリネーム）
-    Custom,
-    /// claude が生成した名前
-    Ai,
-    /// 最後のプロンプト
-    LastPrompt,
-    /// 最初のプロンプト
-    FirstPrompt,
-    /// 上のどれでもない（既定）
-    #[default]
-    Derived,
-}
-
-impl TitleSource {
-    /// 保存表記。**読み（[`Self::parse`]）と対で持つ**ので、増やしたときに
-    /// 片側だけ直した状態にならない
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Custom => "custom",
-            Self::Ai => "ai",
-            Self::LastPrompt => "last_prompt",
-            Self::FirstPrompt => "first_prompt",
-            Self::Derived => "derived",
-        }
-    }
-
-    /// 保存表記からの復元。**未知の値は [`Self::Derived`]**（読みは寛容に:
-    /// 手編集や将来の版が書いた値で起動を止めない）
-    pub(crate) fn parse(text: &str) -> Self {
-        match text {
-            "custom" => Self::Custom,
-            "ai" => Self::Ai,
-            "last_prompt" => Self::LastPrompt,
-            "first_prompt" => Self::FirstPrompt,
-            _ => Self::Derived,
-        }
-    }
-}
-
 /// 一覧に載る 1 行。**プロセスが死んでも残る**のがライブ状態（`claude agents --json`）
-/// との違いで、行の生死と表示する状態は別の知識になる
+/// との違いで、行の生死と表示する状態は別の知識になる。
+///
+/// **表示名は持たない。** 名前の正本は transcript 1 つで、行に写しを置くと
+/// 「保存値」と「正本」の 2 本立てになり、ズレても気づけない（実害が出ていた:
+/// 保存値が `new session` のまま固定される・名前が変わるたびに `updated_at` が
+/// 動いて経過時間が 0s へ戻る）。表示名は描画のたびに導く（[`crate::title::Titles::of`]）
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionRow {
     /// 行の identity（[`SessionId`]）
     pub(crate) session_id: SessionId,
     pub(crate) cwd: String,
-    /// 表示名の**表示用キャッシュ**。正本は transcript（`custom-title` /
-    /// `ai-title` / `last-prompt`。[`crate::title`]）で、ここに置くのは
-    /// transcript を読む前（起動直後・1 ターン前）でも行に名前が出るようにするため
-    pub(crate) title: String,
-    /// `title` がどこから来たか（[`TitleSource`]）
-    pub(crate) title_source: TitleSource,
+    /// **解決済みの transcript の場所。** cwd から毎回導かない理由は、cwd が
+    /// 動く値だから（セッションは走行中に git worktree へ移れる）。不変であるはずの
+    /// パスを動く値から導くのが誤りだったので、解決した結果をここに記録する。
+    /// 消えていたら解決し直す（[`crate::title::Titles::refresh`]）
+    pub(crate) transcript: Option<PathBuf>,
     /// **最後に観測した** state。プロセスが死んでも消さない
     /// （消すと「終わった」のか「見えなくなった」のか行から読めなくなる）
     pub(crate) last_state: String,
@@ -157,18 +112,11 @@ pub(crate) struct SessionRow {
 impl SessionRow {
     /// 新しい行。`now` は epoch ms。**時計は引数で受ける**（呼び出し側が 1 度読んだ
     /// 値を行に揃えられる ＝ 同じ操作で作った行の時刻がばらけない）
-    pub(crate) fn new(
-        session_id: SessionId,
-        cwd: impl Into<String>,
-        title: impl Into<String>,
-        title_source: TitleSource,
-        now: u64,
-    ) -> Self {
+    pub(crate) fn new(session_id: SessionId, cwd: impl Into<String>, now: u64) -> Self {
         Self {
             session_id,
             cwd: cwd.into(),
-            title: title.into(),
-            title_source,
+            transcript: None,
             last_state: String::new(),
             pinned: false,
             // 作った時点では未読にしない（作ったのはユーザー自身の操作）
@@ -191,8 +139,9 @@ impl SessionRow {
         json!({
             ID_KEY: self.session_id.as_str(),
             CWD_KEY: self.cwd,
-            TITLE_KEY: self.title,
-            TITLE_SOURCE_KEY: self.title_source.as_str(),
+            // 解決できていない行はキーごと出さない（「まだ解決していない」と
+            // 「解決したが空だった」を保存の形で作り分けない）
+            TRANSCRIPT_KEY: self.transcript.as_ref().map(|p| p.to_string_lossy()),
             LAST_STATE_KEY: self.last_state,
             PINNED_KEY: self.pinned,
             LAST_OPENED_AT_KEY: self.last_opened_at,
@@ -221,8 +170,11 @@ impl SessionRow {
         Some(Self {
             session_id,
             cwd: text(CWD_KEY),
-            title: text(TITLE_KEY),
-            title_source: TitleSource::parse(&text(TITLE_SOURCE_KEY)),
+            transcript: value
+                .get(TRANSCRIPT_KEY)
+                .and_then(Value::as_str)
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from),
             last_state: text(LAST_STATE_KEY),
             pinned: flag(PINNED_KEY),
             last_opened_at: ms(LAST_OPENED_AT_KEY),
@@ -442,17 +394,13 @@ mod tests {
         }
     }
 
-    /// テスト用の行。`updated_at` はマージの後勝ち判定に効くので明示で受ける
-    fn row(id: &str, title: &str, updated_at: u64) -> SessionRow {
+    /// テスト用の行。`updated_at` はマージの後勝ち判定に効くので明示で受ける。
+    /// 行の中身の違いは `last_state`（表示名は行が持たないので比較材料にできない）
+    fn row(id: &str, state: &str, updated_at: u64) -> SessionRow {
         SessionRow {
             updated_at,
-            ..SessionRow::new(
-                SessionId::new(id),
-                "C:\\dev\\app",
-                title,
-                TitleSource::Derived,
-                1_000,
-            )
+            last_state: state.to_string(),
+            ..SessionRow::new(SessionId::new(id), "C:\\dev\\app", 1_000)
         }
     }
 
@@ -464,14 +412,14 @@ mod tests {
     /// 逆に中身が違っても ID が同じなら同じ行（マージが同一視する単位）
     #[test]
     fn a_row_is_identified_by_its_session_id() {
-        let a = row("11111111-1111-4111-8111-111111111111", "same title", 1);
+        let a = row("11111111-1111-4111-8111-111111111111", "same state", 1);
         let mut b = a.clone();
         b.session_id = SessionId::new("22222222-2222-4222-8222-222222222222");
         assert_ne!(a, b, "became the same row despite different IDs");
         assert_eq!(a.session_id.as_str(), a.session_id.to_string());
 
-        let disk = [row("a", "disk title", 2)];
-        let next = [row("a", "local title", 1)];
+        let disk = [row("a", "disk state", 2)];
+        let next = [row("a", "local state", 1)];
         assert_eq!(
             merge_sessions(&disk, &[], &next).len(),
             1,
@@ -483,13 +431,7 @@ mod tests {
     /// （作ったのはユーザー自身の操作）
     #[test]
     fn a_row_is_unread_when_it_changed_after_it_was_opened() {
-        let mut row = SessionRow::new(
-            SessionId::new("s"),
-            "C:\\dev\\app",
-            "title",
-            TitleSource::Derived,
-            1_000,
-        );
+        let mut row = SessionRow::new(SessionId::new("s"), "C:\\dev\\app", 1_000);
         assert!(!row.unread(), "freshly created row is marked unread");
         row.updated_at = 1_001;
         assert!(row.unread(), "changed row did not become unread");
@@ -520,20 +462,20 @@ mod tests {
         assert_eq!(merge_sessions(&[], &next, &next), next);
     }
 
-    /// **両方が知っている行は後に触った側が勝つ。** 他インスタンスが状態や名前を
+    /// **両方が知っている行は後に触った側が勝つ。** 他インスタンスが状態を
     /// 更新した行を、こちらの古い写しで踏み潰さない（逆にこちらが新しければ残す）
     #[test]
     fn merging_takes_the_more_recently_updated_row() {
-        let baseline = [row("s", "original title", 1)];
-        let disk = [row("s", "renamed by B", 5)];
-        let next = [row("s", "original title", 1)];
+        let baseline = [row("s", "idle", 1)];
+        let disk = [row("s", "changed by B", 5)];
+        let next = [row("s", "idle", 1)];
         let merged = merge_sessions(&disk, &baseline, &next);
-        assert_eq!(merged[0].title, "renamed by B", "clobbered another instance's update");
+        assert_eq!(merged[0].last_state, "changed by B", "clobbered another instance's update");
 
         // こちらの方が新しければこちらが残る（自分の操作が保存の往復で巻き戻らない）
-        let next = [row("s", "renamed by A", 9)];
+        let next = [row("s", "changed by A", 9)];
         let merged = merge_sessions(&disk, &baseline, &next);
-        assert_eq!(merged[0].title, "renamed by A", "own change got rolled back");
+        assert_eq!(merged[0].last_state, "changed by A", "own change got rolled back");
     }
 
     /// **削除した行は、このインスタンスの以降の書き込みでは復活しない。** baseline に
@@ -561,10 +503,9 @@ mod tests {
         let mut written = SessionRow::new(
             SessionId::new("8a1c0f52-0b3e-4a6d-9f11-2c7d5e8b0a34"),
             "C:\\dev\\shop-app",
-            "add dark mode toggle",
-            TitleSource::Custom,
             1_700_000_000_000,
         );
+        written.transcript = Some(PathBuf::from("C:\\Users\\me\\.claude\\projects\\p\\s.jsonl"));
         written.last_state = "blocked".to_string();
         written.pinned = true;
         written.last_opened_at = 1_700_000_000_500;
@@ -574,43 +515,27 @@ mod tests {
         // 読み直しは別のストア（起動しなおしと同じ ＝ メモリ上の写しを見ていない）
         assert_eq!(temp.store().list(), [written]);
 
-        // 未知の title_source は既定へ倒す（手編集・将来の版で起動が止まらない）
+        // 解決できていない行は transcript を持たないまま往復する
+        // （「まだ解決していない」を保存の形で表せる ＝ 次の起動で解決し直せる）
+        std::fs::write(temp.path(), r#"{"sessions":[{"session_id":"s"}]}"#).unwrap();
+        assert_eq!(temp.store().list()[0].transcript, None);
         std::fs::write(
             temp.path(),
-            r#"{"sessions":[{"session_id":"s","title_source":"from-the-future"}]}"#,
+            r#"{"sessions":[{"session_id":"s","transcript":""}]}"#,
         )
         .unwrap();
-        assert_eq!(temp.store().list()[0].title_source, TitleSource::Derived);
+        assert_eq!(temp.store().list()[0].transcript, None, "an empty path is not a resolution");
     }
 
-    /// 出どころの保存表記は**読みと書きが対**（片方だけ増えた状態にならない）。
-    ///
-    /// **優先順はここが持たない**: 正本は transcript から候補を選ぶ側
-    /// （[`crate::title`] の `CANDIDATES` の並び）1 箇所で、行はどこから来たかを
-    /// 覚えているだけ（順位を数でも持つと、同じ知識が 2 箇所になる）
+    /// **行は表示名を持たない。** 保存されるキーはここに並ぶものだけで、
+    /// `title` が戻ってきたらこのテストが落ちる（名前の正本が 2 つに割れない）
     #[test]
-    fn title_sources_round_trip_through_their_stored_spelling() {
-        for source in [
-            TitleSource::Derived,
-            TitleSource::FirstPrompt,
-            TitleSource::LastPrompt,
-            TitleSource::Ai,
-            TitleSource::Custom,
-        ] {
-            assert_eq!(TitleSource::parse(source.as_str()), source);
-        }
-        // 保存表記は互いに重ならない（別の出どころが同じ綴りにならない）
-        let spellings = [
-            TitleSource::Derived.as_str(),
-            TitleSource::FirstPrompt.as_str(),
-            TitleSource::LastPrompt.as_str(),
-            TitleSource::Ai.as_str(),
-            TitleSource::Custom.as_str(),
-        ];
-        let mut unique = spellings.to_vec();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), spellings.len(), "two sources share one spelling");
+    fn a_row_never_stores_a_display_name() {
+        let temp = TempStore::new("a_row_never_stores_a_display_name");
+        temp.store().store(&[row("s", "idle", 1)]);
+        let text = std::fs::read_to_string(temp.path()).unwrap();
+        assert!(!text.contains(r#""title""#), "the row stores a display name: {text}");
+        assert!(!text.contains("title_source"), "the row stores a title source: {text}");
     }
 
     /// 壊れた / 想定外の形でも読みは失敗しない（＝起動が止まらない）。
@@ -625,8 +550,8 @@ mod tests {
             ("not-object", Some("[1,2,3]")),
             ("no-key", Some(r#"{"other":1}"#)),
             ("not-array", Some(r#"{"sessions":"nope"}"#)),
-            ("no-id", Some(r#"{"sessions":[{"title":"title only"},{"session_id":""}]}"#)),
-            ("wrong-types", Some(r#"{"sessions":[{"session_id":7,"title":[]}]}"#)),
+            ("no-id", Some(r#"{"sessions":[{"cwd":"C:\\dev"},{"session_id":""}]}"#)),
+            ("wrong-types", Some(r#"{"sessions":[{"session_id":7,"cwd":[]}]}"#)),
         ];
         for (name, contents) in cases {
             match contents {

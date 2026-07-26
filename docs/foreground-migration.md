@@ -10,6 +10,9 @@
 - 一覧のストア: `src/sessions.rs`
 - 状態の受け渡し（注入する hook と、その受け口）: `src/hooks.rs`
 - 表示名の決め方（transcript の読みを含む）: `src/title.rs`
+- **claude の非公開な形への依存**（transcript のパスとレコード型名・継承させない
+  環境変数・`agents --json` の項目）: `src/claude_format.rs`
+- git の作業ツリーの列挙（transcript の探索範囲）: `src/git.rs`
 - 供給元の口: `src/source.rs` の `DataSource`
 - 排他と原子的書き込み: `src/lib.rs` の `Lock` / `write_json_atomically` / `reap_leftover_tmp`
 
@@ -36,13 +39,15 @@ Claude Desktop も同じ構造（独自の JSON ストアを一覧の正本に�
 |:--|:--|
 | 起動 | PTY で `claude --session-id <uuid> [prompt]`。**`-n <title>` は渡さない**（claude が `-n` の名前を transcript の `custom-title` として残すので、ccdesk が組んだ名前を渡すと表示名がそこで凍る）。`CLAUDE_CODE_CHILD_SESSION` / `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID` / `CLAUDECODE` / `CLAUDE_JOB_DIR` 等の継承環境変数を除去（継承すると transcript 保存が無効になる実測あり） |
 | 一覧の正本 | `~/.ccdesk/sessions.json` |
-| title の正本 | **transcript**（`custom-title` > `ai-title` > `last-prompt`）。ccdesk のリネームも同じ 1 箇所へ行く: **動いているセッションは PTY へ `/rename <名前>` を送って claude 自身に書かせ**（ペイン内の表示名も同時に変わる）、止まっているセッションだけ ccdesk が `custom-title` を追記する。ストアの `title` は表示用キャッシュ。**読みは初回だけ全体・以降は増えたぶんだけ**（`custom-title` は 1 度しか書かれず末尾に居るとは限らないので、末尾だけ読むと `/resume` のピッカーと名前が食い違う）|
+| title の正本 | **transcript**（`custom-title` > `ai-title` > `last-prompt`）**1 つだけ**。**行は表示名を保存しない**（描画のたびに導く）。**ccdesk は claude の内部ファイルへ 1 バイトも書かない** ＝ 名前を変えるのはペインの中の `/rename` に一本化。**読みは初回だけ全体・以降は増えたぶんだけ**（`custom-title` は 1 度しか書かれず末尾に居るとは限らないので、末尾だけ読むと `/resume` のピッカーと名前が食い違う）。材料が 1 つも無い行は `new session` |
+| transcript の場所 | **解決した結果を行に記録する**（`sessions.json` の `transcript`）。cwd は動く値（セッションは走行中に git worktree へ移れる）なので、そこから毎回導くのが誤りだった。解決の範囲は `claude -r` と同じ「cwd のプロジェクトディレクトリ + **cwd の git 作業ツリー**のプロジェクトディレクトリ」。記録が消えていたら解決し直す |
+| 再開の cwd | **transcript が在る作業ツリー**（`claude -r` は cwd の一致が必須）。作業ツリーが消えていれば `claude -r` はどこからも届かないので、同じ UUID で新規として起こす |
 | state | **hooks が主・`claude agents --json` の `status` が従**。どのイベントがどの state を意味するかは `src/hooks.rs` の `HOOK_EVENTS` が正本。**要約文は出さない**（Working / Needs input / Done / Stopped の 4 つだけ） |
 | ペイン内の切り替え | `/resume` `/clear` は claude の中で起きるので ccdesk は関与しない。**気づく口は hook**: hook の記録に「その時点の `session_id`」と「呼んだ claude の pid（`CLAUDE_PID`）」が載るので、自分の子の pid で引けば今どの会話を動かしているかが分かる。受け渡しファイルの更新に気づいたら周期を待たずに一覧を読み直す。pid が載らない環境では `claude agents --json` の従経路へ落ちる |
 | 未読 | `updated_at > last_opened_at`。行頭 2 桁目に `●` |
 | 行の見た目 | 行頭 1 桁目 `❯` ＝ **ペインに出ている行**（名前も太字）、2 桁目 `●` ＝ 未読、次が状態アイコン。行末が `=`（メニュー）。**帯（背景）は選択とホバー、前景の強調は選択だけ**なので、選択・ホバー・ペインに出ているの 3 つが重なっても読める（印は色ではなく文字なので配色に依らない） |
 | 選択とペイン | **開く操作のときだけ選択がペインへ揃う**（クリック・メニューの `open`・新規起動・ペイン内の `/resume`）。`↑↓` で選択だけを動かしてもペインは変わらない |
-| メニュー | `open` / `pin` / `mark as read` / `rename` / `stop`（プロセスを止める・行は残る）/ `close`（一覧から外す・会話ログは残る） |
+| メニュー | `open` / `pin` / `mark as read` / `stop`（プロセスを止める・行は残る）/ `close`（一覧から外す・会話ログは残る）。矩形は**押した `=` の位置から**出る（当たり判定と同じ `menu_zone` から導く） |
 | pin | 行を**一覧先頭の `pinned` 節へ移す**（元のグループには残らない ＝ 同じ行が 2 箇所に出ない）。0 本なら節ごと出ない。グルーピング（state / directory）に関係なく同じ位置。**行にアイコンは足さない**（節に入っていること自体が表示）。集計（`N awaiting input · …`）には数える ＝ pin は隠す操作ではないので、見えている行と数が合う |
 | ショートカット | `Ctrl+S` `Ctrl+X` を撤去。予約は `Ctrl+Q` と `Alt+←→` のみ |
 | `close` の意味 | ccdesk の一覧から外すだけ。`~/.claude/projects/**/*.jsonl` は消さない（だから「削除」とは呼ばない） |
@@ -76,12 +81,13 @@ flowchart LR
         rows[サイドバーの行]
     end
     ccdesk -->|PTY: claude --session-id uuid --settings 注入| child[claude 前景プロセス]
-    child --> jsonl[(~/.claude/projects/**/*.jsonl<br/>transcript / 削除しない)]
+    child --> jsonl[(~/.claude/projects/**/*.jsonl<br/>transcript / ccdesk は読むだけ)]
     child -->|hooks: ccdesk hook イベント<br/>session_id + CLAUDE_PID| hookstates[(~/.ccdesk/hook-states.json<br/>state の受け渡し)]
     hookstates --> rows
     hookstates --> store
     hookstates -->|pid → 今動かしている会話| rows
-    jsonl -->|title| store
+    jsonl -->|title: 保存せず描画のたびに導く| rows
+    store -->|transcript の場所| jsonl
     agents[claude agents --json] -->|status: hook が来ない行だけ| rows
     store --> rows
 ```
@@ -355,6 +361,63 @@ claude 本体のキーバインドが死ぬ**（`Ctrl+S` / `Ctrl+X` は実際に
   `delete` は会話ログを消さないので「削除」は嘘で、実態は「一覧から閉じる」。
   プロセスを殺す方は「止める」が実態。無効化の条件も語に合わせて `stop` へ移した
   （窓が無い行 ＝ 止めるプロセスが無い）
+
+### フェーズ7: 表示名を保存するのをやめ、非公開の形への依存を 1 箇所へ集める（済）
+
+**この段階の本質は「正本が 2 つある」形を残らず潰したこと。** フェーズ5〜6 で
+名前の正本を transcript に決めたのに、行はその**写し**を保存し続けていた。
+そこから出た実害が 3 つあり、どれも「保存しているから」起きていた:
+
+- 「格下げしないガード」が要る → 入れると `/rename` が反映されない、の往復
+- 名前が変わるたびに `updated_at` が動き、行の経過時間が 0s へ戻る
+- 保存値が `new session` のまま固定され、transcript に材料があるのに直らない
+
+やったこと:
+
+- **行から `title` / `title_source` を消した。** 表示名は描画のたびに導く
+  （`title.rs` の `Titles::of`）。`Titles` が持つのは増分走査の**キャッシュだけ**で、
+  捨てても同じ答えになる（`the_answer_does_not_depend_on_the_cache` が固定する）。
+  代償: `sessions.json` を人が開いても UUID しか見えない
+- **ccdesk からのリネームを撤去した。** PTY へ `/rename` を打ち込むのは UI 自動化
+  （claude の入力欄の形に依存し、実際に `>` と `❯` で 1 度踏んだ）、transcript への
+  直書きは内部形式依存。どちらもやめて、名前の変更はペインの中で `/rename` を打つ形に
+  一本化した ＝ **ccdesk は claude の内部ファイルへ 1 バイトも書かない**
+  （`reading_a_transcript_never_writes_to_it` が固定する）。
+  メニューは 5 項目（`open` / `pin` / `mark as read` / `stop` / `close`）
+- **transcript のパスを解決して行に記録する**（`sessions.json` の `transcript`）。
+  cwd から毎回導いていたのが誤りで、cwd は動く値（セッションは走行中に
+  `EnterWorktree` で git worktree へ移れる）。移ると transcript も移動先の cwd から
+  導かれるディレクトリへ移り、**移動の記録は移った先のファイルの中にしか無い**
+  （元の場所に印は残らない・実測）。だから探索は `claude -r` と同じ範囲
+  ——「cwd のプロジェクトディレクトリ + **cwd の git 作業ツリー**のもの」——で行う
+  （`git.rs`。`.git/worktrees/<名前>/gitdir` を読むだけで `git` は起こさない）。
+  記録が生きている間は解決し直さないので、`~/.claude/projects`（実機で 67 件）を
+  周期的に舐めることはない
+- **再開の cwd も同じ解決から出す**（`app.rs` の `relaunch`）。作業ツリーが消えていれば
+  `claude -r` はどこからも届かないので、同じ UUID で新規として起こす
+- **非公開の形への依存を `claude_format.rs` へ集めた**（transcript のパス導出と
+  レコード型名・継承させない環境変数・`CLAUDE_PID`・`agents --json` の項目）。
+  claude が変わったときに直す場所が 1 つになる。**公式に文書化されたもの**
+  （`--session-id` / `-r` / `--settings` / hook のイベント名）は各モジュールに残した
+  ＝ 「どこが脆いか」が混ざらない。責務（`title.rs` が表示名を決める・`hooks.rs` が
+  hook を受ける・`session.rs` が PTY を起こす）は動かしていない
+- **メニューの矩形を記号の位置から出す**（`ui::popup_rect`）。当たり判定
+  （`menu_zone`）と同じ規則を読むので、`=` を右端へ移した後も付いてくる。
+  記号に収まらない広いメニューは従来どおり右ペインへ被せる
+- **アカウント切替のガードを「持ち主の再判定」へ替えた**（`accounts.rs` の `confirm`）。
+  指紋（mtime + サイズ）は「ファイルが動いたか」しか答えないのに、動いている claude は
+  トークン更新のたびに `.credentials.json` を書く ＝ セッションを複数抱えていると
+  切替が毎回弾かれていた。動いていたら `claude auth status --json` で持ち主を
+  判定し直し、**同じ email なら続行・違う / 分からないなら中止**。守る性質
+  （別アカウントのトークンをこの email の保管へ書かない）は変えていない
+- **2 つの保管が同じ refreshToken を指す状態を検出して拒む**（`accounts.rs` の
+  `other_holder`）。実機で「2 つのアカウントが同じトークンを持ち、どちらへ switch しても
+  何も起きない」状態が起きていた。refreshToken は使い捨てなので、その状態は片方を
+  使った瞬間に両方が死ぬ ＝ 書く前に止めるしかない
+- **エラーログの出力先は `main` が有効化する**（`lib.rs` の `enable_error_log`）。
+  既定が「書かない」なので、`main` を通らないプロセス（テストの実行ファイル）は
+  構造上ユーザーの `~/.ccdesk/error.log` へ到達しない（`cargo test` を回すたびに
+  一時ディレクトリのパスを含む失敗が実ログへ溜まっていた）
 
 ## 失うもの（受け入れた代償）
 

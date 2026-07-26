@@ -2,7 +2,7 @@
 //! 本物の端末が返す応答を vt100 の Callbacks で肩代わりし、pending に溜めて PTY へ書き戻す。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
@@ -273,9 +273,29 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// エラーログを書いてよいか。**決めるのは `main` だけ**（[`enable_error_log`]）。
+///
+/// **既定は「書かない」。** ログの出力先はプロセス全体で 1 つしかない隠れた
+/// グローバルなので、注入で受けると呼び出し口の数だけ渡し忘れが作れる。代わりに
+/// 「起動時に 1 度だけ有効化する」形にしてある ＝ `main` を通らないプロセス
+/// （テストの実行ファイル）は構造上ここへ到達しない。
+///
+/// これが無かった頃、単体テストの失敗（一時ディレクトリのパスを含むもの）が
+/// **実ユーザーの `~/.ccdesk/error.log` へ**溜まっていた（`cargo test` を回すたびに増える）
+static ERROR_LOG_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// エラーログを有効にする。**呼ぶのは `main` の先頭だけ**（[`ERROR_LOG_ENABLED`]）
+pub fn enable_error_log() {
+    ERROR_LOG_ENABLED.store(true, Ordering::Relaxed);
+}
+
 /// エラーの集約先 ~/.ccdesk/error.log へ時刻付きで追記する。
-/// panic（TUI は画面ごと消えて読めない）と実行時エラー（attach 失敗等）の両方が集まる
+/// panic（TUI は画面ごと消えて読めない）と実行時エラー（attach 失敗等）の両方が集まる。
+/// **有効化されていないプロセスでは何も書かない**（[`ERROR_LOG_ENABLED`]）
 pub fn log_error(msg: &str) {
+    if !ERROR_LOG_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     let Some(path) = ccdesk_dir().map(|d| d.join("error.log")) else {
         return;
     };
@@ -823,6 +843,25 @@ pub fn dir_key(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **テストは実ユーザーの `~/.ccdesk/error.log` へ 1 バイトも書かない。**
+    ///
+    /// ログの出力先はプロセス全体で 1 つの隠れたグローバルなので、注入で受けると
+    /// 呼び出し口の数だけ渡し忘れが作れる。代わりに「起動時に有効化する」形にしてある
+    /// （[`enable_error_log`] を呼ぶのは `main` だけ）＝ テストの実行ファイルは
+    /// 構造上そこへ到達しない。実際、これが無かった頃は一時ディレクトリのパスを含む
+    /// 失敗が `cargo test` のたびに実ログへ溜まっていた
+    #[test]
+    fn logging_writes_nothing_until_it_is_enabled() {
+        assert!(
+            !ERROR_LOG_ENABLED.load(Ordering::Relaxed),
+            "a test enabled the error log — the real ~/.ccdesk/error.log is now in play"
+        );
+        let size = || error_log_path().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
+        let before = size();
+        log_error("this line must never reach the user's log");
+        assert_eq!(size(), before, "wrote to the real error log from a test");
+    }
 
     /// テスト専用の JSON ファイル。~/.ccdesk は触らない（開発者の state.json を踏まない）
     fn temp_json(name: &str, contents: Option<&str>) -> std::path::PathBuf {

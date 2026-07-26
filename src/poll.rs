@@ -6,7 +6,12 @@ use ratatui::style::Color;
 
 use ccdesk::{claude_settings_channel, version_newer};
 
-use crate::accounts::{Account, AccountStore, ActiveAccount, CredentialsFp};
+use crate::accounts::{Account, AccountStore, ActiveAccount, CredentialsFp, Owner};
+// `agents --json` の項目の綴りは文書化されていないので
+// [`crate::claude_format`] が持つ（外れたときに直す場所を 1 つにするため）
+use crate::claude_format::{
+    AGENT_KIND, AGENT_KIND_INTERACTIVE, AGENT_PID, AGENT_SESSION_ID, AGENT_STATUS,
+};
 use crate::theme::{ui, C_ATTENTION, C_FAIL, C_OK, C_WORKING};
 
 /// `claude agents --json --all` の 1 エントリ（公式のスクリプト向けライブデータ）。
@@ -36,7 +41,7 @@ pub(crate) struct AgentInfo {
 impl AgentInfo {
     /// 前景（interactive）セッションか。bg エントリを行の状態の答えにしない
     pub(crate) fn is_interactive(&self) -> bool {
-        self.kind == "interactive"
+        self.kind == AGENT_KIND_INTERACTIVE
     }
 }
 
@@ -64,12 +69,12 @@ pub(crate) fn spawn_agents_poller(
                                 .to_string()
                         };
                         AgentInfo {
-                            session_id: s("sessionId"),
-                            kind: s("kind"),
-                            status: s("status"),
+                            session_id: s(AGENT_SESSION_ID),
+                            kind: s(AGENT_KIND),
+                            status: s(AGENT_STATUS),
                             // 桁が u32 に収まらない値は pid として使わない
                             pid: v
-                                .get("pid")
+                                .get(AGENT_PID)
                                 .and_then(serde_json::Value::as_u64)
                                 .and_then(|pid| u32::try_from(pid).ok()),
                         }
@@ -419,6 +424,24 @@ impl AccountFetcher {
 /// 「今どう表示されるか」を出す）
 pub(crate) fn fetch_account() -> AccountStatus {
     AccountFetcher::default().fetch(AuthWatch::detect().fingerprint())
+}
+
+/// **現行の認証情報の持ち主を取り直す**（[`crate::accounts::OwnerCheck`] の実体）。
+///
+/// 保管への書き込みの直前に呼ばれる: 認証情報ファイルが動いていたとき、それが
+/// 「同じアカウントのトークン更新」なのか「別アカウントへの差し替え」なのかは
+/// ファイルの見え方では言えないので、ここで判定し直す
+/// （[`crate::accounts::AccountStore::confirm`]）。
+///
+/// **表示と同じ 1 つの経路**（[`fetch_account`]）を通す ＝ 「誰がログイン中か」の
+/// 判定を 2 通り持たない。取得できなければ [`Owner::Unknown`] で、
+/// 呼び手はそれを「中止」として扱う
+pub(crate) fn current_owner() -> Owner {
+    match fetch_account() {
+        AccountStatus::LoggedIn(active) => Owner::LoggedIn(active.account.email),
+        AccountStatus::LoggedOut => Owner::LoggedOut,
+        AccountStatus::Unknown => Owner::Unknown,
+    }
 }
 
 /// 現行バージョンと、それより新しい配布版があれば その版番号。

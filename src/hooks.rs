@@ -25,6 +25,9 @@ use serde_json::{json, Value};
 
 use ccdesk::{lock_path_for, now_ms, write_json_atomically, Lock, LOCK_STALE};
 
+// hook のイベント名と入力 JSON は**公式**（文書化されている）が、pid を渡す
+// 環境変数は非公開なので綴りは [`crate::claude_format`] が持つ
+use crate::claude_format::CLAUDE_PID_ENV;
 use crate::sessions::SessionId;
 
 /// 注入する hook イベントと、それが意味する state。
@@ -54,17 +57,6 @@ const STATE_KEY: &str = "state";
 const AT_KEY: &str = "at";
 const PID_KEY: &str = "pid";
 
-/// **claude が hook の子へ渡すプロセス ID の環境変数。**
-///
-/// 実測（v2.1.220）: hook のコマンドは claude の子として走り、環境に
-/// `CLAUDE_PID=<claude の pid>` が入る。ccdesk は自分が起こした子の pid を
-/// 知っているので、これが **hook の記録と窓を突き合わせる鍵**になる
-/// （[`HookStates::session_of`]）。
-///
-/// **ccdesk 自身が子へ渡さない印**（[`crate::session`] の `INHERITED_MARKERS`）に
-/// この名前が入っているのは、ccdesk を claude の配下から起動したときに親の値が
-/// 子へ流れないようにするため ＝ ここで読む値は必ず「その hook を呼んだ claude」
-const CLAUDE_PID_ENV: &str = "CLAUDE_PID";
 
 /// 受けた state を保つ期間。**動いているセッションは毎 turn 書き直す**ので、
 /// これを過ぎた項目は既に終わったセッションのもの ＝ 読んでも意味が無い。
