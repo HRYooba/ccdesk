@@ -360,8 +360,17 @@ const WARN_MARK: &str = "⚠";
 const LOGGED_OUT_ROW: &str = "not logged in · run /login";
 
 /// アカウント行の文面とスタイル。Frame に触らない純関数なので、`⚠` の有無と
-/// 桁数をテストで固定できる。`unstored` は [`active_unstored`] の判定
-fn account_row(status: &AccountStatus, unstored: bool) -> (String, Style) {
+/// 桁数をテストで固定できる。`unstored` は [`active_unstored`] の判定。
+///
+/// `pending` は進行中のアカウント操作の語（[`crate::app::AccountJob`]）。
+/// **進行中は他の何よりこれを出す**: 操作は別スレッドで走り最大 11 秒かかりうるので、
+/// 何も出さないと「押したのに変わらない行」に見える（版行が `updating…` を出すのと
+/// 同じ方針で、語彙は要求の側が持つ）。進行中の値は「今の持ち主」ではないので、
+/// `⚠` も dim も付けない（判断材料が確定していない間の見た目を作り分けない）
+fn account_row(status: &AccountStatus, unstored: bool, pending: Option<&str>) -> (String, Style) {
+    if let Some(progress) = pending {
+        return (progress.to_string(), Style::default().fg(ui().dim));
+    }
     match status {
         // 未保管のときは `⚠` を前置し、色も dim から注意色へ上げる。dim のままだと
         // 登録し忘れに気づけず、次の /login で前のアカウントの認証情報が
@@ -952,7 +961,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         // アカウント行（表示名 · 組織名）。文面の判断は account_row に閉じる。
         // **この行はクリックできる**（アカウントメニューの入口。当たり判定は
         // handle_mouse 側が同じ `sidebar_layout` の account_y で持つ）
-        let (account, account_style) = account_row(&app.footer.account, active_unstored(app));
+        let (account, account_style) = account_row(
+            &app.footer.account,
+            active_unstored(app),
+            app.account_job.as_ref().map(|job| job.progress),
+        );
         frame.render_widget(
             ratatui::widgets::Paragraph::new(
                 Line::from(clip_to_width(&account, fw)).style(account_style),
@@ -1749,7 +1762,7 @@ mod tests {
 
     /// テスト内でアカウント行の文面だけを見るための短縮
     fn row_text(status: &AccountStatus, unstored: bool) -> String {
-        account_row(status, unstored).0
+        account_row(status, unstored, None).0
     }
 
     /// **アクティブなアカウントが未保管のときだけ `⚠` を前置する。**
@@ -1775,11 +1788,27 @@ mod tests {
         assert!(!LOGGED_OUT_ROW.contains(WARN_MARK));
     }
 
+    /// **進行中のアカウント操作は行に出る**（版行の `updating…` と同じ方針）。
+    /// 操作は別スレッドで走り最大 11 秒かかりうるので、出さないと「押したのに
+    /// 変わらない行」に見える。⚠ より優先するのは、進行中の値がまだ
+    /// 「今の持ち主」ではないため（確定していない間の見た目を作り分けない）
+    #[test]
+    fn the_account_row_shows_a_running_account_action() {
+        use crate::accounts::{Account, ActiveAccount};
+        let active = AccountStatus::LoggedIn(ActiveAccount::unseen(Account::new(
+            "a@example.com",
+            "you",
+        )));
+        let (text, _) = account_row(&active, true, Some("switching…"));
+        assert_eq!(text, "switching…", "進行中が行に出ていない");
+        assert!(!text.contains(WARN_MARK), "確定していない値に ⚠ を付けている");
+    }
+
     /// 未ログインの行は **再ログインの手順まで出す**。保管トークンの期限切れも
     /// この状態で現れる（事前検知はしない方針なので、ここが唯一の気づきどころ）
     #[test]
     fn account_row_prompts_a_login_when_logged_out() {
-        let (text, style) = account_row(&AccountStatus::LoggedOut, false);
+        let (text, style) = account_row(&AccountStatus::LoggedOut, false, None);
         assert!(text.contains("not logged in"), "{text:?}");
         assert!(text.contains("/login"), "再ログインの手順が無い: {text:?}");
         assert_eq!(

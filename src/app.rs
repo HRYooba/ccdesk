@@ -325,9 +325,16 @@ pub(crate) struct App {
     pub(crate) usage_display: bool,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) last_usage_read: std::time::Instant,
+    // 進行中のアカウント操作（登録・切替・登録解除）。**Some の間は次の要求を
+    // 受けない**（多重実行の防止）うえ、アカウント行が進行中の語を出す。
+    // 別スレッドへ逃がしてあるのは、ロック待ちが最大 11 秒あり（claude と共有する
+    // 認証情報ロック 9 秒 + 保管ロック 2 秒）、前景で取ると再描画も Ctrl+Q も
+    // 効かない時間ができるため（[`apply_account`]）
+    pub(crate) account_job: Option<AccountJob>,
     // 画面に出す値の供給元（実データ / 撮影用の固定データ）。起動時に 1 度だけ選ばれ、
-    // 以降ここを通る限り「今 demo か」を問う必要が無い
-    pub(crate) source: Box<dyn DataSource>,
+    // 以降ここを通る限り「今 demo か」を問う必要が無い。
+    // **`Arc` なのはアカウント操作を別スレッドへ渡すため**（[`AccountJob`]）
+    pub(crate) source: Arc<dyn DataSource>,
     // Ctrl+X の 2 度押し削除（short id と 1 回目 stop の時刻。2 秒以内の再押下 = rm）
     pub(crate) pending_delete: Option<(String, std::time::Instant)>,
     // `claude --bg` は ~1s かかるため別スレッドで実行し、完了を channel で受ける
@@ -411,7 +418,8 @@ impl Default for App {
             last_usage_read: std::time::Instant::now(),
             // 撮影用の供給元は state.json / config.json を書かないので、
             // テストが開発者の設定を踏まない
-            source: Box::new(crate::source::DemoSource),
+            account_job: None,
+            source: Arc::new(crate::source::DemoSource),
             pending_delete: None,
             spawn_rx: None,
             input_gate: None,
@@ -676,6 +684,11 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         // 通知が出る**ように run ループ側で見る（門番の中で期限を見ると、
         // ハングに気づけるのが「打った人」だけになる）
         if expire_input_gate(app) {
+            force_draw = true;
+        }
+        // 別スレッドのアカウント操作（登録・切替・登録解除）の完了を取り込む。
+        // UI はロック待ちの間もブロックしない（[`apply_account`]）
+        if take_account_result(app) {
             force_draw = true;
         }
         // 使用率を 5 秒毎に取り込む（実データなら statusline フックが書いた
@@ -1543,7 +1556,7 @@ fn run_popup_action(app: &mut App, action: PopupAction, anchor_y: u16) {
         PopupAction::RegisterCurrent => register_current(app),
         PopupAction::SwitchAccount(email) => switch_account(app, &email),
         PopupAction::UnregisterAccount(email) => {
-            apply_account(app, AccountAction::Unregister(&email), "登録解除")
+            apply_account(app, AccountAction::Unregister(email))
         }
         PopupAction::RemoveProject(cwd) => remove_project(app, &cwd),
     }
@@ -1682,7 +1695,7 @@ fn register_current(app: &mut App) {
         set_notice(app, UNKNOWN_ACTIVE_NOTICE.to_string());
         return;
     };
-    apply_account(app, AccountAction::Register(&active), "登録");
+    apply_account(app, AccountAction::Register(active));
 }
 
 /// `switch`: 保管アカウントへ切り替える。
@@ -1700,18 +1713,98 @@ fn switch_account(app: &mut App, email: &str) {
         set_notice(app, UNKNOWN_ACTIVE_NOTICE.to_string());
         return;
     };
-    apply_account(app, AccountAction::Switch { email, outgoing }, "切替");
+    apply_account(
+        app,
+        AccountAction::Switch {
+            email: email.to_string(),
+            outgoing,
+        },
+    );
 }
 
 /// 「既にそのアカウント」で切替が何もしなかったときの通知。
 /// **成功と同じ無反応にはしない**（メニューの `●` と同じ事実を言葉でも出す）
 const ALREADY_ACTIVE_NOTICE: &str = "既にこのアカウントを使っている";
 
-/// 保管への変更を供給元へ流す。成功したら写しを取り直し（⚠ と一覧が即座に追従する）、
-/// 失敗は下部バーへ出す。**エラー文はそのまま載せてよい**: ドメイン側の失敗は
-/// パスとロックの事情だけを述べ、トークンを含まない
-fn apply_account(app: &mut App, action: AccountAction<'_>, what: &str) {
-    match app.source.apply_account(action) {
+/// 進行中のアカウント操作（[`apply_account`] が別スレッドへ逃がした要求）。
+///
+/// **語を一緒に持つ**のが要点: 結果が届いた時点で要求はもう手元に無いので、
+/// 失敗文と行の進行表示をここで抱えておく（[`AccountAction::what`] /
+/// [`AccountAction::progress`] から受け取る ＝ 語彙の正本は要求の側 1 箇所）
+pub(crate) struct AccountJob {
+    rx: std::sync::mpsc::Receiver<anyhow::Result<AccountChange>>,
+    /// 失敗通知の語（「アカウントの{what}に失敗」）
+    what: &'static str,
+    /// アカウント行に出す進行中の語
+    pub(crate) progress: &'static str,
+}
+
+/// 進行中にもう 1 つアカウント操作を押したときの通知。
+/// **黙って捨てない**（進行中の行表示と併せて、押したのに何も起きないメニューに
+/// 見せない）。待ち行列にしないのは、前の操作が「今の持ち主」を変えるので、
+/// 並んだ要求は古い観測を材料に走ることになるため（[`ActiveAccount`]）。
+/// 取り直した観測で押し直す方が安全
+const ACCOUNT_BUSY_NOTICE: &str = "アカウント操作中 — 完了してからもう一度";
+
+/// 保管への変更を供給元へ流す。**別スレッドで走らせ、結果は run ループが
+/// 受けて反映する**（[`take_account_result`]）。
+///
+/// **前景で取ってはいけない理由**: 登録と切替は claude と共有する認証情報ロック
+/// （最大 9 秒）の下で保管ロック（最大 2 秒）も取るので、claude がトークン更新中に
+/// `register current` を押すと **UI スレッドが最大約 11 秒止まる**（再描画も Ctrl+Q も
+/// 効かない ＝ ハングに見える）。他の重い操作（`claude --bg` / `claude update` /
+/// 自己更新）はすべて別スレッドで、ここだけが前景だった。
+///
+/// **観測時点（[`ActiveAccount`]）は逃がしても守られる**: 要求が運ぶのは
+/// 「押した時点の観測」で、それが今も有効かはドメイン側がロックの下で照合し、
+/// 古ければ書かずに失敗する（`still_current`）。前景でもロック待ちの間に同じことが
+/// 起きるので、逃がしたことで隔たりが伸びるわけではない（送るのは即座）
+fn apply_account(app: &mut App, action: AccountAction) {
+    if app.account_job.is_some() {
+        set_notice(app, ACCOUNT_BUSY_NOTICE.to_string());
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.account_job = Some(AccountJob {
+        rx,
+        what: action.what(),
+        progress: action.progress(),
+    });
+    let source = app.source.clone();
+    std::thread::spawn(move || {
+        // 受け手が消えていても（run ループの終了）送信の失敗は無視する
+        let _ = tx.send(source.apply_account(action));
+    });
+}
+
+/// 別スレーッドのアカウント操作の結果を取り込む（run ループが毎周見る）。
+/// 取り込んだら `true`（＝即描画する）
+fn take_account_result(app: &mut App) -> bool {
+    let Some(job) = app.account_job.take() else {
+        return false;
+    };
+    let result = match job.rx.try_recv() {
+        Ok(result) => result,
+        Err(std::sync::mpsc::TryRecvError::Empty) => {
+            app.account_job = Some(job); // まだ走っている
+            return false;
+        }
+        // 結果は永久に来ない。**進行中の印は降ろす**（降ろさないと行が永久に
+        // `switching…` のままで、以降のアカウント操作も全て拒まれる）
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(anyhow::anyhow!("実行スレッドが結果を返さずに終了した"))
+        }
+    };
+    apply_account_result(app, result, job.what);
+    true
+}
+
+/// アカウント操作の結果を状態へ反映する。成功したら写しを取り直し
+/// （⚠ と一覧が即座に追従する）、失敗は下部バーへ出す。
+/// **エラー文はそのまま載せてよい**: ドメイン側の失敗はパスとロックの事情だけを
+/// 述べ、トークンを含まない
+fn apply_account_result(app: &mut App, result: anyhow::Result<AccountChange>, what: &str) {
+    match result {
         // **切替が成功した時点で「今の持ち主」は確定している**（ccdesk 自身が
         // 書いた値）。ポーラーの追いつき（認証ファイルの変化検出 → 子プロセス起動で
         // 1〜2 秒）を待つと、その間の操作が切替前の持ち主を材料に走り、
@@ -2079,6 +2172,9 @@ mod tests {
     use super::*;
     use unicode_width::UnicodeWidthStr;
 
+    // アカウント操作を逃がした先を見るためのロック（claude が保持している状態を作る）
+    use ccdesk::{Lock, LOCK_STALE};
+
     use crate::source::{persist_projects, WindowState};
 
     const TERM: (u16, u16) = (120, 40);
@@ -2115,6 +2211,24 @@ mod tests {
             column,
             row,
             modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// 別スレーッドで走るアカウント操作（[`apply_account`]）の完了を待って反映する。
+    ///
+    /// **反映は本番と同じ [`take_account_result`] を通す**（待つ点だけが違う）ので、
+    /// 「操作 → 結果が状態へ入る」の順序はテストと実運用で同じ。走っていなければ
+    /// 何もしない ＝ 要求を出さない経路（未取得で止めた場合）でもそのまま呼べる
+    fn settle_account(app: &mut App) {
+        let started = std::time::Instant::now();
+        while app.account_job.is_some() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "アカウント操作が完了しない"
+            );
+            if !take_account_result(app) {
+                std::thread::yield_now();
+            }
         }
     }
 
@@ -2801,7 +2915,7 @@ mod tests {
             }
         }
 
-        fn apply_account(&self, action: AccountAction<'_>) -> anyhow::Result<AccountChange> {
+        fn apply_account(&self, action: AccountAction) -> anyhow::Result<AccountChange> {
             match &self.accounts {
                 AccountBackend::Absent => panic!(
                     "アカウントを扱わない供給元へ変更要求が来た \
@@ -2818,10 +2932,10 @@ mod tests {
                         // 記録用の供給元はファイルを読まないので照合の相手が無い
                         AccountAction::Switch { email, .. } => AccountChange::Switched(
                             ActiveAccount::unseen(Account::new(
-                                *email,
+                                email,
                                 stored
                                     .iter()
-                                    .find(|a| a.email == *email)
+                                    .find(|a| &a.email == email)
                                     .map(|a| a.label.as_str())
                                     .unwrap_or(email),
                             )),
@@ -2834,14 +2948,11 @@ mod tests {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(match action {
-                            AccountAction::Register(active) => Recorded::Register(active.clone()),
-                            AccountAction::Switch { email, outgoing } => Recorded::Switch {
-                                email: email.to_string(),
-                                outgoing,
-                            },
-                            AccountAction::Unregister(email) => {
-                                Recorded::Unregister(email.to_string())
+                            AccountAction::Register(active) => Recorded::Register(active),
+                            AccountAction::Switch { email, outgoing } => {
+                                Recorded::Switch { email, outgoing }
                             }
+                            AccountAction::Unregister(email) => Recorded::Unregister(email),
                         });
                     if *fails {
                         // 実際に返り得る失敗（ロック競合）と同じ形。トークンは含まない
@@ -2871,7 +2982,7 @@ mod tests {
                 ..FooterInfo::default()
             },
             accounts: stored.clone(),
-            source: Box::new(TestSource::for_accounts(AccountBackend::Recording {
+            source: Arc::new(TestSource::for_accounts(AccountBackend::Recording {
                 stored,
                 recorded: recorded.clone(),
                 fails,
@@ -2980,6 +3091,7 @@ mod tests {
         );
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
         handle_mouse(&mut app, &click(rect.x + 1, rect.y + 1)).unwrap();
+        settle_account(&mut app);
         assert_eq!(
             *recorded
                 .lock()
@@ -3004,17 +3116,23 @@ mod tests {
         let stored = vec![active.clone(), Account::new("b@example.com", "hanako")];
         let (mut app, recorded) = recording_app(Some(active.clone()), stored, false);
 
+        // **1 つずつ完了させる**: 要求は別スレッドで走り、進行中は次の要求を
+        // 受けないので（[`ACCOUNT_BUSY_NOTICE`]）、実運用の「押す → 終わる → 押す」と
+        // 同じ順序で流す
         run_popup_action(&mut app, PopupAction::RegisterCurrent, 0);
+        settle_account(&mut app);
         run_popup_action(
             &mut app,
             PopupAction::SwitchAccount("b@example.com".to_string()),
             0,
         );
+        settle_account(&mut app);
         run_popup_action(
             &mut app,
             PopupAction::UnregisterAccount("b@example.com".to_string()),
             0,
         );
+        settle_account(&mut app);
 
         assert_eq!(
             *recorded
@@ -3045,6 +3163,7 @@ mod tests {
             PopupAction::SwitchAccount("a@example.com".to_string()),
             0,
         );
+        settle_account(&mut app);
         assert_eq!(
             *recorded
                 .lock()
@@ -3065,6 +3184,7 @@ mod tests {
     fn register_current_without_a_known_account_says_why() {
         let (mut app, recorded) = recording_app(None, Vec::new(), false);
         run_popup_action(&mut app, PopupAction::RegisterCurrent, 0);
+        settle_account(&mut app); // 要求を出していなければ何もしない
         assert!(
             recorded
                 .lock()
@@ -3088,6 +3208,7 @@ mod tests {
             PopupAction::SwitchAccount("b@example.com".to_string()),
             0,
         );
+        settle_account(&mut app);
         let (msg, _) = app.notice.as_ref().expect("失敗が伝わっていない");
         assert!(msg.contains("切替"), "どの操作が失敗したか分からない: {msg:?}");
         assert!(
@@ -3144,7 +3265,7 @@ mod tests {
             // **実物のストアを通す**（記録用では見えなかった破壊を捕まえる要）。
             // 検査用に返す `store` とは別インスタンスにしてあるのは、
             // ロックの取り合いを含めて本番と同じ経路を通すため
-            source: Box::new(TestSource::for_accounts(AccountBackend::Store(
+            source: Arc::new(TestSource::for_accounts(AccountBackend::Store(
                 crate::accounts::AccountStore::new(home.paths()),
             ))),
             ..test_app(34, TERM)
@@ -3152,8 +3273,14 @@ mod tests {
         (app, home, store)
     }
 
-    /// メニューから switch を選ぶ 1 操作
+    /// メニューから switch を選ぶ 1 操作（完了まで見る）
     fn switch(app: &mut App, email: &str) {
+        press_switch(app, email);
+        settle_account(app);
+    }
+
+    /// switch を**押すだけ**（完了を待たない）。進行中の状態を見るテスト用
+    fn press_switch(app: &mut App, email: &str) {
         run_popup_action(app, PopupAction::SwitchAccount(email.to_string()), 0);
     }
 
@@ -3241,6 +3368,7 @@ mod tests {
 
         switch(&mut app, STORE_B);
         run_popup_action(&mut app, PopupAction::RegisterCurrent, 0);
+        settle_account(&mut app);
 
         assert_eq!(app.notice, None, "失敗している: {:?}", app.notice);
         assert_eq!(
@@ -3335,6 +3463,96 @@ mod tests {
             home.read_credentials()["claudeAiOauth"],
             oauth("access-c", "refresh-c"),
             "未ログインからの切替が止まっている"
+        );
+    }
+
+    /// **アカウント操作は UI スレッドをブロックしない。**
+    ///
+    /// 登録と切替は claude と共有する認証情報ロック（最大 9 秒）の下で保管ロック
+    /// （最大 2 秒）も取るので、前景で取ると **claude のトークン更新中に押した瞬間から
+    /// 最大約 11 秒、再描画も Ctrl+Q も効かない**（ハングに見える）。
+    ///
+    /// 併せて逃がした先の作法も固定する: 進行中はアカウント行が進行中の語を出し
+    /// （[`AccountAction::progress`]）、2 つ目の要求は受けず、完了したら結果が
+    /// アカウント行と保管一覧へ入る
+    #[test]
+    fn an_account_action_does_not_block_the_ui() {
+        let (mut app, home, store) = app_with_real_store("an_account_action_does_not_block_the_ui");
+        // claude がトークン更新中（認証情報ロックを保持）＝ ドメイン側は待たされる
+        let held = Lock::acquire(&home.paths().lock, Duration::ZERO, LOCK_STALE).unwrap();
+
+        let started = std::time::Instant::now();
+        press_switch(&mut app, STORE_B);
+        let blocked = started.elapsed();
+        assert!(
+            blocked < Duration::from_millis(500),
+            "UI スレッドがロックを待っている（{blocked:?}）"
+        );
+
+        // 進行中であることが行に出る（進行表示が無いと固まったように見える）
+        assert_eq!(
+            app.account_job.as_ref().map(|job| job.progress),
+            Some("switching…"),
+            "進行中がアカウント行に出ない"
+        );
+        // 2 つ目の要求は受けない（多重実行の防止）。**黙って捨てない**
+        press_switch(&mut app, STORE_C);
+        let (msg, _) = app.notice.as_ref().expect("落としたことが伝わっていない");
+        assert!(msg.contains("アカウント操作中"), "何が起きたか分からない: {msg:?}");
+        assert!(!take_account_result(&mut app), "終わっていないのに取り込んでいる");
+
+        // claude がロックを離せば完了し、結果がアカウント行と保管一覧へ入る
+        drop(held);
+        settle_account(&mut app);
+        assert_eq!(active_email(&app), STORE_B, "アカウント行が結果を反映していない");
+        assert_eq!(
+            home.read_credentials()["claudeAiOauth"],
+            oauth("access-b", "refresh-b"),
+            "切替が行われていない"
+        );
+        assert_eq!(
+            stored(&store, STORE_A),
+            Some(oauth("access-a2", "refresh-a2")),
+            "出ていく A のトークンを巻き取れていない"
+        );
+        assert_eq!(app.accounts.len(), 3, "保管一覧を取り直していない");
+    }
+
+    /// **逃がしても「いつの観測か」は守られる。**
+    ///
+    /// 要求が運ぶのは押した時点の観測（[`ActiveAccount`]）で、それが今も有効かは
+    /// ドメイン側がロックの下で照合する。待っている間に別端末の `/login` や
+    /// トークン更新が入ったら**書かずに失敗する**（古い判断で切替を通すと、
+    /// 出ていく側の保管に別アカウントのトークンを書いて両方を復旧不能にする）。
+    /// これは前景で取っていた頃と同じ保証で、逃がしたことで崩れていないことを見る
+    #[test]
+    fn a_switch_running_off_thread_still_refuses_a_stale_observation() {
+        let (mut app, home, store) =
+            app_with_real_store("a_switch_running_off_thread_still_refuses_a_stale_observation");
+        let held = Lock::acquire(&home.paths().lock, Duration::ZERO, LOCK_STALE).unwrap();
+
+        press_switch(&mut app, STORE_B);
+        // 待っている間に別端末で /login された（指紋はサイズが変わるので必ず動く）
+        home.write_credentials(&credentials_doc("access-elsewhere", "refresh-elsewhere"));
+        drop(held);
+        settle_account(&mut app);
+
+        let (msg, _) = app.notice.as_ref().expect("古い観測で切替が通っている");
+        assert!(
+            msg.contains("changed since ccdesk last checked"),
+            "観測の古さが理由として出ていない: {msg:?}"
+        );
+        assert_eq!(
+            home.read_credentials()["claudeAiOauth"],
+            oauth("access-elsewhere", "refresh-elsewhere"),
+            "誰の認証情報か分からないまま上書きしている"
+        );
+        // 巻き取りも起きていない ＝ 登録したときの写しのまま（`access-a2` は
+        // 保管へ入っていない。切替が成功したときだけ巻き取られる値）
+        assert_eq!(
+            stored(&store, STORE_A),
+            Some(oauth("access-a", "refresh-a")),
+            "諦めたのに A の保管を書き換えている"
         );
     }
 
@@ -3605,7 +3823,7 @@ mod tests {
         disk.extend(from_other.iter().map(|p| p.to_string()));
         App {
             projects: mine.clone(),
-            source: Box::new(TestSource::for_projects(ProjectsBackend::MemoryDisk {
+            source: Arc::new(TestSource::for_projects(ProjectsBackend::MemoryDisk {
                 disk: Mutex::new(disk),
                 baseline: Mutex::new(mine),
             })),

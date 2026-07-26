@@ -67,10 +67,10 @@ fn main() -> anyhow::Result<()> {
     let usage_display = load_setting("usage_display").as_deref() == Some("on");
     // demo / 実データの選択はこの 1 箇所だけ。以降のコードは供給元を通すので
     // 「今 demo か」を問う分岐を持たない（＝分岐の書き漏らしで実データが漏れない）
-    let source: Box<dyn DataSource> = if demo {
-        Box::new(DemoSource)
+    let source: Arc<dyn DataSource> = if demo {
+        Arc::new(DemoSource)
     } else {
-        Box::new(LiveSource::new(usage_display))
+        Arc::new(LiveSource::new(usage_display))
     };
     // セッション一覧・フッター・ウィンドウ状態はすべて供給元から受け取る
     let jobs = source.jobs();
@@ -155,6 +155,7 @@ fn main() -> anyhow::Result<()> {
         last_usage_read: instant_ago(Duration::from_secs(60)),
         pending_delete: None,
         spawn_rx: None,
+        account_job: None,
         input_gate: None,
         notice: None,
         grouping: window.grouping,

@@ -111,13 +111,13 @@ pub(crate) enum WindowItem<'a> {
 /// アカウント保管への変更要求。[`WindowItem`] と同じ「1 つの enum を受ける
 /// メソッド」の形にしてあるのは理由も同じで、項目を増やすと live 側の match が
 /// 非網羅になる ＝ 撮影用の供給元で実ファイルを触ってしまう漏れが起きない
-pub(crate) enum AccountAction<'a> {
+pub(crate) enum AccountAction {
     /// 今ログイン中のアカウントを保管へ加える
-    Register(&'a ActiveAccount),
+    Register(ActiveAccount),
     /// 保管アカウントへ切り替える
     Switch {
         /// 切替先（[`Account::email`]）
-        email: &'a str,
+        email: String,
         /// 出ていく側（今の持ち主）についての観測。**そのトークンを同じロック下で
         /// 保管へ巻き取るために渡す**（[`AccountStore::switch_to`] 参照）。
         /// 日付（[`ActiveAccount::seen`]）付きで渡すのは、古い判断で
@@ -126,7 +126,31 @@ pub(crate) enum AccountAction<'a> {
         outgoing: Outgoing,
     },
     /// 保管から外す（ログイン自体は外さない）
-    Unregister(&'a str),
+    Unregister(String),
+}
+
+impl AccountAction {
+    /// この要求を指す語（下部バーの「アカウントの…に失敗」）。
+    /// **呼び出し口で文字列を添えない**のが要点で、要求とその語彙を
+    /// 同じ型の隣に置くと、要求を足したときに語を決めるのを忘れられない
+    pub(crate) fn what(&self) -> &'static str {
+        match self {
+            Self::Register(_) => "登録",
+            Self::Switch { .. } => "切替",
+            Self::Unregister(_) => "登録解除",
+        }
+    }
+
+    /// 実行中にアカウント行へ出す語（版行の `updating…` と同じ方鑑）。
+    /// 英語なのはこれが行の表示で、他の行の語彙
+    /// （`not logged in · run /login` / `updating…`）に揃えるため
+    pub(crate) fn progress(&self) -> &'static str {
+        match self {
+            Self::Register(_) => "registering…",
+            Self::Switch { .. } => "switching…",
+            Self::Unregister(_) => "unregistering…",
+        }
+    }
 }
 
 /// バックグラウンド取得の書き込み先（ポーラーが書き、run ループが dirty で取り込む）
@@ -145,7 +169,9 @@ pub(crate) struct PollSinks {
 ///
 /// **新しい取得値を足すときはここにメソッドを足す。** そうすれば demo 側の
 /// 固定値をコンパイラが要求するので、撮影に実データが漏れない
-pub(crate) trait DataSource {
+// **`Send + Sync` が要る**: 重い要求（アカウントの登録・切替）は別スレッドで
+// 走るので、供給元は `Arc` で共有される（[`crate::app`] の `apply_account`）
+pub(crate) trait DataSource: Send + Sync {
     /// サイドバーに並べるセッション一覧（周期的に呼ばれる）
     fn jobs(&self) -> Vec<BgJob>;
 
@@ -184,7 +210,7 @@ pub(crate) trait DataSource {
     /// 保管への変更（登録・切替・登録解除）。失敗は呼び出し側が下部バーへ出す。
     /// 戻り値で「今の持ち主」がどうなったかを返す（[`AccountChange`]）ので、
     /// UI はポーラーの追いつきを待たずにアカウント行を確定値へ更新できる
-    fn apply_account(&self, action: AccountAction<'_>) -> anyhow::Result<AccountChange>;
+    fn apply_account(&self, action: AccountAction) -> anyhow::Result<AccountChange>;
 
     /// 新規セッションの要求で実際に `claude --bg` を起こすか。
     /// **撮影用データは起こさない**（架空のセッション一覧に本物のセッションが混ざると、
@@ -201,13 +227,15 @@ pub(crate) trait DataSource {
 /// [`AccountChange::StoreOnly`]（＝今の持ち主は変わらない）に畳む
 pub(crate) fn apply_account_action(
     store: &AccountStore,
-    action: AccountAction<'_>,
+    action: AccountAction,
 ) -> anyhow::Result<AccountChange> {
     match action {
-        AccountAction::Register(active) => store.register(active).map(|()| AccountChange::StoreOnly),
-        AccountAction::Switch { email, outgoing } => store.switch_to(email, &outgoing),
+        AccountAction::Register(active) => {
+            store.register(&active).map(|()| AccountChange::StoreOnly)
+        }
+        AccountAction::Switch { email, outgoing } => store.switch_to(&email, &outgoing),
         AccountAction::Unregister(email) => {
-            store.unregister(email).map(|()| AccountChange::StoreOnly)
+            store.unregister(&email).map(|()| AccountChange::StoreOnly)
         }
     }
 }
@@ -455,7 +483,7 @@ impl DataSource for LiveSource {
             .unwrap_or_default()
     }
 
-    fn apply_account(&self, action: AccountAction<'_>) -> anyhow::Result<AccountChange> {
+    fn apply_account(&self, action: AccountAction) -> anyhow::Result<AccountChange> {
         let store = AccountStore::detect()
             .ok_or_else(|| anyhow!("could not locate the home directory for the account store"))?;
         apply_account_action(&store, action)
@@ -517,7 +545,7 @@ impl DataSource for DemoSource {
         demo_accounts()
     }
 
-    fn apply_account(&self, _action: AccountAction<'_>) -> anyhow::Result<AccountChange> {
+    fn apply_account(&self, _action: AccountAction) -> anyhow::Result<AccountChange> {
         // 撮影は `~/.ccdesk/accounts.json` も `~/.claude/.credentials.json` も
         // 書かない（実アカウントのトークンを触らせない）。成功を返すのは、
         // 失敗の通知が下部バーに出て撮影の見た目が変わるのを避けるため。
@@ -961,12 +989,12 @@ mod tests {
         // 撮影は認証情報ファイルを読まないので、観測に指紋は無い
         let account = ActiveAccount::unseen(Account::new(&email, "demo"));
         for action in [
-            AccountAction::Register(&account),
+            AccountAction::Register(account.clone()),
             AccountAction::Switch {
-                email: &email,
+                email: email.clone(),
                 outgoing: Outgoing::Known(account.clone()),
             },
-            AccountAction::Unregister(&email),
+            AccountAction::Unregister(email.clone()),
         ] {
             DemoSource.apply_account(action).expect("撮影で失敗を出さない");
         }
@@ -995,12 +1023,12 @@ mod tests {
         // 観測（[`ActiveAccount`]）は「今のファイルを見た」もの ＝ UI が
         // メニューを開いた時点でポーラーが持っていた値に相当する
         home.write_credentials(&credentials_doc("access-t", "refresh-t"));
-        apply_account_action(&store, AccountAction::Register(&home.active(&taro.email, &taro.label)))
+        apply_account_action(&store, AccountAction::Register(home.active(&taro.email, &taro.label)))
             .unwrap();
         home.write_credentials(&credentials_doc("access-h", "refresh-h"));
         apply_account_action(
             &store,
-            AccountAction::Register(&home.active(&hanako.email, &hanako.label)),
+            AccountAction::Register(home.active(&hanako.email, &hanako.label)),
         )
         .unwrap();
         assert_eq!(store.list(), vec![hanako.clone(), taro.clone()]); // email 昇順
@@ -1009,7 +1037,7 @@ mod tests {
         apply_account_action(
             &store,
             AccountAction::Switch {
-                email: &taro.email,
+                email: taro.email.clone(),
                 outgoing: Outgoing::Known(home.active(&hanako.email, &hanako.label)),
             },
         )
@@ -1021,7 +1049,7 @@ mod tests {
         );
 
         // unregister: 一覧から消えるが、ログイン（現行の認証情報）は残る
-        apply_account_action(&store, AccountAction::Unregister(&hanako.email)).unwrap();
+        apply_account_action(&store, AccountAction::Unregister(hanako.email.clone())).unwrap();
         assert_eq!(store.list(), vec![taro.clone()]);
         assert_eq!(
             home.read_credentials()["claudeAiOauth"],
@@ -1041,7 +1069,7 @@ mod tests {
         let store = home.store();
         let taro = Account::new("taro@example.com", "taro");
         home.write_credentials(&credentials_doc("access-t", "refresh-t"));
-        apply_account_action(&store, AccountAction::Register(&home.active(&taro.email, &taro.label)))
+        apply_account_action(&store, AccountAction::Register(home.active(&taro.email, &taro.label)))
             .unwrap();
         // 保管より後にトークンが更新された状態（使い捨ての refreshToken が進む）
         home.write_credentials(&credentials_doc("access-t2", "refresh-t2"));
@@ -1051,7 +1079,7 @@ mod tests {
             apply_account_action(
                 &store,
                 AccountAction::Switch {
-                    email: &taro.email,
+                    email: taro.email.clone(),
                     outgoing: Outgoing::Known(home.active(&taro.email, &taro.label)),
                 },
             )
