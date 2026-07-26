@@ -843,6 +843,10 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                     handle_new_view_key(app, &key)?;
                     continue;
                 }
+                // 起動処理中の打鍵は捨てる（宛先のセッションがまだ無い）
+                if drop_input_while_starting(app) {
+                    continue;
+                }
                 // フォーカスがターミナル側にあるときだけ PTY へ流す
                 if app.sessions.is_empty() {
                     continue;
@@ -874,6 +878,10 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                     continue;
                 }
                 if app.focus != Focus::Terminal {
+                    continue;
+                }
+                // 打鍵と同じ門番（貼り付けのほうが 1 回で送る量が多い ＝ 素通しの害が大きい）
+                if drop_input_while_starting(app) {
                     continue;
                 }
                 if app.sessions.is_empty() {
@@ -1096,8 +1104,9 @@ fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
     // new session はどちらもこの関数へ収束するため、経路が増えても漏れが起きない。
     // 完了後の attach 側に置けないのは、[`App::show_session`] が
     // 「フォーカスは動かさない」契約で、セッション切替と共用のため。
-    // 起動完了までの ~1 秒はまだ前のセッションがキーを受ける ＝ 打つには早い状態なので、
-    // 下部バーの "starting session…"（`spawn_rx` を見て出る）でそれを見せる
+    // 起動完了までの ~1 秒は宛先のセッションがまだ無く、`right_view` は直前まで見ていた
+    // セッションを指したままなので、**その間の入力は捨てる**
+    // （[`drop_input_while_starting`] ＝ 打った文字が無関係なセッションへ届かない）
     app.set_focus(Focus::Terminal);
     // 撮影用データは本物のセッションを起こさない（架空の一覧に実セッションが混ざらない）。
     // 起動しない ＝ 失敗もしないので、「成功したが attach する id は無い」結果を
@@ -1811,7 +1820,43 @@ fn start_claude_update(app: &mut App) {
 /// あわせて ~/.ccdesk/error.log にも残す
 fn set_notice(app: &mut App, msg: String) {
     log_error(&msg);
+    set_hint(app, msg);
+}
+
+/// 下部バーへ出すだけの案内（error.log には残さない）。
+/// **異常ではない案内**用で、打鍵のたびに呼ばれ得るものはこちらを使う
+/// （error.log に残すと 1 秒の取りこぼしで数十行増え、本物の失敗が埋まる）。
+/// 表示の作法（数秒で消える・キーヒントを一時的に隠す）は通知と同じなので、
+/// 置き場所は `notice` 1 つのまま
+fn set_hint(app: &mut App, msg: String) {
     app.notice = Some((msg, std::time::Instant::now()));
+}
+
+/// 起動処理中（`claude --bg` の完了待ち ＝ `spawn_rx` が生きている間）に
+/// ターミナルペインへ来た入力を捨てる。捨てたら `true`（呼び手は何もしない）。
+///
+/// **打った文字が無関係なセッションへ届かないための門番。** [`dispatch_session`] は
+/// 起動と同時にフォーカスを端末へ移すが、attach は `claude --bg` の完了後（~1 秒）なので、
+/// その間 `right_view` は**直前まで見ていたセッション**を指したままになる。素通しすると
+/// 新しいエージェント宛に打ったつもりのプロンプトが、無関係な実行中エージェント
+/// （別プロジェクトの作業中セッションもあり得る）へ送られる。
+/// 起動を待たずに打ち始めるのが普通なので、~1 秒でも現実に踏む。
+///
+/// **フォーカスの移動を attach 側へ遅らせる形は採らない**: それは直前に直した問題
+/// （起動したのにキーがサイドバーへ行き ↑↓ で選択が動く）を戻すことになる。
+/// フォーカスは即座に端末へ移し、**宛先が居ない間だけ入力を捨てる**。
+///
+/// **黙って捨てない**: 下部バーの "starting session…" は通知が出ている間は隠れるため、
+/// 捨てたこと自体をここで伝える（[`set_hint`] ＝ 異常ではないので error.log には残さない）。
+///
+/// マウスは門番の対象外: 届くのはクリックとホイールでプロンプトへ文字を送る経路ではなく、
+/// 移動イベントごとに案内を出すとノイズになる
+fn drop_input_while_starting(app: &mut App) -> bool {
+    if app.spawn_rx.is_none() {
+        return false;
+    }
+    set_hint(app, "セッション起動中 — 打った文字は届いていない".to_string());
+    true
 }
 
 /// id 指定で claude attach を PTY 起動（既に開いていれば切替のみ）。
@@ -3063,6 +3108,33 @@ mod tests {
         assert!(
             app.focus == Focus::Terminal,
             "起動したのにキー入力がサイドバーに残る"
+        );
+    }
+
+    /// **起動処理中に打った文字は、直前まで見ていたセッションへ届かない。**
+    /// フォーカスは端末へ移っているが attach は `claude --bg` の完了後（~1 秒）で、
+    /// その間 `right_view` は前のセッションを指したままなので、素通しすると
+    /// 新エージェント宛のプロンプトが無関係な実行中エージェントへ送られる。
+    /// 捨てたことは下部バーで伝える（無反応に見せない）
+    #[test]
+    fn input_typed_while_a_session_is_starting_reaches_no_session() {
+        let mut app = test_app(34, TERM);
+        open(&mut app, project("C:\\dev\\api", false), 5);
+        handle_popup_key(&mut app, KeyCode::Enter); // 先頭 = new session
+        // 撮影用の供給元は実際に claude を起動しないので、完了待ちの状態を作る
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.spawn_rx = Some(rx);
+        assert!(
+            drop_input_while_starting(&mut app),
+            "起動処理中の入力が前のセッションへ流れる"
+        );
+        assert!(app.notice.is_some(), "捨てたことが伝わっていない");
+        // 起動が終われば宛先は attach したセッション ＝ 素通しに戻る
+        // （門番が残り続けるとタイプできない画面になる）
+        app.spawn_rx = None;
+        assert!(
+            !drop_input_while_starting(&mut app),
+            "起動が終わっても入力が捨てられる"
         );
     }
 
