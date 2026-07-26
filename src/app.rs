@@ -10,7 +10,7 @@ use ratatui::layout::{Position, Rect};
 
 use ccdesk::{log_error, same_dir, BgJob};
 
-use crate::accounts::{Account, AccountChange, ActiveAccount};
+use crate::accounts::{Account, AccountChange, ActiveAccount, Outgoing};
 use crate::keys::{encode_key, forward_mouse};
 use crate::poll::{AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo};
 use crate::session::Session;
@@ -1533,6 +1533,25 @@ fn active_account(app: &App) -> Option<&ActiveAccount> {
     }
 }
 
+/// 切替に渡す「出ていく側」の観測（[`Outgoing`]）。**未取得（`Unknown`）は None**。
+///
+/// [`active_account`] が 3 状態を 2 状態へ畳んでいるのが指摘の穴だった:
+/// あちらの None は「未ログイン」と「まだ取得できていない」の両方で、後者を
+/// 「巻き取る対象が無い」として切替へ渡すと、**登録済みアカウントの
+/// ローテート済み refreshToken を巻き取れないまま `.credentials.json` を上書きする**
+/// （そのアカウントは復旧不能。[`Outgoing`] のドキュメント参照）。
+///
+/// 表示（[`active_account`]）と書き込み（この関数）で読み方を分けたのは、
+/// 未取得のときに求められる振る舞いが逆だから: 表示は「印を付けない」で足りるが、
+/// 書き込みは**止めなければならない**
+fn outgoing_account(app: &App) -> Option<Outgoing> {
+    match &app.footer.account {
+        AccountStatus::LoggedIn(active) => Some(Outgoing::Known(active.clone())),
+        AccountStatus::LoggedOut => Some(Outgoing::NobodyLoggedIn),
+        AccountStatus::Unknown => None,
+    }
+}
+
 /// 「今の持ち主」の表示を確定値へ置き換える。
 ///
 /// **ポーラーの共有側にも書く。** run ループは `footer_dirty` を見て
@@ -1616,31 +1635,37 @@ fn open_account_popup(app: &mut App, anchor_y: u16) {
     });
 }
 
+/// 「今の持ち主」が分からないときの通知。**register も switch も同じ理由で止まる**
+/// （保管すべきトークンがあるかどうかが分からない）ので、文面も 1 つに保つ。
+/// 打つ手は「少し待ってからもう一度」＝ ポーラーが取得すれば通る
+const UNKNOWN_ACTIVE_NOTICE: &str = "ログイン中のアカウントが取得できていない";
+
 /// `register current`: 今ログイン中のアカウントを保管へ加える
 fn register_current(app: &mut App) {
     let Some(active) = active_account(app).cloned() else {
         // 未取得・未ログインでは保管する対象が無い（押しても無反応に見せない）
-        set_notice(app, "ログイン中のアカウントが取得できていない".to_string());
+        set_notice(app, UNKNOWN_ACTIVE_NOTICE.to_string());
         return;
     };
     apply_account(app, AccountAction::Register(&active), "登録");
 }
 
 /// `switch`: 保管アカウントへ切り替える。
-/// **`active` は `footer.account` のアクティブアカウントの観測をそのまま渡す**
+/// **出ていく側の観測（[`outgoing_account`]）をそのまま渡す**
 /// （出ていくアカウントのトークンを同じロック下で保管へ巻き取るために必須。
 /// 渡さないと、切替の直前に更新された使い捨ての refreshToken を落として
-/// そのアカウントへ戻れなくなる）
+/// そのアカウントへ戻れなくなる）。
+///
+/// **観測できていなければ切り替えない**（[`register_current`] と同じ扱い）:
+/// 起動直後の ~350ms とアカウント取得が失敗し続ける間は誰が持ち主か言えず、
+/// そのまま上書きすると巻き取るべきトークンがあったかどうかも分からない。
+/// 諦めれば次の操作でやり直せるが、書いてしまうと取り返しがつかない
 fn switch_account(app: &mut App, email: &str) {
-    let active = active_account(app).cloned();
-    apply_account(
-        app,
-        AccountAction::Switch {
-            email,
-            active: active.as_ref(),
-        },
-        "切替",
-    );
+    let Some(outgoing) = outgoing_account(app) else {
+        set_notice(app, UNKNOWN_ACTIVE_NOTICE.to_string());
+        return;
+    };
+    apply_account(app, AccountAction::Switch { email, outgoing }, "切替");
 }
 
 /// 「既にそのアカウント」で切替が何もしなかったときの通知。
@@ -2514,14 +2539,11 @@ mod tests {
 
     /// 供給元へ渡ったアカウント操作の記録。**UI が組んだ引数そのもの**を見るので、
     /// 実ユーザーの `~/.claude` / `~/.ccdesk` を触らずに配線を固定できる
-    /// （特に switch の `active`。落とすと出ていくアカウントへ戻れなくなる）
+    /// （特に switch の `outgoing`。落とすと出ていくアカウントへ戻れなくなる）
     #[derive(Debug, PartialEq)]
     enum Recorded {
         Register(ActiveAccount),
-        Switch {
-            email: String,
-            active: Option<ActiveAccount>,
-        },
+        Switch { email: String, outgoing: Outgoing },
         Unregister(String),
     }
 
@@ -2713,9 +2735,9 @@ mod tests {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(match action {
                             AccountAction::Register(active) => Recorded::Register(active.clone()),
-                            AccountAction::Switch { email, active } => Recorded::Switch {
+                            AccountAction::Switch { email, outgoing } => Recorded::Switch {
                                 email: email.to_string(),
-                                active: active.cloned(),
+                                outgoing,
                             },
                             AccountAction::Unregister(email) => {
                                 Recorded::Unregister(email.to_string())
@@ -2864,7 +2886,7 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             [Recorded::Switch {
                 email: "x-personal@example.com".to_string(),
-                active: Some(ActiveAccount::unseen(Account::new(
+                outgoing: Outgoing::Known(ActiveAccount::unseen(Account::new(
                     "other@example.com",
                     "other"
                 ))),
@@ -2902,7 +2924,7 @@ mod tests {
                 Recorded::Register(ActiveAccount::unseen(active.clone())),
                 Recorded::Switch {
                     email: "b@example.com".to_string(),
-                    active: Some(ActiveAccount::unseen(active)),
+                    outgoing: Outgoing::Known(ActiveAccount::unseen(active)),
                 },
                 Recorded::Unregister("b@example.com".to_string()),
             ]
@@ -2929,7 +2951,7 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             [Recorded::Switch {
                 email: "a@example.com".to_string(),
-                active: Some(ActiveAccount::unseen(active)),
+                outgoing: Outgoing::Known(ActiveAccount::unseen(active)),
             }]
         );
         assert!(app.notice.is_none(), "no-op が失敗として扱われている");
@@ -3152,6 +3174,68 @@ mod tests {
             "A へ戻れていない（黙って no-op になっている）"
         );
         assert_eq!(active_email(&app), STORE_A);
+    }
+
+    /// **今の持ち主が分からないうちは切り替えない（起動直後の窓）。**
+    ///
+    /// 起動直後の ~350ms（`claude auth status` が返るまで）と、取得が失敗し続ける間は
+    /// [`AccountStatus::Unknown`]。アカウント行は空白に見えるが `app.accounts` は
+    /// 保管から読み込み済みなのでメニューは操作でき、**起動してすぐ切り替えると踏む**。
+    /// このとき「巻き取る対象が無い」と扱って上書きすると、登録済みアカウントが
+    /// 登録後にローテートした refreshToken（使い捨て）が保管へ入らないまま消えて
+    /// **復旧不能**になる。`register current` と同じく理由を出して拒否する
+    #[test]
+    fn switching_before_the_active_account_is_known_leaves_the_credentials_alone() {
+        let (mut app, home, store) = app_with_real_store(
+            "switching_before_the_active_account_is_known_leaves_the_credentials_alone",
+        );
+        // 起動直後（ポーラーがまだ誰がログインしているか答えていない）
+        app.footer.account = AccountStatus::Unknown;
+
+        switch(&mut app, STORE_B);
+
+        assert_eq!(
+            home.read_credentials()["claudeAiOauth"],
+            oauth("access-a2", "refresh-a2"),
+            "持ち主が分からないまま現行の認証情報を上書きしている（A のローテート済み refreshToken が失われる）"
+        );
+        assert_eq!(
+            stored(&store, STORE_A),
+            Some(oauth("access-a", "refresh-a")),
+            "保管が動いている（巻き取れないまま切替が進んでいる）"
+        );
+        assert!(app.notice.is_some(), "拒否した理由が伝わっていない");
+    }
+
+    /// **「まだ観測できていない」と「主張が無い」は別物。** 巻き取る対象が無いと
+    /// **観測できている**ケース（email を返さない認証方式・未ログイン）は従来どおり通す
+    /// ＝ 上の拒否は `Unknown` だけを止める（保管できないアカウントで
+    /// 切替そのものが使えなくならない）
+    #[test]
+    fn switching_with_nothing_to_capture_still_works() {
+        let (mut app, home, _store) =
+            app_with_real_store("switching_with_nothing_to_capture_still_works");
+        // email を返さない認証方式（保管のキーが無い ＝ 巻き取れないが持ち主は言えている）
+        app.footer.account = AccountStatus::LoggedIn(home.active("", "claude.ai"));
+
+        switch(&mut app, STORE_B);
+
+        assert_eq!(app.notice, None, "失敗している: {:?}", app.notice);
+        assert_eq!(
+            home.read_credentials()["claudeAiOauth"],
+            oauth("access-b", "refresh-b"),
+            "巻き取る対象が無いのに切替が止まっている"
+        );
+
+        // 未ログイン（誰も持ち主でないと観測できている）も同じ
+        app.footer.account = AccountStatus::LoggedOut;
+        switch(&mut app, STORE_C);
+        assert_eq!(app.notice, None, "失敗している: {:?}", app.notice);
+        assert_eq!(
+            home.read_credentials()["claudeAiOauth"],
+            oauth("access-c", "refresh-c"),
+            "未ログインからの切替が止まっている"
+        );
     }
 
     /// 切替の影響範囲（稼働セッション数）は**選べない情報行**として末尾に出る。

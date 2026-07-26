@@ -21,7 +21,7 @@ use ccdesk::{
     scan_jobs, update_state_list, BgJob,
 };
 
-use crate::accounts::{Account, AccountChange, AccountStore, ActiveAccount};
+use crate::accounts::{Account, AccountChange, AccountStore, ActiveAccount, Outgoing};
 use crate::poll::{
     read_usage, spawn_agents_poller, spawn_ccdesk_version_check, spawn_footer_poller,
     AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo,
@@ -118,11 +118,12 @@ pub(crate) enum AccountAction<'a> {
     Switch {
         /// 切替先（[`Account::email`]）
         email: &'a str,
-        /// 今ログイン中のアカウントの観測。**出ていく側のトークンを同じロック下で
+        /// 出ていく側（今の持ち主）についての観測。**そのトークンを同じロック下で
         /// 保管へ巻き取るために渡す**（[`AccountStore::switch_to`] 参照）。
         /// 日付（[`ActiveAccount::seen`]）付きで渡すのは、古い判断で
-        /// 別アカウントの保管を潰さないため
-        active: Option<&'a ActiveAccount>,
+        /// 別アカウントの保管を潰さないため。**「まだ観測できていない」は
+        /// この型で表せない**ので、切替はそこへ到達しない（[`Outgoing`]）
+        outgoing: Outgoing,
     },
     /// 保管から外す（ログイン自体は外さない）
     Unregister(&'a str),
@@ -204,7 +205,7 @@ pub(crate) fn apply_account_action(
 ) -> anyhow::Result<AccountChange> {
     match action {
         AccountAction::Register(active) => store.register(active).map(|()| AccountChange::StoreOnly),
-        AccountAction::Switch { email, active } => store.switch_to(email, active),
+        AccountAction::Switch { email, outgoing } => store.switch_to(email, &outgoing),
         AccountAction::Unregister(email) => {
             store.unregister(email).map(|()| AccountChange::StoreOnly)
         }
@@ -893,7 +894,7 @@ mod tests {
             AccountAction::Register(&account),
             AccountAction::Switch {
                 email: &email,
-                active: Some(&account),
+                outgoing: Outgoing::Known(account.clone()),
             },
             AccountAction::Unregister(&email),
         ] {
@@ -939,7 +940,7 @@ mod tests {
             &store,
             AccountAction::Switch {
                 email: &taro.email,
-                active: Some(&home.active(&hanako.email, &hanako.label)),
+                outgoing: Outgoing::Known(home.active(&hanako.email, &hanako.label)),
             },
         )
         .unwrap();
@@ -981,7 +982,7 @@ mod tests {
                 &store,
                 AccountAction::Switch {
                     email: &taro.email,
-                    active: Some(&home.active(&taro.email, &taro.label)),
+                    outgoing: Outgoing::Known(home.active(&taro.email, &taro.label)),
                 },
             )
             .unwrap(),
