@@ -31,6 +31,8 @@ const ACCOUNTS_KEY: &str = "accounts";
 const LABEL_KEY: &str = "label";
 /// 保管 1 件の認証情報（`claudeAiOauth` の中身そのまま）
 const CREDENTIALS_KEY: &str = "credentials";
+/// `claudeAiOauth` の中で **これが無い写しは使えない**（[`usable_oauth`]）
+const REFRESH_TOKEN_KEY: &str = "refreshToken";
 
 /// アカウントの同一性（email）と表示（label）の対。
 ///
@@ -418,7 +420,9 @@ impl AccountStore {
         }
         let oauth = read_oauth(&self.paths.credentials).ok_or_else(|| {
             anyhow!(
-                "no {OAUTH_KEY} in {} (not logged in?)",
+                "{} has no usable {OAUTH_KEY}: either no account is logged in, \
+                 or claude keeps the credentials outside this file \
+                 (OS credential manager), in which case ccdesk cannot store it",
                 self.paths.credentials.display()
             )
         })?;
@@ -607,7 +611,7 @@ impl AccountStore {
         };
         let mut current = self.current_document()?;
         if let Some(outgoing) = outgoing
-            && let Some(oauth) = current.get(OAUTH_KEY).filter(|o| o.is_object()).cloned()
+            && let Some(oauth) = current.get(OAUTH_KEY).filter(|o| usable_oauth(o)).cloned()
         {
             // 未登録のアカウントには何もしない（`only_if_present`）。
             // 明示登録するまで認証情報をコピーしない規則は切替でも同じ
@@ -630,7 +634,9 @@ impl AccountStore {
         )))
     }
 
-    /// 保管 1 件の (ラベル, `claudeAiOauth`)
+    /// 保管 1 件の (ラベル, `claudeAiOauth`)。**戻せない写しは失敗にする**
+    /// （手編集や旧版の残骸で `refreshToken` を持たない写しを書き戻すと、
+    /// 今のログインを壊すだけで切替先へは行けない）
     fn stored_entry(&self, email: &str) -> anyhow::Result<(String, Value)> {
         let entry = read_accounts(&self.paths.store)
             .get(email)
@@ -638,9 +644,14 @@ impl AccountStore {
             .ok_or_else(|| anyhow!("no stored credentials for {email}"))?;
         let credentials = entry
             .get(CREDENTIALS_KEY)
-            .filter(|c| c.is_object())
+            .filter(|c| usable_oauth(c))
             .cloned()
-            .ok_or_else(|| anyhow!("no stored credentials for {email}"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "the stored credentials for {email} have no {REFRESH_TOKEN_KEY}; \
+                     switch to that account elsewhere and register it again"
+                )
+            })?;
         Ok((entry_label(&entry, email).to_string(), credentials))
     }
 
@@ -670,10 +681,25 @@ fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
-/// 認証情報ファイルの `claudeAiOauth`（オブジェクトでなければ無い扱い）
+/// 認証情報ファイルの `claudeAiOauth`（保管に使えない形なら無い扱い）
 fn read_oauth(path: &Path) -> Option<Value> {
     let value = read_json(path)?;
-    value.get(OAUTH_KEY).filter(|o| o.is_object()).cloned()
+    value.get(OAUTH_KEY).filter(|o| usable_oauth(o)).cloned()
+}
+
+/// 保管・復元してよい `claudeAiOauth` か。
+///
+/// **キー集合は固定しない。** 固定すると、将来 claude が増やしたキーを保管の
+/// 時点で落としてしまう（[`OAUTH_KEY`] の方針と同じ）。見るのは `refreshToken` が
+/// あるかだけ: 保管の目的は「そのアカウントへ戻れること」で、refreshToken の無い
+/// 写し（手編集・旧版の残骸・別方式の認証情報）は戻しても何も得られず、
+/// 現行のログインを壊すだけになる
+fn usable_oauth(value: &Value) -> bool {
+    value.is_object()
+        && value
+            .get(REFRESH_TOKEN_KEY)
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| !t.is_empty())
 }
 
 /// 保管 1 件の表示ラベル。**ラベルが失われていても空にはしない**
@@ -1542,6 +1568,43 @@ pub(crate) mod tests {
             !home.paths().store_lock().exists(),
             "保管ファイルのロックを残している"
         );
+    }
+
+    /// `refreshToken` を持たない保管（手編集・旧版の残骸）は書き戻さない。
+    /// 戻しても切替先へは行けず、**今のログインだけが壊れる**。
+    /// キー集合は固定しない（将来 claude が増やすキーを落とさない）
+    #[test]
+    fn switch_refuses_a_stored_entry_without_a_refresh_token() {
+        let home = TempHome::new("switch_refuses_a_stored_entry_without_a_refresh_token");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+        // 手編集で refreshToken が落ちた保管
+        std::fs::write(
+            home.paths().store,
+            serde_json::to_string_pretty(&json!({
+                ACCOUNTS_KEY: {
+                    EMAIL_A: { LABEL_KEY: "taro", CREDENTIALS_KEY: { "accessToken": "access-a" } }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(home.paths().credentials).unwrap();
+
+        let err = store
+            .switch_to(EMAIL_A, None)
+            .expect_err("戻せない写しで切り替えている");
+
+        assert!(
+            err.to_string().contains(REFRESH_TOKEN_KEY),
+            "何が足りないか分からない: {err}"
+        );
+        assert_eq!(std::fs::read(home.paths().credentials).unwrap(), before);
+        // 未知のキーが増えた将来の写しは通す（キー集合を固定しない）
+        let mut future = oauth("access-a", "refresh-a");
+        future["someFutureKey"] = json!("value");
+        assert!(usable_oauth(&future));
     }
 
     /// 書きかけの `.tmp` は **トークンを含む**ので放置しない。消すのは自分たちが
