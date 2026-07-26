@@ -366,13 +366,13 @@ fn account_row(status: &AccountStatus, unstored: bool) -> (String, Style) {
         // 未保管のときは `⚠` を前置し、色も dim から注意色へ上げる。dim のままだと
         // 登録し忘れに気づけず、次の /login で前のアカウントの認証情報が
         // 上書きされて失われる（`.credentials.json` は常に 1 アカウント分だけ）
-        AccountStatus::LoggedIn(account) if unstored => (
-            format!("{WARN_MARK} {}", account.label),
+        AccountStatus::LoggedIn(active) if unstored => (
+            format!("{WARN_MARK} {}", active.account.label),
             Style::default().fg(C_ATTENTION),
         ),
         // 出すのはラベルだけ（email は同一性の保持用で、行には出さない）
-        AccountStatus::LoggedIn(account) => {
-            (account.label.clone(), Style::default().fg(ui().dim))
+        AccountStatus::LoggedIn(active) => {
+            (active.account.label.clone(), Style::default().fg(ui().dim))
         }
         AccountStatus::LoggedOut => {
             (LOGGED_OUT_ROW.to_string(), Style::default().fg(C_ATTENTION))
@@ -1285,16 +1285,16 @@ mod tests {
     /// 供給元は [`DemoSource`] 既定の `App`（ファイルもネットワークも触らない）
     #[test]
     fn account_row_renders_the_label_without_the_email() {
-        use crate::accounts::Account;
+        use crate::accounts::{Account, ActiveAccount};
         use crate::poll::FooterInfo;
 
         let mut app = App {
             term_size: (120, 30),
             footer: FooterInfo {
-                account: AccountStatus::LoggedIn(Account::new(
+                account: AccountStatus::LoggedIn(ActiveAccount::unseen(Account::new(
                     "you@example.com",
                     "you · Acme, Inc.",
-                )),
+                ))),
                 current: "2.1.220".to_string(),
                 latest: None,
             },
@@ -1756,8 +1756,11 @@ mod tests {
     /// 保管済みなら付けない（常時出ていると警告の意味が無くなる）
     #[test]
     fn account_row_marks_only_an_unstored_active_account() {
-        use crate::accounts::Account;
-        let logged_in = AccountStatus::LoggedIn(Account::new("you@example.com", "you · Acme, Inc."));
+        use crate::accounts::{Account, ActiveAccount};
+        let logged_in = AccountStatus::LoggedIn(ActiveAccount::unseen(Account::new(
+            "you@example.com",
+            "you · Acme, Inc.",
+        )));
 
         assert_eq!(row_text(&logged_in, true), "⚠ you · Acme, Inc.");
         assert_eq!(
@@ -1790,11 +1793,12 @@ mod tests {
     /// `⚠ ` の 2 桁ぶんが増えても、現実的なラベルなら収まることの固定
     #[test]
     fn account_row_fits_the_default_sidebar_width() {
-        use crate::accounts::Account;
+        use crate::accounts::{Account, ActiveAccount};
         use unicode_width::UnicodeWidthStr;
         // README・撮影データに出る実寸のラベルと、全角を含むラベル
         for label in ["ooba · 1→10, Inc.", "you · Acme, Inc.", "大場 · 1→10, Inc."] {
-            let status = AccountStatus::LoggedIn(Account::new("you@example.com", label));
+            let status =
+                AccountStatus::LoggedIn(ActiveAccount::unseen(Account::new("you@example.com", label)));
             for unstored in [false, true] {
                 let text = row_text(&status, unstored);
                 assert_eq!(
@@ -1819,7 +1823,7 @@ mod tests {
     /// 保管に加えた瞬間に消えることまで含めて固定する
     #[test]
     fn the_drawn_account_row_warns_until_the_active_account_is_stored() {
-        use crate::accounts::Account;
+        use crate::accounts::{Account, ActiveAccount};
         use crate::poll::FooterInfo;
 
         let active = Account::new("you@example.com", "you · Acme, Inc.");
@@ -1827,7 +1831,7 @@ mod tests {
             let mut app = App {
                 term_size: (120, 30),
                 footer: FooterInfo {
-                    account: AccountStatus::LoggedIn(active.clone()),
+                    account: AccountStatus::LoggedIn(ActiveAccount::unseen(active.clone())),
                     current: "2.1.220".to_string(),
                     latest: None,
                 },

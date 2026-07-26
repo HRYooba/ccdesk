@@ -6,7 +6,7 @@ use ratatui::style::Color;
 
 use ccdesk::{claude_settings_channel, version_newer};
 
-use crate::accounts::{Account, AccountStore};
+use crate::accounts::{Account, AccountStore, ActiveAccount, CredentialsFp};
 use crate::theme::{ui, C_ATTENTION, C_FAIL, C_OK, C_WORKING};
 
 /// `claude agents --json --all` の 1 エントリ（公式のスクリプト向けライブデータ。
@@ -108,8 +108,25 @@ pub(crate) enum AccountStatus {
     ///
     /// **ラベルだけでは足りない。** 複数アカウントの保管はキーに安定した識別子を
     /// 要求するが、ラベルは組織名の抑制（[`is_personal_org`]）で変わるので不適。
-    /// ラベルで同一性を判定すると、表示ロジックと同一性判定に同じ知識が二重化する
-    LoggedIn(Account),
+    /// ラベルで同一性を判定すると、表示ロジックと同一性判定に同じ知識が二重化する。
+    ///
+    /// **「いつの認証情報を見た判断か」まで持つ**（[`ActiveAccount`]）。この値は表示に
+    /// 使われるだけでなく、保管への書き込みで「出ていくアカウント」を決める材料にも
+    /// なるため、日付の無い同一性だけを渡すとポーラーの追いつき待ちの数秒間に
+    /// 別アカウントのトークンを保管へ書いてしまう
+    LoggedIn(ActiveAccount),
+}
+
+impl AccountStatus {
+    /// 観測の指紋を後付けする。**誰がログインしているか**を決めるのはパーサ
+    /// （[`parse_account`]）、**いつの認証情報を見た判断か**を知っているのは
+    /// 取得側なので、それぞれの持ち場で決めて最後に合わせる
+    fn seen_at(self, seen: CredentialsFp) -> Self {
+        match self {
+            Self::LoggedIn(active) => Self::LoggedIn(ActiveAccount::new(active.account, seen)),
+            other => other,
+        }
+    }
 }
 
 /// claude 側のアカウント・バージョン情報。アカウントはサイドバー下部の行、
@@ -195,8 +212,9 @@ fn parse_account(auth_json: &str, profile: Option<(&str, &str)>) -> AccountStatu
     };
     // email は表示に使わない（サイドバーに出るのはラベル）が、アカウントの
     // 同一性として持ち回す。email を返さない認証方式では空になり、その場合は
-    // 保管できない（[`crate::accounts::AccountStore::register`]）
-    AccountStatus::LoggedIn(Account::new(email, label))
+    // 保管できない（[`crate::accounts::AccountStore::register`]）。
+    // 観測の指紋は取得側が付ける（[`AccountStatus::seen_at`]）
+    AccountStatus::LoggedIn(ActiveAccount::unseen(Account::new(email, label)))
 }
 
 /// 個人アカウントに自動で付く組織名か。
@@ -260,25 +278,19 @@ fn out(cmd: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&o.stdout).to_string())
 }
 
-/// ファイルの (mtime, サイズ)。読めない・存在しないときは None
-type AuthFp = Option<(std::time::SystemTime, u64)>;
-
-/// ログイン状態が変わったことを示す安価な signal: 認証情報ファイルの (mtime, サイズ)。
+/// ログイン状態が変わったことを示す安価な signal: 認証情報ファイルの指紋。
 /// ログイン・ログアウト・トークン更新で書き換わるので、これを見て初めて
 /// `claude auth status --json`（1 回 ~350ms のプロセス起動）を叩く。
 ///
 /// `.claude.json` は 100KB 超で claude の通常動作でも常時書き換わるため signal に
 /// 使えない。認証情報が OS の資格情報マネージャ側にある環境ではこの関数は常に
-/// None を返すので、その場合は周期フォールバックだけが効く
-fn auth_fingerprint() -> AuthFp {
-    file_fingerprint(ccdesk::claude_dir()?.join(".credentials.json"))
-}
-
-/// ファイルの (mtime, サイズ)。存在しない・読めないときは None。
-/// 「消えた」も None への変化として検出できる
-fn file_fingerprint(path: impl AsRef<std::path::Path>) -> AuthFp {
-    let md = std::fs::metadata(path).ok()?;
-    Some((md.modified().ok()?, md.len()))
+/// None を返すので、その場合は周期フォールバックだけが効く。
+///
+/// **指紋の取り方とファイルの位置はドメイン側（[`AccountStore`]）に持たせる。**
+/// 同じ値が「再取得の契機」と「観測がまだ有効かの照合」の両方で使われるので、
+/// 2 通りの導出を持つと片方だけ直る形になる
+fn auth_fingerprint() -> CredentialsFp {
+    AccountStore::detect()?.credentials_fingerprint()
 }
 
 /// `.claude.json` の `oauthAccount` から (emailAddress, displayName) を読む。
@@ -314,7 +326,9 @@ struct AccountFetcher {
 }
 
 impl AccountFetcher {
-    fn fetch(&mut self) -> AccountStatus {
+    /// `seen` は **この取得の前に読んだ** 認証情報ファイルの指紋。取得結果は
+    /// 「その状態のファイルを見て決めた持ち主」なので、判断とその材料を対で返す
+    fn fetch(&mut self, seen: CredentialsFp) -> AccountStatus {
         if let Some(profile) = read_profile() {
             self.last_profile = Some(profile);
         }
@@ -323,7 +337,7 @@ impl AccountFetcher {
             .as_ref()
             .map(|(email, display_name)| (email.as_str(), display_name.as_str()));
         match out("claude", &["auth", "status", "--json"]) {
-            Some(json) => parse_account(&json, profile),
+            Some(json) => parse_account(&json, profile).seen_at(seen),
             None => AccountStatus::Unknown,
         }
     }
@@ -332,7 +346,7 @@ impl AccountFetcher {
 /// アカウント行の 1 回取得（`ccdesk doctor` 用。ポーラーと同じ経路で
 /// 「今どう表示されるか」を出す）
 pub(crate) fn fetch_account() -> AccountStatus {
-    AccountFetcher::default().fetch()
+    AccountFetcher::default().fetch(auth_fingerprint())
 }
 
 /// 追従更新の呼び出し口。**登録済みアカウントの保管を現行の認証情報に追従させる**
@@ -342,14 +356,18 @@ pub(crate) fn fetch_account() -> AccountStatus {
 ///
 /// 契機は既存の signal（[`auth_fingerprint`] の変化 + 周期フォールバック）に乗せる。
 /// **新しいポーリングは足さない。** 未登録アカウントには何もしないので、
-/// 「明示登録するまでコピーしない」規則はストア側で守られる
-fn sync_stored_account(account: &Account) {
+/// 「明示登録するまでコピーしない」規則はストア側で守られる。
+///
+/// 渡すのは **取得の前に読んだ指紋を持った観測**（[`ActiveAccount`]）。
+/// 「誰のトークンか」はこの関数に来るより数百 ms 前（`claude auth status` が
+/// 認証情報を読んだ時点）に決まっているので、ストア側がロック下で照合する
+fn sync_stored_account(active: &ActiveAccount) {
     let Some(store) = AccountStore::detect() else {
         return;
     };
     // 失敗しても表示は続ける（保管の追従はアカウント行の表示より優先度が低い）。
     // ログにはパスとエラーだけが出る（トークンは載せない）
-    if let Err(e) = store.sync_active(account) {
+    if let Err(e) = store.sync_active(active) {
         ccdesk::log_error(&format!("account store sync failed: {e}"));
     }
 }
@@ -416,7 +434,7 @@ fn refetch_due(age: u64, interval: u64, changed: bool, forced: bool) -> bool {
 /// アカウントポーリングの持ち越し状態
 struct AccountPollState {
     /// 前回 **取得の前に** 観測した認証ファイルの fingerprint
-    last_fp: AuthFp,
+    last_fp: CredentialsFp,
     /// 最後の取得からの経過秒
     age: u64,
     /// 直前の取得が失敗（`Unknown`）だったか。次の待ち時間を選ぶのに使う
@@ -451,13 +469,17 @@ impl AccountPollState {
 /// 取得中（子プロセスが認証情報を読んだ後）に入ったログインが「もう反映済み」に
 /// 見えて次の周で拾えず、古い表示が周期フォールバック（60s）まで残る。
 /// `claude auth status` 自身は認証ファイルを書き換えない（実行前後で mtime・
-/// サイズが同一と実測）ので、取得起因の空振りは起きない
+/// サイズが同一と実測）ので、取得起因の空振りは起きない。
+///
+/// **その fingerprint を `fetch` へ渡す。** 取得結果は「その状態のファイルを見て
+/// 決めた持ち主」なので、再取得の契機に使う値と観測の日付は同じ 1 回の読みで足りる
+/// （2 回読むと、間に入った書き換えで「古い判断に新しい日付」が付きうる）
 fn account_step(
     state: &mut AccountPollState,
     shown: &AccountStatus,
     forced: bool,
-    read_fp: impl Fn() -> AuthFp,
-    fetch: impl FnOnce() -> AccountStatus,
+    read_fp: impl Fn() -> CredentialsFp,
+    fetch: impl FnOnce(CredentialsFp) -> AccountStatus,
 ) -> Option<AccountStatus> {
     let fp = read_fp();
     let auth_changed = fp != state.last_fp;
@@ -466,7 +488,7 @@ fn account_step(
         return None;
     }
     state.age = 0;
-    let fetched = fetch();
+    let fetched = fetch(fp);
     // 失敗はフォールバック全体（60s）を消費させない。認証ファイルは変わっていないので
     // 次の契機が周期しか無く、そのままではアカウント行が空で固まる
     state.last_failed = fetched == AccountStatus::Unknown;
@@ -495,12 +517,12 @@ pub(crate) fn spawn_footer_poller(
             let forced = refresh.swap(false, std::sync::atomic::Ordering::Relaxed);
             let mut updated = false;
 
-            if let Some(next) = account_step(&mut account, &shown, forced, auth_fingerprint, || {
-                let fetched = fetcher.fetch();
+            if let Some(next) = account_step(&mut account, &shown, forced, auth_fingerprint, |fp| {
+                let fetched = fetcher.fetch(fp);
                 // 追従更新は「取得できた度」に見る。トークン更新はラベルを変えない
                 // ので、表示の差分（account_step の戻り値）では拾えない
-                if let AccountStatus::LoggedIn(account) = &fetched {
-                    sync_stored_account(account);
+                if let AccountStatus::LoggedIn(active) = &fetched {
+                    sync_stored_account(active);
                 }
                 fetched
             }) {
@@ -684,7 +706,7 @@ mod tests {
     }
 
     /// テスト用の fingerprint。値そのものに意味は無く「変わったか」だけを見る
-    fn fp_of(size: u64) -> AuthFp {
+    fn fp_of(size: u64) -> CredentialsFp {
         Some((std::time::UNIX_EPOCH, size))
     }
 
@@ -693,9 +715,11 @@ mod tests {
         logged_in_as(EMAIL, label)
     }
 
-    /// email を明示する版（email を返さない認証方式のケース用）
+    /// email を明示する版（email を返さない認証方式のケース用）。
+    /// 観測の指紋は付けない（パーサは「誰か」だけを決める。日付は
+    /// [`AccountStatus::seen_at`] が後から付ける）
     fn logged_in_as(email: &str, label: &str) -> AccountStatus {
-        AccountStatus::LoggedIn(Account::new(email, label))
+        AccountStatus::LoggedIn(ActiveAccount::unseen(Account::new(email, label)))
     }
 
     /// 保管のキーになる email を落とさないこと。**ラベルとは独立**なので、
@@ -703,19 +727,22 @@ mod tests {
     /// （ラベルで同一性を判定すると表示ロジックと知識が二重化する）
     #[test]
     fn keeps_the_email_as_the_stable_identity() {
-        let AccountStatus::LoggedIn(account) = parse_account(PERSONAL, Some((EMAIL, "alice")))
+        let AccountStatus::LoggedIn(active) = parse_account(PERSONAL, Some((EMAIL, "alice")))
         else {
             panic!("ログイン済みとして解釈されていない");
         };
-        assert_eq!(account.email, EMAIL);
-        assert_eq!(account.label, "alice", "ラベルの生成規則が変わっている");
+        assert_eq!(active.account.email, EMAIL);
+        assert_eq!(
+            active.account.label, "alice",
+            "ラベルの生成規則が変わっている"
+        );
 
         // 組織名が出るケースでも email はそのまま
-        let AccountStatus::LoggedIn(account) = parse_account(&auth_json("Acme, Inc.", None), None)
+        let AccountStatus::LoggedIn(active) = parse_account(&auth_json("Acme, Inc.", None), None)
         else {
             panic!("ログイン済みとして解釈されていない");
         };
-        assert_eq!(account.email, EMAIL);
+        assert_eq!(active.account.email, EMAIL);
     }
 
     /// email を返さない認証方式では email は空（＝保管できないアカウント）。
@@ -726,31 +753,6 @@ mod tests {
             parse_account(r#"{"loggedIn": true, "authMethod": "claude.ai"}"#, None),
             logged_in_as("", "claude.ai")
         );
-    }
-
-    /// スコープを抜けるときに必ずファイルを消す番人。アサート失敗で
-    /// パニックしても Drop は走るので、一時ファイルを残さない
-    struct TempFile(std::path::PathBuf);
-
-    impl Drop for TempFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-
-    impl TempFile {
-        /// 並列実行・別チェックアウトの同時実行と衝突しないよう、
-        /// テスト名とプロセス ID でパスを一意にする
-        fn new(test_name: &str) -> Self {
-            Self(std::env::temp_dir().join(format!(
-                "ccdesk-{test_name}-{}.json",
-                std::process::id()
-            )))
-        }
-
-        fn path(&self) -> &std::path::Path {
-            &self.0
-        }
     }
 
     #[test]
@@ -926,27 +928,6 @@ mod tests {
         );
     }
 
-    /// 認証ファイルの変化検知。ログイン・ログアウトを即時反映する土台なので、
-    /// 「書き換え」と「消滅」の両方が変化として見えることを固定する
-    #[test]
-    fn detects_credential_file_rewrite_and_removal() {
-        let temp = TempFile::new("detects_credential_file_rewrite_and_removal");
-        let path = temp.path();
-        assert_eq!(file_fingerprint(path), None, "無いファイルは None");
-
-        std::fs::write(path, "a").unwrap();
-        let first = file_fingerprint(path);
-        assert!(first.is_some());
-
-        // 長さが変わればサイズで検出できる（mtime の粒度に依存しない）
-        std::fs::write(path, "abcd").unwrap();
-        assert_ne!(file_fingerprint(path), first, "書き換えを検出できていない");
-
-        // ログアウトでファイルが消えるケース
-        std::fs::remove_file(path).unwrap();
-        assert_eq!(file_fingerprint(path), None, "消滅を検出できていない");
-    }
-
     #[test]
     fn keeps_org_name_when_email_is_missing() {
         // email 不在では自動生成組織名かを判定できないので、情報を消さない側に倒す。
@@ -1035,7 +1016,7 @@ mod tests {
                 &AccountStatus::Unknown,
                 false,
                 || None,
-                || AccountStatus::Unknown
+                |_| AccountStatus::Unknown
             ),
             None
         );
@@ -1043,7 +1024,7 @@ mod tests {
         // 失敗直後は短い間隔で再試行する（認証ファイルは変化していない）
         state.age = ACCOUNT_RETRY_SECS;
         assert_eq!(
-            account_step(&mut state, &AccountStatus::Unknown, false, || None, || {
+            account_step(&mut state, &AccountStatus::Unknown, false, || None, |_| {
                 account.clone()
             }),
             Some(account.clone()),
@@ -1053,7 +1034,7 @@ mod tests {
         // 成功した後は通常の周期に戻す（短周期で claude を叩き続けない）
         state.age = ACCOUNT_RETRY_SECS;
         assert_eq!(
-            account_step(&mut state, &account, false, || None, || panic!(
+            account_step(&mut state, &account, false, || None, |_| panic!(
                 "成功後も短周期で再取得している"
             )),
             None
@@ -1077,7 +1058,7 @@ mod tests {
             &AccountStatus::Unknown,
             false,
             || fp.get(),
-            || {
+            |_| {
                 fp.set(fp_of(2));
                 old.clone()
             },
@@ -1085,11 +1066,42 @@ mod tests {
         assert_eq!(first, Some(old.clone()));
 
         // 2 周目: age は 0 に戻っているので、fingerprint の変化だけが契機になる
-        let second = account_step(&mut state, &old, false, || fp.get(), || new.clone());
+        let second = account_step(&mut state, &old, false, || fp.get(), |_| new.clone());
         assert_eq!(
             second,
             Some(new),
             "取得中に入ったログインを次の周で拾えていない"
+        );
+    }
+
+    /// **取得へ渡る指紋は「取得の前に読んだ値」。** 取得結果は「その状態の
+    /// 認証情報を見て決めた持ち主」なので、取得後の値を渡すと *古い判断に新しい日付*
+    /// が付き、ロック下の照合（[`crate::accounts::AccountStore::sync_active`]）を
+    /// 通してしまう ＝ 別アカウントのトークンを古い email の保管へ書く
+    #[test]
+    fn the_fetched_account_is_dated_with_the_fingerprint_read_before_it() {
+        let fp = std::cell::Cell::new(fp_of(1));
+        let mut state = AccountPollState::new();
+
+        let fetched = account_step(
+            &mut state,
+            &AccountStatus::Unknown,
+            false,
+            || fp.get(),
+            |seen| {
+                // 取得中（子プロセスが認証情報を読んだ後）に書き換わる
+                fp.set(fp_of(2));
+                logged_in("taro").seen_at(seen)
+            },
+        );
+
+        assert_eq!(
+            fetched,
+            Some(AccountStatus::LoggedIn(ActiveAccount::new(
+                Account::new(EMAIL, "taro"),
+                fp_of(1)
+            ))),
+            "取得後の指紋で日付を付けている"
         );
     }
 }

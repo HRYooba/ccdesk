@@ -194,8 +194,8 @@ pub(crate) fn run_doctor() -> anyhow::Result<()> {
     // サイドバー下部に出るアカウント行。表示が実際どうなるかをここで確認できる
     // （未ログインは FAIL ではない = ccdesk 自体は動く。ログインを促すだけ）
     match fetch_account() {
-        AccountStatus::LoggedIn(account) => {
-            println!("ok    claude account: {}", account.label)
+        AccountStatus::LoggedIn(active) => {
+            println!("ok    claude account: {}", active.account.label)
         }
         AccountStatus::LoggedOut => {
             println!("warn  claude account: not logged in (run /login in a claude session)");
