@@ -335,7 +335,9 @@ pub(crate) struct App {
     // ターミナルペインへの入力を捨てている間だけ Some（ディスパッチした時刻）。
     // **`spawn_rx` と寿命を分けてある**: あちらは「まだ結果が届きうる」で、
     // ハングした `claude --bg` では永久に Some のまま残る
-    // （[`expire_input_gate`] / [`drop_input_while_starting`]）
+    // （[`expire_input_gate`] / [`drop_input_while_starting`]）。
+    // **降ろすのは [`lift_input_gate`] だけ**（降ろすときは必ず打ち先を確かめる、
+    // という判断をそこ 1 箇所に閉じてある）
     pub(crate) input_gate: Option<std::time::Instant>,
     // 下部バーに数秒表示するエラー等の通知
     pub(crate) notice: Option<(String, std::time::Instant)>,
@@ -505,6 +507,16 @@ impl App {
             }
     }
 
+    /// **キー入力が今この attach id のセッションへ届く形になっているか。**
+    /// `focus` は見ない: 判定したいのは「端末へ流したとき誰に届くか」で、
+    /// 流すかどうかを決める側（[`lift_input_gate`]）がこれを材料にする
+    fn showing(&self, attach_id: &str) -> bool {
+        matches!(self.right_view, RightView::Sessions)
+            && self
+                .sessions
+                .get(self.active)
+                .is_some_and(|s| s.attach_id.as_deref() == Some(attach_id))
+    }
 }
 
 /// now - d の Instant（アンダーフローしない）。「次の周期処理を即発火させる」ための
@@ -652,7 +664,9 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => app.spawn_rx = Some(rx),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    app.input_gate = None; // 結果は永久に来ない（捨て続ける理由が消えた）
+                    // 結果は永久に来ない ＝ 宛先のセッションは決まらない
+                    // （[`lift_input_gate`] が打ち先も戻す）
+                    lift_input_gate(app, None);
                     set_notice(app, "claude --bg の実行スレッドが異常終了".to_string());
                     force_draw = true;
                 }
@@ -977,10 +991,6 @@ pub(crate) fn start_new_session(app: &mut App) -> anyhow::Result<()> {
 /// `dispatch_cwd`（メモリ上の初期値）に残るので、直して押し直す邪魔にはならない。
 /// 保存を UI スレッドに寄せているのは state.json の書込み競合を避けるため
 fn apply_spawn_outcome(app: &mut App, outcome: SpawnOutcome) {
-    // 結果が届いた ＝ 宛先が決まった（失敗ならこの後 attach しないので、
-    // どちらでも「捨て続ける理由」は消える）。**live と撮影用が合流する
-    // この 1 箇所で降ろす**ので、経路が増えても降ろし漏れが起きない
-    app.input_gate = None;
     // 成否の判定は `error` 1 つ。`id` で判定しないのは、セッションを起こさない供給元
     // （撮影用）が「起動を試していない ＝ 失敗もしていない」形でここへ来るため
     // （実起動では id が取れなければ必ず error が入る ＝ 実データでの判定は変わらない）
@@ -991,6 +1001,11 @@ fn apply_spawn_outcome(app: &mut App, outcome: SpawnOutcome) {
     if let Some(id) = &outcome.id {
         attach_by_id(app, id, &outcome.label, &outcome.cwd);
     }
+    // **降ろすのは attach を試した後。** 先に降ろすと、attach しなかった／できなかった
+    // 経路（起動失敗・attach 失敗）で `right_view` が直前のセッションを指したまま
+    // 素通しに戻る。宛先が本当に居るかは [`lift_input_gate`] が右ペインの表示で
+    // 確かめるので、ここは「どの id を宛先にしたつもりか」だけを渡す
+    lift_input_gate(app, outcome.id.as_deref());
     if let Some(err) = outcome.error {
         set_notice(app, err);
     }
@@ -1963,12 +1978,37 @@ fn drop_input_while_starting(app: &mut App) -> bool {
     true
 }
 
+/// 門番を降ろす。**`input_gate` を降ろすのはここだけ**で、
+/// 「門番を降ろすときは必ず打ち先を確かめる」という判断をこの 1 箇所に閉じる。
+///
+/// **なぜ 1 箇所に集めるか。** 降ろす契機は 4 つある（起動が成功して attach した /
+/// 起動が失敗した / attach が失敗した / 起動が応答しない・結果を運ぶスレッドが死んだ）。
+/// 降ろすだけでは入力は `right_view` が指したままの**直前まで見ていたセッション**へ
+/// 流れる ＝ 門番を置いた理由そのものが復活するので、降ろす側とフォーカスを戻す側が
+/// 別だと**片方だけ直した状態**（実際にそうなっていた: ハングの経路だけ戻していた）が
+/// 生まれる。契機が増えてもここを通る限り穴が開かない。
+///
+/// `destination` は「宛先にしたつもりの attach id」。**それが本当に打ち先になって
+/// いるかは呼び手の報告ではなく右ペインの実際の表示で確かめる**（[`App::showing`]）
+/// ＝ 呼び手が「成功した」と言い間違える余地を持たせない。
+///
+/// **門番が立っていなければ何もしない。** セッションを起こさない供給元（撮影用）は
+/// 門番を立てずにここへ合流するので、そこでフォーカスを動かすと
+/// 「起動したのにキーがサイドバーへ行く」という直したはずの問題が戻る
+fn lift_input_gate(app: &mut App, destination: Option<&str>) {
+    if app.input_gate.take().is_none() {
+        return;
+    }
+    if !destination.is_some_and(|id| app.showing(id)) {
+        // 宛先が居ない。フォーカスを戻せばキーはサイドバー操作になり、
+        // ユーザーは打ち先を選び直せる（Alt+→ / 行を開く）
+        app.set_focus(Focus::Sidebar);
+    }
+}
+
 /// 応答しない起動から入力を取り戻す（run ループが毎周見る）。降ろしたら `true`。
 ///
-/// **打ち先をサイドバーへ戻すのが要点。** 門番を降ろすだけでは、入力は
-/// `right_view` が指したままの**直前まで見ていたセッション**へ流れる ＝ 門番を
-/// 置いた理由そのものが復活する。フォーカスを戻せばキーはサイドバー操作になり、
-/// ユーザーは打ち先を選び直せる（Alt+→ / 行を開く）。
+/// 打ち先の扱いは [`lift_input_gate`]（宛先は無い ＝ サイドバーへ戻る）。
 ///
 /// **`spawn_rx` は残す。** 遅れて結果が届けば attach するし、多重ディスパッチの
 /// 抑止も続く（ハングした起動が「次の dispatch」だけを止めるのは、門番を
@@ -1981,8 +2021,7 @@ fn expire_input_gate(app: &mut App) -> bool {
     {
         return false;
     }
-    app.input_gate = None;
-    app.set_focus(Focus::Sidebar);
+    lift_input_gate(app, None);
     // ハングしていることを伝える（下部バーと error.log の両方。ここは異常）
     set_notice(
         app,
@@ -3790,6 +3829,71 @@ mod tests {
         assert!(app.spawn_rx.is_some(), "遅れて届く結果の受け口を捨てている");
         // 2 度目は何もしない（毎周通知を出し直さない）
         assert!(!expire_input_gate(&mut app), "降りた門番をもう一度降ろしている");
+    }
+
+    /// **起動に失敗したときも、打った文字は直前まで見ていたセッションへ届かない。**
+    ///
+    /// 門番（[`drop_input_while_starting`]）は「宛先のセッションがまだ無い間」だけ
+    /// 入力を捨てるので、結果が届いたら降りる。しかし**失敗して届いた**ときは
+    /// attach しない ＝ `right_view` は直前まで見ていたセッションを指したままで、
+    /// [`dispatch_session`] が移した `Focus::Terminal` も戻らない。門番だけ降ろすと
+    /// 「見出しメニュー → new session → 起動失敗 → そのまま打鍵」で、稼働中の
+    /// 別プロジェクトのエージェントへプロンプトが送られる（門番が防いでいた経路が
+    /// 失敗直後に復活する）。ハングの経路（[`expire_input_gate`]）と同じ扱いに
+    /// 揃えるのが要点で、判断は [`lift_input_gate`] 1 箇所に置いてある
+    #[test]
+    fn a_failed_launch_gives_input_back_to_the_sidebar() {
+        let mut app = test_app(34, TERM);
+        app.input_gate = Some(std::time::Instant::now());
+        app.set_focus(Focus::Terminal); // dispatch_session と同じ状態
+        apply_spawn_outcome(
+            &mut app,
+            SpawnOutcome {
+                id: None,
+                label: String::new(),
+                cwd: "C:\\dev\\api".to_string(),
+                error: Some("claude --bg 起動失敗".to_string()),
+            },
+        );
+        assert!(
+            !drop_input_while_starting(&mut app),
+            "結果が届いたのに入力が捨てられ続ける"
+        );
+        assert!(
+            app.focus == Focus::Sidebar,
+            "門番だけ降ろして打ち先を戻していない（打った文字が古いセッションへ流れる）"
+        );
+    }
+
+    /// **attach に失敗したときも打ち先を戻す。** `claude --bg` は成功したのに
+    /// attach（`claude attach <id>`）が失敗すると、起動失敗と同じ状態になる
+    /// ＝ 宛先のセッションが無いまま門番が降りる。
+    ///
+    /// **`apply_spawn_outcome` 越しには書けない**: attach の失敗を作るには本物の
+    /// 子プロセス生成を失敗させる必要があり、portable-pty は存在しない cwd を
+    /// `USERPROFILE` に差し替えて**成功させる**（＝ テストが本物の `claude attach` を
+    /// 起こしてしまう）。代わりに、attach が失敗した後の状態（宛先の id の
+    /// セッションが開いていない）をそのまま作って判断だけを検査する。
+    /// 判断は [`lift_input_gate`] 1 箇所なので、起動失敗の経路
+    /// （[`a_failed_launch_gives_input_back_to_the_sidebar`]）と同じ穴を見ている
+    #[test]
+    fn a_failed_attach_gives_input_back_to_the_sidebar() {
+        let mut app = test_app(34, TERM);
+        app.input_gate = Some(std::time::Instant::now());
+        app.set_focus(Focus::Terminal);
+        assert!(
+            !app.showing("abc123"),
+            "attach 失敗の状態になっていない（テストの前提が崩れている）"
+        );
+        lift_input_gate(&mut app, Some("abc123"));
+        assert!(
+            !drop_input_while_starting(&mut app),
+            "結果が届いたのに入力が捨てられ続ける"
+        );
+        assert!(
+            app.focus == Focus::Sidebar,
+            "attach 失敗で門番だけ降りて打ち先が端末に残っている"
+        );
     }
 
     /// **起動に失敗したフォルダは登録しない。** 通知が失敗を報告しているのに見出しが
