@@ -1,6 +1,12 @@
 //! 端末クエリ応答: claude CLI は起動時に CPR（\x1b[6n）等を送り、応答が無いとブロックする。
 //! 本物の端末が返す応答を vt100 の Callbacks で肩代わりし、pending に溜めて PTY へ書き戻す。
 
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use anyhow::anyhow;
+
 /// vt100 が処理しないシーケンスのうち「応答を要求するクエリ」に応答を生成し、
 /// 子プロセスが有効化した入力プロトコル（kitty / modifyOtherKeys / focus）を追跡する。
 #[derive(Default)]
@@ -407,6 +413,270 @@ fn now_iso() -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// 複数プロセスで共有するファイルへの書き込み（advisory lock + tmp → rename）。
+//
+// **ここに置いてある理由**: 守る対象が 2 系統ある（`~/.claude/.credentials.json` と
+// `~/.ccdesk/accounts.json` = ドメイン層の accounts モジュール、`~/.ccdesk/state.json` と
+// `config.json` = このファイルの kv 群）。「どう安全に書くか」の知識を系統ごとに
+// 持つと、片方だけ直した状態が生まれる（実際に起きた: 保管ファイル側は pid + 連番の
+// tmp 名で同時書き込みを避けているのに、state.json 側は全インスタンス共通の
+// `state.json.tmp` を使っていた）。**仕組みは 1 つ、守る対象ごとに違うのは
+// 「どのロックを使うか」と「どれだけ待つか」だけ**にしてある。
+// ---------------------------------------------------------------------------
+
+/// proper-lockfile のロック名は `<target>.lock`（拡張子の置換ではなく **付加**）。
+/// 設定ホーム `~/.claude` に対しては `~/.claude.lock` になる
+pub fn lock_path_for(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    target.with_file_name(name)
+}
+
+/// mtime がこれより古いロックは死んだ保持者のものとして奪う（proper-lockfile の既定と同じ）
+pub const LOCK_STALE: Duration = Duration::from_secs(10);
+/// 取得の再試行間隔
+const LOCK_RETRY: Duration = Duration::from_millis(100);
+/// stale ロックを奪う回数の上限。奪った直後に別プロセスが取り直したなら
+/// それは正当な競合なので、以降は通常の待ちに落とす（奪い合いで回り続けない）
+const LOCK_MAX_STEALS: u32 = 3;
+
+/// claude と共有する advisory lock（RAII）。
+///
+/// claude Code は OAuth トークン更新を npm `proper-lockfile` で保護している。
+/// 合わせる必要があるプロトコル:
+/// - ロックの実体は **ディレクトリ** `<target>.lock`。`mkdir` の原子性が mutex
+/// - mtime が 10 秒より古いロックは stale とみなして奪ってよい
+/// - 保持者は 5 秒ごとに mtime を touch して生存を示す
+/// - claude は取れないとき 1〜2 秒のジッタ付きで 5 回リトライしてから諦める
+///   （＝短時間の保持は協調的で、待たせても壊れない）
+///
+/// ロックを取らずに書くと、claude のトークン更新（読む → ネットワーク更新 → 保存を
+/// `~/.claude.lock` の下で行う）と衝突し、**差し替えた認証情報が旧アカウントの
+/// 更新済みトークンで上書きされる**。
+///
+/// # 解放は所有権を確認してから行う
+///
+/// 取得した瞬間の mtime を所有権の印として持ち、[`Drop`] では **それが今も
+/// 一致するときだけ** `rmdir` する。無条件に消すと、自分のロックが stale 判定で
+/// 奪われた後（奪取は rmdir → mkdir なので mtime が変わる）に **奪った側＝claude の
+/// ロックを消してしまい**、トークン更新の最中に第三者が入れる状態を作る。
+/// それはこのロックがまさに防ごうとしている上書きそのもので、使い捨ての
+/// refreshToken が壊れるとログインは復旧不能になりうる。
+///
+/// 印に mtime を選んだ理由:
+/// - **claude 側（proper-lockfile）も同じ基準で所有権を見ている。** 取得時の mtime と
+///   現在の mtime が違えば "compromised" と判定する実装で、claude のバイナリにも
+///   その痕跡（`mtimePrecision` / `ECOMPROMISED` / `onCompromised` /
+///   `Unable to update lock within the stale threshold` の文字列）がある
+/// - **ロックディレクトリの中に印のファイルは置けない。** 奪う側は `rmdir` で
+///   消すが、非空ディレクトリの `rmdir` は `ENOTEMPTY` で失敗する（この定数も
+///   claude のバイナリにある）。中身を置くと claude が stale ロックを回収できず、
+///   トークン更新が永久に失敗しうる
+///
+/// mtime の分解能（NTFS は 100ns 刻み）より短い間隔で奪われると判別できないが、
+/// 奪取は「mtime が 10 秒より古い」ことが前提なので実運用では起きない。
+///
+/// **mtime を更新するスレッドは持たない。** ここでの保持は小さなファイル 2 本の
+/// 読み書き（ミリ秒）で、stale 閾値 10 秒に対して十分短い。仮に環境要因
+/// （ウイルス対策のスキャン・スリープ復帰）で 10 秒を超えて奪われても、
+/// 上の所有権確認があるので他者のロックを消すことはなく、こちらの書き込みが
+/// 失敗するだけで済む（touch スレッドを足しても「奪われた後に消す」経路は
+/// 消えないので、守りとしては所有権確認の方が単純かつ確実）
+#[derive(Debug)] // 取れなかったことをテストで `expect_err` するため
+pub struct Lock {
+    path: PathBuf,
+    /// 取得した瞬間の mtime＝所有権の印。取れなかった（None）ときは所有を
+    /// 証明できないので解放しない（stale 化して誰かが奪うのに任せる。
+    /// 他者のロックを消す危険より、10 秒待たせる方が軽い）
+    mtime: Option<std::time::SystemTime>,
+}
+
+impl Lock {
+    /// `wait` まで待って取る。`stale` より古いロックは奪う
+    pub fn acquire(path: &Path, wait: Duration, stale: Duration) -> anyhow::Result<Self> {
+        // ロックの置き場所が無いと mkdir は必ず失敗する。保管ファイル用のロックは
+        // 初回起動（`~/.ccdesk` がまだ無い）で実際にこの状況になる
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let deadline = Instant::now() + wait;
+        let mut steals = 0;
+        loop {
+            match std::fs::create_dir(path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path: path.to_path_buf(),
+                        mtime: lock_mtime(path),
+                    })
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(anyhow!(
+                        "could not create the lock at {}: {e}",
+                        path.display()
+                    ))
+                }
+            }
+            // 死んだ保持者のロックは奪う。奪えたら即座に取り直しへ戻る
+            // （待ち時間を消費させない: 誰も生きていないのだから待つ理由が無い）
+            let stolen = steals < LOCK_MAX_STEALS
+                && lock_age(path).is_some_and(|age| age >= stale)
+                && std::fs::remove_dir(path).is_ok();
+            if stolen {
+                steals += 1;
+                continue;
+            }
+            if Instant::now() >= deadline {
+                // **打つ手まで書く。** 時計の巻き戻し・スリープ復帰・ネットワーク
+                // ドライブの skew でロックの mtime が未来に付くと [`lock_age`] は
+                // 永久に stale と判定しないので、"try again" は何度やっても通らない。
+                // ロックの実体が空ディレクトリで、保持者が居なければ消してよいことは
+                // ここでしか伝わらない（未ログイン行が `run /login` まで書くのと同じ方針）
+                return Err(anyhow!(
+                    "another process is holding the lock at {}; \
+                     if no claude session and no other ccdesk window is running, \
+                     this leftover lock is an empty directory and can be deleted",
+                    path.display()
+                ));
+            }
+            std::thread::sleep(LOCK_RETRY);
+        }
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // 所有権の確認（[`Lock`] の解説を参照）。奪われている・確認できないなら
+        // 何もしない。ここで無条件に消すと他者のロックを外すことになる
+        if self.mtime.is_some() && lock_mtime(&self.path) == self.mtime {
+            let _ = std::fs::remove_dir(&self.path);
+        }
+    }
+}
+
+/// ロックの mtime（所有権の印）。無い・読めないときは None
+fn lock_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// ロックの経過時間。mtime が未来のとき（時刻のずれ）は None＝stale ではない扱い。
+///
+/// **未来の mtime を「十分古い」側に倒さない。** 未来に付くのは保持者の時計ではなく
+/// ファイルシステム側の時刻がずれているときで、そうなると経過時間そのものが
+/// 信用できない ＝ 生きている claude のロックを奪う判断材料にはできない。
+/// 代わりに、取得できなかったときのエラー文が「消してよい」ことを案内する
+/// （[`Lock::acquire`]）
+fn lock_age(path: &Path) -> Option<Duration> {
+    lock_mtime(path)?.elapsed().ok()
+}
+
+
+/// `<target>.<pid>-<連番>.tmp` の形か（[`write_json_atomically`] が付ける名前）。
+/// pid と連番の形まで見るのは、無関係な `.tmp`（claude や他ツールのもの）を
+/// 消さないため
+pub fn is_leftover_tmp(name: &str, target: &str) -> bool {
+    let Some(rest) = name.strip_prefix(&format!("{target}.")) else {
+        return false;
+    };
+    let Some((pid, seq)) = rest.strip_suffix(".tmp").and_then(|m| m.split_once('-')) else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(pid) && digits(seq)
+}
+
+
+/// tmp → rename で置く（読み手が書きかけの JSON を見ないため）。
+/// tmp は同じディレクトリに作る（別ボリュームだと rename が失敗する）。
+/// 名前は pid + 連番で一意にする（同じパスへの同時書き込みで tmp を共有しない）。
+/// **rename 前に取り残された tmp は起動時に回収する**
+/// （[`reap_leftover_tmp`]。保管ファイルの tmp は中身がトークンなので放置しない）
+pub fn write_json_atomically(path: &Path, value: &serde_json::Value) -> anyhow::Result<()> {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| anyhow!("could not create {}: {e}", dir.display()))?;
+    }
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}-{seq}.tmp", std::process::id()));
+    let tmp = path.with_file_name(name);
+    let text = serde_json::to_string_pretty(value)?;
+    // **rename の前に中身をディスクへ確定させる。** rename 自体は NTFS の
+    // メタデータジャーナルで守られるが、tmp の中身は守られない。電源断で
+    // 0 バイトの `.credentials.json` が残ると、claude 本体から見て全アカウントの
+    // ログインが飛ぶ（保管ファイル側なら全アカウントの保管が飛ぶ）。
+    // 小さなファイル 1 本なので代償は小さい
+    if let Err(e) = write_and_sync(&tmp, text.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp); // 中間ファイルを残さない
+        return Err(anyhow!("could not write {}: {e}", tmp.display()));
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow!("could not replace {}: {e}", path.display())
+    })
+}
+
+/// 書いて fsync する（[`write_json_atomically`] 用）
+fn write_and_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// 回収してよい `.tmp` の古さ（[`reap_leftover_tmp`]）。
+/// 書いている最中の別インスタンスの tmp を消さないため、十分に古いものだけを消す
+pub const TMP_KEEP: Duration = Duration::from_secs(3600);
+
+/// `target` の書きかけ `.tmp` を回収する。**[`write_json_atomically`] が
+/// rename する前にプロセスが死ぬと、その tmp は誰にも消されずに残る**
+/// （保管ファイルなら中身はトークン）。`update::cleanup_old_exe` と同じ
+/// 「次にプロセスを起こしたときに片付ける」方式。
+///
+/// **tmp の名前を決めるのと同じ場所に置いてある**のが要点で、名前の形
+/// （[`is_leftover_tmp`]）を知らずに回収はできない ＝ 書き手ごとに回収を書くと
+/// 名前の規則が 2 通りに分かれる。消すのは自分たちが付ける形の名前で、かつ
+/// 十分に古いもの（[`TMP_KEEP`]）だけ: 今まさに書いている別インスタンスの tmp や
+/// 無関係な `.tmp` を消さないため。失敗は無視する（掃除は次の起動でまた来る）
+pub fn reap_leftover_tmp(target: &Path) {
+    let (Some(dir), Some(name)) = (target.parent(), target.file_name().and_then(|n| n.to_str()))
+    else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|file| is_leftover_tmp(file, name))
+        {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|md| md.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age >= TMP_KEEP);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// 起動時の掃除: ウィンドウ状態・設定の書きかけ `.tmp` を回収する。
+/// **保管ファイル側（`AccountStore::cleanup_leftover_tmp`）と同じ理由**で、
+/// tmp 名が一意になった以上、rename 前に死んだ分は積もる
+pub fn reap_leftover_kv_tmp() {
+    for target in [state_path(), settings_path()].into_iter().flatten() {
+        reap_leftover_tmp(&target);
+    }
+}
+
 /// kv_save の read-modify-write を直列化するプロセス内ロック
 /// （UI スレッドとディスパッチスレッドの同時書込みでキーが消えるのを防ぐ）
 static KV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -446,16 +716,40 @@ fn value_strings(value: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// キー 1 つの read-modify-write。**書き込みの作法（プロセス内ロック・オブジェクト以外の
-/// 上書き・tmp → rename）をここ 1 箇所に持つ**ので、値が文字列でも配列でも同じ保証になる。
+/// state.json / config.json の read-modify-write を守る advisory lock の待ち。
+///
+/// **[`KV_LOCK`] では足りない。** あちらはプロセス内 Mutex なので、ccdesk を
+/// 複数起動していると「A が読む → B が読む → A が書く → B が書く」を許す
+/// ＝ A の変更が消える。それは `update_state_list` の戻り値
+/// （[`crate::update_state_list`]）が防いだはずの状態そのもので、A は「書けた」と
+/// 記録したのにディスクには B の内容が乗る ＝ **次の保存で外したフォルダが
+/// 「他インスタンスの登録」と分類されて復活する**。
+///
+/// 待ちが短いのは **UI スレッドから呼ばれる**ため（サイドバー幅・見出しの登録・
+/// 最後に見た画面）。守る区間は小さなファイル 1 本の読み書きだけで、競合していても
+/// 数 ms で空くので、フリーズとして感じられる長さを待つ理由が無い。取れなければ
+/// 諦めて `false` を返す（呼び手は基準を進めない ＝ 次の保存でもう一度載せに行く）
+const KV_LOCK_WAIT: Duration = Duration::from_millis(500);
+
+/// キー 1 つの read-modify-write。**書き込みの作法（ロック・オブジェクト以外の
+/// 上書き・原子的な置き換え）をここ 1 箇所に持つ**ので、値が文字列でも配列でも
+/// 同じ保証になる。
 ///
 /// `edit` は**同じロックの下でディスク上の今の値**を受け取る（読みと書きの間に
 /// 別の書き込みを挟ませないため）＝ 呼び手は「今の値の上に載せる」判断ができる。
+/// ロックは 2 段で、プロセス内（[`KV_LOCK`]）と**インスタンス間**
+/// （[`KV_LOCK_WAIT`]）の両方を閉じる: 前者だけでは多重起動で読み書きが交差する。
 ///
-/// **戻り値は「ディスクへ載ったか」。** tmp 書き込みと rename は失敗しうる
-/// （ディスク満杯・権限・ウイルス対策のロック）。黙って捨てると、呼び手が
-/// 「こう書いた」と記録したのに実際は書かれていない状態になり、次の書き込みの
-/// 判断材料が嘘になる（[`crate::update_state_list`] の呼び手が持つマージの基準）
+/// 置き換えは [`write_json_atomically`]（保管ファイルと同じ 1 実装）。
+/// **自前で tmp を書かない**のが要点で、以前ここは全インスタンス共通の
+/// `state.json.tmp` を使っており、同時保存で他インスタンスの tmp を rename して
+/// 「成功したのに自分の内容が乗っていない」状態を作れた。
+///
+/// **戻り値は「ディスクへ載ったか」。** ロックの取得・tmp 書き込み・rename は
+/// 失敗しうる（他インスタンス・ディスク満杯・権限・ウイルス対策のロック）。
+/// 黙って捨てると、呼び手が「こう書いた」と記録したのに実際は書かれていない状態に
+/// なり、次の書き込みの判断材料が嘘になる
+/// （[`crate::update_state_list`] の呼び手が持つマージの基準）
 #[must_use]
 fn kv_edit(
     path: Option<std::path::PathBuf>,
@@ -464,6 +758,11 @@ fn kv_edit(
 ) -> bool {
     let Some(path) = path else { return false };
     let _guard = KV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // 別インスタンスとの直列化。**ファイルごとに別のロック**（state.json と
+    // config.json は別物で、片方の保存が他方を待つ理由が無い）
+    let Ok(_shared) = Lock::acquire(&lock_path_for(&path), KV_LOCK_WAIT, LOCK_STALE) else {
+        return false;
+    };
     let mut v = std::fs::read_to_string(&path)
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -472,17 +771,7 @@ fn kv_edit(
         v = serde_json::json!({});
     }
     v[key] = edit(v.get(key));
-    // 読み手が書きかけの JSON を見ないよう tmp → rename で置く
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, serde_json::to_string_pretty(&v).unwrap_or_default()).is_err() {
-        let _ = std::fs::remove_file(&tmp); // 書きかけを残さない
-        return false;
-    }
-    if std::fs::rename(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return false;
-    }
-    true
+    write_json_atomically(&path, &v).is_ok()
 }
 
 fn kv_save(path: Option<std::path::PathBuf>, key: &str, value: &str) {
@@ -744,28 +1033,228 @@ mod tests {
     /// 外したはずの要素が次の保存で復活する（[`crate::update_state_list`]）
     #[test]
     fn a_write_that_cannot_land_reports_failure() {
-        // 親ディレクトリが無いパス（tmp の作成自体が失敗する）
-        let missing = std::env::temp_dir()
-            .join(format!("ccdesk-test-{}-absent", std::process::id()))
-            .join("nowhere")
-            .join("state.json");
+        // 書けないパス ＝ **保存先がディレクトリ**（作成そのものが失敗する）。
+        // 「親ディレクトリが無いパス」では書けてしまう: 保存は置き場所を作ってから
+        // 書く（`ccdesk_dir` / `Lock::acquire` / `write_json_atomically` のいずれも
+        // 先に `create_dir_all` する ＝ 初回起動で ~/.ccdesk が無くても保存できる）
+        let blocked = temp_json("blocked", None).with_file_name("blocked-dir.json");
+        std::fs::create_dir_all(&blocked).unwrap();
         assert!(
-            !kv_update_list(Some(missing.clone()), "projects", |_| vec![
+            !kv_update_list(Some(blocked.clone()), "projects", |_| vec![
                 "C:\\dev\\a".to_string()
             ]),
             "書けていないのに成功と報告している"
         );
-        assert!(!missing.exists(), "書けない前提が崩れている");
+        assert!(blocked.is_dir(), "書けない前提が崩れている");
         // 置き場所そのものが分からないとき（ホームが取れない）も同じ
         assert!(!kv_update_list(None, "projects", |_| Vec::new()));
-        // 書きかけの tmp を残さない（次の読み手が中途の JSON を拾わない）
+        // 書きかけの tmp を残さない（次の読み手が中途の JSON を拾わない）。
+        // tmp 名はインスタンスごとに一意なので、名前を組み立てずに走査で見る
         let path = temp_json("tmp-cleanup", Some("{}"));
         assert!(kv_update_list(Some(path.clone()), "projects", |_| vec![
             "C:\\dev\\a".to_string()
         ]));
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp が残っている: {leftovers:?}");
+    }
+
+    /// **他インスタンスの書きかけ tmp と名前を共有しない。**
+    ///
+    /// tmp が全インスタンス共通（`state.json.tmp`）だと、同時保存で
+    /// 「A が tmp を書く → B が同じ tmp を上書き → A が rename して成功を返す」
+    /// が成立し、**成功を返した A の内容ではなく B の内容がディスクに乗る**。
+    /// 保管ファイル側（`accounts.json`）は pid + 連番の tmp 名でこれを塞いでいたのに、
+    /// こちらは塞いでいなかった ＝ 同じ危険に対策が 2 通りあった。
+    ///
+    /// 状況は **共有を許さないハンドル**で作る: 別インスタンスが tmp を掴んでいる間、
+    /// 名前を共有していればこちらの書き込みは共有違反で失敗する
+    #[test]
+    fn a_save_does_not_share_its_tmp_with_another_instance() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let path = temp_json("tmp-collision", Some("{}"));
+        // 修正前の tmp 名（全インスタンス共通）を別インスタンスが掴んでいる状態
+        let shared = path.with_extension("json.tmp");
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(0) // 読みも書きも共有しない
+            .open(&shared)
+            .unwrap();
+
+        let wrote = kv_update_list(Some(path.clone()), "projects", |_| {
+            vec!["C:\\dev\\mine".to_string()]
+        });
+        drop(held);
+        let _ = std::fs::remove_file(&shared);
+
         assert!(
-            !path.with_extension("json.tmp").exists(),
-            "tmp が残っている"
+            wrote,
+            "他インスタンスの tmp と名前を共有していて自分の保存が通らない"
+        );
+        assert_eq!(
+            kv_load_list(Some(path), "projects"),
+            ["C:\\dev\\mine"],
+            "成功を返したのに自分の内容がディスクに乗っていない"
+        );
+    }
+
+    /// **別インスタンスが保存中なら諦める（読みと書きを交差させない）。**
+    ///
+    /// [`KV_LOCK`] はプロセス内 Mutex なので、多重起動では
+    /// 「A が読む → B が読む → A が書く → B が書く」を許す ＝ A は成功を返したのに
+    /// ディスクには A の変更を含まない B の内容が乗り、A は自分のマージ結果を
+    /// 基準として記録する。次の保存でその差が「他インスタンスの登録」と分類され、
+    /// **外したフォルダが復活する**（[`crate::update_state_list`] が防ぐはずの状態）。
+    ///
+    /// 待ちが有界であることも同時に見る（保存は UI スレッドから呼ばれる）
+    #[test]
+    fn a_save_gives_up_while_another_instance_is_writing() {
+        let path = temp_json("kv-lock", Some("{\"projects\": [\"C:\\\\dev\\\\disk\"]}"));
+        let before = std::fs::read(&path).unwrap();
+
+        let held = Lock::acquire(&lock_path_for(&path), Duration::ZERO, LOCK_STALE).unwrap();
+        let started = Instant::now();
+        let wrote = kv_update_list(Some(path.clone()), "projects", |_| {
+            vec!["C:\\dev\\mine".to_string()]
+        });
+        let waited = started.elapsed();
+
+        assert!(!wrote, "他インスタンスが書いている間に書けたことになっている");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "他インスタンスの書き込みと交差してディスクを動かしている"
+        );
+        assert!(
+            waited < KV_LOCK_WAIT * 2,
+            "UI スレッドが待ち続けている（{waited:?}）"
+        );
+
+        // 解放後は通常どおり書けて、**その内容がディスクに乗る**
+        // （ロックが理由で保存が死んだままにならない）
+        drop(held);
+        assert!(
+            kv_update_list(Some(path.clone()), "projects", |disk| {
+                assert_eq!(disk, ["C:\\dev\\disk"], "ロックの下で読んだ値が古い");
+                vec!["C:\\dev\\mine".to_string()]
+            }),
+            "解放後も書けない"
+        );
+        assert_eq!(kv_load_list(Some(path), "projects"), ["C:\\dev\\mine"]);
+    }
+
+    /// ロック検査用のパス（実ユーザーのホームは触らない）。
+    /// 前回の残りがあれば消してから返す（Drop で消すのはロック自身の仕事）
+    fn temp_lock_path(name: &str) -> std::path::PathBuf {
+        let path = temp_json(name, None).with_file_name(format!("{name}.lock"));
+        let _ = std::fs::remove_dir(&path);
+        path
+    }
+
+    /// 他者がロックを保持していたら待つ（claude 側も 1〜2 秒のジッタ付きで
+    /// 5 回リトライするので、短時間の保持は協調的に待ち合わせられる）
+    #[test]
+    fn acquire_waits_until_the_holder_releases() {
+        let path = temp_lock_path("acquire_waits_until_the_holder_releases");
+        let held = Lock::acquire(&path, Duration::ZERO, LOCK_STALE).unwrap();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
+
+        let started = Instant::now();
+        let mine = Lock::acquire(&path, Duration::from_secs(5), LOCK_STALE)
+            .expect("解放されたのに取れていない");
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "保持中に取れてしまっている: {:?}",
+            started.elapsed()
+        );
+        drop(mine);
+        holder.join().unwrap();
+    }
+
+    /// **奪われた後の Drop で他者のロックを消してはいけない。**
+    /// 消すと、claude がトークン更新の最中（`~/.claude.lock` の下で
+    /// 読む → ネットワーク更新 → 保存を行う）に第三者が入れる状態になり、
+    /// このロック機構が防ごうとしている上書きそのものが起きる
+    #[test]
+    fn drop_keeps_a_lock_that_another_holder_took_over() {
+        let path = temp_lock_path("drop_keeps_a_lock_that_another_holder_took_over");
+        let mine = Lock::acquire(&path, Duration::ZERO, LOCK_STALE).unwrap();
+
+        // 自分のロックが stale 判定で奪われた状況（他者の rmdir → mkdir）を作る。
+        // 所有権の印は mtime なので、奪い直しが元と同じ刻（Windows のシステム
+        // クロックは ~15ms 刻み）に収まると判別できない。実運用では奪取は
+        // 取得から 10 秒以上経ってからしか起きないので衝突しないが、
+        // テストは同じ刻を踏み得るため mtime が変わるまで作り直す
+        let mtime_of = || std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mine_mtime = mtime_of();
+        for _ in 0..500 {
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            if mtime_of() != mine_mtime {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_ne!(mtime_of(), mine_mtime, "奪取を作れていない（前提が崩れている）");
+
+        drop(mine);
+
+        assert!(
+            path.exists(),
+            "奪われた後の Drop が他者のロックを消している（claude のトークン更新を無防備にする）"
+        );
+    }
+
+    /// stale 閾値より古いロックは奪う（保持者が死んで残った `.lock` で
+    /// 永久に書けなくなるのを防ぐ）。閾値を注入して mtime の経過を待たずに固定する
+    #[test]
+    fn acquire_steals_a_stale_lock_but_not_a_fresh_one() {
+        let path = temp_lock_path("acquire_steals_a_stale_lock_but_not_a_fresh_one");
+        std::fs::create_dir(&path).unwrap(); // 死んだ保持者が残したロック
+
+        // 新しいロックは奪わない: 有界時間で諦める
+        let started = Instant::now();
+        assert!(Lock::acquire(&path, Duration::from_millis(50), LOCK_STALE).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(path.exists(), "諦めたのに他者のロックを消している");
+
+        // mtime が閾値より古ければ奪える
+        let stolen = Lock::acquire(&path, Duration::ZERO, Duration::ZERO)
+            .expect("stale ロックを奪えていない");
+        drop(stolen);
+        assert!(!path.exists(), "解放されていない");
+    }
+
+    /// ロックが取れなかったときのエラーは **打つ手まで言う**。
+    /// 時計のずれで mtime が未来に付いたロックは stale 判定に掛からず、
+    /// 「もう一度試す」では永久に通らない（[`lock_age`]）。実体が空ディレクトリで
+    /// 保持者が居なければ消してよいことは、この文面でしか伝わらない
+    #[test]
+    fn a_lock_we_cannot_take_says_how_to_recover() {
+        let path = temp_lock_path("a_lock_we_cannot_take_says_how_to_recover");
+        std::fs::create_dir(&path).unwrap();
+
+        let err = Lock::acquire(&path, Duration::from_millis(20), LOCK_STALE)
+            .expect_err("取れてしまっている")
+            .to_string();
+
+        assert!(
+            err.contains(&path.display().to_string()),
+            "どのロックか分からない: {err}"
+        );
+        assert!(
+            err.contains("empty directory") && err.contains("deleted"),
+            "打つ手（消してよいこと）が書かれていない: {err}"
         );
     }
 

@@ -332,6 +332,9 @@ impl LiveSource {
         if let Some(store) = AccountStore::detect() {
             store.cleanup_leftover_tmp();
         }
+        // ウィンドウ状態・設定側も同じ理由で回収する（tmp 名が一意なので、
+        // rename 前に死んだ分は上書きされずに積もる）
+        ccdesk::reap_leftover_kv_tmp();
         Self {
             usage_display,
             projects_baseline: Mutex::new(Vec::new()),
