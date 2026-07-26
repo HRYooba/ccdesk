@@ -278,19 +278,67 @@ fn out(cmd: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&o.stdout).to_string())
 }
 
-/// ログイン状態が変わったことを示す安価な signal: 認証情報ファイルの指紋。
-/// ログイン・ログアウト・トークン更新で書き換わるので、これを見て初めて
-/// `claude auth status --json`（1 回 ~350ms のプロセス起動）を叩く。
+/// ポーラーが持ち回す保管ストア。**パスの解決は 1 起動につき 1 回**。
 ///
-/// `.claude.json` は 100KB 超で claude の通常動作でも常時書き換わるため signal に
-/// 使えない。認証情報が OS の資格情報マネージャ側にある環境ではこの関数は常に
-/// None を返すので、その場合は周期フォールバックだけが効く。
+/// 持ち上げてある理由: [`AccountStore::detect`] は [`crate::accounts::Paths::detect`]
+/// を通り、そこで呼ぶ `accounts_store_path()` と `usage_cache_path()` がどちらも
+/// `ccdesk_dir()`（＝ `create_dir_all`）を経由する。指紋読みはポーラーが**毎秒**
+/// 呼ぶので、毎ティックでストアを作り直すと `metadata()` 1 回で済む処理が
+/// **毎秒 create_dir_all 2 回 + stat 1 回**になる（ccdesk のインスタンスごとに永続的に）。
 ///
-/// **指紋の取り方とファイルの位置はドメイン側（[`AccountStore`]）に持たせる。**
-/// 同じ値が「再取得の契機」と「観測がまだ有効かの照合」の両方で使われるので、
-/// 2 通りの導出を持つと片方だけ直る形になる
-fn auth_fingerprint() -> CredentialsFp {
-    AccountStore::detect()?.credentials_fingerprint()
+/// ホームが取れない環境では None のまま（指紋は常に None ＝ 周期フォールバックだけが
+/// 効く）。起動後にホームが生える環境は無いので、取り直しはしない
+struct AuthWatch(Option<AccountStore>);
+
+impl AuthWatch {
+    fn new(store: Option<AccountStore>) -> Self {
+        Self(store)
+    }
+
+    fn detect() -> Self {
+        Self::new(AccountStore::detect())
+    }
+
+    /// ログイン状態が変わったことを示す安価な signal: 認証情報ファイルの指紋。
+    /// ログイン・ログアウト・トークン更新で書き換わるので、これを見て初めて
+    /// `claude auth status --json`（1 回 ~350ms のプロセス起動）を叩く。
+    ///
+    /// `.claude.json` は 100KB 超で claude の通常動作でも常時書き換わるため signal に
+    /// 使えない。認証情報が OS の資格情報マネージャ側にある環境ではこれは常に
+    /// None を返すので、その場合は周期フォールバックだけが効く。
+    ///
+    /// **指紋の取り方とファイルの位置はドメイン側（[`AccountStore`]）に持たせる。**
+    /// 同じ値が「再取得の契機」と「観測がまだ有効かの照合」の両方で使われるので、
+    /// 2 通りの導出を持つと片方だけ直る形になる。
+    /// **ここが触るのは認証情報ファイルの `metadata()` だけ**（ディレクトリは作らない）
+    fn fingerprint(&self) -> CredentialsFp {
+        self.0
+            .as_ref()
+            .and_then(AccountStore::credentials_fingerprint)
+    }
+
+    /// 追従更新の呼び出し口。**登録済みアカウントの保管を現行の認証情報に追従させる**
+    /// （claude はトークン更新で refreshToken を使い捨てにするため、放置すると保管が
+    /// 腐って切替で復元できなくなる。詳細は
+    /// [`crate::accounts::AccountStore::sync_active`]）。
+    ///
+    /// 契機は既存の signal（[`Self::fingerprint`] の変化 + 周期フォールバック）に乗せる。
+    /// **新しいポーリングは足さない。** 未登録アカウントには何もしないので、
+    /// 「明示登録するまでコピーしない」規則はストア側で守られる。
+    ///
+    /// 渡すのは **取得の前に読んだ指紋を持った観測**（[`ActiveAccount`]）。
+    /// 「誰のトークンか」はここに来るより数百 ms 前（`claude auth status` が
+    /// 認証情報を読んだ時点）に決まっているので、ストア側がロック下で照合する
+    fn sync(&self, active: &ActiveAccount) {
+        let Some(store) = self.0.as_ref() else {
+            return;
+        };
+        // 失敗しても表示は続ける（保管の追従はアカウント行の表示より優先度が低い）。
+        // ログにはパスとエラーだけが出る（トークンは載せない）
+        if let Err(e) = store.sync_active(active) {
+            ccdesk::log_error(&format!("account store sync failed: {e}"));
+        }
+    }
 }
 
 /// `.claude.json` の `oauthAccount` から (emailAddress, displayName) を読む。
@@ -346,30 +394,7 @@ impl AccountFetcher {
 /// アカウント行の 1 回取得（`ccdesk doctor` 用。ポーラーと同じ経路で
 /// 「今どう表示されるか」を出す）
 pub(crate) fn fetch_account() -> AccountStatus {
-    AccountFetcher::default().fetch(auth_fingerprint())
-}
-
-/// 追従更新の呼び出し口。**登録済みアカウントの保管を現行の認証情報に追従させる**
-/// （claude はトークン更新で refreshToken を使い捨てにするため、放置すると保管が
-/// 腐って切替で復元できなくなる。詳細は
-/// [`crate::accounts::AccountStore::sync_active`]）。
-///
-/// 契機は既存の signal（[`auth_fingerprint`] の変化 + 周期フォールバック）に乗せる。
-/// **新しいポーリングは足さない。** 未登録アカウントには何もしないので、
-/// 「明示登録するまでコピーしない」規則はストア側で守られる。
-///
-/// 渡すのは **取得の前に読んだ指紋を持った観測**（[`ActiveAccount`]）。
-/// 「誰のトークンか」はこの関数に来るより数百 ms 前（`claude auth status` が
-/// 認証情報を読んだ時点）に決まっているので、ストア側がロック下で照合する
-fn sync_stored_account(active: &ActiveAccount) {
-    let Some(store) = AccountStore::detect() else {
-        return;
-    };
-    // 失敗しても表示は続ける（保管の追従はアカウント行の表示より優先度が低い）。
-    // ログにはパスとエラーだけが出る（トークンは載せない）
-    if let Err(e) = store.sync_active(active) {
-        ccdesk::log_error(&format!("account store sync failed: {e}"));
-    }
+    AccountFetcher::default().fetch(AuthWatch::detect().fingerprint())
 }
 
 /// 現行バージョンと、それより新しい配布版があれば その版番号。
@@ -509,6 +534,9 @@ pub(crate) fn spawn_footer_poller(
     std::thread::spawn(move || {
         let mut account = AccountPollState::new();
         let mut fetcher = AccountFetcher::default();
+        // **ループの外で 1 度だけ解決する**（毎ティックのディレクトリ操作をなくす。
+        // 理由は [`AuthWatch`]）
+        let auth = AuthWatch::detect();
         // 共有側へ最後に書いたアカウント。書き手はこのスレッドだけなので、
         // 毎秒ロックを取らずに手元の写しと比べられる
         let mut shown = AccountStatus::default();
@@ -517,15 +545,21 @@ pub(crate) fn spawn_footer_poller(
             let forced = refresh.swap(false, std::sync::atomic::Ordering::Relaxed);
             let mut updated = false;
 
-            if let Some(next) = account_step(&mut account, &shown, forced, auth_fingerprint, |fp| {
-                let fetched = fetcher.fetch(fp);
-                // 追従更新は「取得できた度」に見る。トークン更新はラベルを変えない
-                // ので、表示の差分（account_step の戻り値）では拾えない
-                if let AccountStatus::LoggedIn(active) = &fetched {
-                    sync_stored_account(active);
-                }
-                fetched
-            }) {
+            if let Some(next) = account_step(
+                &mut account,
+                &shown,
+                forced,
+                || auth.fingerprint(),
+                |fp| {
+                    let fetched = fetcher.fetch(fp);
+                    // 追従更新は「取得できた度」に見る。トークン更新はラベルを変えない
+                    // ので、表示の差分（account_step の戻り値）では拾えない
+                    if let AccountStatus::LoggedIn(active) = &fetched {
+                        auth.sync(active);
+                    }
+                    fetched
+                },
+            ) {
                 shown = next.clone();
                 shared
                     .lock()
@@ -1103,5 +1137,33 @@ mod tests {
             ))),
             "取得後の指紋で日付を付けている"
         );
+    }
+
+    /// **毎ティックの指紋読みはディレクトリを触らない。**
+    ///
+    /// [`AccountStore::detect`] は `~/.ccdesk` を作る（`accounts_store_path()` と
+    /// `usage_cache_path()` がどちらも `ccdesk_dir()` ＝ `create_dir_all` を通る）。
+    /// フッターのポーラーは指紋を**毎秒**読むので、そこで detect を通していた頃は
+    /// `metadata()` 1 回だった処理が毎秒 create_dir_all 2 回 + stat 1 回になっていた。
+    /// ストアを持ち上げてあること（[`AuthWatch`]）を、ディレクトリを消してから
+    /// 何度も読んで確かめる ＝ 呼び出し回数を数えずに構造を固定する
+    #[test]
+    fn reading_the_auth_fingerprint_creates_no_directories() {
+        use crate::accounts::tests::{credentials_doc, TempHome};
+
+        let home = TempHome::new("reading_the_auth_fingerprint_creates_no_directories");
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        let auth = AuthWatch::new(Some(home.store()));
+        // ストアの置き場所（`~/.ccdesk` 相当）を消す。持ち上げてあれば作り直されない
+        let store_dir = home.paths().store.parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(&store_dir).unwrap();
+
+        for _ in 0..3 {
+            assert!(auth.fingerprint().is_some(), "認証情報の指紋が読めていない");
+            assert!(
+                !store_dir.exists(),
+                "指紋を読むだけでディレクトリを作っている（毎秒 create_dir_all が走る）"
+            );
+        }
     }
 }
