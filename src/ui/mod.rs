@@ -13,8 +13,8 @@ use tui_term::widget::PseudoTerminal;
 use ccdesk::dir_key;
 
 use crate::app::{
-    active_unstored, selected_enter, App, Focus, Popup, RightView, RowAction, SelfUpdate,
-    SidebarPos, SidebarRow,
+    active_unstored, selected_enter, sidebar_cols, App, Focus, Popup, RightView, RowAction,
+    SelfUpdate, SidebarPos, SidebarRow,
 };
 use crate::poll::{
     classify, foreground_state, AccountStatus, Bucket, Group, Grouping, StateView,
@@ -50,10 +50,10 @@ fn unread_mark(unread: bool) -> &'static str {
 ///   動いていない）。生きている行の判断材料は使わない
 /// - 生きている行は hook（[`crate::hooks`]）が答える。turn 単位で届くので
 ///   Working / Needs input / Done を取り違えない
-/// - ただし**生きている行の `stopped` は捨てる**: 生死の真実は PTY の
-///   `try_wait`（[`crate::session::Session::alive`]）で、再開した直後は前回の
-///   `SessionEnd` が保管に残っている ＝ 次の `SessionStart` が届くまでの
-///   数秒だけ「動いているのに Stopped」に見えてしまう
+/// - **どの hook を採るかはここでは決めない**: 前回の実行の残骸を捨てる判断は
+///   [`crate::hooks::HookStates::get`] が窓の起動時刻で行うので、ここへ来る
+///   `hook` は「今の実行が書いたもの」だけ（`stopped` も含めてそのまま採る ＝
+///   `stop` 直後に生死の観測を待たずに Stopped が出る）
 /// - hook が一度も来ていない行だけ `agents --json` の `status` へ落ちる
 ///   （ccdesk が起こしていないセッション・注入が効かなかった場合）
 /// - `status` も無い（ポーラーが拾う前）間は出力の変化から推す
@@ -68,7 +68,6 @@ fn row_state(
         let state = if last_state.is_empty() { "stopped" } else { last_state };
         return classify(state, false);
     }
-    let hook = hook.filter(|state| *state != "stopped");
     match (hook, status, heuristic) {
         (Some(state), _, _) => classify(state, true),
         (None, "", Some(SessionStatus::Working)) => classify("working", true),
@@ -103,7 +102,7 @@ pub(crate) struct SidebarLayout {
 
 pub(crate) fn sidebar_layout(app: &App) -> SidebarLayout {
     // 下部バー 1 行を除いたサイドバー矩形は draw の chunks[0] と一致する
-    sidebar_layout_of(app.term_size.1.saturating_sub(1), app.sidebar_width)
+    sidebar_layout_of(app.term_size.1.saturating_sub(1), sidebar_cols(app))
 }
 
 /// [`sidebar_layout`] の本体。更新行が上部の版行に集約されたことでフッターは
@@ -698,10 +697,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         .split(frame.area());
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(app.sidebar_width),
-            Constraint::Min(1),
-        ])
+        .constraints([Constraint::Length(sidebar_cols(app)), Constraint::Min(1)])
         .split(vert[0]);
 
     // サイドバー: **行の正本は `~/.ccdesk/sessions.json`**（`app.sessions`）。
@@ -718,7 +714,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         session_id: crate::sessions::SessionId,
         alive: bool,
         heuristic: SessionStatus,
-        idle_secs: u64,
+        /// この窓が claude を起こした時刻（hook の新旧判断の材料）
+        launched_at: u64,
     }
     let windows: Vec<WindowView> = app
         .windows
@@ -727,12 +724,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             session_id: w.session_id.clone(),
             alive: w.alive(),
             heuristic: w.status_heuristic(),
-            idle_secs: w
-                .last_output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .elapsed()
-                .as_secs(),
+            launched_at: w.started_at,
         })
         .collect();
     let active = app.active;
@@ -787,15 +779,19 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         let view = row_state(
             alive,
             &row.last_state,
-            app.hook_states.get(&row.session_id),
+            app.hook_states
+                .get(&row.session_id, window.map(|(_, w)| w.launched_at)),
             status,
             window.map(|(_, w)| w.heuristic),
         );
-        // 経過時間: 動いている窓は最後の出力から、止まっている行は最後の更新から
-        let age_secs = match window {
-            Some((_, w)) if alive => w.idle_secs,
-            _ => now_ms.saturating_sub(row.updated_at) / 1000,
-        };
+        // **経過時間は「その行が今の姿になってからの時間」**（＝ 行の内容が最後に
+        // 実際に変わってからの経過）で、材料は `updated_at` 1 つだけ。
+        //
+        // **PTY の最後の出力からの経過は使わない**: そちらは行の中身と関係なく動く
+        // （フォーカスの出入り・カーソルの点滅・スピナーの描き直しでも新しくなる）ので、
+        // 他の行をクリックしただけで 0s に戻る。行に出す数が答えるべきなのは
+        // 「この行は最後にいつ変わったか」なので、材料も行の側に置く
+        let age_secs = now_ms.saturating_sub(row.updated_at) / 1000;
         data.push(RowData {
             action: RowAction::Open(row.session_id.clone()),
             group: view.group,
@@ -985,7 +981,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         }
         Grouping::Directory => {
             // 見出しに出すフォルダと並びの決定は project_rows に閉じている。
-            // 選択・close・delete 等の操作では並び替えない
+            // 選択・stop・close 等の操作では並び替えない
             let cwds: Vec<&str> = data.iter().map(|d| d.cwd.as_str()).collect();
             // セッション行の振り分けキーも**行ごとに 1 度だけ**作る（見出し × 行の
             // 総当たりになるので、突き合わせのたびに作ると描画 1 回で数千の String に
@@ -1439,15 +1435,33 @@ mod tests {
         assert_eq!(label(None, "", None), "Needs input");
     }
 
-    /// **生きている行の `stopped` は捨てる。** 再開した直後は前回の `SessionEnd` が
-    /// 保管に残っているので、そのまま出すと「動いているのに Stopped」になる
-    /// （生死の真実は PTY の `try_wait`）
+    /// **今の実行が書いた hook は `stopped` でもそのまま採る。**
+    ///
+    /// 以前は「生きている行の `stopped` は捨てる」ガードを持っていたが、生死の観測
+    /// （`try_wait`）は 2 秒周期で遅れて届くので、`stop` した直後の**正当な
+    /// `stopped` まで捨てて**前の state（`blocked` ＝ Needs input）へ戻していた
+    /// （実機で「一瞬 Stopped になってすぐ Needs input へ戻る」として出た）。
+    /// 前回の実行の残骸を捨てる判断は [`crate::hooks::HookStates::get`]
+    /// （窓の起動との時刻比較）が持つので、ここへ来るのは今の実行が書いた hook だけ
     #[test]
-    fn a_live_row_ignores_a_stale_stopped_from_the_previous_run() {
-        assert_eq!(row_state(true, "", Some("stopped"), "busy", None).label, "Working");
-        assert_eq!(row_state(true, "", Some("stopped"), "idle", None).label, "Needs input");
-        // 死んでいる行では捨てない（そこは本当に止まっている）
-        assert_eq!(row_state(false, "stopped", None, "", None).label, "Stopped");
+    fn a_stopped_hook_is_shown_before_the_process_death_is_observed() {
+        // pid の消失がまだ届いていない周期（窓は生きて見えている）
+        let view = row_state(
+            true,
+            "blocked",
+            Some("stopped"),
+            "idle",
+            Some(SessionStatus::NeedsInput),
+        );
+        assert_eq!(view.label, "Stopped", "a fresh stopped was thrown away");
+        assert!(view.group == Group::Completed, "a stopped row is not in the last group");
+        assert!(!view.spinning);
+        // **アイコンの形は状態ではなくプロセスの生死**を表す（観測どおりに出す）
+        assert!(view.alive, "the shape stopped following the process");
+        // 観測が届いた後も Stopped のまま（行に残る state が `stopped` になっている）
+        let dead = row_state(false, "stopped", None, "", None);
+        assert_eq!(dead.label, "Stopped");
+        assert!(!dead.alive);
     }
 
     /// **死んでいる行は最後に観測した state のまま**（生きている行の材料は使わない）。
@@ -1950,7 +1964,9 @@ mod tests {
             .enumerate()
             .map(|(idx, row)| {
                 let y = idx as u16 + 1; // 上枠の次の行から積まれる
-                let text: String = (1..app.sidebar_width.saturating_sub(1))
+                // 読む桁は**描画と同じ導出幅**（[`sidebar_cols`]）の内側。保存値を
+                // そのまま使うと、狭い端末では枠の外まで読んでしまう
+                let text: String = (1..sidebar_cols(app).saturating_sub(1))
                     .map(|x| buffer[(x, y)].symbol())
                     .collect();
                 (row.clone(), text.trim_end().to_string())
@@ -2077,6 +2093,105 @@ mod tests {
         render_sidebar(app).into_iter().map(|(_, t)| t).collect()
     }
 
+    /// **行に出る経過時間は `updated_at` からの経過**（＝ その行が今の姿になってからの
+    /// 時間）。材料が行の側にあるので、**行に関係のない出来事では動かない**
+    /// （以前は動いている行だけ PTY の最後の出力から数えていたので、フォーカスの
+    /// 出入りや claude の描き直しで 0s へ戻っていた）
+    #[test]
+    fn the_age_on_a_row_counts_from_the_last_change_to_that_row() {
+        let now = ccdesk::now_ms();
+        let aged = |secs: u64, id: &str, title: &str| crate::sessions::SessionRow {
+            updated_at: now.saturating_sub(secs * 1_000),
+            last_opened_at: now,
+            ..named_session(id, "C:\\dev\\api", title)
+        };
+        let mut app = App {
+            term_size: (120, 40),
+            sidebar_width: 34,
+            sessions: vec![aged(12, "a", "fresh"), aged(3 * 60, "b", "older")],
+            ..Default::default()
+        };
+        let lines = session_lines(&mut app);
+        let line = |needle: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} is not on any row: {lines:?}"))
+                .clone()
+        };
+        assert!(line("fresh").ends_with("· 12s"), "{:?}", line("fresh"));
+        assert!(line("older").ends_with("· 3m"), "{:?}", line("older"));
+    }
+
+    /// **止めた行は `Stopped`（Completed グループ・dim・停止形のアイコン）。**
+    ///
+    /// 実機では `stop` の直後に一瞬 `Stopped` になってから `Needs input` へ戻っていた
+    /// （保管に残った停止前の hook が載り直していた）。行の `last_state` が
+    /// `stopped` なら画面もそうなることを描画で固定する
+    #[test]
+    fn a_stopped_row_is_drawn_as_stopped_and_not_as_needs_input() {
+        let mut app = App {
+            term_size: (120, 40),
+            sidebar_width: 34,
+            sessions: vec![crate::sessions::SessionRow {
+                last_state: "stopped".to_string(),
+                ..named_session("s", "C:\\dev\\api", "stopped-row")
+            }],
+            ..Default::default()
+        };
+        let texts = sidebar_texts(&mut app);
+        let row = texts
+            .iter()
+            .find(|t| t.contains("stopped-row"))
+            .expect("the row was not drawn");
+        assert!(row.contains("Stopped"), "{row:?}");
+        assert!(!row.contains("Needs input"), "a dead row is asking for input: {row:?}");
+        // アイコンは生死を表すので停止形（生きている行の `✻` ではない）
+        assert!(row.starts_with(&format!("{MENU_MARK} {READ_MARK}∙")), "{row:?}");
+        // 集計もその 1 本を Completed 側で数える
+        let counts = texts
+            .iter()
+            .find(|t| t.contains("awaiting input"))
+            .expect("the summary row is missing");
+        assert!(
+            counts.starts_with("0 awaiting input · 0 working · 1"),
+            "a stopped row was counted as awaiting: {counts:?}"
+        );
+    }
+
+    /// **狭い端末はサイドバーを縮めて描くが、ユーザーが選んだ幅を忘れない。**
+    /// 端末が広がれば同じ幅で描き直される（実機で「セッションを止めると縮んだまま
+    /// 戻らない」として出た症状の描画側の固定）
+    #[test]
+    fn a_narrow_terminal_draws_a_narrower_sidebar_without_forgetting_the_width() {
+        let mut app = App {
+            term_size: (120, 20),
+            sidebar_width: 34,
+            ..Default::default()
+        };
+        // 右ペインの左枠線がサイドバー幅の位置に立つ（そこが境目）
+        let border_x = |app: &mut App| {
+            let (w, h) = app.term_size;
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
+                .expect("test terminal");
+            terminal.draw(|frame| {
+                draw(frame, app);
+            })
+            .expect("draw");
+            let buffer = terminal.backend().buffer().clone();
+            // 1 つ目はサイドバー自身の角、2 つ目が右ペインの角 ＝ そこが境目
+            (0..w)
+                .filter(|x| buffer[(*x, 0)].symbol() == "┌")
+                .nth(1)
+                .expect("the right pane has no top-left corner")
+        };
+        assert_eq!(border_x(&mut app), 34, "the chosen width is not what gets drawn");
+        app.term_size = (60, 20);
+        assert_eq!(border_x(&mut app), 20, "the narrow terminal did not shrink the sidebar");
+        app.term_size = (120, 20);
+        assert_eq!(border_x(&mut app), 34, "the sidebar stayed narrow after there was room again");
+    }
+
     /// **ピン留めした行はグループ内の先頭へ。** 並べ替えは安定なので、
     /// ピン留め以外の相対順は動かない（どちらのグルーピングでも同じ規則）
     #[test]
@@ -2106,14 +2221,15 @@ mod tests {
     }
 
     /// **一覧に隠し区画は無い。** アーカイブを廃止したので、行はどちらの
-    /// グルーピングでも通常の一覧に出て集計にも数えられる（`delete` が消すのは
+    /// グルーピングでも通常の一覧に出て集計にも数えられる（`close` が外すのは
     /// 行だけなので、アーカイブとの差は「戻す導線があるか」しか残らず、
     /// 節を 1 つ増やす価値が無かった）
     #[test]
     fn every_row_stays_in_the_normal_list_and_is_counted() {
         for grouping in [Grouping::State, Grouping::Directory] {
             let mut app = App {
-                term_size: (60, 40),
+                // 集計行が切られない幅の端末（このテストの関心は行数と集計の一致）
+                term_size: (120, 40),
                 sidebar_width: 34,
                 grouping,
                 sessions: vec![

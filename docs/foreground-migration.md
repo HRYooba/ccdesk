@@ -36,12 +36,12 @@ Claude Desktop も同じ構造（独自の JSON ストアを一覧の正本に�
 |:--|:--|
 | 起動 | PTY で `claude --session-id <uuid> [prompt]`。**`-n <title>` は渡さない**（claude が `-n` の名前を transcript の `custom-title` として残すので、ccdesk が組んだ名前を渡すと表示名がそこで凍る）。`CLAUDE_CODE_CHILD_SESSION` / `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID` / `CLAUDECODE` / `CLAUDE_JOB_DIR` 等の継承環境変数を除去（継承すると transcript 保存が無効になる実測あり） |
 | 一覧の正本 | `~/.ccdesk/sessions.json` |
-| title の正本 | **transcript**（`custom-title` > `ai-title` > `last-prompt`）。ccdesk のリネームもそこへ `custom-title` を追記する ＝ claude の `/rename` と同じ 1 箇所。ストアの `title` は表示用キャッシュ |
+| title の正本 | **transcript**（`custom-title` > `ai-title` > `last-prompt`）。ccdesk のリネームも同じ 1 箇所へ行く: **動いているセッションは PTY へ `/rename <名前>` を送って claude 自身に書かせ**（ペイン内の表示名も同時に変わる）、止まっているセッションだけ ccdesk が `custom-title` を追記する。ストアの `title` は表示用キャッシュ |
 | state | **hooks が主・`claude agents --json` の `status` が従**。どのイベントがどの state を意味するかは `src/hooks.rs` の `HOOK_EVENTS` が正本。**要約文は出さない**（Working / Needs input / Done / Stopped の 4 つだけ） |
 | 未読 | `updated_at > last_opened_at`。行頭のメニュー記号の右に `●` |
-| メニュー | 開く / ピン留め / 既読にする / 名前を変更 / 閉じる / 削除 |
+| メニュー | `open` / `pin` / `mark as read` / `rename` / `stop`（プロセスを止める・行は残る）/ `close`（一覧から外す・会話ログは残る） |
 | ショートカット | `Ctrl+S` `Ctrl+X` を撤去。予約は `Ctrl+Q` と `Alt+←→` のみ |
-| 削除の意味 | ccdesk の一覧から消すだけ。`~/.claude/projects/**/*.jsonl` は消さない |
+| `close` の意味 | ccdesk の一覧から外すだけ。`~/.claude/projects/**/*.jsonl` は消さない（だから「削除」とは呼ばない） |
 | 失うもの | ccdesk 終了で全セッション終了（行は残り再開できる）/ 外部からの `claude attach` 不可 / PR番号による Ready for review |
 
 **要約文を出さない**のは項目の削減ではなく、正本を 1 つにするための帰結:
@@ -141,11 +141,11 @@ flowchart LR
 - `App` の持ち物を「窓（`windows`）」と「行（`sessions`）」に分けた。
   行の identity は `SessionId`（`RowAction::Open` / `PopupKind::Session` /
   `pending_delete` まで型で通してある）
-- stop / delete は `claude stop|rm` の起動ではなく `child.kill()` + ストア操作へ。
-  **stop でも行は消さない**（`last_state` を `stopped` にして残す）
+- プロセスの停止と一覧からの行外しは `claude stop|rm` の起動ではなく `child.kill()` +
+  ストア操作へ。**止めても行は消さない**（`last_state` を `stopped` にして残す）
 - bg 前提で意味を失ったものを削除: `spawn_rx` / `SpawnOutcome`（PTY 起動は同期で
   数 ms なので別スレッドが要らない）/ 多重ディスパッチの抑止 /
-  `rescan_hot_until`（stop・delete が即時反映になった）/ `seen_alive` と
+  `rescan_hot_until`（停止・行外しが即時反映になった）/ `seen_alive` と
   `agents --json` の pid 消失による外部 stop 追従（生死は `child.try_wait()` が真実）/
   `run_claude_silent` / `Group::ReadyForReview`（PR 番号は state.json にしか無い）
 - `input_gate` は**意味を変えて残した**。宛先は起動時点で決まるので守る対象は
@@ -173,8 +173,8 @@ flowchart LR
   **hook が主・`agents --json` の `status` が従**（hook が一度も来ていない行だけ
   従へ落ちる）で、受けた state は行の `last_state` へも写す
   （写さないと ccdesk を落とした時点で「最後にどうなったか」が消える）
-- **生きている行の `stopped` は捨てる**: 生死の真実は PTY の `try_wait` なので、
-  再開直後に前回の `SessionEnd` が残っていても「動いているのに Stopped」にならない
+- **前回の実行が残した hook は捨てる**（判断は `hooks.rs` の `HookStates::get`。
+  当初は「生きている行の `stopped` を捨てる」形だったが、それはフェーズ6で置き換えた）
 - **title は transcript の末尾だけを読む。** `custom-title` / `ai-title` /
   `last-prompt` を拾い、優先順で選ぶ。先頭ユーザープロンプトは起動時に ccdesk が
   渡したものなので transcript を読み直さない（行はすべて ccdesk が起こしている）
@@ -195,7 +195,7 @@ flowchart LR
 claude 本体のキーバインドが死ぬ**（`Ctrl+S` / `Ctrl+X` は実際に claude 側の打鍵）。
 
 - セッションのメニューを **`open` を先頭に置いた 6 項目**へ（`open` / `pin` /
-  `mark as read` / `rename` / `close` / `delete`）。落ちるのは `close` だけで、
+  `mark as read` / `rename` / `stop` / `close`。語はフェーズ6で実態に合わせた）。落ちるのは `stop` だけで、
   条件は「窓が開いていない」（他は停止中の行にも効く ＝ `open` は止まっている行を起こし直す）。
   `open` は行クリックと同じ `open_session` を通る ＝ 開く経路を 2 つ持たない
 - `Ctrl+S` `Ctrl+X` を撤去。**予約キーの判定を 1 つの純関数**
@@ -247,7 +247,7 @@ claude 本体のキーバインドが死ぬ**（`Ctrl+S` / `Ctrl+X` は実際に
 - 行への操作（ピン留め・名前）は `updated_at` を進めるが**未読を作らない**。
   未読は「見ていない間に新しいことが起きた」の意味なので、自分が触ったことで
   `●` が生えるのは嘘になる（`app.rs` の `edit_row`）
-- `delete` が消すのは行だけ。`~/.claude/projects/**/*.jsonl` は残す
+- 一覧から行を外しても消えるのは行だけ。`~/.claude/projects/**/*.jsonl` は残す
   （`claude -r` の材料であり、claude 側の持ち物）
 
 ### フェーズ5: 名前の正本を transcript へ寄せ、行と claude の実体を一致させる（済）
@@ -256,10 +256,10 @@ claude 本体のキーバインドが死ぬ**（`Ctrl+S` / `Ctrl+X` は実際に
 名前・会話・プロセスの 3 つで、行と claude の記録がずれる経路を閉じた。
 
 - **アーカイブを廃止**（メニュー・`Archived` 節・`SessionRow.archived` ごと）。
-  ccdesk の `delete` は行を忘れるだけで transcript を消さないので、
-  **archive と delete の差は「戻す導線があるか」だけ**になる ＝ 節を 1 つ増やして
+  一覧から行を外す操作は行を忘れるだけで transcript を消さないので、
+  **archive との差は「戻す導線があるか」だけ**になる ＝ 節を 1 つ増やして
   一覧を二分する価値が無い。メニューは 6 項目（`open` / `pin` / `mark as read` /
-  `rename` / `close` / `delete`）
+  `rename` / `stop` / `close`）
 - **名前の正本を transcript の 1 箇所にした。** ccdesk の `rename` は
   `custom-title` を 1 行追記し（claude の `/rename` と同じ形・同じ場所）、
   読み直しは**格下げのガードも `Custom` の行の除外も持たない** ＝
@@ -302,6 +302,54 @@ claude 本体のキーバインドが死ぬ**（`Ctrl+S` / `Ctrl+X` は実際に
 名前が `last-prompt` へ落ちる（格下げのガードを外した代償）。名前を固定したいときは
 `rename` で `custom-title` に置ける。また pid の追従は `claude` が中間プロセス越しに
 起動する環境（npm 版の `.cmd` シム等）では効かない ＝ 追従しないだけで壊れはしない。
+
+### フェーズ6: 実機で見つかった食い違いを閉じる（済）
+
+**この段階の本質は「画面に出ている値が何を材料にしているか」を揃えたこと。**
+どれも実機でしか出ない食い違いで、原因はすべて**同じ問いに 2 つの材料があった**こと。
+
+- **リネームは動いているセッションでは claude に打たせる**（`app.rs` の
+  `send_rename_to_session`）。ccdesk が `custom-title` を追記しても
+  **claude は自分の transcript を監視していない**ので、ペイン内の表示名は起動時の値
+  （`new session`）のまま残っていた。`/rename <名前>` を PTY へ送れば claude が
+  表示名と `custom-title` の両方を更新する ＝ ユーザーが手で打つのと同じ結果になり、
+  ccdesk が内部形式へ書く必要も消える。止まっている行は送り先が無いので従来どおり追記する
+  （分岐はリネームの確定 1 箇所）。**打ちかけの文字は消さない**: 行頭までクリアすれば
+  必ず送れるが、それは送信前の取り返せない文字を捨てることになるので、入力欄が空と
+  言えないとき（打ちかけがある・応答生成中・許可待ち）は追記側へ倒す。名前は
+  `title_text` で 1 行に畳んでから送る（改行・制御文字を PTY へ生で流さない）
+- **サイドバー幅は保存値を書き換えない**（`app.rs` の `sidebar_cols` / `fit_sidebar`）。
+  端末幅で丸める処理が保存値そのものを上書きしていたので、**端末サイズ変化イベントが
+  1 度届くだけで幅が縮み、端末が元に戻っても復元しなかった**（Windows では PTY の
+  破棄がこのイベントを連れてくる ＝ セッションを止めるたびに数桁ずつ縮んで見える）。
+  保存値はユーザーが選んだ幅の正本のままにし、**画面に出す桁数は端末幅から導く**
+  ＝ 書き換える経路はドラッグ 1 つだけになった
+- **行の経過時間は `updated_at` だけから出す**（`ui::mod` の `age_secs`）。
+  動いている行は「PTY の最後の出力から」を材料にしていたので、フォーカスの出入りや
+  claude の描き直しでも新しくなり、**他の行をクリックするだけで 0s へ戻っていた**。
+  経過時間の意味を「**その行が今の姿になってからの時間**」＝ 行の内容が最後に実際に
+  変わってからの経過に決め、材料も行の側 1 つにした。あわせて `edit_row` は
+  **中身が実際に変わったときだけ** `updated_at` を進める（既読の行への `mark as read` の
+  ように何も変えない操作で経過時間が戻らない）
+- **hook の新旧は時刻で判断する**（`hooks.rs` の `HookStates::get`）。
+  以前は「生きている行の `stopped` を捨てる」形だったが、生死の観測（`try_wait`）は
+  2 秒周期で遅れて届くので、**`stop` した直後の正当な `stopped` が捨てられ**、
+  行が一瞬 `Stopped` になってから `Needs input` へ戻っていた（実データで
+  `hook-states.json` が `stopped`、`sessions.json` が `blocked` になっていた原因）。
+  判断材料を「**その hook はいつの実行のものか**」へ替え、
+  **窓（PTY）を起こした時刻より新しい記録だけ**を採る。窓の時刻を正本にしたのは、
+  前景セッションの実体がその子プロセスで起こした瞬間を正確に知っているのがそこだけだから
+  （`claude agents --json` の `startedAt` は 2 秒周期の観測なので、再開直後は前回の実行の
+  値が残り、自分の子の pid が載らない環境では値そのものが来ない）。
+  窓が無い行の hook はすべて過去の実行のもの ＝ 採らない
+- **終了時に開いている行を `stopped` として記録する**（`app.rs` の
+  `stop_sessions_on_exit`）。記録せずに子を殺すと、次の起動で行が「動いていた頃の
+  state」を出し続ける ＝ 死んでいるのに `Needs input` に見える。`last_state` が
+  「最後に観測した state」である以上、殺す側は観測者なので記録する義務がある
+- メニューの語を実態に合わせた（`close` → `stop` / `delete` → `close`）。
+  `delete` は会話ログを消さないので「削除」は嘘で、実態は「一覧から閉じる」。
+  プロセスを殺す方は「止める」が実態。無効化の条件も語に合わせて `stop` へ移した
+  （窓が無い行 ＝ 止めるプロセスが無い）
 
 ## 失うもの（受け入れた代償）
 

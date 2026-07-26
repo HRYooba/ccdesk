@@ -26,7 +26,7 @@ mod title;
 mod ui;
 mod update;
 
-use app::{clamp_sidebar, instant_ago, open_session, run, App, Focus, RightView, SelfUpdate};
+use app::{instant_ago, open_session, run, App, Focus, RightView, SelfUpdate};
 use cli::{print_usage, run_doctor, show_logs, statusline_hook, update_self};
 use poll::FooterInfo;
 use source::{DataSource, DemoSource, LiveSource};
@@ -139,6 +139,8 @@ fn main() -> anyhow::Result<()> {
         titles: title::Titles::default(),
         last_scan: std::time::Instant::now(),
         last_live_scan: std::time::Instant::now(),
+        // 保存値はそのまま持つ（画面に出す桁数は端末幅から導くので丸めない ＝
+        // 狭い端末で一度起動しただけでユーザーの選んだ幅が失われない）
         sidebar_width: window.sidebar_width,
         dragging: false,
         last_drag_resize: std::time::Instant::now(),
@@ -175,7 +177,6 @@ fn main() -> anyhow::Result<()> {
         focus: Focus::Terminal,
         source,
     };
-    clamp_sidebar(&mut app); // 保存値が現在の端末幅を超えていたら丸める
     // 既にあるセッションのフォルダを登録へ埋め戻す（以前から使っているフォルダの
     // 見出しが、最後のセッションを消した時点で消えないように）。一覧を読んだ後・
     // 画面を組む前のこの位置に置く: 埋め戻しは初回の一覧に効く必要がある
@@ -199,9 +200,7 @@ fn main() -> anyhow::Result<()> {
 
     // 終了時に子プロセスを残さない。**行は残す**（`sessions.json` はそのまま ＝
     // 次の起動で一覧に出て `claude -r` で再開できる）
-    for window in &mut app.windows {
-        let _ = window.child.kill();
-    }
+    app::stop_sessions_on_exit(&mut app);
     let _ = crossterm::execute!(
         std::io::stdout(),
         DisableFocusChange,

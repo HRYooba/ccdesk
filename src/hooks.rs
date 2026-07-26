@@ -66,26 +66,56 @@ const KEEP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// 次のイベントで載る（状態は毎 turn 上書きされるので取り返しがつく）
 const LOCK_WAIT: Duration = Duration::from_millis(500);
 
-/// hook が書いた state の写し（`session_id` → state）。
-///
-/// **時刻は持たない**: 読み手が使うのは「今この行の state は何か」だけで、
-/// 古い項目を落とすのは書き手側（[`record`]）の仕事
+/// hook が書いた state 1 件。**受けた時刻（`at`）を捨てない**のが要点で、
+/// 保管に残っている項目が「今動いている実行のもの」か「前回の実行の残骸」かは
+/// この時刻でしか区別できない（[`HookStates::get`]）
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Entry {
+    state: String,
+    /// 受けた時刻（epoch ms）。**書き手（[`record`]）と同じ時計**
+    at: u64,
+}
+
+/// hook が書いた state の写し（`session_id` → [`Entry`]）
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct HookStates(BTreeMap<SessionId, String>);
+pub(crate) struct HookStates(BTreeMap<SessionId, Entry>);
 
 impl HookStates {
-    /// その行に hook 由来の state があるか。**None は「hook が来ていない」**で、
-    /// 呼び手（描画）はそのとき `agents --json` の従経路へ落ちる
-    pub(crate) fn get(&self, id: &SessionId) -> Option<&str> {
-        self.0.get(id).map(String::as_str)
+    /// その行の hook 由来の state。`launched` は**その行を今動かしている窓を
+    /// 起こした時刻**（窓が無ければ None）。**None は「使える hook が無い」**で、
+    /// 呼び手（描画）はそのとき `agents --json` の従経路へ落ちる。
+    ///
+    /// **保管に残っているだけでは採らない。** 受け渡しファイルはセッションが
+    /// 終わっても残る（[`KEEP`]）ので、次の 2 つはどちらも残骸として捨てる:
+    ///
+    /// - 窓が無い ＝ その行は動いていない（前景セッションの実体は ccdesk の子）
+    /// - 記録が窓の起動より古い ＝ 前回の実行のもの（再開直後に前回の
+    ///   `SessionEnd` が残っている場合）
+    ///
+    /// **「行が生きているか」では判断しない。** 生死の観測（`try_wait`）は
+    /// 2 秒周期で遅れて届くので、それを材料にすると `stop` 直後の**正当な
+    /// `stopped` が捨てられ**、前の state（`blocked` ＝ Needs input）に戻る
+    pub(crate) fn get(&self, id: &SessionId, launched: Option<u64>) -> Option<&str> {
+        let entry = self.0.get(id)?;
+        (entry.at >= launched?).then_some(entry.state.as_str())
     }
 
     #[cfg(test)]
-    pub(crate) fn from_pairs<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+    pub(crate) fn from_entries<'a>(
+        entries: impl IntoIterator<Item = (&'a str, &'a str, u64)>,
+    ) -> Self {
         Self(
-            pairs
+            entries
                 .into_iter()
-                .map(|(id, state)| (SessionId::new(id), state.to_string()))
+                .map(|(id, state, at)| {
+                    (
+                        SessionId::new(id),
+                        Entry {
+                            state: state.to_string(),
+                            at,
+                        },
+                    )
+                })
                 .collect(),
         )
     }
@@ -192,7 +222,7 @@ fn states_at(path: &Path) -> HookStates {
     HookStates(
         read_entries(path)
             .into_iter()
-            .map(|(id, (state, _))| (SessionId::new(id), state))
+            .map(|(id, (state, at))| (SessionId::new(id), Entry { state, at }))
             .collect(),
     )
 }
@@ -297,6 +327,13 @@ mod tests {
         SessionId::new(text)
     }
 
+    /// 保管に載っている state（時刻の新旧は問わない）。**新旧の判断そのものは
+    /// [`a_hook_state_belongs_to_the_run_that_was_launched_before_it`] が固定する**ので、
+    /// 保管の読み書きを見る他のテストは起動時刻 0（＝ 何でも受ける）で引く
+    fn stored(states: &HookStates, id: &SessionId) -> Option<String> {
+        states.get(id, Some(0)).map(str::to_string)
+    }
+
     /// **注入する表と受け口が同じ表を読む。** 片方だけ知っているイベントがあると、
     /// 注入したのに何も起きない（または登録されていない口が残る）
     #[test]
@@ -354,15 +391,40 @@ mod tests {
         record(&temp.path(), &id("s-2"), "blocked", 1_000);
         assert_eq!(
             states_at(&temp.path()),
-            HookStates::from_pairs([("s-1", "working"), ("s-2", "blocked")])
+            HookStates::from_entries([("s-1", "working", 1_000), ("s-2", "blocked", 1_000)])
         );
 
         // 同じセッションの次のイベントは上書き（状態は最後に受けたものが正しい）
         record(&temp.path(), &id("s-1"), "done", 2_000);
         let states = states_at(&temp.path());
-        assert_eq!(states.get(&id("s-1")), Some("done"));
-        assert_eq!(states.get(&id("s-2")), Some("blocked"), "affected another session");
-        assert_eq!(states.get(&id("s-3")), None, "answered for an unknown session");
+        assert_eq!(stored(&states, &id("s-1")).as_deref(), Some("done"));
+        assert_eq!(
+            stored(&states, &id("s-2")).as_deref(),
+            Some("blocked"),
+            "affected another session"
+        );
+        assert_eq!(stored(&states, &id("s-3")), None, "answered for an unknown session");
+    }
+
+    /// **hook の記録は「その行を今動かしている窓の起動より新しいもの」だけが有効。**
+    ///
+    /// 受け渡しファイルはセッションが終わっても残るので、時刻で新旧を見ないと
+    /// 前回の実行の `SessionEnd` が再開直後の行を Stopped に見せる。逆に
+    /// 「行が生きているか」で判断すると（生死の観測は 2 秒周期で遅れて届く）
+    /// `stop` 直後の正当な `stopped` が捨てられる
+    #[test]
+    fn a_hook_state_belongs_to_the_run_that_was_launched_before_it() {
+        let states = HookStates::from_entries([("s", "stopped", 2_000)]);
+        // 起動より後に記録された ＝ 今の実行のもの
+        assert_eq!(states.get(&id("s"), Some(1_000)), Some("stopped"));
+        // 起動と同時刻も今の実行（時計の分解能で同じ ms に並び得る）
+        assert_eq!(states.get(&id("s"), Some(2_000)), Some("stopped"));
+        // 起動より前に記録された ＝ 前回の実行の残骸
+        assert_eq!(states.get(&id("s"), Some(3_000)), None);
+        // 窓が無い行は動いていない ＝ 保管の値は過去の実行のもの
+        assert_eq!(states.get(&id("s"), None), None);
+        // 記録の無い行はいつでも None（hook が一度も来ていない）
+        assert_eq!(states.get(&id("other"), Some(0)), None);
     }
 
     /// **古い項目は書くたびに落ちる**（1 セッション 1 項目で永久に積もらない）。
@@ -377,9 +439,13 @@ mod tests {
         // old は keep をちょうど過ぎた時点で落ちる
         record(&temp.path(), &id("now"), "blocked", keep + 1);
         let states = states_at(&temp.path());
-        assert_eq!(states.get(&id("old")), None, "an entry past the keep window remains");
-        assert_eq!(states.get(&id("fresh")), Some("working"), "dropped an entry still within the window");
-        assert_eq!(states.get(&id("now")), Some("blocked"));
+        assert_eq!(stored(&states, &id("old")), None, "an entry past the keep window remains");
+        assert_eq!(
+            stored(&states, &id("fresh")).as_deref(),
+            Some("working"),
+            "dropped an entry still within the window"
+        );
+        assert_eq!(stored(&states, &id("now")).as_deref(), Some("blocked"));
     }
 
     /// 壊れた / 想定外の形でも読みは失敗しない（＝ TUI の周期処理が止まらない）。
@@ -403,7 +469,7 @@ mod tests {
         }
         // 時刻が無い / 型違いでも state は読む（既定 0 ＝ 次の書き込みで落ちる）
         std::fs::write(temp.path(), r#"{"states":{"s":{"state":"done","at":"soon"}}}"#).unwrap();
-        assert_eq!(states_at(&temp.path()).get(&id("s")), Some("done"));
+        assert_eq!(stored(&states_at(&temp.path()), &id("s")).as_deref(), Some("done"));
     }
 
     /// hook 入力から取るのは `session_id` だけ。**取れなければ何も書かない**
@@ -460,6 +526,6 @@ mod tests {
         assert_eq!(std::fs::read(temp.path()).unwrap(), before, "wrote even though the lock wasn't acquired");
         // 解放後は通常どおり載る（ロックが理由で壊れているわけではない）
         record(&temp.path(), &id("s"), "done", 2_000);
-        assert_eq!(states_at(&temp.path()).get(&id("s")), Some("done"));
+        assert_eq!(stored(&states_at(&temp.path()), &id("s")).as_deref(), Some("done"));
     }
 }

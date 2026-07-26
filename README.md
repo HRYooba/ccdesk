@@ -24,27 +24,35 @@ reopen one and it resumes from its transcript.
 - **Foreground sessions you own** — a new session starts as
   `claude --session-id <uuid>` in the pane and reopening a row resumes it with
   `claude -r`, or starts it fresh under the same UUID when the row has no transcript yet
-  (a session you closed before its first turn has no conversation to resume);
-  `close` ends the process while the row stays (resume it any time) and
-  `delete` drops the row (your transcripts in `~/.claude/projects/` are never removed).
+  (a session you stopped before its first turn has no conversation to resume);
+  `stop` ends the process while the row stays (`open` resumes it any time) and
+  `close` drops the row from the list (your transcripts in `~/.claude/projects/` are never
+  removed, which is why neither word is "delete").
   Running `/resume` inside a pane moves that process to another conversation, and the
   sidebar follows it: the row (and its name) become the session the pane is really running
 - **A menu per row** — clicking the `=` at the head of a session row, or pressing `Enter` with
-  the sidebar focused, opens `open` / `pin` / `mark as read` / `rename` / `close` /
-  `delete`. `open` is the same thing a click on the row body does (switch to the window, or
-  resume it), and it is how the keyboard opens a session. `close` is the only
-  entry that greys out, and only when no window is open.
+  the sidebar focused, opens `open` / `pin` / `mark as read` / `rename` / `stop` /
+  `close`. `open` is the same thing a click on the row body does (switch to the window, or
+  resume it), and it is how the keyboard opens a session. `stop` is the only
+  entry that greys out, and only when no window is open (there is no process to end).
   Pinned rows sort to the top of their group; `rename` turns the row itself into an input —
-  `Enter` keeps the name, `Esc` throws it away. There is no `archive`: `delete` only forgets
+  `Enter` keeps the name, `Esc` throws it away. There is no `archive`: `close` only forgets
   the row, so archiving would differ from it by nothing but having a way back.
   **None of these operations gets its own shortcut key**: one
   entry point means one thing to read, and every key ccdesk does not reserve is a key
   claude Code still gets
 - **Names that match what claude shows** — a row is named after its transcript
-  (`custom-title` > `ai-title` > the last prompt), so `rename` writes the same
-  `custom-title` record `/rename` writes inside the session and either one shows up
-  in both places. Until the first turn creates the transcript, the name you typed is held
-  in `~/.ccdesk/sessions.json` and lands in the transcript as soon as it exists
+  (`custom-title` > `ai-title` > the last prompt), the same record `/rename` writes
+  inside the session. On a running session `rename` types `/rename <name>` into the pane for
+  you, so claude updates both its own header and the transcript — nothing else can change the
+  name claude is showing. On a stopped session (or while you have half-typed text waiting in
+  the prompt, which ccdesk will not throw away) the name is appended to the transcript
+  instead and claude picks it up the next time you open the row. Until the first turn creates
+  the transcript, the name you typed is held in `~/.ccdesk/sessions.json` and lands in the
+  transcript as soon as it exists
+- **A row's age** — the `· 12s` at the right of a row is how long the row has looked the way
+  it does, i.e. the time since its state or name last actually changed. Clicking around the
+  list, focusing a pane or claude redrawing itself does not reset it
 - **Unread rows** — a `●` right after the `=` marks a row that changed while you were not
   looking at it (`mark as read` clears it, and so does opening the row). The column is
   reserved either way, so names never shift sideways
@@ -82,7 +90,9 @@ reopen one and it resumes from its transcript.
   the background by default, so the claude row may clear itself without you doing anything
 - **Mouse-first**: click to switch/focus, the `=` at the head of a row for what you can do
   to it, `⊞ group` row to switch grouping, account line for account switching, drag the
-  border to resize
+  border to resize. **Dragging is the only thing that changes the sidebar width**: a terminal
+  too narrow to hold it draws a narrower sidebar without forgetting the width you picked, so
+  the sidebar comes back when there is room again
 - **Keyboard**: ccdesk reserves exactly two things — `Alt+←/→` pane focus and `Ctrl+Q`
   quit. **Everything else passes through to claude untouched**, including `Ctrl+S`, `Ctrl+X`
   and a bare `←`/`→`. With the sidebar focused there are only two keys: `↑↓` select — past

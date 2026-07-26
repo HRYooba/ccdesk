@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
-use ccdesk::{new_parser, Parser};
+use ccdesk::{new_parser, now_ms, Parser};
 
 use crate::sessions::SessionId;
 use crate::theme::HOST_COLORS;
@@ -52,6 +52,15 @@ pub(crate) struct Session {
     pub(crate) master: Box<dyn MasterPty + Send>,
     pub(crate) child: Box<dyn Child + Send + Sync>,
     pub(crate) size: (u16, u16), // (rows, cols)
+    /// **この窓が claude を起こした時刻**（epoch ms）。hook が書いた state が
+    /// 今の実行のものか前回の実行の残骸かを決める材料
+    /// （[`crate::hooks::HookStates::get`]）。
+    ///
+    /// **正本をここに置く理由**: 前景セッションの実体はこの子プロセスなので、
+    /// 「いつ起こしたか」を正確に知っているのはここだけ。`claude agents --json` の
+    /// `startedAt` は 2 秒周期の観測で、再開直後は前回の実行の値が残っているうえ、
+    /// 自分の子の pid が載らない環境（npm 版）では値そのものが来ない
+    pub(crate) started_at: u64,
     pub(crate) last_output: Arc<Mutex<std::time::Instant>>,
     // PTY から新しい出力が来たら true（再描画が必要かの判定に使う）
     pub(crate) dirty: Arc<AtomicBool>,
@@ -121,6 +130,18 @@ fn build_command(
         }
     }
     cmd
+}
+
+/// カーソルより左の 1 行から「入力欄が空か」を読む（[`Session::input_line_is_empty`] の
+/// 判断。画面を組まずに検査できる）。
+///
+/// 最後の `>`（claude の入力プロンプト）より右に文字が無ければ空。**`>` が無ければ
+/// 空とは言わない** ＝ 判断がつかないときは「送れない」側へ倒れる
+fn input_is_empty(line_up_to_cursor: &str) -> bool {
+    match line_up_to_cursor.rfind('>') {
+        Some(at) => line_up_to_cursor[at + 1..].trim().is_empty(),
+        None => false,
+    }
 }
 
 impl Session {
@@ -274,6 +295,7 @@ impl Session {
             master: pair.master,
             child,
             size: (rows, cols),
+            started_at: now_ms(),
             last_output,
             dirty,
             started,
@@ -299,6 +321,41 @@ impl Session {
         let seq: &[u8] = if gained { b"\x1b[I" } else { b"\x1b[O" };
         let mut writer = self.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = writer.write_all(seq);
+        let _ = writer.flush();
+    }
+
+    /// **claude の入力欄が空か**（＝ こちらから 1 行送っても打ちかけを壊さないか）。
+    ///
+    /// 判定は画面のカーソル行だけを見る: 行内の最後の `>`（claude の入力プロンプト）から
+    /// カーソル位置までに文字が無ければ空。**カーソル行に `>` が無ければ空とは言わない**
+    /// ので、応答生成中・許可待ちのダイアログ・起動直後（まだ入力欄が出ていない）は
+    /// すべて「送れない」側へ倒れる。
+    ///
+    /// **claude の画面の形に依存する判定なので、外したときに倒れる向きを選んである**:
+    /// 形が変わって `>` が見つからなくなっても、起きるのは「PTY へ送らず transcript へ
+    /// 書く」＝ 従来どおりの経路で、ユーザーの打ちかけを消す方へは倒れない
+    pub(crate) fn input_line_is_empty(&self) -> bool {
+        let parser = self
+            .parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let screen = parser.screen();
+        let (row, col) = screen.cursor_position();
+        input_is_empty(&screen.contents_between(row, 0, row, col))
+    }
+
+    /// 入力欄へ 1 行送る（`/rename <名前>` のようなスラッシュコマンド）。
+    ///
+    /// **改行まで含めて 1 回の write** にするのは、reader スレッドが書き戻す端末応答と
+    /// 行の途中で混ざらないため（[`Self::send_focus`] と同じ作り）。
+    /// 行末は打鍵と同じ `\r`（[`crate::keys::encode_key`] の Enter）
+    pub(crate) fn send_line(&mut self, line: &str) {
+        let payload = format!("{line}\r");
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = writer.write_all(payload.as_bytes());
         let _ = writer.flush();
     }
 
@@ -392,6 +449,41 @@ mod tests {
     fn resuming_passes_only_the_session_id() {
         let cmd = build_command(&id(), "C:\\dev\\app", Launch::Resume, None);
         assert_eq!(argv(&cmd), ["-r", id().as_str()]);
+    }
+
+    /// **入力欄が空だと言えるのは、プロンプト（`>`）が見えていてその右が空のときだけ。**
+    ///
+    /// この判断が守るのは 2 つ: ユーザーの打ちかけの文字を消さないこと（打ちかけが
+    /// あるときは送らない ＝ 呼び手が transcript へ倒れる）と、claude が入力を
+    /// 受け付けていない画面（応答生成中・許可待ち・起動直後）へ打鍵を投げないこと。
+    /// **判断がつかない形はすべて「空ではない」側**へ倒す
+    #[test]
+    fn the_input_is_only_empty_when_the_prompt_is_visible_and_nothing_follows_it() {
+        // claude の入力枠（枠線 + プロンプト）。カーソルはプロンプトの直後
+        assert!(input_is_empty("│ > "));
+        assert!(input_is_empty(">"));
+        // 打ちかけの文字がある ＝ 送ると混ざる
+        assert!(!input_is_empty("│ > half-typed message"));
+        assert!(!input_is_empty("│ > /ren"));
+        // プロンプトが見えない行（応答生成中のスピナー行・許可待ち・空の画面）
+        for line in ["", "  ", "✻ Thinking…", "│ 1. Yes, allow once"] {
+            assert!(!input_is_empty(line), "claimed the input is empty for {line:?}");
+        }
+        // 出力に `>` が出ていても、その右に文字があれば空とは言わない
+        assert!(!input_is_empty("  => result"));
+    }
+
+    /// 送る 1 行は**改行と制御文字を含まない**（PTY へ生で流すので、混ざると
+    /// 別の打鍵として解釈される）。畳むのは [`crate::title::title_text`] 1 箇所
+    #[test]
+    fn a_line_sent_to_the_pty_carries_no_control_characters() {
+        let folded = crate::title::title_text("new\nname\twith\rbreaks");
+        let line = format!("/rename {folded}");
+        assert_eq!(line, "/rename new name with breaks");
+        assert!(
+            !line.chars().any(|c| c.is_control()),
+            "a control character survived into the line: {line:?}"
+        );
     }
 
     /// 使用率表示（opt-in）の settings は起動の種類に関係なく前に付く
