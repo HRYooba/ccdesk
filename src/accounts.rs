@@ -689,11 +689,20 @@ impl AccountStore {
     /// 差し替えの土台になる現行ファイル。無い・空なら新規（`{}`）から作る。
     ///
     /// **中身があるのに JSON として読めないときは失敗させる。** そこで `{}` に
-    /// 倒すと、読めなかっただけの `mcpOAuth` を消してしまう
+    /// 倒すと、読めなかっただけの `mcpOAuth` を消してしまう。
+    ///
+    /// **「無い」と言えるのは `NotFound` だけ。** 存在するが読めない（権限・
+    /// ウイルス対策やバックアップの共有違反・I/O エラー）を未ログインと同じ扱いに
+    /// すると、rename が通る限り `mcpOAuth` と未知のトップレベルキーを丸ごと失う
+    /// ＝ 壊れた JSON を失敗にしている理由がそのまま当てはまる
     fn current_document(&self) -> anyhow::Result<Value> {
         let path = &self.paths.credentials;
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Ok(json!({})); // 未ログイン（ファイルが無い）
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(json!({})); // 未ログイン（ファイルが無い）
+            }
+            Err(e) => return Err(anyhow!("could not read {}: {e}", path.display())),
         };
         if text.trim().is_empty() {
             return Ok(json!({}));
@@ -1199,6 +1208,52 @@ pub(crate) mod tests {
             std::fs::read_to_string(home.paths().credentials).unwrap(),
             "{ this is not json",
             "壊れたファイルを上書きしている（mcpOAuth を失う経路）"
+        );
+    }
+
+    /// **「読めない」を「まだログインしていない」に倒さない。**
+    ///
+    /// 壊れた JSON は失敗にしているのに、**存在するが読めない**（権限・
+    /// ウイルス対策やバックアップの共有違反・I/O エラー）を「ファイルが無い」と
+    /// 同じ扱いにすると、土台が `{}` になって `mcpOAuth` と未知のトップレベルキーを
+    /// 丸ごと失う。許すのは `NotFound` だけ。
+    ///
+    /// 状況は **FILE_SHARE_DELETE だけを許した開きっぱなしのハンドル**で作る:
+    /// 読みは共有違反で失敗するが rename での差し替えは通る ＝ 実際に上書きが
+    /// 起きうる条件をそのまま再現できる（読みも rename も止まる `share_mode(0)`
+    /// では「壊す経路」が作れない）
+    #[test]
+    fn switch_refuses_to_clobber_credentials_it_cannot_read() {
+        use std::os::windows::fs::OpenOptionsExt;
+        /// FILE_SHARE_DELETE のみ（読みは拒否し、rename での差し替えは許す）
+        const FILE_SHARE_DELETE: u32 = 0x4;
+
+        let home = TempHome::new("switch_refuses_to_clobber_credentials_it_cannot_read");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+        let before = std::fs::read(home.paths().credentials).unwrap();
+
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_DELETE)
+            .open(home.paths().credentials)
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(home.paths().credentials).is_err(),
+            "テストの前提が崩れている（読めてしまっている）"
+        );
+        let result = store.switch_to(EMAIL_A, &Outgoing::NobodyLoggedIn);
+        drop(held);
+
+        assert!(
+            result.is_err(),
+            "読めなかっただけのファイルを未ログイン扱いで差し替えている"
+        );
+        assert_eq!(
+            std::fs::read(home.paths().credentials).unwrap(),
+            before,
+            "読めないファイルを上書きしている（mcpOAuth と未知のキーを失う経路）"
         );
     }
 
