@@ -258,6 +258,12 @@ pub(crate) struct LiveSource {
 
 impl LiveSource {
     pub(crate) fn new(usage_display: bool) -> Self {
+        // 前回の異常終了が残した書きかけの `.tmp`（**中身はトークン**）を回収する。
+        // 実データ側だけで行う ＝ 撮影（[`DemoSource`]）は実ファイルに触らない、
+        // という約束を「今 demo か」の分岐を足さずに守れる置き場所
+        if let Some(store) = AccountStore::detect() {
+            store.cleanup_leftover_tmp();
+        }
         Self {
             usage_display,
             projects_baseline: Mutex::new(Vec::new()),

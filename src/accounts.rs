@@ -325,6 +325,10 @@ fn lock_age(path: &Path) -> Option<Duration> {
 /// claude と共有するロックの待ち（[`LOCK_WAIT`]）より短くてよい
 const STORE_LOCK_WAIT: Duration = Duration::from_secs(2);
 
+/// 起動時に回収する `.tmp` の古さ（[`AccountStore::cleanup_leftover_tmp`]）。
+/// 書いている最中の別インスタンスの tmp を消さないため、十分に古いものだけを消す
+const TMP_KEEP: Duration = Duration::from_secs(3600);
+
 /// アカウント保管ストア。保管先とロックの位置は [`Paths`] で注入する
 pub(crate) struct AccountStore {
     paths: Paths,
@@ -454,6 +458,44 @@ impl AccountStore {
         )
     }
 
+    /// 起動時の掃除: [`write_json_atomically`] が rename する前にプロセスが死ぬと、
+    /// **トークン入りの `.tmp` が誰にも消されずに残る**（README が
+    /// 「`accounts.json` は `.credentials.json` と同じ扱いをせよ」と案内している
+    /// 対象の外にファイルが増える）。`update::cleanup_old_exe` と同じ
+    /// 「次にプロセスを起こしたときに片付ける」方式で回収する。
+    ///
+    /// 消すのは **自分たちが付ける形の名前**（[`is_leftover_tmp`]）で、かつ十分に
+    /// 古いもの（[`TMP_KEEP`]）だけ。今まさに書いている別インスタンスの tmp や、
+    /// 無関係な `.tmp` を消さないため。失敗は無視する（掃除は次の起動でまた来る）
+    pub(crate) fn cleanup_leftover_tmp(&self) {
+        for target in [&self.paths.store, &self.paths.credentials] {
+            let (Some(dir), Some(name)) = (target.parent(), target.file_name().and_then(|n| n.to_str()))
+            else {
+                continue;
+            };
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|file| is_leftover_tmp(file, name))
+                {
+                    continue;
+                }
+                let old = entry
+                    .metadata()
+                    .and_then(|md| md.modified())
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .is_some_and(|age| age >= TMP_KEEP);
+                if old {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
 }
 
 /// 観測が古かったときのエラー。**打つ手を書く**: もう一度メニューを開けば
@@ -465,6 +507,20 @@ fn stale_active_error(credentials: &Path) -> anyhow::Error {
          reopen the account menu and try again",
         credentials.display()
     )
+}
+
+/// `<target>.<pid>-<連番>.tmp` の形か（[`write_json_atomically`] が付ける名前）。
+/// pid と連番の形まで見るのは、無関係な `.tmp`（claude や他ツールのもの）を
+/// 消さないため
+fn is_leftover_tmp(name: &str, target: &str) -> bool {
+    let Some(rest) = name.strip_prefix(&format!("{target}.")) else {
+        return false;
+    };
+    let Some((pid, seq)) = rest.strip_suffix(".tmp").and_then(|m| m.split_once('-')) else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(pid) && digits(seq)
 }
 
 /// UI（アカウント切替ポップアップ）向けの公開 API。
@@ -644,7 +700,9 @@ fn read_accounts(path: &Path) -> serde_json::Map<String, Value> {
 
 /// tmp → rename で置く（読み手が書きかけの JSON を見ないため）。
 /// tmp は同じディレクトリに作る（別ボリュームだと rename が失敗する）。
-/// 名前は pid + 連番で一意にする（同じパスへの同時書き込みで tmp を共有しない）
+/// 名前は pid + 連番で一意にする（同じパスへの同時書き込みで tmp を共有しない）。
+/// **rename 前に取り残された tmp は起動時に回収する**
+/// （[`AccountStore::cleanup_leftover_tmp`]。中身はトークンなので放置しない）
 fn write_json_atomically(path: &Path, value: &Value) -> anyhow::Result<()> {
     static SEQ: AtomicUsize = AtomicUsize::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -656,11 +714,27 @@ fn write_json_atomically(path: &Path, value: &Value) -> anyhow::Result<()> {
     name.push(format!(".{}-{seq}.tmp", std::process::id()));
     let tmp = path.with_file_name(name);
     let text = serde_json::to_string_pretty(value)?;
-    std::fs::write(&tmp, text).map_err(|e| anyhow!("could not write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
+    // **rename の前に中身をディスクへ確定させる。** rename 自体は NTFS の
+    // メタデータジャーナルで守られるが、tmp の中身は守られない。電源断で
+    // 0 バイトの `.credentials.json` が残ると、claude 本体から見て全アカウントの
+    // ログインが飛ぶ（保管ファイル側なら全アカウントの保管が飛ぶ）。
+    // 小さなファイル 1 本なので代償は小さい
+    if let Err(e) = write_and_sync(&tmp, text.as_bytes()) {
         let _ = std::fs::remove_file(&tmp); // 中間ファイルを残さない
+        return Err(anyhow!("could not write {}: {e}", tmp.display()));
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
         anyhow!("could not replace {}: {e}", path.display())
     })
+}
+
+/// 書いて fsync する（[`write_json_atomically`] 用）
+fn write_and_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 #[cfg(test)]
@@ -1468,6 +1542,44 @@ pub(crate) mod tests {
             !home.paths().store_lock().exists(),
             "保管ファイルのロックを残している"
         );
+    }
+
+    /// 書きかけの `.tmp` は **トークンを含む**ので放置しない。消すのは自分たちが
+    /// 付ける形の名前で、かつ十分に古いものだけ（書いている最中の別インスタンスの
+    /// tmp を消さない）
+    #[test]
+    fn leftover_tmp_files_are_reclaimed_at_startup() {
+        assert!(is_leftover_tmp("accounts.json.1234-0.tmp", "accounts.json"));
+        assert!(!is_leftover_tmp("accounts.json.tmp", "accounts.json"));
+        assert!(!is_leftover_tmp("accounts.json.abc-0.tmp", "accounts.json"));
+        assert!(!is_leftover_tmp("accounts.json.1234-0.tmp", ".credentials.json"));
+        assert!(!is_leftover_tmp("accounts.json", "accounts.json"));
+
+        let home = TempHome::new("leftover_tmp_files_are_reclaimed_at_startup");
+        let paths = home.paths();
+        let old = paths.store.with_file_name("accounts.json.4242-7.tmp");
+        let fresh = paths
+            .credentials
+            .with_file_name(".credentials.json.4243-0.tmp");
+        let other = paths.store.with_file_name("something-else.tmp");
+        for path in [&old, &fresh, &other] {
+            std::fs::write(path, "{}").unwrap();
+        }
+        // 古い側だけ mtime を閾値の外へ動かす（経過を待たずに固定する）
+        let handle = std::fs::File::options().write(true).open(&old).unwrap();
+        handle
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - TMP_KEEP - Duration::from_secs(60)),
+            )
+            .unwrap();
+        drop(handle);
+
+        home.store().cleanup_leftover_tmp();
+
+        assert!(!old.exists(), "古い tmp を回収していない（トークンが残る）");
+        assert!(fresh.exists(), "書いている最中かもしれない tmp を消している");
+        assert!(other.exists(), "無関係な tmp を消している");
     }
 
     /// 認証情報ファイルの指紋: 書き換えと消滅を検出できる。
