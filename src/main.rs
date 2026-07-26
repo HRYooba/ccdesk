@@ -18,6 +18,7 @@ mod cli;
 mod keys;
 mod poll;
 mod session;
+mod sessions;
 mod source;
 mod theme;
 mod ui;

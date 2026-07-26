@@ -26,6 +26,7 @@ use crate::poll::{
     read_usage, spawn_agents_poller, spawn_ccdesk_version_check, spawn_footer_poller,
     AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo,
 };
+use crate::sessions::{SessionId, SessionRow, SessionStore, TitleSource};
 
 /// サイドバーに載せるセッション数の上限（state.json の走査本数）
 pub(crate) const JOBS_LIMIT: usize = 50;
@@ -172,8 +173,30 @@ pub(crate) struct PollSinks {
 // **`Send + Sync` が要る**: 重い要求（アカウントの登録・切替）は別スレッドで
 // 走るので、供給元は `Arc` で共有される（[`crate::app`] の `apply_account`）
 pub(crate) trait DataSource: Send + Sync {
-    /// サイドバーに並べるセッション一覧（周期的に呼ばれる）
+    /// サイドバーに並べるセッション一覧（周期的に呼ばれる）。
+    ///
+    /// **bg セッション（`claude --bg`）専用の経路で、前景移行のフェーズ2で消える。**
+    /// 新しい一覧の正本は [`Self::sessions`]（`docs/foreground-migration.md`）
     fn jobs(&self) -> Vec<BgJob>;
+
+    /// 一覧に載るセッション行（正本は `~/.ccdesk/sessions.json`）。
+    /// **前景セッションは `~/.claude/jobs` に痕跡を残さない**ので、
+    /// 「どのセッションが存在するか」はこちらが持つ。
+    ///
+    /// 呼び出し口はフェーズ2で入る（追加のみのフェーズ1では未使用。
+    /// [`crate::sessions`] のモジュール冒頭と同じ理由で許可する）
+    #[allow(dead_code)]
+    fn sessions(&self) -> Vec<SessionRow>;
+
+    /// セッション行の保存。**差分ではなく全量で渡し、永続化された一覧を返す**。
+    ///
+    /// 戻り値がある理由は [`Self::store_projects`] と同じで、保存はディスクとの
+    /// マージを通るので**渡した一覧と保存された一覧は一致しない**（他インスタンスが
+    /// 起こしたセッションが増える）。返さないと App 側の一覧がディスクとずれ、
+    /// 画面には出続けるのに再起動で消える / 消したはずの行が戻る、が起きる。
+    /// 呼び手はこれを自分の一覧として取り込む ＝ 正本は sessions.json 1 つのまま
+    #[allow(dead_code)]
+    fn store_sessions(&self, next: &[SessionRow]) -> Vec<SessionRow>;
 
     /// フッター（アカウント・バージョン）の初期値。
     /// live はポーラーが後から埋めるので既定値でよい
@@ -350,6 +373,12 @@ pub(crate) struct LiveSource {
     /// 判断した一覧。**書き込みのマージの基準**（[`merge_projects`]）で、
     /// 起動時の読み込みと、**実際にディスクへ書いた内容**で更新する
     projects_baseline: Mutex<Vec<String>>,
+    /// セッション一覧のストア。**アカウント保管（毎回 `detect` する）と違い
+    /// 持ち回る**のは、マージの基準を呼び出しを跨いで保つ必要があるため
+    /// （基準はストアの中にある。[`SessionStore`]）。
+    /// ホームが取れない環境では None ＝ 一覧を持たない（読みは空・保存は素通し）
+    #[allow(dead_code)] // 読み口はフェーズ2で入る（[`DataSource::sessions`] と同じ）
+    sessions: Option<SessionStore>,
 }
 
 impl LiveSource {
@@ -363,9 +392,16 @@ impl LiveSource {
         // ウィンドウ状態・設定側も同じ理由で回収する（tmp 名が一意なので、
         // rename 前に死んだ分は上書きされずに積もる）
         ccdesk::reap_leftover_kv_tmp();
+        let sessions = SessionStore::detect();
+        // セッション一覧の tmp も同じ理由で回収する（中身はトークンではないが、
+        // rename の前に死んだ分は誰にも消されずに積もる）
+        if let Some(store) = &sessions {
+            store.cleanup_leftover_tmp();
+        }
         Self {
             usage_display,
             projects_baseline: Mutex::new(Vec::new()),
+            sessions,
         }
     }
 }
@@ -373,6 +409,24 @@ impl LiveSource {
 impl DataSource for LiveSource {
     fn jobs(&self) -> Vec<BgJob> {
         scan_jobs(JOBS_LIMIT)
+    }
+
+    /// 起動時と周期的に読む。**読むたびにマージの基準が進む**（[`SessionStore::list`]）
+    fn sessions(&self) -> Vec<SessionRow> {
+        self.sessions
+            .as_ref()
+            .map(SessionStore::list)
+            .unwrap_or_default()
+    }
+
+    /// **書く前にディスクを読み直してマージし、書いた内容を返す**（意味論は
+    /// [`crate::sessions`] の `merge_sessions`）。書けなかったときは渡された一覧を
+    /// そのまま返す ＝ ディスクが動いていないので「こう書いた」と記録しない
+    fn store_sessions(&self, next: &[SessionRow]) -> Vec<SessionRow> {
+        match &self.sessions {
+            Some(store) => store.store(next),
+            None => next.to_vec(),
+        }
     }
 
     fn footer(&self) -> FooterInfo {
@@ -502,6 +556,17 @@ impl DataSource for DemoSource {
         demo_jobs()
     }
 
+    fn sessions(&self) -> Vec<SessionRow> {
+        demo_sessions()
+    }
+
+    fn store_sessions(&self, next: &[SessionRow]) -> Vec<SessionRow> {
+        // 撮影は開発者の `~/.ccdesk/sessions.json` を踏み潰さない。書かない ＝
+        // ディスクとのマージも起きないので、渡された一覧をそのまま返す
+        // （撮影中の行が保存の有無で動かない）
+        next.to_vec()
+    }
+
     fn footer(&self) -> FooterInfo {
         demo_footer()
     }
@@ -580,6 +645,42 @@ fn demo_jobs() -> Vec<BgJob> {
             mtime: std::time::SystemTime::now(),
             created_at_ms: 0,
             updated_at_ms: 0,
+        })
+        .collect()
+}
+
+/// 撮影用の架空セッション行。**[`demo_jobs`] から導く**のが要点で、架空の
+/// セッション名・フォルダの一覧を 2 つ持たない（片方だけ増やすと、前景移行の
+/// 途中で撮った画像だけ中身が違う ＝ 撮り直しで見た目が動く）。
+///
+/// ID は架空の UUID（実セッションの ID を出さない）。時刻は「今から N 分前」なので、
+/// いつ撮っても同じ見た目になる（[`demo_usage`] と同じ理由）。
+/// **未読は出さない**（`last_opened_at` = `updated_at`）: 撮影の見た目を
+/// 撮った時刻で変えないため
+#[allow(dead_code)] // 呼び出し口はフェーズ2（[`DataSource::sessions`] と同じ）
+fn demo_sessions() -> Vec<SessionRow> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    demo_jobs()
+        .into_iter()
+        .enumerate()
+        .map(|(i, job)| {
+            let minutes = (i as u64 + 1) * 7;
+            let updated = now.saturating_sub(minutes * 60_000);
+            SessionRow {
+                last_state: job.state,
+                updated_at: updated,
+                ..SessionRow::new(
+                    // 架空の UUID（実セッションの ID を出さない）
+                    SessionId::new(format!("demo0000-0000-4000-8000-{:012}", i + 1)),
+                    job.cwd,
+                    job.name,
+                    TitleSource::Ai,
+                    updated,
+                )
+            }
         })
         .collect()
 }
@@ -668,6 +769,59 @@ mod tests {
         assert_eq!(usage.five.map(|(pct, _)| pct), Some(34.0));
         assert_eq!(usage.seven.map(|(pct, _)| pct), Some(58.0));
         assert!(!usage.stale);
+    }
+
+    /// 撮影用のセッション行も固定。**[`demo_jobs`] と同じ架空データから導く**ので、
+    /// 前景移行の途中で撮っても中身（名前・フォルダ・状態）が変わらない。
+    /// 実 ID・実パスは出さず、未読も出さない（撮った時刻で見た目が動かない）
+    #[test]
+    fn demo_sessions_mirror_the_demo_jobs() {
+        let jobs = DemoSource.jobs();
+        let sessions = DemoSource.sessions();
+        assert_eq!(
+            sessions.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
+            jobs.iter().map(|j| j.name.as_str()).collect::<Vec<_>>(),
+            "撮影用のセッション名が 2 通りに分かれている"
+        );
+        for session in &sessions {
+            assert!(
+                session.session_id.as_str().starts_with("demo0000-"),
+                "実セッションらしい ID: {}",
+                session.session_id
+            );
+            assert!(session.cwd.starts_with("C:\\dev\\"), "cwd: {:?}", session.cwd);
+            assert!(!session.unread(), "撮影に未読マーカーが写る");
+            assert!(!session.archived && !session.pinned);
+        }
+    }
+
+    /// 撮影はセッション一覧も書かない（開発者の `~/.ccdesk/sessions.json` を
+    /// 踏み潰さない）。書かない ＝ マージも起きないので、戻り値は渡した一覧そのまま。
+    ///
+    /// 検査は「番人の行が実ファイルに現れたか」だけを見る（[`write_sentinel`]）。
+    /// 実ファイルの前後を比べる形は、開発者が ccdesk を使っているだけで落ちる
+    #[test]
+    fn demo_does_not_persist_sessions() {
+        // 漏れても実害が無い架空の行（存在しないフォルダ・番人の ID）
+        let asked = vec![crate::sessions::SessionRow::new(
+            crate::sessions::SessionId::new(write_sentinel("session")),
+            "C:\\demo-must-not-write",
+            "demo",
+            crate::sessions::TitleSource::Derived,
+            0,
+        )];
+        assert_eq!(
+            DemoSource.store_sessions(&asked),
+            asked,
+            "demo が渡した一覧と違うものを返している"
+        );
+        let after = crate::sessions::SessionStore::detect()
+            .map(|store| store.list())
+            .unwrap_or_default();
+        assert!(
+            !after.iter().any(|row| row.session_id == asked[0].session_id),
+            "demo が sessions.json へ書いている"
+        );
     }
 
     /// 撮影用のウィンドウ状態はディスクを読まない。

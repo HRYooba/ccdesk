@@ -373,6 +373,13 @@ pub fn accounts_store_path() -> Option<std::path::PathBuf> {
     Some(ccdesk_dir()?.join("accounts.json"))
 }
 
+/// セッション一覧の正本 ~/.ccdesk/sessions.json。
+/// 前景セッション（`claude --session-id <uuid>`）は `~/.claude/jobs` に痕跡を残さないので、
+/// 「どのセッションが存在するか」は ccdesk 自身が持つ（`docs/foreground-migration.md`）
+pub fn sessions_store_path() -> Option<std::path::PathBuf> {
+    Some(ccdesk_dir()?.join("sessions.json"))
+}
+
 /// エラーの集約先 ~/.ccdesk/error.log へ時刻付きで追記する。
 /// panic（TUI は画面ごと消えて読めない）と実行時エラー（attach 失敗等）の両方が集まる
 pub fn log_error(msg: &str) {

@@ -2854,6 +2854,21 @@ mod tests {
             Vec::new()
         }
 
+        // セッション一覧は差し替えの軸に入れていない（今の検査対象はアカウントと
+        // プロジェクト永続化の 2 つだけ）。永続化層を持たない ＝ 読みは 0 件、
+        // 保存は渡された一覧をそのまま返す（ディスクが空の単独起動と同じ結果なので
+        // live の意味論と矛盾しない。[`ProjectsBackend::Absent`] と同じ判断）
+        fn sessions(&self) -> Vec<crate::sessions::SessionRow> {
+            Vec::new()
+        }
+
+        fn store_sessions(
+            &self,
+            next: &[crate::sessions::SessionRow],
+        ) -> Vec<crate::sessions::SessionRow> {
+            next.to_vec()
+        }
+
         fn footer(&self) -> FooterInfo {
             FooterInfo::default()
         }
