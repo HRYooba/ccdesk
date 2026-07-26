@@ -264,25 +264,53 @@ fn merge_projects(disk: &[String], baseline: &[String], next: &[String]) -> Vec<
     merged
 }
 
-/// 保存 1 回分: 読み直した `disk` から**書く内容**を決め、次のマージの基準を
-/// **実際に書く内容**へ進める（[`merge_projects`] の結果 ＝ 上限適用後）。
+/// 保存 1 回分: 読み直した `disk` から**書く内容**を決め、**書けたことが確認できてから**
+/// 次のマージの基準を進める（[`merge_projects`] の結果 ＝ 上限適用後）。
+/// 戻り値は呼び手が自分の一覧として取り込む内容（[`DataSource::store_projects`]）。
 ///
-/// **基準を「上限適用前の `next`」にしないのが要点**: 上限で削った分はディスクから
+/// `persist` は「マージ関数を受けて実際に置き換え、**ディスクへ載ったか**を返す」もの。
+/// マージがディスクの読みと同じロックの下で走らなければならないので
+/// （読みと書きの間に別インスタンスの書き込みを挟ませない）、書き込み側の
+/// 手続きに畳み込む形で受け取る。
+///
+/// **基準を書く前に進めてはいけない**: `kv_edit` の tmp 書き込み / rename は失敗しうる。
+/// 進めてしまうと「P を外した」がディスクに載っていないのに基準からは消え、
+/// 次の保存で P は `merged` にも `baseline` にも居ない ＝ [`merge_projects`] が
+/// 「他インスタンスの登録」と分類して**外したフォルダを復活させる**。
+///
+/// **基準を「上限適用前の `next`」にしないのも同じ根**: 上限で削った分はディスクから
 /// 消えるのに基準には残る ＝ 「こう書いた」の記録が実際と食い違い、
 /// 保存するたび同じ登録が落ち続ける（呼び手の一覧にだけ残る）。
 /// 他インスタンスの登録を含む書いた内容が次の `next` から落ちないのは、
-/// 呼び手が戻り値を取り込むため（[`DataSource::store_projects`]）。
+/// 呼び手が戻り値を取り込むため。
 ///
 /// **crate 内へ出しているのはテスト用の供給元も同じ手順を通すため**
 /// （保存の意味論をテスト側へ写し取ると、live だけが壊れても気づけない）
-pub(crate) fn merge_and_advance_baseline(
-    disk: Vec<String>,
+pub(crate) fn persist_projects(
     baseline: &mut Vec<String>,
     next: &[String],
+    persist: impl FnOnce(&mut dyn FnMut(Vec<String>) -> Vec<String>) -> bool,
 ) -> Vec<String> {
-    let written = merge_projects(&disk, baseline, next);
-    *baseline = written.clone();
-    written
+    let mut merged: Option<Vec<String>> = None;
+    let wrote = {
+        let baseline = &*baseline;
+        persist(&mut |disk| {
+            let written = merge_projects(&disk, baseline, next);
+            merged = Some(written.clone());
+            written
+        })
+    };
+    // 書けたことが確認できたときだけ基準を進める。書けていないならディスクは
+    // 動いていないので、基準も「最後に確認できたディスクの内容」のままにする
+    // （呼び手には自分の一覧をそのまま返す ＝ 画面はユーザーの操作を反映し続け、
+    //  次の保存で同じ差分をもう一度ディスクへ載せに行く）
+    match merged.filter(|_| wrote) {
+        Some(written) => {
+            *baseline = written.clone();
+            written
+        }
+        None => next.to_vec(),
+    }
 }
 
 /// 実データ。~/.claude と ~/.ccdesk を読み、ポーラーで claude CLI と
@@ -392,23 +420,17 @@ impl DataSource for LiveSource {
     /// 「このインスタンスが外した」と読めて消える）と矛盾しない: 他インスタンスの登録は
     /// 戻り値に入るので呼び手の一覧にも入り、次の `next` から落ちないため。
     ///
-    /// 書かなかったとき（ホームが取れず `update_state_list` がマージを呼ばない）は
-    /// `baseline` を動かさず渡された一覧を返す ＝ ディスクを触っていないので
-    /// 「こう書いた」と記録しない
+    /// 書けなかったとき（ホームが取れない・tmp 書き込みや rename の失敗）は
+    /// `baseline` を動かさず渡された一覧を返す ＝ ディスクが動いていないので
+    /// 「こう書いた」と記録しない（[`persist_projects`]）
     fn store_projects(&self, next: &[String]) -> Vec<String> {
         let mut baseline = self
             .projects_baseline
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut written: Option<Vec<String>> = None;
-        update_state_list("projects", |disk| {
-            let merged = merge_and_advance_baseline(disk, &mut baseline, next);
-            written = Some(merged.clone());
-            merged
-        });
-        // 書かなかったなら基準も動いていない（[`merge_and_advance_baseline`] を
-        // 通っていない）ので、渡された一覧をそのまま返す
-        written.unwrap_or_else(|| next.to_vec())
+        persist_projects(&mut baseline, next, |merge| {
+            update_state_list("projects", merge)
+        })
     }
 
     fn spawns_sessions(&self) -> bool {
@@ -758,13 +780,58 @@ mod tests {
     fn a_second_save_of_the_same_state_leaves_the_disk_unchanged() {
         let mut baseline = paths(&["C:\\dev\\mine"]);
         let mine = paths(&["C:\\dev\\mine"]);
-        let disk = paths(&["C:\\dev\\mine", "C:\\dev\\from-b"]);
-        let first = merge_and_advance_baseline(disk, &mut baseline, &mine);
+        let mut disk = paths(&["C:\\dev\\mine", "C:\\dev\\from-b"]);
+        let first = persist_projects(&mut baseline, &mine, write_to(&mut disk, true));
         assert_eq!(first, ["C:\\dev\\mine", "C:\\dev\\from-b"]);
         assert_eq!(baseline, first, "基準が実際に書いた内容になっていない");
+        assert_eq!(disk, first, "ディスクに載った内容と戻り値が違う");
         // 2 度目: ディスクも自分の一覧も 1 度目に書いた内容（呼び手が取り込んだ後）
-        let second = merge_and_advance_baseline(first.clone(), &mut baseline, &first);
+        let second = persist_projects(&mut baseline, &first, write_to(&mut disk, true));
         assert_eq!(second, first, "保存するたびディスクが書き換わる");
+    }
+
+    /// メモリ上のディスクへの保存 1 回分（[`persist_projects`] の `persist`）。
+    /// `wrote` を false にすると **tmp 書き込み / rename の失敗**（`kv_edit` が
+    /// 報告する形）と同じになる ＝ マージは走るがディスクは動かない
+    fn write_to(
+        disk: &mut Vec<String>,
+        wrote: bool,
+    ) -> impl FnOnce(&mut dyn FnMut(Vec<String>) -> Vec<String>) -> bool + '_ {
+        move |merge| {
+            let written = merge(disk.clone());
+            if wrote {
+                *disk = written;
+            }
+            wrote
+        }
+    }
+
+    /// **書けなかったら次のマージの基準を進めない。**
+    ///
+    /// 進めてしまうと、外したフォルダがディスクには残っているのに基準からは消え、
+    /// 次の保存で [`merge_projects`] が「他インスタンスの登録」と分類して
+    /// **`app.projects` とディスクの両方へ復活させる**（`kv_edit` の tmp 書き込み /
+    /// rename の失敗が黙って無視されていたときに起きていた）
+    #[test]
+    fn a_failed_write_keeps_the_baseline_and_the_removal() {
+        let mut baseline = paths(&["C:\\dev\\p", "C:\\dev\\q"]);
+        let mut disk = paths(&["C:\\dev\\p", "C:\\dev\\q"]);
+        let next = paths(&["C:\\dev\\q"]); // P を remove project した
+
+        let returned = persist_projects(&mut baseline, &next, write_to(&mut disk, false));
+
+        assert_eq!(
+            baseline,
+            ["C:\\dev\\p", "C:\\dev\\q"],
+            "書けていないのに「こう書いた」と記録している"
+        );
+        assert_eq!(disk, ["C:\\dev\\p", "C:\\dev\\q"], "書けない前提が崩れている");
+        assert_eq!(returned, next, "ユーザーの操作が画面から巻き戻っている");
+
+        // 次の保存は書ける。P は基準に居るので「このインスタンスが外した」と読める
+        let written = persist_projects(&mut baseline, &next, write_to(&mut disk, true));
+        assert_eq!(written, next, "削除したフォルダが復活している");
+        assert_eq!(disk, next, "削除がディスクへ載っていない");
     }
 
     /// このテストしか書き得ない番人の値。**「実ファイルが変わっていないこと」を

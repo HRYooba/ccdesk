@@ -2040,7 +2040,7 @@ mod tests {
     use super::*;
     use unicode_width::UnicodeWidthStr;
 
-    use crate::source::{merge_and_advance_baseline, WindowState};
+    use crate::source::{persist_projects, WindowState};
 
     const TERM: (u16, u16) = (120, 40);
 
@@ -2627,7 +2627,7 @@ mod tests {
     /// [`crate::accounts::AccountStore`] を通すテストだった。統合後も
     /// [`AccountBackend::Store`] は実物のストアを保持し、
     /// [`ProjectsBackend::MemoryDisk`] は live と同じ
-    /// [`merge_and_advance_baseline`] を通る ＝ ドメインを偽物へ置き換えていない。
+    /// [`persist_projects`] を通る ＝ ドメインを偽物へ置き換えていない。
     /// 各テストがどちらの軸を実物で見ているかは、下の 3 つの組み立てヘルパ
     /// （[`recording_app`] / [`app_with_real_store`] / [`app_with_disk`]）が表す
     struct TestSource {
@@ -2667,7 +2667,7 @@ mod tests {
         Absent,
         /// state.json をメモリに置く。**保存の意味論（他インスタンスの登録との
         /// マージ・上限・次の基準）は live と同じ関数**
-        /// （[`merge_and_advance_baseline`]）を通すので、「保存するとどうなるか」を
+        /// （[`persist_projects`]）を通すので、「保存するとどうなるか」を
         /// テスト側へ写し取らずに App の側を検査できる。
         /// 実ファイルを触らないので実ユーザーの ~/.ccdesk は動かない
         MemoryDisk {
@@ -2738,9 +2738,10 @@ mod tests {
                     let mut baseline = baseline
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let written = merge_and_advance_baseline(disk.clone(), &mut baseline, next);
-                    *disk = written.clone();
-                    written
+                    persist_projects(&mut baseline, next, |merge| {
+                        *disk = merge(disk.clone());
+                        true // メモリ上のディスクは書き込みに失敗しない
+                    })
                 }
             }
         }
@@ -3557,7 +3558,7 @@ mod tests {
 
     /// ディスクに他インスタンスの登録が居る App。自分の一覧は起動時の読み込みと
     /// 同じく「そのとき読んだディスクの内容」＝ 基準と揃えておく。
-    /// 保存は live と同じ [`merge_and_advance_baseline`] を通る
+    /// 保存は live と同じ [`persist_projects`] を通る
     /// （[`ProjectsBackend::MemoryDisk`]）
     fn app_with_disk(mine: &[&str], from_other: &[&str]) -> App {
         let mine: Vec<String> = mine.iter().map(|p| p.to_string()).collect();

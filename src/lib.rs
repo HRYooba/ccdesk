@@ -450,13 +450,19 @@ fn value_strings(value: Option<&serde_json::Value>) -> Vec<String> {
 /// 上書き・tmp → rename）をここ 1 箇所に持つ**ので、値が文字列でも配列でも同じ保証になる。
 ///
 /// `edit` は**同じロックの下でディスク上の今の値**を受け取る（読みと書きの間に
-/// 別の書き込みを挟ませないため）＝ 呼び手は「今の値の上に載せる」判断ができる
+/// 別の書き込みを挟ませないため）＝ 呼び手は「今の値の上に載せる」判断ができる。
+///
+/// **戻り値は「ディスクへ載ったか」。** tmp 書き込みと rename は失敗しうる
+/// （ディスク満杯・権限・ウイルス対策のロック）。黙って捨てると、呼び手が
+/// 「こう書いた」と記録したのに実際は書かれていない状態になり、次の書き込みの
+/// 判断材料が嘘になる（[`crate::update_state_list`] の呼び手が持つマージの基準）
+#[must_use]
 fn kv_edit(
     path: Option<std::path::PathBuf>,
     key: &str,
     edit: impl FnOnce(Option<&serde_json::Value>) -> serde_json::Value,
-) {
-    let Some(path) = path else { return };
+) -> bool {
+    let Some(path) = path else { return false };
     let _guard = KV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut v = std::fs::read_to_string(&path)
         .ok()
@@ -468,20 +474,31 @@ fn kv_edit(
     v[key] = edit(v.get(key));
     // 読み手が書きかけの JSON を見ないよう tmp → rename で置く
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, serde_json::to_string_pretty(&v).unwrap_or_default()).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+    if std::fs::write(&tmp, serde_json::to_string_pretty(&v).unwrap_or_default()).is_err() {
+        let _ = std::fs::remove_file(&tmp); // 書きかけを残さない
+        return false;
     }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    true
 }
 
 fn kv_save(path: Option<std::path::PathBuf>, key: &str, value: &str) {
-    kv_edit(path, key, |_| serde_json::Value::String(value.to_string()));
+    // 単値（サイドバー幅・最後に開いた画面）は失敗しても次の保存で上書きされる
+    // ＝ 呼び手に判断させるものが無いので、成否は返さない
+    let _ = kv_edit(path, key, |_| {
+        serde_json::Value::String(value.to_string())
+    });
 }
 
+#[must_use]
 fn kv_update_list(
     path: Option<std::path::PathBuf>,
     key: &str,
     merge: impl FnOnce(Vec<String>) -> Vec<String>,
-) {
+) -> bool {
     kv_edit(path, key, |current| {
         serde_json::Value::Array(
             merge(value_strings(current))
@@ -489,7 +506,7 @@ fn kv_update_list(
                 .map(serde_json::Value::String)
                 .collect(),
         )
-    });
+    })
 }
 
 pub fn load_setting(key: &str) -> Option<String> {
@@ -521,9 +538,14 @@ pub fn load_state_list(key: &str) -> Vec<String> {
 /// 共有なので、メモリ上の写しをそのまま書くと、その間に別のインスタンスが足した
 /// 要素が消える（[`kv_edit`] は他のキーは保つが、同じキーへの同時編集は保たない）。
 /// 単値（サイドバー幅など）も後勝ちだが、あちらは設定でこちらはユーザーのデータなので
-/// 黙って捨ててはいけない。マージの意味論は呼び手（保存する値の持ち主）が決める
-pub fn update_state_list(key: &str, merge: impl FnOnce(Vec<String>) -> Vec<String>) {
-    kv_update_list(state_path(), key, merge);
+/// 黙って捨ててはいけない。マージの意味論は呼び手（保存する値の持ち主）が決める。
+///
+/// **戻り値は「ディスクへ載ったか」**（[`kv_edit`]）。呼び手は次のマージの基準を
+/// これで進めるかどうかを決める ＝ 書けていないのに「こう書いた」と記録すると、
+/// 外したはずの要素が次の保存で復活する
+#[must_use]
+pub fn update_state_list(key: &str, merge: impl FnOnce(Vec<String>) -> Vec<String>) -> bool {
+    kv_update_list(state_path(), key, merge)
 }
 
 /// 2 つのパスが同じフォルダを指すか。**「同じフォルダか」の判断はここ 1 箇所だけ**に置く
@@ -659,7 +681,10 @@ mod tests {
         let path = temp_json("round-trip", Some("{\"projects\": \"legacy\"}"));
         let some = |p: &std::path::PathBuf| Some(p.clone());
         let write = |p: &std::path::PathBuf, values: &[String]| {
-            kv_update_list(some(p), "projects", |_| values.to_vec());
+            assert!(
+                kv_update_list(some(p), "projects", |_| values.to_vec()),
+                "書けたと報告されていない"
+            );
         };
         kv_save(some(&path), "sidebar_width", "33");
         let projects = vec!["C:\\dev\\a".to_string(), "C:\\dev\\b".to_string()];
@@ -688,12 +713,13 @@ mod tests {
         let path = temp_json("merge-base", Some("{\"projects\": [\"C:\\\\dev\\\\disk\"]}"));
         let some = || Some(path.clone());
         let mut seen = Vec::new();
-        kv_update_list(some(), "projects", |disk| {
+        let wrote = kv_update_list(some(), "projects", |disk| {
             seen = disk.clone();
             let mut next = disk;
             next.push("C:\\dev\\mine".to_string());
             next
         });
+        assert!(wrote, "書けたと報告されていない");
         assert_eq!(seen, ["C:\\dev\\disk"], "ディスク上の値が渡っていない");
         assert_eq!(
             kv_load_list(some(), "projects"),
@@ -702,11 +728,45 @@ mod tests {
         // 配列でない値は「保存が無い」扱い（読みと同じ寛容さ）
         let legacy = temp_json("merge-legacy", Some("{\"projects\": \"legacy\"}"));
         let mut seen_legacy = vec!["dirty".to_string()];
-        kv_update_list(Some(legacy.clone()), "projects", |disk| {
-            seen_legacy = disk;
-            Vec::new()
-        });
+        assert!(
+            kv_update_list(Some(legacy.clone()), "projects", |disk| {
+                seen_legacy = disk;
+                Vec::new()
+            }),
+            "書けたと報告されていない"
+        );
         assert!(seen_legacy.is_empty(), "旧形式の単値が一覧として渡っている");
+    }
+
+    /// **書けなかったことを黙って飲まない。** tmp 書き込み / rename は失敗しうる
+    /// （ディスク満杯・権限・ウイルス対策のロック）。呼び手はこの戻り値で
+    /// 「こう書いた」と記録するかどうかを決めるので、失敗を成功と報告すると
+    /// 外したはずの要素が次の保存で復活する（[`crate::update_state_list`]）
+    #[test]
+    fn a_write_that_cannot_land_reports_failure() {
+        // 親ディレクトリが無いパス（tmp の作成自体が失敗する）
+        let missing = std::env::temp_dir()
+            .join(format!("ccdesk-test-{}-absent", std::process::id()))
+            .join("nowhere")
+            .join("state.json");
+        assert!(
+            !kv_update_list(Some(missing.clone()), "projects", |_| vec![
+                "C:\\dev\\a".to_string()
+            ]),
+            "書けていないのに成功と報告している"
+        );
+        assert!(!missing.exists(), "書けない前提が崩れている");
+        // 置き場所そのものが分からないとき（ホームが取れない）も同じ
+        assert!(!kv_update_list(None, "projects", |_| Vec::new()));
+        // 書きかけの tmp を残さない（次の読み手が中途の JSON を拾わない）
+        let path = temp_json("tmp-cleanup", Some("{}"));
+        assert!(kv_update_list(Some(path.clone()), "projects", |_| vec![
+            "C:\\dev\\a".to_string()
+        ]));
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "tmp が残っている"
+        );
     }
 
     /// フォルダの同一判定。**大小と末尾の区切りは無視する**（登録リスト・claude が記録した
