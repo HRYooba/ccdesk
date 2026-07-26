@@ -4,26 +4,28 @@ A Claude Code session manager TUI, modeled after **Claude Desktop** and the buil
 **Agent View** — see, switch, and drive all your sessions in one terminal.
 
 ccdesk embeds the official `claude` CLI in a PTY pane and keeps an Agent View–style
-session list in a persistent sidebar (like Claude Desktop's session list). Sessions are
-dispatched and owned by the official Claude Code supervisor (`claude --bg` /
-`claude attach`), so they survive ccdesk restarts and stay consistent with the official
-Agent View.
+session list in a persistent sidebar (like Claude Desktop's session list). Each pane **is**
+a foreground `claude` session that ccdesk owns, and the list itself lives in
+`~/.ccdesk/sessions.json`, so closing ccdesk ends the processes while the rows stay —
+reopen one and it resumes from its transcript.
 
 ![ccdesk](docs/screenshot.png)
 
 ## Features
 
-- **Persistent sidebar** with every Claude Code session across all projects,
-  grouped by state (Ready for review / Needs input / Working / Completed) or by directory
+- **Persistent sidebar** with every session ccdesk knows about across all projects,
+  grouped by state (Needs input / Working / Completed) or by directory
 - **Persistent projects** — a directory becomes a project the moment you start a session in it,
   and its heading stays in the directory grouping even after its last session is gone, so the
   way in is never lost. Clicking a heading opens `new session` / `remove project`;
   `remove project` is disabled while sessions remain there, since the folder would keep its
   heading anyway. Registrations survive a restart but are only visible in the directory
   grouping — the state grouping has no directory headings to show them on
-- **Official lifecycle** — new sessions dispatch via `claude --bg`, windows are
-  `claude attach` clients; stop/delete use `claude stop` / `claude rm`
-- **Live status** from `claude agents --json` (rename, state changes reflect in ~2 s)
+- **Foreground sessions you own** — a new session starts as
+  `claude --session-id <uuid>` in the pane and reopening a row resumes it with
+  `claude -r`; `stop` ends the process and `delete` drops the row (your transcripts in
+  `~/.claude/projects/` are never removed)
+- **Live status** from `claude agents --json` (state changes reflect in ~2 s)
 - **Account line** in the sidebar footer, showing the signed-in Claude account, the same value
   `ccdesk doctor` prints. A login or logout that rewrites `~/.claude/.credentials.json` shows
   up in ~1 s; where credentials live outside that file, only the ~60 s refresh applies
@@ -116,8 +118,8 @@ like `~/.claude/.credentials.json` and never share or copy it elsewhere.
 Add `"usage_display": "on"` to `~/.ccdesk/config.json` to show your Claude
 rate-limit usage (5h / 7d windows, with time until reset) at the bottom right.
 
-When enabled, ccdesk passes the official `--settings` flag to its embedded
-`claude attach` processes to install a status-line hook. The hook saves the
+When enabled, ccdesk passes the official `--settings` flag to the `claude`
+sessions it starts to install a status-line hook. The hook saves the
 official rate-limit JSON that Claude Code provides to status lines, and then
 chains to your own status line if you have one configured — your display keeps
 working unchanged. No files outside `~/.ccdesk/` are modified, and sessions

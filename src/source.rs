@@ -18,7 +18,7 @@ use anyhow::anyhow;
 
 use ccdesk::{
     load_setting, load_state, load_state_list, same_dir, save_setting, save_state,
-    scan_jobs, update_state_list, BgJob,
+    update_state_list,
 };
 
 use crate::accounts::{Account, AccountChange, AccountStore, ActiveAccount, Outgoing};
@@ -28,9 +28,6 @@ use crate::poll::{
 };
 use crate::sessions::{SessionId, SessionRow, SessionStore, TitleSource};
 
-/// サイドバーに載せるセッション数の上限（state.json の走査本数）
-pub(crate) const JOBS_LIMIT: usize = 50;
-
 /// 登録プロジェクト（ディレクトリ）の保持上限。
 ///
 /// **上限を設ける判断**: 登録は自動（セッションの起動が成功した時点）なので、無制限だと
@@ -39,8 +36,8 @@ pub(crate) const JOBS_LIMIT: usize = 50;
 /// フォルダが残るので、落ちたことが操作の邪魔にならない（セッションがあるフォルダは
 /// 登録から落ちてもセッション由来で見出しが出続ける）。「最近使った順」を保つのは
 /// 登録側（[`crate::app`] の `register_project`。使い直したフォルダを末尾へ動かす）。
-/// 本数はセッション上限（[`JOBS_LIMIT`]）と同じ 50 に揃える:
-/// サイドバーに同時に載り得る規模を超えて持つ意味が無い
+/// 本数は 50: サイドバーに同時に載り得る規模を超えて持つ意味が無い
+/// （セッション一覧の側に上限は無い ＝ 理由は [`crate::sessions`] の `merge_sessions`）
 pub(crate) const PROJECTS_LIMIT: usize = 50;
 
 /// 実データ側のサイドバー既定幅（保存値が無いとき）
@@ -85,7 +82,7 @@ const DEMO_PROJECTS: [&str; 4] = [
 /// 供給元から受け取る（demo は固定値、live は state.json / config.json）
 pub(crate) struct WindowState {
     pub(crate) sidebar_width: u16,
-    /// 復元するセッションの short id。None = new session 画面から始める
+    /// 復元するセッションの [`SessionId`]。None = new session 画面から始める
     pub(crate) last_view: Option<String>,
     /// new session の初期フォルダ
     pub(crate) dispatch_cwd: String,
@@ -173,19 +170,11 @@ pub(crate) struct PollSinks {
 // **`Send + Sync` が要る**: 重い要求（アカウントの登録・切替）は別スレッドで
 // 走るので、供給元は `Arc` で共有される（[`crate::app`] の `apply_account`）
 pub(crate) trait DataSource: Send + Sync {
-    /// サイドバーに並べるセッション一覧（周期的に呼ばれる）。
+    /// サイドバーに並べるセッション行（周期的に呼ばれる。正本は
+    /// `~/.ccdesk/sessions.json`）。
     ///
-    /// **bg セッション（`claude --bg`）専用の経路で、前景移行のフェーズ2で消える。**
-    /// 新しい一覧の正本は [`Self::sessions`]（`docs/foreground-migration.md`）
-    fn jobs(&self) -> Vec<BgJob>;
-
-    /// 一覧に載るセッション行（正本は `~/.ccdesk/sessions.json`）。
     /// **前景セッションは `~/.claude/jobs` に痕跡を残さない**ので、
-    /// 「どのセッションが存在するか」はこちらが持つ。
-    ///
-    /// 呼び出し口はフェーズ2で入る（追加のみのフェーズ1では未使用。
-    /// [`crate::sessions`] のモジュール冒頭と同じ理由で許可する）
-    #[allow(dead_code)]
+    /// 「どのセッションが存在するか」はこちらが持つ
     fn sessions(&self) -> Vec<SessionRow>;
 
     /// セッション行の保存。**差分ではなく全量で渡し、永続化された一覧を返す**。
@@ -195,7 +184,6 @@ pub(crate) trait DataSource: Send + Sync {
     /// 起こしたセッションが増える）。返さないと App 側の一覧がディスクとずれ、
     /// 画面には出続けるのに再起動で消える / 消したはずの行が戻る、が起きる。
     /// 呼び手はこれを自分の一覧として取り込む ＝ 正本は sessions.json 1 つのまま
-    #[allow(dead_code)]
     fn store_sessions(&self, next: &[SessionRow]) -> Vec<SessionRow>;
 
     /// フッター（アカウント・バージョン）の初期値。
@@ -235,7 +223,7 @@ pub(crate) trait DataSource: Send + Sync {
     /// UI はポーラーの追いつきを待たずにアカウント行を確定値へ更新できる
     fn apply_account(&self, action: AccountAction) -> anyhow::Result<AccountChange>;
 
-    /// 新規セッションの要求で実際に `claude --bg` を起こすか。
+    /// 新規セッションの要求で実際に claude の PTY を起こすか。
     /// **撮影用データは起こさない**（架空のセッション一覧に本物のセッションが混ざると、
     /// 撮影の再現性が壊れるうえ開発者の環境にセッションが残る）。起こさない供給元では
     /// 新規セッションの要求はフォルダの登録と初期値の更新までで止まる
@@ -377,7 +365,6 @@ pub(crate) struct LiveSource {
     /// 持ち回る**のは、マージの基準を呼び出しを跨いで保つ必要があるため
     /// （基準はストアの中にある。[`SessionStore`]）。
     /// ホームが取れない環境では None ＝ 一覧を持たない（読みは空・保存は素通し）
-    #[allow(dead_code)] // 読み口はフェーズ2で入る（[`DataSource::sessions`] と同じ）
     sessions: Option<SessionStore>,
 }
 
@@ -407,10 +394,6 @@ impl LiveSource {
 }
 
 impl DataSource for LiveSource {
-    fn jobs(&self) -> Vec<BgJob> {
-        scan_jobs(JOBS_LIMIT)
-    }
-
     /// 起動時と周期的に読む。**読むたびにマージの基準が進む**（[`SessionStore::list`]）
     fn sessions(&self) -> Vec<SessionRow> {
         self.sessions
@@ -444,7 +427,7 @@ impl DataSource for LiveSource {
         // 「今この瞬間見えない」だけで、消えたわけではない。ここで黙って隠すと
         // ドライブを挿し直したときに見出しが復活する理由が読めないし、
         // 登録を外す操作（remove project）も出せなくなる。
-        // 見えないフォルダで new session を選んだ場合は `claude --bg` が
+        // 見えないフォルダで new session を選んだ場合は claude の起動が
         // 失敗して下部バーに出るので、間違いは操作した時点で伝わる
         let projects = load_state_list("projects");
         // **読んだ内容が以降の書き込みでマージする基準になる**（[`merge_projects`]）
@@ -552,10 +535,6 @@ impl DataSource for LiveSource {
 pub(crate) struct DemoSource;
 
 impl DataSource for DemoSource {
-    fn jobs(&self) -> Vec<BgJob> {
-        demo_jobs()
-    }
-
     fn sessions(&self) -> Vec<SessionRow> {
         demo_sessions()
     }
@@ -619,64 +598,40 @@ impl DataSource for DemoSource {
     }
 }
 
-/// 撮影用の架空セッション。実セッション名・実プロジェクトパスを出さない
-fn demo_jobs() -> Vec<BgJob> {
-    let rows: [(&str, &str, &str, &str, &str); 6] = [
-        ("demo01", "fix login form validation", "working", "", "refining error messages"),
-        ("demo02", "add dark mode toggle", "blocked", "blocked", "choose accent color?"),
-        ("demo03", "refactor api client", "working", "", "extracting retry logic"),
-        ("demo04", "write onboarding docs", "done", "", "docs published"),
-        ("demo05", "optimize image pipeline", "done", "", "2.3x faster builds"),
-        ("demo06", "migrate to vite", "stopped", "", ""),
-    ];
-    let projects = ["C:\\dev\\shop-app", "C:\\dev\\shop-app", "C:\\dev\\api", "C:\\dev\\docs", "C:\\dev\\api", "C:\\dev\\shop-app"];
-    rows.iter()
-        .zip(projects)
-        .map(|((short, name, state, tempo, detail), cwd)| BgJob {
-            short: short.to_string(),
-            cwd: cwd.to_string(),
-            state: state.to_string(),
-            tempo: tempo.to_string(),
-            name: name.to_string(),
-            needs: "which option should I take?".to_string(),
-            detail: detail.to_string(),
-            result: detail.to_string(),
-            children: Vec::new(),
-            mtime: std::time::SystemTime::now(),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        })
-        .collect()
-}
-
-/// 撮影用の架空セッション行。**[`demo_jobs`] から導く**のが要点で、架空の
-/// セッション名・フォルダの一覧を 2 つ持たない（片方だけ増やすと、前景移行の
-/// 途中で撮った画像だけ中身が違う ＝ 撮り直しで見た目が動く）。
+/// 撮影用の架空セッション行。実セッション名・実プロジェクトパス・実 ID を出さない。
 ///
-/// ID は架空の UUID（実セッションの ID を出さない）。時刻は「今から N 分前」なので、
-/// いつ撮っても同じ見た目になる（[`demo_usage`] と同じ理由）。
-/// **未読は出さない**（`last_opened_at` = `updated_at`）: 撮影の見た目を
-/// 撮った時刻で変えないため
-#[allow(dead_code)] // 呼び出し口はフェーズ2（[`DataSource::sessions`] と同じ）
+/// ID は架空の UUID。時刻は「今から N 分前」なので、いつ撮っても同じ見た目になる
+/// （[`demo_usage`] と同じ理由）。**未読は出さない**
+/// （`last_opened_at` = `updated_at`）: 撮影の見た目を撮った時刻で変えないため。
+///
+/// **どの行も生きた PTY を持たない**（撮影はセッションを起こさない）ので、
+/// 状態は `last_state` から決まる ＝ ここに書いた state がそのまま画面に出る
 fn demo_sessions() -> Vec<SessionRow> {
+    let rows: [(&str, &str, &str); 6] = [
+        ("fix login form validation", "working", "C:\\dev\\shop-app"),
+        ("add dark mode toggle", "blocked", "C:\\dev\\shop-app"),
+        ("refactor api client", "working", "C:\\dev\\api"),
+        ("write onboarding docs", "done", "C:\\dev\\docs"),
+        ("optimize image pipeline", "done", "C:\\dev\\api"),
+        ("migrate to vite", "stopped", "C:\\dev\\shop-app"),
+    ];
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    demo_jobs()
-        .into_iter()
+    rows.iter()
         .enumerate()
-        .map(|(i, job)| {
+        .map(|(i, (title, state, cwd))| {
             let minutes = (i as u64 + 1) * 7;
             let updated = now.saturating_sub(minutes * 60_000);
             SessionRow {
-                last_state: job.state,
+                last_state: (*state).to_string(),
                 updated_at: updated,
                 ..SessionRow::new(
                     // 架空の UUID（実セッションの ID を出さない）
                     SessionId::new(format!("demo0000-0000-4000-8000-{:012}", i + 1)),
-                    job.cwd,
-                    job.name,
+                    *cwd,
+                    *title,
                     TitleSource::Ai,
                     updated,
                 )
@@ -740,17 +695,6 @@ mod tests {
     /// 中身そのもので固定する（描画側はこの値をそのまま出す）
     #[test]
     fn demo_source_yields_fixed_fake_data() {
-        let jobs = DemoSource.jobs();
-        assert_eq!(
-            jobs.iter().map(|j| j.short.as_str()).collect::<Vec<_>>(),
-            ["demo01", "demo02", "demo03", "demo04", "demo05", "demo06"]
-        );
-        assert_eq!(jobs[0].name, "fix login form validation");
-        // プロジェクトパスは架空のものだけ（実パスの断片が混ざっていない）
-        for job in &jobs {
-            assert!(job.cwd.starts_with("C:\\dev\\"), "cwd: {:?}", job.cwd);
-        }
-
         assert_eq!(
             DemoSource.footer().account,
             AccountStatus::LoggedIn(ActiveAccount::unseen(Account::new(
@@ -771,17 +715,21 @@ mod tests {
         assert!(!usage.stale);
     }
 
-    /// 撮影用のセッション行も固定。**[`demo_jobs`] と同じ架空データから導く**ので、
-    /// 前景移行の途中で撮っても中身（名前・フォルダ・状態）が変わらない。
-    /// 実 ID・実パスは出さず、未読も出さない（撮った時刻で見た目が動かない）
+    /// 撮影用のセッション行は固定。実 ID・実パスは出さず、未読も出さない
+    /// （撮った時刻で見た目が動かない）
     #[test]
-    fn demo_sessions_mirror_the_demo_jobs() {
-        let jobs = DemoSource.jobs();
+    fn demo_sessions_are_fixed_fake_rows() {
         let sessions = DemoSource.sessions();
         assert_eq!(
             sessions.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
-            jobs.iter().map(|j| j.name.as_str()).collect::<Vec<_>>(),
-            "撮影用のセッション名が 2 通りに分かれている"
+            [
+                "fix login form validation",
+                "add dark mode toggle",
+                "refactor api client",
+                "write onboarding docs",
+                "optimize image pipeline",
+                "migrate to vite",
+            ]
         );
         for session in &sessions {
             assert!(
@@ -846,17 +794,17 @@ mod tests {
         for path in &projects {
             assert!(path.starts_with("C:\\dev\\"), "実パスらしい登録: {path:?}");
         }
-        let jobs = DemoSource.jobs();
-        for job in &jobs {
+        let sessions = DemoSource.sessions();
+        for session in &sessions {
             assert!(
-                projects.contains(&job.cwd),
+                projects.contains(&session.cwd),
                 "セッションのあるフォルダが未登録: {:?}",
-                job.cwd
+                session.cwd
             );
         }
         let empty: Vec<&String> = projects
             .iter()
-            .filter(|p| !jobs.iter().any(|j| &j.cwd == *p))
+            .filter(|p| !sessions.iter().any(|s| &s.cwd == *p))
             .collect();
         assert_eq!(
             empty.len(),
@@ -1067,23 +1015,23 @@ mod tests {
         const DEMO_HEADER: &str = "1 awaiting input · 0 working · 5 completed";
 
         let inner = usize::from(DEMO_SIDEBAR_WIDTH - 2);
-        // 名前より前の固定部分 `☰ ␣ <グリフ> ␣`。demo は agents ポーラーを
-        // 起こさないので生存プロセスは無く、グリフは常に停止形（∙）
+        // 名前より前の固定部分 `☰ ␣ <グリフ> ␣`。撮影はセッションを起こさないので
+        // 生きた PTY は無く、グリフは常に停止形（∙）
         let prefix = "☰ ∙ ".width();
         let mut widest = DEMO_HEADER.width();
         let (mut awaiting, mut working, mut completed) = (0, 0, 0);
-        for job in demo_jobs() {
-            let view = classify(&job.state, job.tempo == "blocked", false);
+        for session in demo_sessions() {
+            let view = classify(&session.last_state, false);
             match view.bucket {
                 Bucket::Awaiting => awaiting += 1,
                 Bucket::Working => working += 1,
                 Bucket::Completed => completed += 1,
             }
-            let need = prefix + job.name.width() + 2 + view.label.width();
+            let need = prefix + session.title.width() + 2 + view.label.width();
             assert!(
                 need <= inner,
                 "{:?} + {:?} に {need} 桁必要（内側 {inner} 桁）",
-                job.name,
+                session.title,
                 view.label
             );
             widest = widest.max(need);

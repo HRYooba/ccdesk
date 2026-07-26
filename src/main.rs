@@ -24,7 +24,7 @@ mod theme;
 mod ui;
 mod update;
 
-use app::{clamp_sidebar, instant_ago, open_short, run, App, Focus, RightView, SelfUpdate};
+use app::{clamp_sidebar, instant_ago, open_session, run, App, Focus, RightView, SelfUpdate};
 use cli::{print_usage, run_doctor, show_logs, statusline_hook, update_self};
 use poll::FooterInfo;
 use source::{DataSource, DemoSource, LiveSource};
@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some("doctor") => return run_doctor(),
         Some("logs") => return show_logs(),
-        // 使用率表示（opt-in）が attach セッションへ注入する内部フック
+        // 使用率表示（opt-in）が起こしたセッションへ注入する内部フック
         Some("statusline-hook") => return statusline_hook(),
         Some("update") => return update_self(),
         Some("--help" | "-h" | "help") => {
@@ -74,7 +74,7 @@ fn main() -> anyhow::Result<()> {
         Arc::new(LiveSource::new(usage_display))
     };
     // セッション一覧・フッター・ウィンドウ状態はすべて供給元から受け取る
-    let jobs = source.jobs();
+    let sessions = source.sessions();
     let footer = source.footer();
     let window = source.window_state();
     // 保管済みアカウントは起動時に 1 度読む（以降はアカウント行を開いた時と
@@ -119,15 +119,14 @@ fn main() -> anyhow::Result<()> {
 
     let area = terminal.get_frame().area();
     let mut app = App {
-        sessions: Vec::new(),
+        windows: Vec::new(),
         active: 0,
         agents: Vec::new(),
         agents_shared: Arc::new(Mutex::new(Vec::new())),
         agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        jobs,
+        sessions,
         last_scan: std::time::Instant::now(),
         last_live_scan: std::time::Instant::now(),
-        rescan_hot_until: None,
         sidebar_width: window.sidebar_width,
         dragging: false,
         last_drag_resize: std::time::Instant::now(),
@@ -155,7 +154,6 @@ fn main() -> anyhow::Result<()> {
         usage: None,
         last_usage_read: instant_ago(Duration::from_secs(60)),
         pending_delete: None,
-        spawn_rx: None,
         account_job: None,
         input_gate: None,
         notice: None,
@@ -167,18 +165,19 @@ fn main() -> anyhow::Result<()> {
     };
     clamp_sidebar(&mut app); // 保存値が現在の端末幅を超えていたら丸める
     // 既にあるセッションのフォルダを登録へ埋め戻す（以前から使っているフォルダの
-    // 見出しが、最後のセッションを消した時点で消えないように）。jobs を読んだ後・
+    // 見出しが、最後のセッションを消した時点で消えないように）。一覧を読んだ後・
     // 画面を組む前のこの位置に置く: 埋め戻しは初回の一覧に効く必要がある
     app::backfill_projects(&mut app);
     // バックグラウンド取得の起動。撮影用の供給元は 1 本も起こさないので、
     // ここに `if !demo` は要らない
     app.source.spawn_pollers(app.poll_sinks());
-    // 前回開いていた画面を復元: セッションを見ていたなら再 attach、それ以外は new session 画面
-    match window.last_view {
-        Some(short) if app.jobs.iter().any(|j| j.short == short) => {
-            open_short(&mut app, &short);
-            if app.sessions.is_empty() {
-                app.open_new_view(); // attach 失敗時のフォールバック
+    // 前回開いていた画面を復元: セッションを見ていたなら `claude -r` で再開、
+    // それ以外は new session 画面
+    match window.last_view.map(sessions::SessionId::new) {
+        Some(id) if app.sessions.iter().any(|row| row.session_id == id) => {
+            open_session(&mut app, &id);
+            if app.windows.is_empty() {
+                app.open_new_view(); // 再開に失敗したときのフォールバック
             }
         }
         _ => app.open_new_view(),
@@ -186,9 +185,10 @@ fn main() -> anyhow::Result<()> {
 
     let result = run(&mut terminal, &mut app);
 
-    // 終了時に子プロセスを残さない
-    for session in &mut app.sessions {
-        let _ = session.child.kill();
+    // 終了時に子プロセスを残さない。**行は残す**（`sessions.json` はそのまま ＝
+    // 次の起動で一覧に出て `claude -r` で再開できる）
+    for window in &mut app.windows {
+        let _ = window.child.kill();
     }
     let _ = crossterm::execute!(
         std::io::stdout(),

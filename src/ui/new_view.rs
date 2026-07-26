@@ -171,7 +171,7 @@ pub(crate) struct NewState {
     /// `dir_idx` は 0 = 起動ボタン行に戻るが `focus` は Browser のまま残るので、これが
     /// 無いと「フォルダ行を再クリックして潜った直後の起動ボタン 1 クリック」が
     /// 再クリック扱いになり、書きかけのプロンプトでセッションが起動してしまう
-    /// （supervisor 管理なので取り消せない）。作り直しで立て、明示的な選択移動
+    /// （送ったメッセージは取り消せない）。作り直しで立て、明示的な選択移動
     /// （↑↓・ホイール・選択を動かすクリック）で倒す
     pub(crate) selection_from_rebuild: bool,
 }
@@ -448,7 +448,7 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
                     state.cancel_path_edit();
                     state.focus = NewFocus::Prompt;
                 }
-                _ if !app.sessions.is_empty() => {
+                _ if !app.windows.is_empty() => {
                     app.right_view = RightView::Sessions;
                 }
                 _ => {}
@@ -658,7 +658,7 @@ fn list_rows_for_message(no_folder_rows: bool, list_height: u16) -> usize {
 }
 
 /// 新規セッション画面の描画（フォルダブラウザ + 初回チャット入力）。
-/// starting = `claude --bg` 実行中（別スレッド）: プロンプト欄に進行中表示を出す
+/// starting = 起こした子がまだ端末を掴んでいない: プロンプト欄に進行中表示を出す
 pub(crate) fn draw_new_view(
     frame: &mut Frame,
     area: Rect,

@@ -14,12 +14,6 @@
 //! tmp → rename）。ここが持つのは「どのファイルをどのロックで守り、どれだけ待つか」と
 //! 「一覧をどうマージするか」だけで、書き方そのものは持たない。
 
-// **移行フェーズ1（追加のみ）の間だけの許可。** このモジュールを呼ぶのは今のところ
-// テストと [`crate::source::DataSource`] の実装だけで、UI から使うのはフェーズ2
-// （`docs/foreground-migration.md`）。振る舞いはテストが押さえてあるので、
-// 未使用の警告で他の警告が埋もれる方が害が大きい。**フェーズ2でこの行を外す**
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -185,7 +179,12 @@ impl SessionRow {
         }
     }
 
-    /// 未読か（状態ラベルの前に `●` を出す判定）
+    /// 未読か（状態ラベルの前に `●` を出す判定）。
+    ///
+    /// **描画に繋ぐのはフェーズ3**（`docs/foreground-migration.md`）。判定そのものは
+    /// 行の意味論なのでここが持ち、`updated_at` を進める側（[`crate::app`] の
+    /// `mark_state`）とテストが既に依存している ＝ 描画待ちで消す理由が無い
+    #[allow(dead_code)]
     pub(crate) fn unread(&self) -> bool {
         self.updated_at > self.last_opened_at
     }

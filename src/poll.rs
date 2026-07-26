@@ -9,15 +9,30 @@ use ccdesk::{claude_settings_channel, version_newer};
 use crate::accounts::{Account, AccountStore, ActiveAccount, CredentialsFp};
 use crate::theme::{ui, C_ATTENTION, C_FAIL, C_OK, C_WORKING};
 
-/// `claude agents --json --all` の 1 エントリ（公式のスクリプト向けライブデータ。
-/// フィールドは agent-view.md に文書化されている: state は
-/// working|blocked|done|failed|stopped、pid はプロセス生存中のみ載る）
+/// `claude agents --json --all` の 1 エントリ（公式のスクリプト向けライブデータ）。
+///
+/// **前景移行後に読むのは前景セッションを名指しできる項目だけ。** `sessionId` が
+/// ccdesk の行（[`crate::sessions::SessionRow`]）と同じ鍵で、`status` が前景
+/// セッションの生きた状態（`~/.claude/sessions/<pid>.json` に書かれる
+/// busy|idle|waiting|shell）。bg 専用の `id`（short）・`state`・要約は読まない
+/// ＝ 非公開の内部形式に依存する経路をここで断つ（`docs/foreground-migration.md`）
 #[derive(Clone, Default)]
 pub(crate) struct AgentInfo {
-    pub(crate) id: String, // bg セッションの short id（interactive は空）
-    pub(crate) name: String,
-    pub(crate) state: String,
-    pub(crate) has_pid: bool, // プロセス生存（文書化: 生存中のみ pid が載る）
+    /// transcript の `sessionId`（＝ `claude --session-id` へ渡した UUID）
+    pub(crate) session_id: String,
+    /// `"interactive"` | `"background"` 等。前景セッションの行だけを突き合わせる
+    pub(crate) kind: String,
+    /// 前景セッションが書くライブ状態（busy|idle|waiting|shell）
+    pub(crate) status: String,
+    /// プロセス生存（文書化: 生存中のみ pid が載る）
+    pub(crate) has_pid: bool,
+}
+
+impl AgentInfo {
+    /// 前景（interactive）セッションか。bg エントリを行の状態の答えにしない
+    pub(crate) fn is_interactive(&self) -> bool {
+        self.kind == "interactive"
+    }
 }
 
 /// agents --json は 1 回 ~900ms かかるためバックグラウンドスレッドで回す
@@ -44,9 +59,9 @@ pub(crate) fn spawn_agents_poller(
                                 .to_string()
                         };
                         AgentInfo {
-                            id: s("id"),
-                            name: s("name"),
-                            state: s("state"),
+                            session_id: s("sessionId"),
+                            kind: s("kind"),
+                            status: s("status"),
                             has_pid: v.get("pid").is_some(),
                         }
                     })
@@ -602,10 +617,13 @@ pub(crate) enum Grouping {
     Directory,
 }
 
-/// 公式のグループ順: Ready for review → Needs input → Working → Completed
+/// グループ順: Needs input → Working → Completed。
+///
+/// **Ready for review は持たない**: 判定材料（PR 番号）は bg の state.json
+/// （非公開の内部形式）にしか無く、前景セッションは書かない。正本を
+/// `sessions.json` 1 つにする代償として落とした（`docs/foreground-migration.md`）
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Group {
-    ReadyForReview,
     NeedsInput,
     Working,
     Completed,
@@ -614,7 +632,6 @@ pub(crate) enum Group {
 impl Group {
     pub(crate) fn title(self) -> &'static str {
         match self {
-            Self::ReadyForReview => "Ready for review",
             Self::NeedsInput => "Needs input",
             Self::Working => "Working",
             Self::Completed => "Completed",
@@ -642,8 +659,20 @@ pub(crate) struct StateView {
     pub(crate) bucket: Bucket,
 }
 
-/// 文書化された state 値（working|blocked|done|failed|stopped）+ tempo + 生死から表示を決める
-pub(crate) fn classify(live_state: &str, tempo_blocked: bool, alive: bool) -> StateView {
+/// 生きている前景セッションのライブ状態（`agents --json` の `status`）を、
+/// [`classify`] が読む state 値へ写す。**呼ぶのは status が空でないときだけ**
+/// （空 ＝ まだ書かれていない・拾えていないので、判断の材料が無い）。
+///
+/// **フェーズ2の暫定**: ここから出るのは Working か Needs input の 2 つだけ
+/// （`docs/foreground-migration.md` のフェーズ3で hooks 由来の state に置き換わる）。
+/// `busy` 以外を Needs input へ倒すのは、前景セッションが `busy` でないなら
+/// ユーザーの入力を待っているため（`idle` = プロンプト待ち、`waiting` = 確認待ち）
+pub(crate) fn foreground_state(status: &str) -> &'static str {
+    if status == "busy" { "working" } else { "blocked" }
+}
+
+/// state 値（working|blocked|done|failed|stopped）+ 生死から表示を決める
+pub(crate) fn classify(live_state: &str, alive: bool) -> StateView {
     let needs_input = StateView {
         group: Group::NeedsInput,
         label: "Needs input",
@@ -678,7 +707,6 @@ pub(crate) fn classify(live_state: &str, tempo_blocked: bool, alive: bool) -> St
             bucket: Bucket::Completed,
         },
         "blocked" => needs_input,
-        _ if tempo_blocked => needs_input,
         _ if alive => StateView {
             group: Group::Working,
             label: "Working",

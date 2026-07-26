@@ -120,31 +120,54 @@ flowchart LR
 （UUID）がどちらも素の `String` だと、**移行を半分だけやってもコンパイルが通る**ため。
 型で止める。
 
-### フェーズ2: 起動を前景へ差し替える
+### フェーズ2: 所有権を supervisor から ccdesk へ移す（済）
 
-- `Session::spawn` を `claude attach <short>` から
-  `claude --session-id <uuid> -n <title>` へ
-- 継承環境変数の除去（上表の一覧。継承すると transcript が保存されない）
-- サイドバーの行を `jobs()` から `sessions()` へ載せ替え、`DataSource::jobs` と
-  `scan_jobs` / `BgJob` を消す
-- 一覧の読み書きを UI に繋ぎ、`src/sessions.rs` 冒頭の `#![allow(dead_code)]` を外す
+**この段階の本質は起動コマンドの差し替えではなく所有権の反転。** ccdesk の PTY が
+`claude attach` のクライアントではなく**セッションそのもの**になり、
+「窓を閉じる = プロセスを終わらせる」に変わった。
+
+- `Session::spawn` を前景起動へ（新規 `claude --session-id <uuid> -n <title> [prompt]` /
+  再開 `claude -r <session-id>`）。UUID は ccdesk が採番する（`uuid` crate）
+- 継承環境変数の除去（上表の一覧）。`env_clear` ではなく個別除去
+  （`CommandBuilder::env_remove`）＝ PATH 等は残す
+- 一覧の生成元を `jobs()` から `sessions()` へ載せ替え、`DataSource::jobs` /
+  `scan_jobs` / `BgJob` / `iso_to_epoch_ms` を削除。サイドバーの行生成は
+  「自 PTY 行 + job 行」の 2 ループから**行の一覧 1 本**へ統合した
+- `App` の持ち物を「窓（`windows`）」と「行（`sessions`）」に分けた。
+  行の identity は `SessionId`（`RowAction::Open` / `PopupKind::Session` /
+  `pending_delete` まで型で通してある）
+- stop / delete は `claude stop|rm` の起動ではなく `child.kill()` + ストア操作へ。
+  **stop でも行は消さない**（`last_state` を `stopped` にして残す）
+- bg 前提で意味を失ったものを削除: `spawn_rx` / `SpawnOutcome`（PTY 起動は同期で
+  数 ms なので別スレッドが要らない）/ 多重ディスパッチの抑止 /
+  `rescan_hot_until`（stop・delete が即時反映になった）/ `seen_alive` と
+  `agents --json` の pid 消失による外部 stop 追従（生死は `child.try_wait()` が真実）/
+  `run_claude_silent` / `Group::ReadyForReview`（PR 番号は state.json にしか無い）
+- `input_gate` は**意味を変えて残した**。宛先は起動時点で決まるので守る対象は
+  「子が端末を掴む前の打鍵」になり、降ろす合図は最初の出力（`Session::started`）と
+  期限切れの 2 つ。`-r` の再開は読み直しに時間がかかるのでこれが要る
+- `poll::AgentInfo` は `sessionId` / `kind` / `status` / `pid` だけを読む形へ。
+  state はフェーズ3までの暫定として `status`（busy → Working / それ以外 →
+  Needs input）と PTY 生存（無ければ Stopped）から出す
+- 一覧の読み書きを UI に繋ぎ、`src/sessions.rs` 冒頭の `#![allow(dead_code)]` を外した
 
 ### フェーズ3: 状態・title・未読
 
 - hooks（`Notification` / `Stop` / `UserPromptSubmit`）で `last_state` を更新
+  （フェーズ2 が書くのは `stopped` だけ。生きている行の状態は毎周
+  `agents --json` から導いていて保管に残っていない）
 - `claude agents --json` の `status` と突き合わせる
 - title の優先順（上表）を実装。ccdesk のリネームは `customTitle` の位置
-- 未読（`updated_at > last_opened_at`）と `●` の描画
+  （フェーズ2 の title は起動時のプロンプト先頭 30 桁 ＝ `TitleSource::Derived` 固定）
+- 未読（`updated_at > last_opened_at`）と `●` の描画（判定は
+  `SessionRow::unread` が既に持っている）
 
 ### フェーズ4: メニューとショートカット
 
 - 二次操作をポップアップへ集約（ピン留め / 既読にする / 名前を変更 / 閉じる /
-  アーカイブ / 削除）
+  アーカイブ / 削除）。`archived` / `pinned` は行が既に持っているが、まだ
+  一覧の並びにも描画にも効いていない
 - `Ctrl+S` `Ctrl+X` を撤去（予約は `Ctrl+Q` と `Alt+←→` だけ）
-- **`src/ui/mod.rs` のサイドバー冒頭コメントを直す。** 「行の正本は agents --json
-  （ライブ）+ state.json（summary 補完）」と書いてあるが、実装は state.json 由来の行に
-  agents --json を重ねる形で**逆**。移行後の正本は `sessions.json` なので、
-  この記述はどのみち書き換わる
 
 ## 失うもの（受け入れた代償）
 

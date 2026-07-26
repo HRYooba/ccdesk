@@ -12,7 +12,9 @@ use tui_term::widget::PseudoTerminal;
 use ccdesk::dir_key;
 
 use crate::app::{active_unstored, App, Focus, Popup, RightView, RowAction, SelfUpdate};
-use crate::poll::{classify, AccountStatus, Bucket, Group, Grouping, StateView};
+use crate::poll::{
+    classify, foreground_state, AccountStatus, Bucket, Group, Grouping, StateView,
+};
 use crate::session::SessionStatus;
 use crate::theme::{
     ui, usage_color, C_ATTENTION, C_FAIL, C_WORKING, FOCUS_BORDER, MUTED_FG,
@@ -460,7 +462,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         ])
         .split(vert[0]);
 
-    // 下部バー: 通知（attach 失敗等）があれば数秒それを出し、無ければキーヒント
+    // 下部バー: 通知（起動失敗等）があれば数秒それを出し、無ければキーヒント
     if let Some((msg, at)) = &app.notice {
         if at.elapsed() < Duration::from_secs(5) {
             frame.render_widget(
@@ -483,11 +485,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 " ↑↓ select · Enter open · Ctrl+S group · Ctrl+X stop→delete",
             ));
         }
-        // `claude --bg` の実行中（~1 秒）であることを出す。**見出しメニューの
+        // 起こした子がまだ端末を掴んでいないことを出す。**見出しメニューの
         // new session は右ペインの表示を変えない**ので、ここに出さないと無反応に見える。
-        // 判定は `spawn_rx` 1 つ（起動中かどうかの正本を増やさない）。
+        // 判定は `input_gate` 1 つ（起動中かどうかの正本を増やさない）。
         // New 画面は入力欄に自前の starting 表示を持つので、そこでは二重に出さない
-        if app.spawn_rx.is_some() && !matches!(app.right_view, RightView::New(_)) {
+        if app.input_gate.is_some() && !matches!(app.right_view, RightView::New(_)) {
             hint_spans.push(Span::styled(
                 "  starting session…",
                 Style::default().fg(C_WORKING),
@@ -547,38 +549,38 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         }
     }
 
-    // サイドバー: 行の正本は agents --json（ライブ）+ state.json（summary 補完）。
-    // 自分の PTY 行は「attach ウィンドウ」としてだけ出す
-    let active = app.active;
+    // サイドバー: **行の正本は `~/.ccdesk/sessions.json`**（`app.sessions`）。
+    // 生死は自分の子プロセス（`child.try_wait()`）が、生きている行のライブ状態は
+    // `claude agents --json` の `status` が答える
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    // 自分のウィンドウの表示は agents --json（attach_id で突合）→ classify で決める。
-    // agents に居なければ出力ヒューリスティックへフォールバック
-    let agents_snapshot = app.agents.clone();
-    let views: Vec<StateView> = app
-        .sessions
+    // 窓ごとの観測を**先に**確定させる（生死と出力ヒューリスティックは可変借用が要る）。
+    // 以降は行の一覧を不変で回せるので、行の組み立ては 1 本のループで済む
+    struct WindowView {
+        session_id: crate::sessions::SessionId,
+        alive: bool,
+        heuristic: SessionStatus,
+        idle_secs: u64,
+    }
+    let windows: Vec<WindowView> = app
+        .windows
         .iter_mut()
-        .map(|s| {
-            if let Some(agent) = s
-                .attach_id
-                .as_deref()
-                .and_then(|id| agents_snapshot.iter().find(|a| a.id == id))
-            {
-                classify(&agent.state, false, agent.has_pid)
-            } else if !s.alive() {
-                classify("stopped", false, false)
-            } else {
-                match s.status_heuristic() {
-                    SessionStatus::Working => classify("working", false, true),
-                    SessionStatus::NeedsInput => classify("blocked", false, true),
-                    SessionStatus::Exited => classify("stopped", false, false),
-                }
-            }
+        .map(|w| WindowView {
+            session_id: w.session_id.clone(),
+            alive: w.alive(),
+            heuristic: w.status_heuristic(),
+            idle_secs: w
+                .last_output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .elapsed()
+                .as_secs(),
         })
         .collect();
+    let active = app.active;
 
     // ---- 行データを先に組み立てる（State / Directory 両グルーピング対応）----
     struct RowData {
@@ -590,8 +592,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         label: String,
         is_active_window: bool,
         status_label: &'static str,
-        summary: String,
-        children: Vec<String>,
         age: String,
         bucket: Bucket,
     }
@@ -609,88 +609,45 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     };
 
     let mut data: Vec<RowData> = Vec::new();
-    for (i, session) in app.sessions.iter().enumerate() {
-        let view = views[i];
-        let age_secs = session
-            .last_output
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .elapsed()
-            .as_secs();
-        data.push(RowData {
-            action: RowAction::Open(session.attach_id.clone().unwrap_or_default()),
-            group: view.group,
-            cwd: session.cwd.clone(),
-            glyph: glyph_of(&view),
-            color: view.color,
-            label: session.name.clone(),
-            is_active_window: i == active && matches!(app.right_view, RightView::Sessions),
-            status_label: view.label,
-            summary: String::new(),
-            children: Vec::new(),
-            age: fmt_age(age_secs),
-            bucket: view.bucket,
-        });
-    }
-    for job in app.jobs.iter() {
-        if app
-            .sessions
+    for row in &app.sessions {
+        let window = windows
             .iter()
-            .any(|s| s.attach_id.as_deref() == Some(job.short.as_str()))
-        {
-            continue; // attach 中は自分のウィンドウ行が代表する（集計もウィンドウ行が担う）
-        }
-        // agents --json のライブ状態を優先（rename・state 変化が即時反映される）
-        let agent = app.agents.iter().find(|a| a.id == job.short);
-        let live_state = agent
-            .map(|a| a.state.as_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(job.state.as_str());
-        let alive = agent.map(|a| a.has_pid).unwrap_or(false);
-        let view = classify(live_state, job.tempo == "blocked", alive);
-        let summary = match view.label {
-            "Done" | "Failed" => job.result.clone(),
-            "Needs input" => job.needs.clone(),
-            _ => job.detail.clone(),
+            .enumerate()
+            .find(|(_, w)| w.session_id == row.session_id);
+        let alive = window.is_some_and(|(_, w)| w.alive);
+        // 生きている行のライブ状態は `agents --json` の interactive エントリが答える
+        let status = app
+            .agents
+            .iter()
+            .find(|a| a.is_interactive() && a.session_id == row.session_id.as_str())
+            .map(|a| a.status.as_str())
+            .unwrap_or_default();
+        let view = match (alive, status, window.map(|(_, w)| w.heuristic)) {
+            // 死んでいる窓・窓の無い行は、最後に観測した state のまま出す
+            // （空 ＝ 一度も観測していない行は動いていない）
+            (false, _, _) if row.last_state.is_empty() => classify("stopped", false),
+            (false, _, _) => classify(&row.last_state, false),
+            // status が無い（まだ書かれていない・ポーラーが拾う前）間は
+            // 出力の変化から推す
+            (true, "", Some(SessionStatus::Working)) => classify("working", true),
+            (true, "", _) => classify("blocked", true),
+            (true, status, _) => classify(foreground_state(status), true),
         };
-        // 表示名はライブ名を優先。未命名はプロンプト投入前なら "new session"、他は "bg"
-        let live_name = agent
-            .map(|a| a.name.clone())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| job.name.clone());
-        let label = if !live_name.is_empty() {
-            live_name
-        } else if live_state == "working" && job.result.is_empty() {
-            "new session".to_string()
-        } else {
-            "bg".to_string()
-        };
-        // 公式の経過時間: 作業中 = 作成からの経過、終了後 = 総実行時間で凍結。
-        // 隣に出す状態表示と同じ live_state で判定する（state.json 直読みは古い）
-        let age_secs = match live_state {
-            "done" | "failed" | "stopped" if job.updated_at_ms >= job.created_at_ms => {
-                (job.updated_at_ms - job.created_at_ms) / 1000
-            }
-            _ if job.created_at_ms > 0 => now_ms.saturating_sub(job.created_at_ms) / 1000,
-            _ => job.mtime.elapsed().map(|d| d.as_secs()).unwrap_or(0),
-        };
-        // PR 持ちで未完了なら Ready for review（公式: 完了系はそのまま Completed へ）
-        let group = if !job.children.is_empty() && view.group != Group::Completed {
-            Group::ReadyForReview
-        } else {
-            view.group
+        // 経過時間: 動いている窓は最後の出力から、止まっている行は最後の更新から
+        let age_secs = match window {
+            Some((_, w)) if alive => w.idle_secs,
+            _ => now_ms.saturating_sub(row.updated_at) / 1000,
         };
         data.push(RowData {
-            action: RowAction::Open(job.short.clone()),
-            group,
-            cwd: job.cwd.clone(),
+            action: RowAction::Open(row.session_id.clone()),
+            group: view.group,
+            cwd: row.cwd.clone(),
             glyph: glyph_of(&view),
             color: view.color,
-            label,
-            is_active_window: false,
+            label: row.title.clone(),
+            is_active_window: window.is_some_and(|(i, _)| i == active)
+                && matches!(app.right_view, RightView::Sessions),
             status_label: view.label,
-            summary,
-            children: job.children.clone(),
             age: fmt_age(age_secs),
             bucket: view.bucket,
         });
@@ -742,14 +699,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 Span::raw("  "),
                 Span::styled(d.status_label, Style::default().fg(d.color)),
             ];
-            if !d.summary.is_empty() {
-                spans.push(Span::raw(" · "));
-                spans.push(Span::raw(d.summary.clone()));
-            }
-            for child in &d.children {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(child.clone(), Style::default().fg(C_ATTENTION)));
-            }
             spans.push(Span::raw(" · "));
             spans.push(Span::styled(
                 d.age.clone(),
@@ -829,12 +778,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
 
     match app.grouping {
         Grouping::State => {
-            for group in [
-                Group::ReadyForReview,
-                Group::NeedsInput,
-                Group::Working,
-                Group::Completed,
-            ] {
+            for group in [Group::NeedsInput, Group::Working, Group::Completed] {
                 let members: Vec<&RowData> =
                     data.iter().filter(|d| d.group == group).collect();
                 if members.is_empty() {
@@ -854,8 +798,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         Grouping::Directory => {
             // 見出しに出すフォルダと並びの決定は project_rows に閉じている。
             // 選択・stop・delete 等の操作では並び替えない
-            let mut cwds: Vec<&str> = app.jobs.iter().map(|j| j.cwd.as_str()).collect();
-            cwds.extend(data.iter().map(|d| d.cwd.as_str()));
+            let cwds: Vec<&str> = data.iter().map(|d| d.cwd.as_str()).collect();
             // セッション行の振り分けキーも**行ごとに 1 度だけ**作る（見出し × 行の
             // 総当たりになるので、突き合わせのたびに作ると描画 1 回で数千の String に
             // なる。見出し側のキーは project_rows が持っている）
@@ -1027,11 +970,11 @@ fn draw_right_pane(frame: &mut Frame, pane: Rect, app: &mut App) -> FrameCursor 
     let focus_style = Style::default().fg(FOCUS_BORDER);
     let blur_style = Style::default().fg(ui().dim);
     let terminal_focused = app.focus == Focus::Terminal;
-    let starting = app.spawn_rx.is_some();
+    let starting = app.input_gate.is_some();
     if let RightView::New(state) = &mut app.right_view {
         return draw_new_view(frame, pane, state, terminal_focused, starting);
     }
-    if app.sessions.is_empty() {
+    if app.windows.is_empty() {
         frame.render_widget(
             Block::default()
                 .borders(Borders::ALL)
@@ -1041,12 +984,12 @@ fn draw_right_pane(frame: &mut Frame, pane: Rect, app: &mut App) -> FrameCursor 
         );
         return FrameCursor::hidden_at(pane_fallback_pos(pane));
     }
-    let session = &app.sessions[app.active];
-    let parser = session.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let window = &app.windows[app.active];
+    let parser = window.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let screen = parser.screen();
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(session.name.clone())
+        .title(window.name.clone())
         .border_style(if app.focus == Focus::Terminal {
             focus_style
         } else {
@@ -1537,7 +1480,9 @@ mod tests {
                 sidebar_width: 34,
                 grouping: Grouping::Directory,
                 projects: (0..n).map(|i| format!("C:\\dev\\p{i}")).collect(),
-                jobs: (0..n).map(|i| job_in(&format!("C:\\dev\\p{i}"))).collect(),
+                sessions: (0..n)
+                    .map(|i| session_in(&format!("C:\\dev\\p{i}")))
+                    .collect(),
                 ..Default::default()
             };
             let (dir_keys, leaves) = key_calls(|| {
@@ -1548,10 +1493,10 @@ mod tests {
                     .count();
                 assert_eq!(headings, n, "n={n} で見出しの数が合わない");
             });
-            // project_rows へ渡るのは登録 n + (jobs n + セッション行 n) で、
+            // project_rows へ渡るのは登録 n + セッション行 n で、
             // セッション行の振り分けキーがさらに n。末端名は project_rows のぶんだけ
-            assert_eq!(dir_keys, 4 * n, "n={n} で dir_key の回数が入力数に比例していない");
-            assert_eq!(leaves, 3 * n, "n={n} で末端名の取り出しが入力数に比例していない");
+            assert_eq!(dir_keys, 3 * n, "n={n} で dir_key の回数が入力数に比例していない");
+            assert_eq!(leaves, 2 * n, "n={n} で末端名の取り出しが入力数に比例していない");
         }
     }
 
@@ -1564,22 +1509,15 @@ mod tests {
         (DIR_KEY_CALLS.get(), LEAF_NAME_CALLS.get())
     }
 
-    /// そのフォルダで動いているセッション 1 本
-    fn job_in(cwd: &str) -> ccdesk::BgJob {
-        ccdesk::BgJob {
-            short: format!("s-{cwd}"),
-            cwd: cwd.to_string(),
-            state: "working".to_string(),
-            tempo: String::new(),
-            name: String::new(),
-            needs: String::new(),
-            detail: String::new(),
-            result: String::new(),
-            children: Vec::new(),
-            mtime: std::time::SystemTime::now(),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        }
+    /// そのフォルダのセッション行 1 本
+    fn session_in(cwd: &str) -> crate::sessions::SessionRow {
+        crate::sessions::SessionRow::new(
+            crate::sessions::SessionId::new(format!("s-{cwd}")),
+            cwd,
+            "session",
+            crate::sessions::TitleSource::Derived,
+            0,
+        )
     }
 
     /// **キーを持ち回る形にしても一覧の中身・並び・重複排除が変わらないことの固定。**
@@ -1688,7 +1626,7 @@ mod tests {
             term_size: (60, 40),
             sidebar_width: 34,
             grouping: Grouping::Directory,
-            jobs: DemoSource.jobs(),
+            sessions: DemoSource.sessions(),
             projects: DemoSource.window_state().projects,
             ..Default::default()
         };
@@ -1909,14 +1847,13 @@ mod tests {
     }
 
     /// **起動処理中であることを下部バーへ出す。** 見出しメニューの new session は
-    /// 右ペインの表示を変えないので、ここに出さないと ~1 秒間まったく無反応に見える。
-    /// 判定は `spawn_rx` 1 つ（起動中の正本を増やさない）
+    /// 右ペインの表示を変えないので、ここに出さないと起動から表示までまったく
+    /// 無反応に見える。判定は `input_gate` 1 つ（起動中の正本を増やさない）
     #[test]
     fn the_bottom_bar_shows_that_a_session_is_starting() {
-        let (_tx, rx) = std::sync::mpsc::channel();
         let mut app = App {
             term_size: (120, 30),
-            spawn_rx: Some(rx),
+            input_gate: Some(std::time::Instant::now()),
             ..Default::default()
         };
         // 下部バーは最下行

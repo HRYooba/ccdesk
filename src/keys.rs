@@ -12,9 +12,9 @@ use crate::app::App;
 pub(crate) fn forward_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<()> {
     use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
-    let session = &mut app.sessions[app.active];
+    let window = &mut app.windows[app.active];
     let (mode, encoding, size) = {
-        let parser = session.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let parser = window.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let screen = parser.screen();
         (
             screen.mouse_protocol_mode(),
@@ -69,7 +69,7 @@ pub(crate) fn forward_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result
 
     let suffix = if release { 'm' } else { 'M' };
     let seq = format!("\x1b[<{code};{x};{y}{suffix}");
-    let mut writer = session.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut writer = window.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     writer.write_all(seq.as_bytes())?;
     writer.flush()?;
     Ok(())

@@ -8,12 +8,13 @@ use crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 
-use ccdesk::{log_error, same_dir, BgJob};
+use ccdesk::{log_error, same_dir};
 
 use crate::accounts::{Account, AccountChange, ActiveAccount, Outgoing};
 use crate::keys::{encode_key, forward_mouse};
 use crate::poll::{AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo};
-use crate::session::Session;
+use crate::session::{Launch, Session};
+use crate::sessions::{SessionId, SessionRow, TitleSource};
 use crate::source::{AccountAction, DataSource, PollSinks, WindowItem, PROJECTS_LIMIT};
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
 use crate::ui::{draw, popup_rect, row_at, sidebar_layout};
@@ -23,9 +24,10 @@ use crate::ui::{draw, popup_rect, row_at, sidebar_layout};
 pub(crate) const MIN_SIDEBAR: u16 = 12;
 const MIN_PANE: u16 = 40;
 
-// state.json は name(/rename)・needs・summary の正本なので短周期で読む
-// （数十ファイルの小さな read。描画は dirty 時のみなので負荷は無視できる）
+// 一覧の正本（~/.ccdesk/sessions.json）を読み直す周期。**他インスタンスが起こした
+// セッションを取り込むため**に要る（小さな JSON 1 本の read。描画は dirty 時のみ）
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
+// 自分の PTY の生死を見る周期（前景では `child.try_wait()` が生死の唯一の真実）
 const LIVE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// 使用率の読み取り周期（statusline フックが書くキャッシュを見に行く間隔）
 const USAGE_INTERVAL: Duration = Duration::from_secs(5);
@@ -37,9 +39,9 @@ pub(crate) enum Focus {
     Terminal,
 }
 
-/// サイドバー行のクリック動作。セッションは short id で参照する。
-/// jobs / sessions は 2 秒毎に再構築され並びも変わるため、描画時の生 index を
-/// 保持すると実行時に別セッションを stop/rm し得る
+/// サイドバー行のクリック動作。セッションは [`SessionId`] で参照する。
+/// 一覧は 2 秒毎に読み直され並びも変わるため、描画時の生 index を
+/// 保持すると実行時に別セッションを stop/delete し得る
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum RowAction {
     New, // 新規セッション画面を開く
@@ -47,7 +49,8 @@ pub(crate) enum RowAction {
     /// **クリックで即セッションが立つ行ではない**（起動は開いたメニューの中で選ぶ）
     Project(String),
     ToggleGroup, // グルーピング切替（state ⇔ directory）
-    Open(String),  // short id: ウィンドウが開いていれば切替、無ければ claude attach
+    /// セッション行: ウィンドウが開いていれば切替、無ければ `claude -r` で再開
+    Open(SessionId),
     UpdateCcdesk,  // ccdesk 自身を更新（サイドバー先頭の版行）
     UpdateClaude,  // claude 本体を更新（同じく版行）
 }
@@ -93,7 +96,7 @@ pub(crate) struct AccountItem {
 /// 2 つの match に閉じる（幅は項目から導くので触らない）
 #[derive(Debug, PartialEq)]
 pub(crate) enum PopupKind {
-    Session { short: String, stopped: bool },
+    Session { id: SessionId, stopped: bool },
     Group,
     /// アカウント一覧。開いた時点の写しを持つ（一覧の供給はデータ層の責務で、
     /// メニューは受け取った並びをそのまま出す）。保管 0 件でも
@@ -117,8 +120,8 @@ pub(crate) enum PopupKind {
 /// 副作用は持たず、実行は [`run_popup_action`] だけが行う
 #[derive(Debug, PartialEq)]
 enum PopupAction {
-    Stop(String),
-    Delete(String),
+    Stop(SessionId),
+    Delete(SessionId),
     SetGrouping(Grouping),
     /// 2 階層目のメニューへ遷移する
     Open(PopupKind),
@@ -192,9 +195,9 @@ impl PopupKind {
     /// 動的な項目は index で対象（アカウント）を引く
     fn action(&self, index: usize) -> Option<PopupAction> {
         match self {
-            PopupKind::Session { short, .. } => match index {
-                0 => Some(PopupAction::Stop(short.clone())),
-                1 => Some(PopupAction::Delete(short.clone())),
+            PopupKind::Session { id, .. } => match index {
+                0 => Some(PopupAction::Stop(id.clone())),
+                1 => Some(PopupAction::Delete(id.clone())),
                 _ => None,
             },
             PopupKind::Group => match index {
@@ -267,17 +270,19 @@ pub(crate) enum RightView {
 }
 
 pub(crate) struct App {
-    pub(crate) sessions: Vec<Session>,
+    /// 開いているウィンドウ（前景セッションの PTY そのもの）。**一覧の行とは別物**で、
+    /// 窓を閉じてもプロセスが終わるだけ ＝ 行（[`Self::sessions`]）は残る
+    pub(crate) windows: Vec<Session>,
+    /// 表示中のウィンドウ（[`Self::windows`] の添字）
     pub(crate) active: usize,
     // claude agents --json のライブ状態（正規 IF。バックグラウンドスレッドが更新）
     pub(crate) agents: Vec<AgentInfo>,
     pub(crate) agents_shared: Arc<Mutex<Vec<AgentInfo>>>,
     pub(crate) agents_dirty: Arc<std::sync::atomic::AtomicBool>,
-    pub(crate) jobs: Vec<BgJob>,
+    /// サイドバーに並ぶ行。**正本は `~/.ccdesk/sessions.json`**（供給元が読み書きする）
+    pub(crate) sessions: Vec<SessionRow>,
     pub(crate) last_scan: std::time::Instant,
     pub(crate) last_live_scan: std::time::Instant,
-    // stop/delete 直後は反映を早めるため、この時刻まで 1 秒間隔で再スキャン
-    pub(crate) rescan_hot_until: Option<std::time::Instant>,
     pub(crate) sidebar_width: u16,
     pub(crate) dragging: bool,
     pub(crate) last_drag_resize: std::time::Instant,
@@ -335,16 +340,11 @@ pub(crate) struct App {
     // 以降ここを通る限り「今 demo か」を問う必要が無い。
     // **`Arc` なのはアカウント操作を別スレッドへ渡すため**（[`AccountJob`]）
     pub(crate) source: Arc<dyn DataSource>,
-    // Ctrl+X の 2 度押し削除（short id と 1 回目 stop の時刻。2 秒以内の再押下 = rm）
-    pub(crate) pending_delete: Option<(String, std::time::Instant)>,
-    // `claude --bg` は ~1s かかるため別スレッドで実行し、完了を channel で受ける
-    pub(crate) spawn_rx: Option<std::sync::mpsc::Receiver<SpawnOutcome>>,
-    // ターミナルペインへの入力を捨てている間だけ Some（ディスパッチした時刻）。
-    // **`spawn_rx` と寿命を分けてある**: あちらは「まだ結果が届きうる」で、
-    // ハングした `claude --bg` では永久に Some のまま残る
-    // （[`expire_input_gate`] / [`drop_input_while_starting`]）。
-    // **降ろすのは [`lift_input_gate`] だけ**（降ろすときは必ず打ち先を確かめる、
-    // という判断をそこ 1 箇所に閉じてある）
+    // Ctrl+X の 2 度押し削除（対象と 1 回目 stop の時刻。2 秒以内の再押下 = delete）
+    pub(crate) pending_delete: Option<(SessionId, std::time::Instant)>,
+    // 起動した子がまだ端末を掴んでいない間だけ Some（起こした時刻）。
+    // 降ろす契機は「子が最初の出力を出した」（run ループ）と期限切れ
+    // （[`expire_input_gate`]）の 2 つで、**降ろすのは [`lift_input_gate`] だけ**
     pub(crate) input_gate: Option<std::time::Instant>,
     // 下部バーに数秒表示するエラー等の通知
     pub(crate) notice: Option<(String, std::time::Instant)>,
@@ -381,15 +381,14 @@ pub(crate) struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
-            sessions: Vec::new(),
+            windows: Vec::new(),
             active: 0,
             agents: Vec::new(),
             agents_shared: Arc::new(Mutex::new(Vec::new())),
             agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            jobs: Vec::new(),
+            sessions: Vec::new(),
             last_scan: std::time::Instant::now(),
             last_live_scan: std::time::Instant::now(),
-            rescan_hot_until: None,
             sidebar_width: 34,
             dragging: false,
             last_drag_resize: std::time::Instant::now(),
@@ -421,7 +420,6 @@ impl Default for App {
             account_job: None,
             source: Arc::new(crate::source::DemoSource),
             pending_delete: None,
-            spawn_rx: None,
             input_gate: None,
             notice: None,
             grouping: Grouping::State,
@@ -433,13 +431,11 @@ impl Default for App {
     }
 }
 
-/// `claude --bg` ディスパッチ（別スレッド）の結果
-pub(crate) struct SpawnOutcome {
-    pub(crate) id: Option<String>,
-    pub(crate) label: String,
-    pub(crate) cwd: String,
-    pub(crate) error: Option<String>,
-}
+/// 起動 1 回の結果。**成功なら起こしたセッション**（起こさない供給元 ＝ 撮影用は
+/// `Ok(None)`。「起動を試していない ＝ 失敗もしていない」を表す）、失敗なら理由。
+///
+/// 反映は [`apply_launch`] だけが行う（フォルダの登録を成功時に 1 箇所で行うため）
+type Launched = Result<Option<SessionId>, String>;
 
 impl App {
     fn pane_size(&self) -> (u16, u16) {
@@ -455,8 +451,8 @@ impl App {
 
     fn resize_sessions(&mut self) {
         let (rows, cols) = self.pane_size();
-        for session in &mut self.sessions {
-            session.resize(rows, cols);
+        for window in &mut self.windows {
+            window.resize(rows, cols);
         }
     }
 
@@ -481,14 +477,14 @@ impl App {
     }
 
     /// フォーカス変更（PTY への focus in/out 通知つき）。
-    /// サイドバーへ移った瞬間は state.json を即スキャンして表示を最新化する
+    /// サイドバーへ移った瞬間は一覧と生死を即スキャンして表示を最新化する
     fn set_focus(&mut self, focus: Focus) {
         if self.focus == focus {
             return;
         }
         if matches!(self.right_view, RightView::Sessions)
-            && let Some(session) = self.sessions.get_mut(self.active) {
-                session.send_focus(focus == Focus::Terminal);
+            && let Some(window) = self.windows.get_mut(self.active) {
+                window.send_focus(focus == Focus::Terminal);
             }
         self.focus = focus;
         if focus == Focus::Sidebar {
@@ -497,33 +493,33 @@ impl App {
         }
     }
 
-    /// 右ペインに表示するセッションを切り替える（フォーカスは動かさない）
+    /// 右ペインに表示するウィンドウを切り替える（フォーカスは動かさない）
     fn show_session(&mut self, idx: usize) {
         if self.focus == Focus::Terminal && idx != self.active
-            && let Some(old) = self.sessions.get_mut(self.active) {
+            && let Some(old) = self.windows.get_mut(self.active) {
                 old.send_focus(false);
             }
         self.active = idx;
         self.right_view = RightView::Sessions;
         // 次回起動時に同じセッションを復元する
-        if let Some(short) = self.sessions.get(idx).and_then(|s| s.attach_id.clone()) {
-            self.source.save_window(WindowItem::LastView(&short));
+        if let Some(id) = self.windows.get(idx).map(|w| w.session_id.clone()) {
+            self.source.save_window(WindowItem::LastView(id.as_str()));
         }
         if self.focus == Focus::Terminal
-            && let Some(session) = self.sessions.get_mut(idx) {
-                session.send_focus(true);
+            && let Some(window) = self.windows.get_mut(idx) {
+                window.send_focus(true);
             }
     }
 
-    /// **キー入力が今この attach id のセッションへ届く形になっているか。**
+    /// **キー入力が今このセッションへ届く形になっているか。**
     /// `focus` は見ない: 判定したいのは「端末へ流したとき誰に届くか」で、
     /// 流すかどうかを決める側（[`lift_input_gate`]）がこれを材料にする
-    fn showing(&self, attach_id: &str) -> bool {
+    fn showing(&self, id: &SessionId) -> bool {
         matches!(self.right_view, RightView::Sessions)
             && self
-                .sessions
+                .windows
                 .get(self.active)
-                .is_some_and(|s| s.attach_id.as_deref() == Some(attach_id))
+                .is_some_and(|w| &w.session_id == id)
     }
 }
 
@@ -537,9 +533,9 @@ pub(crate) fn instant_ago(d: Duration) -> std::time::Instant {
 }
 
 /// 使用率表示 opt-in 用の注入 settings ファイルを書き、そのパスを返す。
-/// `claude --bg` の dispatch 時に --settings で渡す（attach 側に渡しても statusLine は
-/// 無視される・実測）。コマンドのパスは / 区切り必須: claude は statusline を
-/// bash 経由で実行するため \ 区切りはエスケープとして食われる（実測）
+/// セッション起動時に `--settings` で渡す。コマンドのパスは / 区切り必須:
+/// claude は statusline を bash 経由で実行するため \ 区切りはエスケープとして
+/// 食われる（実測）
 fn write_inject_settings() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = ccdesk::ccdesk_dir()?;
@@ -638,47 +634,32 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
     let mut force_draw = true;
     loop {
         if app.last_live_scan.elapsed() > LIVE_SCAN_INTERVAL {
-            // 死んだ attach クライアント PTY は行として残さない
-            // （セッション本体は bg 行が代表する。detach 後の重複行を防ぐ）
-            while let Some(pos) = app.sessions.iter_mut().position(|s| !s.alive()) {
+            // **前景では `child.try_wait()` が生死の唯一の真実。** 死んだ PTY の窓は
+            // 閉じるが、**行は消さない**（最後に観測した状態のまま一覧に残り、
+            // `claude -r` で再開できる ＝ 窓を閉じる ≠ 行を消す）
+            while let Some(pos) = app.windows.iter_mut().position(|w| !w.alive()) {
+                let id = app.windows[pos].session_id.clone();
+                mark_state(app, &id, "stopped");
                 remove_window(app, pos);
             }
             app.last_live_scan = std::time::Instant::now();
         }
-        let hot = app
-            .rescan_hot_until
-            .is_some_and(|t| std::time::Instant::now() < t);
-        let scan_due = if hot {
-            app.last_scan.elapsed() > Duration::from_millis(500)
-        } else {
-            app.last_scan.elapsed() > SCAN_INTERVAL
-        };
-        if scan_due {
-            app.jobs = app.source.jobs();
+        if app.last_scan.elapsed() > SCAN_INTERVAL {
+            refresh_sessions(app);
             app.last_scan = std::time::Instant::now();
-            if !hot {
-                app.rescan_hot_until = None;
-            }
             force_draw = true; // 並びが変わったら即描画（表示と行データのずれを残さない）
         }
-        // `claude --bg`（別スレッド）の完了を受け取って attach。UI はブロックしない
-        if let Some(rx) = app.spawn_rx.take() {
-            match rx.try_recv() {
-                Ok(outcome) => {
-                    apply_spawn_outcome(app, outcome);
-                    app.last_scan = instant_ago(SCAN_INTERVAL);
-                    app.last_live_scan = instant_ago(LIVE_SCAN_INTERVAL);
-                    force_draw = true;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => app.spawn_rx = Some(rx),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // 結果は永久に来ない ＝ 宛先のセッションは決まらない
-                    // （[`lift_input_gate`] が打ち先も戻す）
-                    lift_input_gate(app, None);
-                    set_notice(app, "claude --bg の実行スレッドが異常終了".to_string());
-                    force_draw = true;
-                }
-            }
+        // 起こした子が端末を掴んだら門番を降ろす（前景では宛先は起動の時点で
+        // 決まっているので、待つのは「子が入力を読める状態になるまで」だけ）
+        if app.input_gate.is_some()
+            && let Some(id) = app
+                .windows
+                .get(app.active)
+                .filter(|w| w.started())
+                .map(|w| w.session_id.clone())
+        {
+            lift_input_gate(app, Some(&id));
+            force_draw = true;
         }
         // 起動が応答しないまま期限を過ぎたら入力を取り戻す。**打鍵が無くても
         // 通知が出る**ように run ループ側で見る（門番の中で期限を見ると、
@@ -745,7 +726,8 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 .clone();
             force_draw = true;
         }
-        // agents --json のライブ状態を取り込む（rename・state 変化の即時反映）
+        // agents --json のライブ状態を取り込む（state 変化の即時反映）。
+        // **生死はここでは見ない**（前景セッションは自分の子なので `try_wait` が真実）
         if app
             .agents_dirty
             .swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -755,40 +737,14 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            // attach ウィンドウの表示名もライブ名に追従
-            for session in &mut app.sessions {
-                if let Some(id) = &session.attach_id
-                    && let Some(agent) = app.agents.iter().find(|a| &a.id == id)
-                        && !agent.name.is_empty() {
-                            session.name = agent.name.clone();
-                        }
-            }
-            // セッション本体の生死を追跡し、生存 → 終了へ遷移した attach ウィンドウは
-            // 閉じて新規セッション画面へ（/exit・外部 stop 追従。claude は /exit 後に
-            // 操作できない画面が残るため）。停止中への attach 復帰は誤検知しない
-            let mut dead: Vec<String> = Vec::new();
-            for session in &mut app.sessions {
-                let Some(id) = &session.attach_id else { continue };
-                let Some(agent) = app.agents.iter().find(|a| &a.id == id) else {
-                    continue;
-                };
-                if agent.has_pid {
-                    session.seen_alive = true;
-                } else if session.seen_alive {
-                    dead.push(id.clone());
-                }
-            }
-            for short in dead {
-                close_window_of(app, &short);
-            }
             force_draw = true;
         }
         // 再描画は「PTY に新出力」「UI イベント」「250ms 周期（スピナー等）」のときだけ。
         // 無条件 60fps 再描画は claude 画面全体の再構築が毎フレーム走り重い
         let pty_dirty = app
-            .sessions
+            .windows
             .iter()
-            .any(|s| s.dirty.swap(false, std::sync::atomic::Ordering::Relaxed));
+            .any(|w| w.dirty.swap(false, std::sync::atomic::Ordering::Relaxed));
         if force_draw || pty_dirty || last_draw.elapsed() > Duration::from_millis(250) {
             draw_frame(terminal, app)?;
             last_draw = std::time::Instant::now();
@@ -856,8 +812,8 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                                     let y = selected_row_y(app);
                                     open_project_popup(app, cwd, y);
                                 }
-                                Some(RowAction::Open(short)) => {
-                                    open_short(app, &short);
+                                Some(RowAction::Open(id)) => {
+                                    open_session(app, &id);
                                     app.set_focus(Focus::Terminal);
                                 }
                                 Some(RowAction::UpdateCcdesk) => start_ccdesk_update(app),
@@ -868,10 +824,10 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                         KeyCode::Char('x')
                             if key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
-                            if let Some(RowAction::Open(short)) =
+                            if let Some(RowAction::Open(id)) =
                                 app.sidebar_rows.get(app.selected_row).cloned().flatten()
                             {
-                                ctrl_x_short(app, &short);
+                                ctrl_x_session(app, &id);
                             }
                         }
                         _ => {}
@@ -888,13 +844,13 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                     continue;
                 }
                 // フォーカスがターミナル側にあるときだけ PTY へ流す
-                if app.sessions.is_empty() {
+                if app.windows.is_empty() {
                     continue;
                 }
-                let session = &mut app.sessions[app.active];
-                let bytes = encode_key(&key, &session.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+                let window = &mut app.windows[app.active];
+                let bytes = encode_key(&key, &window.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
                 if !bytes.is_empty() {
-                    let mut writer = session.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut writer = window.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     writer.write_all(&bytes)?;
                     writer.flush()?;
                 }
@@ -924,7 +880,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 if drop_input_while_starting(app) {
                     continue;
                 }
-                if app.sessions.is_empty() {
+                if app.windows.is_empty() {
                     continue;
                 }
                 // paste injection 対策: 制御文字（特に ESC = ペースト終端の偽装）を除去
@@ -932,9 +888,9 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                     .chars()
                     .filter(|c| matches!(c, '\n' | '\r' | '\t') || !c.is_control())
                     .collect();
-                let session = &mut app.sessions[app.active];
-                let bracketed = session.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner).screen().bracketed_paste();
-                let mut writer = session.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let window = &mut app.windows[app.active];
+                let bracketed = window.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner).screen().bracketed_paste();
+                let mut writer = window.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if bracketed {
                     writer.write_all(b"\x1b[200~")?;
                     writer.write_all(sanitized.as_bytes())?;
@@ -965,14 +921,14 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             // （ターミナルペインがフォーカス中のときだけ意味を持つ）
             Event::FocusGained => {
                 if app.focus == Focus::Terminal
-                    && let Some(session) = app.sessions.get_mut(app.active) {
-                        session.send_focus(true);
+                    && let Some(window) = app.windows.get_mut(app.active) {
+                        window.send_focus(true);
                     }
             }
             Event::FocusLost => {
                 if app.focus == Focus::Terminal
-                    && let Some(session) = app.sessions.get_mut(app.active) {
-                        session.send_focus(false);
+                    && let Some(window) = app.windows.get_mut(app.active) {
+                        window.send_focus(false);
                     }
             }
             _ => {}
@@ -980,10 +936,8 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
     }
 }
 
-/// New 画面からの起動 = 公式と同じ「`claude --bg` でディスパッチ → 即 attach」。
-/// セッション実体は supervisor 管理になり、ccdesk を閉じても残り再起動後も一覧に出る。
-/// `claude --bg` は ~1s かかるため別スレッドで実行する（UI スレッドを止めない）。
-/// 結果は run ループが spawn_rx で受けて attach する
+/// New 画面からの起動。**セッションの実体は ccdesk の子プロセス**になり、
+/// ccdesk を閉じると終わる（行は `sessions.json` に残り `claude -r` で再開できる）
 pub(crate) fn start_new_session(app: &mut App) -> anyhow::Result<()> {
     let RightView::New(state) = &app.right_view else {
         return Ok(());
@@ -994,33 +948,38 @@ pub(crate) fn start_new_session(app: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `claude --bg` の結果を状態へ反映する（run ループが `spawn_rx` で受けて呼ぶ）。
+/// 起動 1 回の結果を状態へ反映する（[`dispatch_session`] だけが呼ぶ）。
 ///
 /// **「そのフォルダを使った」の記録をここ 1 箇所に集める**のが要点: 登録プロジェクトと
 /// new session 画面の初期値（[`WindowItem::LastFolder`]）は同じ操作に対する 2 つの
 /// 永続化なので、判断が別だと通知は失敗を報告しているのに見出しだけが生える。
 /// 起動できないフォルダ（打ち間違い・権限が無い・古いネットワークパス）を登録すると
 /// state.json に永久に残るので、**成功した起動だけを記録する**。打った文字列は
-/// `dispatch_cwd`（メモリ上の初期値）に残るので、直して押し直す邪魔にはならない。
-/// 保存を UI スレッドに寄せているのは state.json の書込み競合を避けるため
-fn apply_spawn_outcome(app: &mut App, outcome: SpawnOutcome) {
-    // 成否の判定は `error` 1 つ。`id` で判定しないのは、セッションを起こさない供給元
-    // （撮影用）が「起動を試していない ＝ 失敗もしていない」形でここへ来るため
-    // （実起動では id が取れなければ必ず error が入る ＝ 実データでの判定は変わらない）
-    if outcome.error.is_none() {
-        app.source.save_window(WindowItem::LastFolder(&outcome.cwd));
-        register_project(app, &outcome.cwd);
-    }
-    if let Some(id) = &outcome.id {
-        attach_by_id(app, id, &outcome.label, &outcome.cwd);
-    }
-    // **降ろすのは attach を試した後。** 先に降ろすと、attach しなかった／できなかった
-    // 経路（起動失敗・attach 失敗）で `right_view` が直前のセッションを指したまま
-    // 素通しに戻る。宛先が本当に居るかは [`lift_input_gate`] が右ペインの表示で
-    // 確かめるので、ここは「どの id を宛先にしたつもりか」だけを渡す
-    lift_input_gate(app, outcome.id.as_deref());
-    if let Some(err) = outcome.error {
-        set_notice(app, err);
+/// `dispatch_cwd`（メモリ上の初期値）に残るので、直して押し直す邪魔にはならない
+fn apply_launch(app: &mut App, cwd: String, launched: Launched) {
+    // 成否の判定は `Result` 1 つ。`Ok(None)`（セッションを起こさない撮影用の供給元）は
+    // 「起動を試していない ＝ 失敗もしていない」ので記録する側へ倒す
+    match launched {
+        Ok(started) => {
+            app.source.save_window(WindowItem::LastFolder(&cwd));
+            register_project(app, &cwd);
+            // **門番を立てるのは起こせたときだけ。** 子が端末を掴むまでの打鍵は
+            // 捨てる（run ループが最初の出力で降ろす。理由は
+            // [`drop_input_while_starting`]）
+            if started.is_some() {
+                app.input_gate = Some(std::time::Instant::now());
+            } else {
+                // 起こしていない ＝ 待つものが無いので、打ち先だけ確かめて戻す
+                lift_input_gate(app, None);
+            }
+        }
+        Err(err) => {
+            // 宛先のセッションが無いまま端末にフォーカスが残ると、打った文字が
+            // 直前まで見ていたセッションへ流れる（[`lift_input_gate`] が戻す）
+            lift_input_gate(app, None);
+            app.set_focus(Focus::Sidebar);
+            set_notice(app, err);
+        }
     }
 }
 
@@ -1036,7 +995,80 @@ fn save_projects(app: &mut App) {
     app.projects = app.source.store_projects(&app.projects);
 }
 
-/// そのフォルダを登録プロジェクトへ加える。**呼ばれるのは [`apply_spawn_outcome`]
+/// セッション一覧を保存し、**永続化された内容を自分の一覧として取り込む**。
+/// 一覧を変える操作（起動・状態の更新・削除）はどれもここを通る。
+///
+/// 取り込む理由は [`save_projects`] と同じで、保存はディスクとのマージを通るので
+/// 渡した一覧と保存された一覧は一致しない（他インスタンスが起こしたセッションが
+/// 増える）。取り込まないと次の保存でそれを「自分が削除した」と読ませてしまう
+/// （[`crate::sessions`] の `merge_sessions`）
+fn save_sessions(app: &mut App) {
+    app.sessions = app.source.store_sessions(&app.sessions);
+}
+
+/// 一覧をディスクから読み直す（他インスタンスが起こしたセッションを取り込む。
+/// 読むたびにマージの基準も進む ＝ [`crate::sessions::SessionStore::list`]）。
+///
+/// **開いている窓の行は必ず残す。** 読み直しは丸ごとの置き換えなので、保存が
+/// まだディスクへ載っていない（ロックが取れなかった）間に読むと、その行だけが
+/// 消えて**プロセスは動いているのにサイドバーのどこからも指せない**状態になる。
+/// 落ちていた行はここで戻し、次の保存でもう一度ディスクへ載せに行く
+fn refresh_sessions(app: &mut App) {
+    let open: Vec<SessionId> = app.windows.iter().map(|w| w.session_id.clone()).collect();
+    let fresh = app.source.sessions();
+    let dropped: Vec<SessionRow> = rows_dropped_while_open(&fresh, &app.sessions, &open)
+        .into_iter()
+        .cloned()
+        .collect();
+    app.sessions = fresh;
+    if !dropped.is_empty() {
+        app.sessions.extend(dropped);
+        save_sessions(app);
+    }
+}
+
+/// 読み直しで落ちてしまった「窓が開いている行」（[`refresh_sessions`] の判断。
+/// 副作用を持たないので単体で検査できる）。
+///
+/// 戻す対象を**窓が開いている行だけ**に絞るのが要点: そうしないと他インスタンスの
+/// `delete` が自分の写しから復活し続ける（削除がどちらのインスタンスからも効かなくなる）
+fn rows_dropped_while_open<'a>(
+    fresh: &[SessionRow],
+    mine: &'a [SessionRow],
+    open: &[SessionId],
+) -> Vec<&'a SessionRow> {
+    mine.iter()
+        .filter(|row| {
+            open.contains(&row.session_id)
+                && !fresh.iter().any(|r| r.session_id == row.session_id)
+        })
+        .collect()
+}
+
+/// epoch ms（行の時刻はすべてこの単位。[`crate::sessions::SessionRow`]）
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 行の状態を書き換えて保存する（行が無ければ何もしない）。
+/// **プロセスが死んでも行は残す**ので、窓を閉じる側はここで状態だけを残す
+fn mark_state(app: &mut App, id: &SessionId, state: &str) {
+    let Some(row) = app.sessions.iter_mut().find(|r| &r.session_id == id) else {
+        return;
+    };
+    if row.last_state == state {
+        return;
+    }
+    row.last_state = state.to_string();
+    // 行の内容を変えたら `updated_at` を進める（マージの後勝ち判定の材料）
+    row.updated_at = now_ms();
+    save_sessions(app);
+}
+
+/// そのフォルダを登録プロジェクトへ加える。**呼ばれるのは [`apply_launch`]
 /// だけ**（明示的な「追加」UI は持たず、セッションの起動が成功した時点で登録される。
 /// 「登録するか」の判断を散らさないため、呼び出し口を増やさない）。
 ///
@@ -1077,27 +1109,30 @@ fn register_project(app: &mut App, cwd: &str) {
 /// **上限を超えていても既存の登録は落とさない**のが [`register_project`] との違い:
 /// 登録はユーザーの操作の記録（state.json が唯一の正本）で、埋め戻しは入口を
 /// 増やすためのものなので、空きが尽きたらそこで止める。空きの取り合いになったら
-/// 新しいセッションのフォルダを優先する（`jobs` は mtime 降順 = 新しい順）
+/// **最近更新した行のフォルダを優先する**（一覧の並び順は保存順で新旧を表さないので、
+/// ここで `updated_at` の降順に並べ直してから積む）
 pub(crate) fn backfill_projects(app: &mut App) {
     let room = PROJECTS_LIMIT.saturating_sub(app.projects.len());
+    let mut newest: Vec<&SessionRow> = app.sessions.iter().collect();
+    newest.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
     let mut fresh: Vec<String> = Vec::new();
-    for job in &app.jobs {
+    for row in newest {
         if fresh.len() >= room {
             break;
         }
         // cwd の取れなかった行から空の見出しを作らない（register_project と同じ扱い）
-        if job.cwd.is_empty() {
+        if row.cwd.is_empty() {
             continue;
         }
-        if app.projects.iter().chain(fresh.iter()).any(|p| same_dir(p, &job.cwd)) {
+        if app.projects.iter().chain(fresh.iter()).any(|p| same_dir(p, &row.cwd)) {
             continue;
         }
-        fresh.push(job.cwd.clone());
+        fresh.push(row.cwd.clone());
     }
     if fresh.is_empty() {
         return;
     }
-    // 登録の並びは最近使った順（末尾が最新）なので、新しい順の jobs を逆に積む
+    // 登録の並びは最近使った順（末尾が最新）なので、新しい順の一覧を逆に積む
     fresh.reverse();
     app.projects.extend(fresh);
     save_projects(app);
@@ -1113,12 +1148,11 @@ fn remove_project(app: &mut App, cwd: &str) {
     }
 }
 
-/// そのフォルダにセッションがあるか。材料は jobs と attach 中のウィンドウで、
-/// **描画側が見出しの配下へ振り分ける集合と同じ**（片方だけを見ると、
+/// そのフォルダにセッションがあるか。材料は一覧の行で、
+/// **描画側が見出しの配下へ振り分ける集合と同じ**（別の集合を見ると、
 /// 行が出ているのに `remove project` が押せてしまう）
 fn project_has_sessions(app: &App, cwd: &str) -> bool {
-    app.jobs.iter().any(|j| same_dir(&j.cwd, cwd))
-        || app.sessions.iter().any(|s| same_dir(&s.cwd, cwd))
+    app.sessions.iter().any(|row| same_dir(&row.cwd, cwd))
 }
 
 /// プロジェクト見出し行のメニューを開く（Enter とクリックで同じものが出る）。
@@ -1143,98 +1177,81 @@ fn selected_row_y(app: &App) -> u16 {
     row as u16 + 1
 }
 
-/// 指定フォルダ・プロンプトで `claude --bg` をディスパッチし、完了後に attach する
-/// （見出しメニューの new session は空プロンプトで直接ここに来る）
+/// 表示名に使うプロンプトの桁数。**行に出す名前の長さの正本はここ 1 箇所**
+/// （title の本格的な決め方はフェーズ3。`docs/foreground-migration.md`）
+const TITLE_FROM_PROMPT: usize = 30;
+
+/// プロンプトの無いセッションの表示名
+const UNTITLED: &str = "new session";
+
+/// 指定フォルダ・プロンプトで前景セッションを 1 本起こす
+/// （見出しメニューの new session は空プロンプトで直接ここに来る）。
+///
+/// **PTY の起動は同期**（数 ms）。結果を待つ別スレッドが要らないので、
+/// 起動と反映が 1 本の流れに収まる
 fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
-    if app.spawn_rx.is_some() {
-        // 起動処理中の多重ディスパッチを防ぐ。**黙って捨てない**のが要点で、
-        // 見出しメニューの new session は右ペインの表示を変えないため、
-        // 落としたことを伝えないと「押しても何も起きないメニュー」に見える
-        set_notice(app, "セッション起動中 — 完了してからもう一度".to_string());
-        return;
-    }
-    // フォルダの登録はここでは行わない（起動が成功してから ＝ [`apply_spawn_outcome`]）。
+    // フォルダの登録はここでは行わない（起動が成功してから ＝ [`apply_launch`]）。
     // 打った文字列は new session 画面の初期値として持つだけに留める
     app.dispatch_cwd = cwd.clone();
     // 起動したら打ち先はそのセッションなので、フォーカスを端末へ移す。
     // **ここに置くのが要点**で、new session 画面の起動ボタンと見出しメニューの
-    // new session はどちらもこの関数へ収束するため、経路が増えても漏れが起きない。
-    // 完了後の attach 側に置けないのは、[`App::show_session`] が
-    // 「フォーカスは動かさない」契約で、セッション切替と共用のため。
-    // 起動完了までの ~1 秒は宛先のセッションがまだ無く、`right_view` は直前まで見ていた
-    // セッションを指したままなので、**その間の入力は捨てる**
-    // （[`drop_input_while_starting`] ＝ 打った文字が無関係なセッションへ届かない）
+    // new session はどちらもこの関数へ収束するため、経路が増えても漏れが起きない
+    // （[`App::show_session`] は「フォーカスは動かさない」契約で切替と共用）
     app.set_focus(Focus::Terminal);
     // 撮影用データは本物のセッションを起こさない（架空の一覧に実セッションが混ざらない）。
-    // 起動しない ＝ 失敗もしないので、「成功したが attach する id は無い」結果を
-    // その場で作って実データと同じ反映経路へ渡す（attach だけを飛ばす ＝
-    // demo だけフォルダの登録の意味が違う、という状態を作らない）
-    if !app.source.spawns_sessions() {
-        let outcome = SpawnOutcome {
-            id: None,
-            label: String::new(),
-            cwd,
-            error: None,
-        };
-        apply_spawn_outcome(app, outcome);
-        return;
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    app.spawn_rx = Some(rx);
-    // 宛先のセッションがまだ無い間だけ入力を捨てる（[`drop_input_while_starting`]）。
-    // 期限は [`expire_input_gate`] が見るので、起動がハングしても入力は戻る
-    app.input_gate = Some(std::time::Instant::now());
-    // 使用率表示（opt-in）: dispatch にだけ statusline フックが効く（実測）
-    let inject = app.usage_display.then(write_inject_settings).flatten();
-    std::thread::spawn(move || {
-        // 空プロンプトも可: "idle — send a prompt to start" のセッションになる
-        let mut bg = std::process::Command::new("claude");
-        bg.arg("--bg").arg(&prompt);
-        if let Some(path) = inject {
-            bg.arg("--settings");
-            bg.arg(path);
-        }
-        let output = bg
-            .current_dir(&cwd)
-            .stdin(std::process::Stdio::null())
-            .output();
-    let outcome = match output {
-            Err(e) => SpawnOutcome {
-                id: None,
-                label: String::new(),
-                cwd,
-                error: Some(format!("claude --bg 起動失敗: {e}")),
-            },
-            Ok(output) => {
-                // 公式ドキュメント記載の出力形式「backgrounded · <id> · <name>」の行から id を取る
-                let text = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                let id = text
-                    .lines()
-                    .find_map(|line| {
-                        line.trim()
-                            .strip_prefix("backgrounded")
-                            .and_then(|rest| rest.split('·').nth(1))
-                            .and_then(|field| field.split_whitespace().next())
-                    })
-                    .map(str::to_string)
-                    .filter(|id| !id.is_empty());
-                let label: String = if prompt.is_empty() {
-                    "new session".to_string()
-                } else {
-                    prompt.chars().take(30).collect()
-                };
-                let error = id
-                    .is_none()
-                    .then(|| "claude --bg がセッション id を返さなかった".to_string());
-                SpawnOutcome { id, label, cwd, error }
-            }
-        };
-        let _ = tx.send(outcome);
-    });
+    // 起動しない ＝ 失敗もしないので `Ok(None)` で実データと同じ反映経路へ渡す
+    // （demo だけフォルダの登録の意味が違う、という状態を作らない）
+    let launched = if app.source.spawns_sessions() {
+        start_foreground(app, &cwd, &prompt)
+    } else {
+        Ok(None)
+    };
+    apply_launch(app, cwd, launched);
+}
+
+/// 新規の前景セッションを起こし、一覧へ行を足してその窓を表示する。
+///
+/// **UUID は ccdesk が採番する**（`claude --session-id` へ渡した値がそのまま
+/// transcript の `sessionId` になる ＝ 行と claude 側の記録が同じ鍵で結びつく）。
+/// 新規生成なので同 cwd の既存 transcript と衝突しない。
+///
+/// **行を足すのは起動できてから**（起動できなかったセッションを一覧に残さない）
+fn start_foreground(app: &mut App, cwd: &str, prompt: &str) -> Launched {
+    let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+    let title: String = if prompt.is_empty() {
+        UNTITLED.to_string()
+    } else {
+        prompt.chars().take(TITLE_FROM_PROMPT).collect()
+    };
+    // 使用率表示（opt-in）の statusline フックを注入する
+    let settings = app.usage_display.then(write_inject_settings).flatten();
+    let (rows, cols) = app.pane_size();
+    let window = Session::spawn(
+        &session_id,
+        &title,
+        cwd,
+        rows,
+        cols,
+        Launch::New {
+            title: &title,
+            prompt,
+        },
+        settings.as_deref(),
+    )
+    .map_err(|e| format!("セッションの起動に失敗: {e}"))?;
+    app.sessions.push(SessionRow::new(
+        session_id.clone(),
+        cwd,
+        title,
+        // 起動時の名前はプロンプト（無ければ既定）から作った暫定値。
+        // CLI 本体と同じ優先順を実装するのはフェーズ3
+        TitleSource::Derived,
+        now_ms(),
+    ));
+    save_sessions(app);
+    app.windows.push(window);
+    app.show_session(app.windows.len() - 1);
+    Ok(Some(session_id))
 }
 
 pub(crate) fn clamp_sidebar(app: &mut App) {
@@ -1327,12 +1344,12 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                 app.selected_row = row;
             }
             // 行頭の ☰ クリック → コンテキストメニューを開く
-            if let Some(RowAction::Open(short)) = &action
+            if let Some(RowAction::Open(id)) = &action
                 && mouse.column <= 2 {
-                    let stopped = short_stopped(app, short);
+                    let stopped = session_stopped(app, id);
                     app.popup = Some(Popup {
                         kind: PopupKind::Session {
-                            short: short.clone(),
+                            id: id.clone(),
                             stopped,
                         },
                         anchor_y: mouse.row,
@@ -1358,8 +1375,8 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                 Some(RowAction::Project(cwd)) => {
                     open_project_popup(app, cwd, mouse.row);
                 }
-                Some(RowAction::Open(short)) => {
-                    open_short(app, &short);
+                Some(RowAction::Open(id)) => {
+                    open_session(app, &id);
                     app.set_focus(Focus::Terminal);
                 }
                 // 更新行はその場で実行するだけ（右ペインを切り替えない）
@@ -1416,7 +1433,7 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                             // 起動ボタン行もフォルダ行と同じ 2 段階（選択 → 再クリック）にする。
                             // 1 クリックで起動すると、プロンプト入力中に一覧へフォーカスを
                             // 移すだけのクリックが書きかけのプロンプトでセッションを起動して
-                            // しまう（supervisor 管理なので取り消せない）。
+                            // しまう（送ったメッセージは取り消せない）。
                             // 判定はクリックで選択を動かす前に取る（動かした後では
                             // 常に dir_idx == idx になり 2 段階が崩れる）
                             let reclick = state.click_activates(idx);
@@ -1449,7 +1466,7 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             }
             return Ok(false);
         }
-        if app.sessions.is_empty() {
+        if app.windows.is_empty() {
             return Ok(false);
         }
         // 右ペイン: イベントを claude へ転送（ホイールも claude 自身がスクロール処理する）
@@ -1458,9 +1475,12 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
     Ok(false)
 }
 
-/// 対象が停止済みかどうか（agents --json の pid 有無 = プロセス生存で判定）
-fn short_stopped(app: &App, short: &str) -> bool {
-    !app.agents.iter().any(|a| a.id == short && a.has_pid)
+/// 対象が停止済みかどうか。**前景では自分の子プロセスが唯一の真実**なので、
+/// 生きた窓を持たない行はすべて停止済み（`claude -r` で再開できる）
+fn session_stopped(app: &mut App, id: &SessionId) -> bool {
+    !app.windows
+        .iter_mut()
+        .any(|w| &w.session_id == id && w.alive())
 }
 
 /// モーダル表示中のキー操作（Esc = 全閉 / ↑↓ = 選択 / Enter = 実行）
@@ -1531,8 +1551,8 @@ fn activate_popup(app: &mut App, index: usize) {
 /// 判定は [`PopupKind::action`]（純関数）に置く
 fn run_popup_action(app: &mut App, action: PopupAction, anchor_y: u16) {
     match action {
-        PopupAction::Stop(short) => menu_stop(app, &short),
-        PopupAction::Delete(short) => menu_delete(app, &short),
+        PopupAction::Stop(id) => menu_stop(app, &id),
+        PopupAction::Delete(id) => menu_delete(app, &id),
         PopupAction::SetGrouping(next) => {
             if app.grouping != next {
                 toggle_grouping(app);
@@ -1659,7 +1679,10 @@ fn account_items(app: &App) -> Vec<AccountItem> {
 
 /// 切替の影響を受けるセッション数 ＝ **プロセスが生きているセッション**
 /// （`agents --json` の pid 有無。停止中は次の起動時に新しいアカウントで始まるので
-/// 「会話の途中で移る」対象ではない）
+/// 「会話の途中で移る」対象ではない）。
+///
+/// **この機体で動いている全部**を数える: 認証情報は 1 ファイル共有なので、
+/// 切替は ccdesk の外で動いているセッションにも及ぶ（自分の窓だけでは足りない）
 fn running_sessions(app: &App) -> usize {
     app.agents.iter().filter(|a| a.has_pid).count()
 }
@@ -1752,8 +1775,8 @@ const ACCOUNT_BUSY_NOTICE: &str = "アカウント操作中 — 完了してか�
 /// **前景で取ってはいけない理由**: 登録と切替は claude と共有する認証情報ロック
 /// （最大 9 秒）の下で保管ロック（最大 2 秒）も取るので、claude がトークン更新中に
 /// `register current` を押すと **UI スレッドが最大約 11 秒止まる**（再描画も Ctrl+Q も
-/// 効かない ＝ ハングに見える）。他の重い操作（`claude --bg` / `claude update` /
-/// 自己更新）はすべて別スレッドで、ここだけが前景だった。
+/// 効かない ＝ ハングに見える）。他の重い操作（`claude update` / 自己更新）は
+/// すべて別スレッドで、ここだけが前景だった。
 ///
 /// **観測時点（[`ActiveAccount`]）は逃がしても守られる**: 要求が運ぶのは
 /// 「押した時点の観測」で、それが今も有効かはドメイン側がロックの下で照合し、
@@ -1830,112 +1853,78 @@ fn toggle_grouping(app: &mut App) {
     app.source.save_window(WindowItem::Grouping(app.grouping));
 }
 
-/// stop/delete 後の反映を早める（数秒間 1 秒間隔で再スキャン）
-fn schedule_hot_rescan(app: &mut App) {
-    app.rescan_hot_until = Some(std::time::Instant::now() + Duration::from_secs(8));
-    app.last_scan = instant_ago(SCAN_INTERVAL);
-}
-
-/// claude サブコマンドを画面を汚さずに実行する。
-/// spawn のまま stdio を継承すると子プロセスの出力が ccdesk の画面に直接混ざる
-fn run_claude_silent(args: &[&str]) {
-    use std::process::Stdio;
-    let _ = std::process::Command::new("claude")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-}
-
-/// メニュー: stop（supervisor 側のセッション本体を停止）。
-/// attach 中のウィンドウは閉じ、右ペインは New 画面へ戻す（死んだ画面を表示しない）
-fn menu_stop(app: &mut App, short: &str) {
-    if short.is_empty() {
+/// メニュー: stop（セッションのプロセスを終わらせる）。
+///
+/// **行は消さない。** 前景セッションは ccdesk の子なので、止める ＝ 窓を閉じること
+/// そのもの。行は最後に観測した状態（`stopped`）のまま一覧に残り、`claude -r` で
+/// 再開できる（窓を閉じる ≠ 行を消す）
+fn menu_stop(app: &mut App, id: &SessionId) {
+    if id.is_empty() {
         return;
     }
-    run_claude_silent(&["stop", short]);
-    close_window_of(app, short);
-    schedule_hot_rescan(app);
+    mark_state(app, id, "stopped");
+    close_window_of(app, id);
 }
 
-/// メニュー: delete（セッション本体を削除。attach 中のウィンドウも閉じる）。
-/// `claude rm` の文書上の保証は「終了済みに効く」なので、稼働中は stop → rm の 2 段で行う
-fn menu_delete(app: &mut App, short: &str) {
-    if short.is_empty() {
+/// メニュー: delete（一覧から行を消す）。**消えるのは ccdesk の一覧だけ**で、
+/// transcript（`~/.claude/projects/**/*.jsonl`）は残す。
+/// 動いていれば先にプロセスを終わらせる（窓の無い行になってプロセスだけが残らない）
+fn menu_delete(app: &mut App, id: &SessionId) {
+    if id.is_empty() {
         return;
     }
-    let running = app.agents.iter().any(|a| a.id == short && a.has_pid);
-    let short_for_thread = short.to_string();
-    std::thread::spawn(move || {
-        let short = short_for_thread;
-        use std::process::Stdio;
-        let quiet = |args: &[&str]| {
-            let _ = std::process::Command::new("claude")
-                .args(args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .output(); // 完了を待って順序を保証する
-        };
-        if running {
-            quiet(&["stop", &short]);
-        }
-        quiet(&["rm", &short]);
-    });
-    close_window_of(app, short);
-    schedule_hot_rescan(app);
+    close_window_of(app, id);
+    let before = app.sessions.len();
+    app.sessions.retain(|row| &row.session_id != id);
+    if app.sessions.len() != before {
+        save_sessions(app);
+    }
 }
 
-/// 指定セッションを見ているウィンドウ（attach クライアント）を閉じる
-fn close_window_of(app: &mut App, short: &str) {
-    if let Some(i) = app
-        .sessions
-        .iter()
-        .position(|s| s.attach_id.as_deref() == Some(short))
-    {
-        if let Some(session) = app.sessions.get_mut(i) {
-            let _ = session.child.kill();
+/// 指定セッションのウィンドウを閉じる（＝ 子プロセスを終わらせる）。
+/// 窓が開いていなければ何もしない
+fn close_window_of(app: &mut App, id: &SessionId) {
+    if let Some(i) = app.windows.iter().position(|w| &w.session_id == id) {
+        if let Some(window) = app.windows.get_mut(i) {
+            let _ = window.child.kill();
         }
         remove_window(app, i);
     }
 }
 
-/// PTY ウィンドウ行を一覧から外す（active 添字も詰める）。
+/// ウィンドウを一覧から外す（active 添字も詰める）。
 /// 表示するウィンドウが無くなったら右ペインは New 画面へ
 fn remove_window(app: &mut App, idx: usize) {
-    if idx >= app.sessions.len() {
+    if idx >= app.windows.len() {
         return;
     }
     let was_active = idx == app.active;
-    app.sessions.remove(idx);
+    app.windows.remove(idx);
     app.hovered_row = None;
     if app.active >= idx && app.active > 0 {
         app.active -= 1;
     }
-    if app.sessions.is_empty() || was_active {
+    if app.windows.is_empty() || was_active {
         app.open_new_view();
     }
 }
 
-/// Ctrl+X（公式準拠）: 1 回目 = stop、2 秒以内の 2 回目 or 停止済み = delete。
-/// ウィンドウ行・bg 行とも short id で扱う
-fn ctrl_x_short(app: &mut App, short: &str) {
-    if short.is_empty() {
+/// Ctrl+X: 1 回目 = stop、2 秒以内の 2 回目 or 停止済み = delete
+fn ctrl_x_session(app: &mut App, id: &SessionId) {
+    if id.is_empty() {
         return;
     }
     let recent = app
         .pending_delete
         .as_ref()
-        .is_some_and(|(s, t)| s == short && t.elapsed() < Duration::from_secs(2));
-    let stopped = short_stopped(app, short);
-    if !stopped && !recent {
-        menu_stop(app, short);
-        app.pending_delete = Some((short.to_string(), std::time::Instant::now()));
+        .is_some_and(|(pending, t)| pending == id && t.elapsed() < Duration::from_secs(2));
+    if !session_stopped(app, id) && !recent {
+        menu_stop(app, id);
+        app.pending_delete = Some((id.clone(), std::time::Instant::now()));
         return;
     }
     app.pending_delete = None;
-    menu_delete(app, short);
+    menu_delete(app, id);
 }
 
 /// サイドバーの選択行を、クリック可能な行へ上下に移動する
@@ -2016,7 +2005,7 @@ fn start_claude_update(app: &mut App) {
     });
 }
 
-/// 下部バーに数秒表示する通知（attach 失敗など、無反応に見せないため）。
+/// 下部バーに数秒表示する通知（起動失敗など、無反応に見せないため）。
 /// あわせて ~/.ccdesk/error.log にも残す
 fn set_notice(app: &mut App, msg: String) {
     log_error(&msg);
@@ -2032,31 +2021,25 @@ fn set_hint(app: &mut App, msg: String) {
     app.notice = Some((msg, std::time::Instant::now()));
 }
 
-/// 入力を捨てる門番の期限。`claude --bg` は通常 ~1 秒で返るので、これを超えたら
-/// 「応答しない」と見なす。**これが有界であることが要点**で、
-/// `claude --bg` の待ちにはタイムアウトが無い（結果を受けるスレッドは
-/// `bg.output()` でブロックする）ため、期限を持たないと門番は
-/// プロセスの残りの寿命ぶん降りない ＝ 既存の全セッションへのタイプが死ぬ
+/// 入力を捨てる門番の期限。**これが有界であることが要点**で、期限を持たないと
+/// 起こした子が端末を掴まないまま（起動直後の認証プロンプト・AV スキャン・
+/// 長い `-r` の読み込み）門番が降りず、既存の全セッションへのタイプが死ぬ
 const INPUT_GATE_LIMIT: Duration = Duration::from_secs(10);
 
 /// 起動処理中（[`App::input_gate`] が生きている間）に
 /// ターミナルペインへ来た入力を捨てる。捨てたら `true`（呼び手は何もしない）。
 ///
-/// **打った文字が無関係なセッションへ届かないための門番。** [`dispatch_session`] は
-/// 起動と同時にフォーカスを端末へ移すが、attach は `claude --bg` の完了後（~1 秒）なので、
-/// その間 `right_view` は**直前まで見ていたセッション**を指したままになる。素通しすると
-/// 新しいエージェント宛に打ったつもりのプロンプトが、無関係な実行中エージェント
-/// （別プロジェクトの作業中セッションもあり得る）へ送られる。
-/// 起動を待たずに打ち始めるのが普通なので、~1 秒でも現実に踏む。
+/// **子が端末を掴む前の打鍵を守る門番。** 前景セッションは PTY を開いた時点で
+/// 宛先が決まるが、claude が raw mode に入るまでの打鍵は行き場が定まらない
+/// （読み捨てられる・エコーが混ざる）。特に `-r` の再開は transcript の読み直しに
+/// 時間がかかりうるので、掴むまでは捨てて「届いていない」と伝える方が確実。
 ///
-/// **フォーカスの移動を attach 側へ遅らせる形は採らない**: それは直前に直した問題
+/// **フォーカスの移動を遅らせる形は採らない**: それは直したはずの問題
 /// （起動したのにキーがサイドバーへ行き ↑↓ で選択が動く）を戻すことになる。
-/// フォーカスは即座に端末へ移し、**宛先が居ない間だけ入力を捨てる**。
+/// フォーカスは即座に端末へ移し、**子が掴むまでの入力だけを捨てる**。
 ///
-/// **見るのは `spawn_rx` ではない。** あちらは「まだ結果が届きうる」を表し、
-/// ハングした起動（ネットワーク・認証プロンプト・AV スキャン）では永久に残るので、
-/// 門番の条件にすると入力が二度と戻らない。期限付きの短命な signal
-/// （[`expire_input_gate`]）に分けてある。
+/// 降ろす契機は「子が最初の出力を出した」（run ループ）と期限切れ
+/// （[`expire_input_gate`]）の 2 つ。**判断は [`lift_input_gate`] 1 箇所**。
 ///
 /// **黙って捨てない**: 下部バーの "starting session…" は通知が出ている間は隠れるため、
 /// 捨てたこと自体をここで伝える（[`set_hint`] ＝ 異常ではないので error.log には残さない）。
@@ -2074,21 +2057,21 @@ fn drop_input_while_starting(app: &mut App) -> bool {
 /// 門番を降ろす。**`input_gate` を降ろすのはここだけ**で、
 /// 「門番を降ろすときは必ず打ち先を確かめる」という判断をこの 1 箇所に閉じる。
 ///
-/// **なぜ 1 箇所に集めるか。** 降ろす契機は 4 つある（起動が成功して attach した /
-/// 起動が失敗した / attach が失敗した / 起動が応答しない・結果を運ぶスレッドが死んだ）。
-/// 降ろすだけでは入力は `right_view` が指したままの**直前まで見ていたセッション**へ
-/// 流れる ＝ 門番を置いた理由そのものが復活するので、降ろす側とフォーカスを戻す側が
-/// 別だと**片方だけ直した状態**（実際にそうなっていた: ハングの経路だけ戻していた）が
-/// 生まれる。契機が増えてもここを通る限り穴が開かない。
+/// **なぜ 1 箇所に集めるか。** 降ろす契機は 3 つある（起こした子が端末を掴んだ /
+/// 起動が失敗した / 子が応答しない）。降ろすだけでは入力は `right_view` が指した
+/// ままの**直前まで見ていたセッション**へ流れる ＝ 門番を置いた理由そのものが
+/// 復活するので、降ろす側とフォーカスを戻す側が別だと**片方だけ直した状態**
+/// （実際にそうなっていた: ハングの経路だけ戻していた）が生まれる。
+/// 契機が増えてもここを通る限り穴が開かない。
 ///
-/// `destination` は「宛先にしたつもりの attach id」。**それが本当に打ち先になって
-/// いるかは呼び手の報告ではなく右ペインの実際の表示で確かめる**（[`App::showing`]）
-/// ＝ 呼び手が「成功した」と言い間違える余地を持たせない。
+/// `destination` は「宛先にしたつもりの [`SessionId`]」。**それが本当に打ち先に
+/// なっているかは呼び手の報告ではなく右ペインの実際の表示で確かめる**
+/// （[`App::showing`]）＝ 呼び手が「成功した」と言い間違える余地を持たせない。
 ///
 /// **門番が立っていなければ何もしない。** セッションを起こさない供給元（撮影用）は
 /// 門番を立てずにここへ合流するので、そこでフォーカスを動かすと
 /// 「起動したのにキーがサイドバーへ行く」という直したはずの問題が戻る
-fn lift_input_gate(app: &mut App, destination: Option<&str>) {
+fn lift_input_gate(app: &mut App, destination: Option<&SessionId>) {
     if app.input_gate.take().is_none() {
         return;
     }
@@ -2103,10 +2086,8 @@ fn lift_input_gate(app: &mut App, destination: Option<&str>) {
 ///
 /// 打ち先の扱いは [`lift_input_gate`]（宛先は無い ＝ サイドバーへ戻る）。
 ///
-/// **`spawn_rx` は残す。** 遅れて結果が届けば attach するし、多重ディスパッチの
-/// 抑止も続く（ハングした起動が「次の dispatch」だけを止めるのは、門番を
-/// 入れる前からの挙動で害が小さい）。ハングしたまま終わった場合でも、
-/// 起きたセッションは次の `agents --json` の走査でサイドバーに出る
+/// **窓は閉じない。** 子は生きているかもしれない（読み込みが長い `-r` など）ので、
+/// 生死の判断は `child.try_wait()` に任せる ＝ ここが決めるのは入力の行き先だけ
 fn expire_input_gate(app: &mut App) -> bool {
     if !app
         .input_gate
@@ -2123,48 +2104,40 @@ fn expire_input_gate(app: &mut App) -> bool {
     true
 }
 
-/// id 指定で claude attach を PTY 起動（既に開いていれば切替のみ）。
-/// 失敗（cwd 消失等）は握りつぶさず下部バーへ通知する
-fn attach_by_id(app: &mut App, id: &str, label: &str, cwd: &str) {
-    if let Some(i) = app
-        .sessions
-        .iter()
-        .position(|s| s.attach_id.as_deref() == Some(id))
-    {
+/// 一覧の行を開く: ウィンドウが開いていれば切替、無ければ `claude -r` で再開する。
+///
+/// **再開は行が持つ cwd で行う**（`claude -r` は cwd の一致が必須で、別 cwd からは
+/// `No conversation found` になる・実測）。失敗（cwd 消失等）は握りつぶさず
+/// 下部バーへ通知する
+pub(crate) fn open_session(app: &mut App, id: &SessionId) {
+    if let Some(i) = app.windows.iter().position(|w| &w.session_id == id) {
         app.show_session(i);
         return;
     }
+    let Some(row) = app.sessions.iter().find(|r| &r.session_id == id) else {
+        return; // 再読み込みで消えた行（クリックと削除の競合）は何もしない
+    };
+    let (title, cwd) = (row.title.clone(), row.cwd.clone());
+    let settings = app.usage_display.then(write_inject_settings).flatten();
     let (rows, cols) = app.pane_size();
-    match Session::spawn(label, cwd, rows, cols, id) {
-        Ok(session) => {
-            app.sessions.push(session);
-            app.show_session(app.sessions.len() - 1);
+    match Session::spawn(
+        id,
+        &title,
+        &cwd,
+        rows,
+        cols,
+        Launch::Resume,
+        settings.as_deref(),
+    ) {
+        Ok(window) => {
+            app.windows.push(window);
+            app.show_session(app.windows.len() - 1);
+            // 再開は transcript の読み直しに時間がかかりうる。子が端末を掴むまでの
+            // 打鍵は捨てる（[`drop_input_while_starting`]）
+            app.input_gate = Some(std::time::Instant::now());
         }
-        Err(e) => set_notice(app, format!("attach {id} 失敗: {e}")),
+        Err(e) => set_notice(app, format!("セッション {id} の再開に失敗: {e}")),
     }
-}
-
-/// short id でセッションを開く: ウィンドウが開いていれば切替、無ければ bg 行から attach
-/// （停止中でも supervisor が保存状態から復帰させる）
-pub(crate) fn open_short(app: &mut App, short: &str) {
-    if let Some(i) = app
-        .sessions
-        .iter()
-        .position(|s| s.attach_id.as_deref() == Some(short))
-    {
-        app.show_session(i);
-        return;
-    }
-    let Some(job) = app.jobs.iter().find(|j| j.short == short) else {
-        return; // 再スキャンで消えた行（クリックと削除の競合）は何もしない
-    };
-    let label = if job.name.is_empty() {
-        "bg".to_string()
-    } else {
-        job.name.clone()
-    };
-    let cwd = job.cwd.clone();
-    attach_by_id(app, short, &label, &cwd);
 }
 
 #[cfg(test)]
@@ -2248,9 +2221,9 @@ mod tests {
         }
     }
 
-    fn session(short: &str, stopped: bool) -> PopupKind {
+    fn session(id: &str, stopped: bool) -> PopupKind {
         PopupKind::Session {
-            short: short.to_string(),
+            id: SessionId::new(id),
             stopped,
         }
     }
@@ -2274,11 +2247,11 @@ mod tests {
         let kind = session("abc123", false);
         assert_eq!(
             kind.action(0),
-            Some(PopupAction::Stop("abc123".to_string()))
+            Some(PopupAction::Stop(SessionId::new("abc123")))
         );
         assert_eq!(
             kind.action(1),
-            Some(PopupAction::Delete("abc123".to_string()))
+            Some(PopupAction::Delete(SessionId::new("abc123")))
         );
         assert_eq!(kind.action(2), None, "項目の無い index は何も起こさない");
     }
@@ -2309,11 +2282,11 @@ mod tests {
     #[test]
     fn clicking_the_hamburger_opens_the_session_menu() {
         let mut app = test_app(34, TERM);
-        app.sidebar_rows = vec![Some(RowAction::Open("abc123".to_string()))];
+        app.sidebar_rows = vec![Some(RowAction::Open(SessionId::new("abc123")))];
         app.sidebar_header_rows = 1;
         handle_mouse(&mut app, &click(0, 1)).unwrap();
         let popup = app.popup.as_ref().expect("メニューが開いていない");
-        // agents が空 = プロセス無しなので停止済み扱い
+        // 生きた窓が無い = 停止済み扱い
         assert_eq!(popup.kind, session("abc123", true));
         assert_eq!(labels(&popup.kind, app.grouping), ["stop", "delete"]);
         assert_eq!(popup.anchor_y, 1, "クリックした行の下に出る");
@@ -2850,22 +2823,15 @@ mod tests {
     }
 
     impl DataSource for TestSource {
-        fn jobs(&self) -> Vec<BgJob> {
-            Vec::new()
-        }
-
         // セッション一覧は差し替えの軸に入れていない（今の検査対象はアカウントと
         // プロジェクト永続化の 2 つだけ）。永続化層を持たない ＝ 読みは 0 件、
         // 保存は渡された一覧をそのまま返す（ディスクが空の単独起動と同じ結果なので
         // live の意味論と矛盾しない。[`ProjectsBackend::Absent`] と同じ判断）
-        fn sessions(&self) -> Vec<crate::sessions::SessionRow> {
+        fn sessions(&self) -> Vec<SessionRow> {
             Vec::new()
         }
 
-        fn store_sessions(
-            &self,
-            next: &[crate::sessions::SessionRow],
-        ) -> Vec<crate::sessions::SessionRow> {
+        fn store_sessions(&self, next: &[SessionRow]) -> Vec<SessionRow> {
             next.to_vec()
         }
 
@@ -2916,7 +2882,7 @@ mod tests {
 
         fn spawn_pollers(&self, _sinks: PollSinks) {}
 
-        // テストが実プロセス（claude --bg）を起こさない。既定の供給元
+        // テストが実プロセス（claude）を起こさない。既定の供給元
         // （[`crate::source::DemoSource`]）と同じ約束を、差し替えた側でも守る
         fn spawns_sessions(&self) -> bool {
             false
@@ -3616,9 +3582,7 @@ mod tests {
             let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
             app.agents = alive
                 .iter()
-                .enumerate()
-                .map(|(i, has_pid)| AgentInfo {
-                    id: format!("s{i}"),
+                .map(|has_pid| AgentInfo {
                     has_pid: *has_pid,
                     ..AgentInfo::default()
                 })
@@ -3659,21 +3623,18 @@ mod tests {
         }
     }
 
-    /// テスト用のセッション 1 本（cwd だけが関心事）
-    fn job_in(short: &str, cwd: &str) -> BgJob {
-        BgJob {
-            short: short.to_string(),
-            cwd: cwd.to_string(),
-            state: "working".to_string(),
-            tempo: String::new(),
-            name: String::new(),
-            needs: String::new(),
-            detail: String::new(),
-            result: String::new(),
-            children: Vec::new(),
-            mtime: std::time::SystemTime::now(),
-            created_at_ms: 0,
-            updated_at_ms: 0,
+    /// テスト用の一覧行 1 本（cwd と更新時刻だけが関心事）。
+    /// `updated_at` は埋め戻しの「新しい順」に効くので明示で受ける
+    fn session_row(id: &str, cwd: &str, updated_at: u64) -> SessionRow {
+        SessionRow {
+            updated_at,
+            ..SessionRow::new(
+                SessionId::new(id),
+                cwd,
+                "session",
+                TitleSource::Derived,
+                updated_at,
+            )
         }
     }
 
@@ -3733,7 +3694,7 @@ mod tests {
         assert_eq!(popup.kind, project("C:\\dev\\api", false));
         assert_eq!(popup.anchor_y, 1, "クリックした行の下に出る");
         assert!(app.focus == Focus::Sidebar, "フォーカスが右ペインへ移った");
-        assert!(app.spawn_rx.is_none(), "クリックでセッションが起動している");
+        assert!(app.sessions.is_empty(), "クリックでセッションが起動している");
     }
 
     /// メニューを開く時点でセッションの有無を写す。**同名の末端ディレクトリが別パスに
@@ -3742,7 +3703,7 @@ mod tests {
     #[test]
     fn opening_a_project_menu_reads_sessions_for_that_exact_folder() {
         let mut app = test_app(34, TERM);
-        app.jobs = vec![job_in("s1", "C:\\work\\api")];
+        app.sessions = vec![session_row("s1", "C:\\work\\api", 1)];
         // セッションを持つ側
         open_project_popup(&mut app, "C:\\work\\api".to_string(), 3);
         assert_eq!(app.popup.as_ref().unwrap().kind, project("C:\\work\\api", true));
@@ -3927,7 +3888,7 @@ mod tests {
     }
 
     /// **自動登録の経路 1: 新規セッション画面の起動。** 供給元が撮影用データなので
-    /// 本物の `claude --bg` は起きず、フォルダの登録と初期値の更新だけが観測できる
+    /// 本物の claude は起きず、フォルダの登録と初期値の更新だけが観測できる
     #[test]
     fn launching_from_the_new_session_view_registers_its_folder() {
         let dir = std::env::temp_dir().to_string_lossy().to_string();
@@ -3936,7 +3897,7 @@ mod tests {
         start_new_session(&mut app).unwrap();
         assert_eq!(app.projects, std::slice::from_ref(&dir), "起動したフォルダが登録されない");
         assert_eq!(app.dispatch_cwd, dir);
-        assert!(app.spawn_rx.is_none(), "撮影用データで claude を起動している");
+        assert!(app.sessions.is_empty(), "撮影用データで claude を起動している");
     }
 
     /// **自動登録の経路 2: 見出しメニューの new session。** 経路 1 と同じ
@@ -3953,7 +3914,7 @@ mod tests {
 
     /// **見出しメニューの new session はフォーカスを端末へ移す。** 起動したのに
     /// キーがサイドバーへ行き続けると、↑↓ で選択が動き Ctrl+X で止まる ＝
-    /// クリックか Alt+→ を押すまでタイプできない。attach 側
+    /// クリックか Alt+→ を押すまでタイプできない。窓を出す側
     /// （[`App::show_session`]）はフォーカスを動かさない契約なので、
     /// ディスパッチの時点で移す（New 画面の起動ボタンと同じ挙動）
     #[test]
@@ -3967,27 +3928,23 @@ mod tests {
         );
     }
 
-    /// **起動処理中に打った文字は、直前まで見ていたセッションへ届かない。**
-    /// フォーカスは端末へ移っているが attach は `claude --bg` の完了後（~1 秒）で、
-    /// その間 `right_view` は前のセッションを指したままなので、素通しすると
-    /// 新エージェント宛のプロンプトが無関係な実行中エージェントへ送られる。
+    /// **子が端末を掴むまでに打った文字は、どのセッションへも届かない。**
+    /// フォーカスは端末へ移っているが claude はまだ raw mode に入っていないので、
+    /// 素通しすると打った文字が読み捨てられたりエコーに混ざったりする。
     /// 捨てたことは下部バーで伝える（無反応に見せない）
     #[test]
     fn input_typed_while_a_session_is_starting_reaches_no_session() {
         let mut app = test_app(34, TERM);
         open(&mut app, project("C:\\dev\\api", false), 5);
         handle_popup_key(&mut app, KeyCode::Enter); // 先頭 = new session
-        // 撮影用の供給元は実際に claude を起動しないので、完了待ちの状態を作る
-        let (_tx, rx) = std::sync::mpsc::channel();
-        app.spawn_rx = Some(rx);
+        // 撮影用の供給元は実際に claude を起こさないので、起動直後の状態を作る
         app.input_gate = Some(std::time::Instant::now());
         assert!(
             drop_input_while_starting(&mut app),
-            "起動処理中の入力が前のセッションへ流れる"
+            "起動処理中の入力がそのまま PTY へ流れる"
         );
         assert!(app.notice.is_some(), "捨てたことが伝わっていない");
-        // 起動が終われば宛先は attach したセッション ＝ 素通しに戻る
-        // （門番が残り続けるとタイプできない画面になる）
+        // 子が端末を掴めば素通しに戻る（門番が残り続けるとタイプできない画面になる）
         app.input_gate = None;
         assert!(
             !drop_input_while_starting(&mut app),
@@ -3995,34 +3952,26 @@ mod tests {
         );
     }
 
-    /// **結果が届いたら門番は降りる。** 降ろす場所を live と撮影用の合流点
-    /// （[`apply_spawn_outcome`]）に置いてあることの固定で、ここが漏れると
-    /// 起動が成功した後もタイプできない画面になる
+    /// **起動の反映で門番は降りる。** 降ろす場所を live と撮影用の合流点
+    /// （[`apply_launch`]）に置いてあることの固定で、ここが漏れると
+    /// セッションを起こさない供給元でタイプできない画面になる
     #[test]
     fn a_finished_launch_lifts_the_input_gate() {
         let mut app = test_app(34, TERM);
         app.input_gate = Some(std::time::Instant::now());
-        apply_spawn_outcome(
-            &mut app,
-            SpawnOutcome {
-                id: None,
-                label: String::new(),
-                cwd: "C:\\dev\\api".to_string(),
-                error: None,
-            },
-        );
+        // 起動を試していない（撮影用の供給元）＝ 待つものが無いので門番は降りる
+        apply_launch(&mut app, "C:\\dev\\api".to_string(), Ok(None));
         assert!(
             !drop_input_while_starting(&mut app),
             "起動が終わったのに入力が捨てられる"
         );
     }
 
-    /// **ハングした起動から入力が有界時間で戻る。**
+    /// **応答しない起動から入力が有界時間で戻る。**
     ///
-    /// `claude --bg` の結果を待つスレッドは `bg.output()` でブロックし、
-    /// **タイムアウトを持たない**。門番を `spawn_rx` の生死で判定していた頃は、
-    /// ハング（ネットワーク・認証プロンプト・AV スキャン）で
-    /// **既存の全セッションへのタイプがプロセスの残りの寿命ぶん死んでいた**。
+    /// 門番が降りる合図は「子が最初の出力を出した」なので、子が端末を掴まないまま
+    /// （起動直後の認証プロンプト・AV スキャン・長い `-r` の読み込み）だと
+    /// **既存の全セッションへのタイプがその間ずっと死ぬ**。
     /// 期限（[`INPUT_GATE_LIMIT`]）を超えたら門番を降ろす。
     ///
     /// **降りた後も、打った文字は直前まで見ていたセッションへ流れない**:
@@ -4032,9 +3981,7 @@ mod tests {
     #[test]
     fn a_hung_launch_gives_input_back_within_a_bounded_time() {
         let mut app = test_app(34, TERM);
-        // 結果を送らない = ハングした `claude --bg`（受け側は永久に Empty）
-        let (_tx, rx) = std::sync::mpsc::channel();
-        app.spawn_rx = Some(rx);
+        // 子がまだ何も出力していない状態（起動直後）
         app.input_gate = Some(std::time::Instant::now());
         app.set_focus(Focus::Terminal); // dispatch_session と同じ状態
 
@@ -4042,55 +3989,46 @@ mod tests {
         assert!(!expire_input_gate(&mut app), "期限前に門番が降りている");
         assert!(
             drop_input_while_starting(&mut app),
-            "起動処理中の入力が前のセッションへ流れる"
+            "起動処理中の入力がそのまま PTY へ流れる"
         );
 
-        // 期限ぶん前にディスパッチした状態（時刻を注入して待たずに検査する）
+        // 期限ぶん前に起こした状態（時刻を注入して待たずに検査する）
         app.input_gate = Some(instant_ago(INPUT_GATE_LIMIT));
         assert!(expire_input_gate(&mut app), "期限を過ぎても門番が降りない");
         assert!(
             !drop_input_while_starting(&mut app),
-            "ハングした起動で入力が永久に死んでいる"
+            "応答しない起動で入力が永久に死んでいる"
         );
         assert!(
             app.focus == Focus::Sidebar,
             "門番だけ降ろして打ち先を戻していない（打った文字が古いセッションへ流れる）"
         );
-        let (msg, _) = app.notice.as_ref().expect("ハングが伝わっていない");
+        let (msg, _) = app.notice.as_ref().expect("応答しないことが伝わっていない");
         assert!(msg.contains("応答しない"), "何が起きたか分からない: {msg:?}");
-        // `spawn_rx` は残す（遅れて届いた結果は attach できる。多重起動の抑止も続く）
-        assert!(app.spawn_rx.is_some(), "遅れて届く結果の受け口を捨てている");
         // 2 度目は何もしない（毎周通知を出し直さない）
         assert!(!expire_input_gate(&mut app), "降りた門番をもう一度降ろしている");
     }
 
     /// **起動に失敗したときも、打った文字は直前まで見ていたセッションへ届かない。**
     ///
-    /// 門番（[`drop_input_while_starting`]）は「宛先のセッションがまだ無い間」だけ
-    /// 入力を捨てるので、結果が届いたら降りる。しかし**失敗して届いた**ときは
-    /// attach しない ＝ `right_view` は直前まで見ていたセッションを指したままで、
-    /// [`dispatch_session`] が移した `Focus::Terminal` も戻らない。門番だけ降ろすと
-    /// 「見出しメニュー → new session → 起動失敗 → そのまま打鍵」で、稼働中の
-    /// 別プロジェクトのエージェントへプロンプトが送られる（門番が防いでいた経路が
-    /// 失敗直後に復活する）。ハングの経路（[`expire_input_gate`]）と同じ扱いに
-    /// 揃えるのが要点で、判断は [`lift_input_gate`] 1 箇所に置いてある
+    /// 起動が失敗すると窓は増えない ＝ `right_view` は直前まで見ていたセッションを
+    /// 指したままで、[`dispatch_session`] が移した `Focus::Terminal` も戻らない。
+    /// そのまま打鍵すると稼働中の別プロジェクトのセッションへプロンプトが送られる。
+    /// 応答しない経路（[`expire_input_gate`]）と同じ扱いに揃えるのが要点で、
+    /// 判断は [`lift_input_gate`] 1 箇所に置いてある
     #[test]
     fn a_failed_launch_gives_input_back_to_the_sidebar() {
         let mut app = test_app(34, TERM);
         app.input_gate = Some(std::time::Instant::now());
         app.set_focus(Focus::Terminal); // dispatch_session と同じ状態
-        apply_spawn_outcome(
+        apply_launch(
             &mut app,
-            SpawnOutcome {
-                id: None,
-                label: String::new(),
-                cwd: "C:\\dev\\api".to_string(),
-                error: Some("claude --bg 起動失敗".to_string()),
-            },
+            "C:\\dev\\api".to_string(),
+            Err("セッションの起動に失敗".to_string()),
         );
         assert!(
             !drop_input_while_starting(&mut app),
-            "結果が届いたのに入力が捨てられ続ける"
+            "失敗したのに入力が捨てられ続ける"
         );
         assert!(
             app.focus == Focus::Sidebar,
@@ -4098,34 +4036,32 @@ mod tests {
         );
     }
 
-    /// **attach に失敗したときも打ち先を戻す。** `claude --bg` は成功したのに
-    /// attach（`claude attach <id>`）が失敗すると、起動失敗と同じ状態になる
-    /// ＝ 宛先のセッションが無いまま門番が降りる。
+    /// **宛先が居ないまま門番を降ろすと打ち先も戻る。** 起動には成功したのに
+    /// その窓が表示されていない（切替と削除が競合した等）状態でも、
+    /// 素通しに戻ると打った文字が別のセッションへ流れる。
     ///
-    /// **`apply_spawn_outcome` 越しには書けない**: attach の失敗を作るには本物の
-    /// 子プロセス生成を失敗させる必要があり、portable-pty は存在しない cwd を
-    /// `USERPROFILE` に差し替えて**成功させる**（＝ テストが本物の `claude attach` を
-    /// 起こしてしまう）。代わりに、attach が失敗した後の状態（宛先の id の
-    /// セッションが開いていない）をそのまま作って判断だけを検査する。
-    /// 判断は [`lift_input_gate`] 1 箇所なので、起動失敗の経路
-    /// （[`a_failed_launch_gives_input_back_to_the_sidebar`]）と同じ穴を見ている
+    /// [`apply_launch`] 越しには書けない: 本物の子プロセス生成が要るため
+    /// （portable-pty は存在しない cwd を `USERPROFILE` に差し替えて**成功させる**
+    /// ＝ テストが本物の claude を起こしてしまう）。代わりに、その後の状態
+    /// （宛先の窓が開いていない）をそのまま作って判断だけを検査する
     #[test]
-    fn a_failed_attach_gives_input_back_to_the_sidebar() {
+    fn lifting_the_gate_without_its_destination_gives_input_back_to_the_sidebar() {
         let mut app = test_app(34, TERM);
+        let id = SessionId::new("abc123");
         app.input_gate = Some(std::time::Instant::now());
         app.set_focus(Focus::Terminal);
         assert!(
-            !app.showing("abc123"),
-            "attach 失敗の状態になっていない（テストの前提が崩れている）"
+            !app.showing(&id),
+            "宛先が居ない状態になっていない（テストの前提が崩れている）"
         );
-        lift_input_gate(&mut app, Some("abc123"));
+        lift_input_gate(&mut app, Some(&id));
         assert!(
             !drop_input_while_starting(&mut app),
-            "結果が届いたのに入力が捨てられ続ける"
+            "門番が降りたのに入力が捨てられ続ける"
         );
         assert!(
             app.focus == Focus::Sidebar,
-            "attach 失敗で門番だけ降りて打ち先が端末に残っている"
+            "門番だけ降りて打ち先が端末に残っている"
         );
     }
 
@@ -4136,44 +4072,20 @@ mod tests {
     #[test]
     fn a_failed_launch_registers_no_folder() {
         let mut app = test_app(34, TERM);
-        let failed = SpawnOutcome {
-            id: None,
-            label: String::new(),
-            cwd: "C:\\dev\\api".to_string(),
-            error: Some("claude --bg 起動失敗".to_string()),
-        };
-        apply_spawn_outcome(&mut app, failed);
+        apply_launch(
+            &mut app,
+            "C:\\dev\\api".to_string(),
+            Err("セッションの起動に失敗".to_string()),
+        );
         assert!(app.projects.is_empty(), "起動に失敗したフォルダが登録された");
         assert!(app.notice.is_some(), "失敗が伝わっていない");
-        // 成否の判定は error 1 つ。id が無くても error が無ければ「起動を試していない」
-        // ＝ 失敗ではないので記録する（セッションを起こさない撮影用の供給元がこの形）
-        let not_launched = SpawnOutcome {
-            id: None,
-            label: String::new(),
-            cwd: "C:\\dev\\web".to_string(),
-            error: None,
-        };
-        apply_spawn_outcome(&mut app, not_launched);
+        // 成否の判定は Result 1 つ。`Ok(None)` は「起動を試していない」＝ 失敗では
+        // ないので記録する（セッションを起こさない撮影用の供給元がこの形）
+        apply_launch(&mut app, "C:\\dev\\web".to_string(), Ok(None));
         assert_eq!(
             app.projects,
             ["C:\\dev\\web"],
             "起動結果の反映で登録されない ＝ 登録の判断が起動前に残っている"
-        );
-    }
-
-    /// 起動処理中の 2 度目のディスパッチは**黙って捨てない**。選んでも画面が
-    /// 変わらない操作なので、落としたことを下部バーで伝える
-    #[test]
-    fn a_second_dispatch_while_one_is_in_flight_is_reported() {
-        let mut app = test_app(34, TERM);
-        let (_tx, rx) = std::sync::mpsc::channel();
-        app.spawn_rx = Some(rx); // 起動処理中
-        open(&mut app, project("C:\\dev\\api", false), 5);
-        handle_popup_key(&mut app, KeyCode::Enter);
-        assert!(app.notice.is_some(), "無反応になっている");
-        assert!(
-            app.projects.is_empty() && app.dispatch_cwd.is_empty(),
-            "捨てたディスパッチが状態を変えている"
         );
     }
 
@@ -4234,16 +4146,16 @@ mod tests {
     fn startup_backfills_projects_from_existing_sessions() {
         let mut app = test_app(34, TERM);
         app.projects = vec!["C:\\dev\\registered".to_string()];
-        // jobs は新しい順（scan_jobs が mtime 降順で並べる）
-        app.jobs = vec![
-            job_in("s1", "C:\\dev\\api"),
+        // 一覧の並びは保存順で新旧を表さない。新しさは `updated_at` が持つ
+        app.sessions = vec![
+            session_row("s5", "C:\\dev\\old", 10),
+            session_row("s1", "C:\\dev\\api", 50),
             // 同じフォルダ（大小・末尾の区切り違い）は 1 件だけ
-            job_in("s2", "c:\\dev\\api\\"),
+            session_row("s2", "c:\\dev\\api\\", 40),
             // 既に登録済みのフォルダは増えない
-            job_in("s3", "C:\\dev\\registered"),
+            session_row("s3", "C:\\dev\\registered", 30),
             // cwd の取れなかった行から空の見出しを作らない
-            job_in("s4", ""),
-            job_in("s5", "C:\\dev\\old"),
+            session_row("s4", "", 20),
         ];
         backfill_projects(&mut app);
         // 既存の登録はそのまま。埋め戻しは古い側から積むので、末尾 = 最近使ったフォルダ
@@ -4261,8 +4173,8 @@ mod tests {
         app.projects = (0..PROJECTS_LIMIT)
             .map(|i| format!("C:\\dev\\p{i}"))
             .collect();
-        app.jobs = (0..5)
-            .map(|i| job_in(&format!("s{i}"), &format!("C:\\jobs\\j{i}")))
+        app.sessions = (0..5)
+            .map(|i| session_row(&format!("s{i}"), &format!("C:\\sessions\\j{i}"), i as u64))
             .collect();
         backfill_projects(&mut app);
         assert_eq!(app.projects.len(), PROJECTS_LIMIT);
@@ -4273,13 +4185,21 @@ mod tests {
         );
     }
 
-    /// 既存セッションが上限を超えるときは**新しいセッションのフォルダを優先する**
-    /// （jobs は新しい順。最近使ったものが残るという登録の並びと同じ規則）
+    /// 既存セッションが上限を超えるときは**最近更新した行のフォルダを優先する**
+    /// （最近使ったものが残るという登録の並びと同じ規則）
     #[test]
     fn backfilling_prefers_the_newest_sessions_when_they_exceed_the_limit() {
         let mut app = test_app(34, TERM);
-        app.jobs = (0..PROJECTS_LIMIT + 5)
-            .map(|i| job_in(&format!("s{i}"), &format!("C:\\dev\\j{i}")))
+        // `updated_at` は j0 が最新（新しい順に並べ替えられることを見る）
+        let total = PROJECTS_LIMIT + 5;
+        app.sessions = (0..total)
+            .map(|i| {
+                session_row(
+                    &format!("s{i}"),
+                    &format!("C:\\dev\\j{i}"),
+                    (total - i) as u64,
+                )
+            })
             .collect();
         backfill_projects(&mut app);
         assert_eq!(app.projects.len(), PROJECTS_LIMIT, "上限を超えて積まれている");
@@ -4292,6 +4212,37 @@ mod tests {
             !app.projects.iter().any(|p| p == &format!("C:\\dev\\j{PROJECTS_LIMIT}")),
             "上限を超えた古いセッションのフォルダが入っている"
         );
+    }
+
+    /// **開いている窓の行は一覧の読み直しで消えない。** 読み直しは丸ごとの
+    /// 置き換えなので、保存がまだディスクへ載っていない（ロックが取れなかった）
+    /// 間に読むとその行だけが落ち、**プロセスは動いているのにサイドバーの
+    /// どこからも指せない**状態になる。
+    ///
+    /// 戻すのは窓が開いている行だけ ＝ 他インスタンスの `delete` は普通に効く
+    /// （窓を持たない行を戻すと、削除がどちらのインスタンスからも効かなくなる）
+    #[test]
+    fn refreshing_the_list_keeps_the_rows_of_open_windows() {
+        let mine = [
+            session_row("open", "C:\\dev\\api", 1),
+            session_row("closed", "C:\\dev\\web", 1),
+        ];
+        let open = [SessionId::new("open")];
+
+        // ディスクにまだ載っていない（＝ 保存が失敗した直後の読み直し）
+        assert_eq!(
+            rows_dropped_while_open(&[], &mine, &open),
+            [&mine[0]],
+            "窓が開いている行を落としている"
+        );
+        // 窓を持たない行は戻さない（他インスタンスの削除を復活させない）
+        assert!(
+            !rows_dropped_while_open(&[], &mine, &open)
+                .iter()
+                .any(|row| row.session_id.as_str() == "closed")
+        );
+        // ディスクに載っていれば戻すものは無い（通常の読み直し）
+        assert!(rows_dropped_while_open(&mine, &mine, &open).is_empty());
     }
 
     /// Enter でメニューを開く行の画面 y。固定ヘッダーはスクロールに動かされず、
