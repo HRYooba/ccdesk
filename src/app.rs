@@ -979,6 +979,18 @@ fn apply_spawn_outcome(app: &mut App, outcome: SpawnOutcome) {
     }
 }
 
+/// 登録プロジェクト一覧を保存し、**永続化された内容を自分の一覧として取り込む**。
+/// 一覧を変える 3 つの操作（登録・埋め戻し・登録解除）はどれもここを通る。
+///
+/// 取り込みが要点: 保存はディスクとのマージと上限の適用を通るので、渡した一覧が
+/// そのまま載るわけではない（[`crate::source::DataSource::store_projects`]）。
+/// 取り込まないと、**上限で落ちた登録が画面には出続けるのに再起動で消える**
+/// ＝ 見出しの正本が state.json とメモリの 2 箇所に割れる。あわせて他インスタンスの
+/// 登録もこの時点で一覧に入るので、次の保存でそれを「自分が外した」と読ませない
+fn save_projects(app: &mut App) {
+    app.projects = app.source.store_projects(&app.projects);
+}
+
 /// そのフォルダを登録プロジェクトへ加える。**呼ばれるのは [`apply_spawn_outcome`]
 /// だけ**（明示的な「追加」UI は持たず、セッションの起動が成功した時点で登録される。
 /// 「登録するか」の判断を散らさないため、呼び出し口を増やさない）。
@@ -1006,7 +1018,7 @@ fn register_project(app: &mut App, cwd: &str) {
     // 落ちたこと自体が操作の邪魔にならない
     let excess = app.projects.len().saturating_sub(PROJECTS_LIMIT);
     app.projects.drain(..excess);
-    app.source.save_window(WindowItem::Projects(&app.projects));
+    save_projects(app);
 }
 
 /// 起動時に、既にあるセッションの cwd を登録へ埋め戻す（初回読み込みで 1 度だけ）。
@@ -1043,7 +1055,7 @@ pub(crate) fn backfill_projects(app: &mut App) {
     // 登録の並びは最近使った順（末尾が最新）なので、新しい順の jobs を逆に積む
     fresh.reverse();
     app.projects.extend(fresh);
-    app.source.save_window(WindowItem::Projects(&app.projects));
+    save_projects(app);
 }
 
 /// 登録プロジェクトから外す。セッションが残っているかの判断はメニュー側
@@ -1052,7 +1064,7 @@ fn remove_project(app: &mut App, cwd: &str) {
     let before = app.projects.len();
     app.projects.retain(|p| !same_dir(p, cwd));
     if app.projects.len() != before {
-        app.source.save_window(WindowItem::Projects(&app.projects));
+        save_projects(app);
     }
 }
 
@@ -1908,7 +1920,7 @@ mod tests {
     use super::*;
     use unicode_width::UnicodeWidthStr;
 
-    use crate::source::WindowState;
+    use crate::source::{merge_and_advance_baseline, WindowState};
 
     const TERM: (u16, u16) = (120, 40);
 
@@ -2511,6 +2523,10 @@ mod tests {
 
         fn save_window(&self, _item: WindowItem<'_>) {}
 
+        fn store_projects(&self, next: &[String]) -> Vec<String> {
+            next.to_vec() // アカウントの配線を見る供給元なので、一覧はそのまま返す
+        }
+
         fn spawn_pollers(&self, _sinks: PollSinks) {}
 
         // テストが実プロセス（claude --bg）を起こさない。既定の供給元
@@ -3036,6 +3052,140 @@ mod tests {
             app.projects.last().map(String::as_str),
             Some("C:\\dev\\new"),
             "最後に使ったフォルダが末尾に来ていない"
+        );
+    }
+
+    /// state.json をメモリに置いた供給元。**保存の意味論（他インスタンスの登録との
+    /// マージ・上限・次の基準）は live と同じ関数**（[`merge_and_advance_baseline`]）を
+    /// 通すので、「保存するとどうなるか」をテスト側へ写し取らずに App の側を検査できる。
+    /// 実ファイルを触らないので実ユーザーの ~/.ccdesk は動かない
+    struct MemoryDiskSource {
+        /// ディスク上の一覧（他インスタンスの登録を仕込むのもここ）
+        disk: Mutex<Vec<String>>,
+        /// 「ディスクはこうなっている」との判断 = マージの基準（live と同じ持ち方）
+        baseline: Mutex<Vec<String>>,
+    }
+
+    impl DataSource for MemoryDiskSource {
+        fn jobs(&self) -> Vec<BgJob> {
+            Vec::new()
+        }
+
+        fn footer(&self) -> FooterInfo {
+            FooterInfo::default()
+        }
+
+        fn usage(&self) -> Option<UsageInfo> {
+            None
+        }
+
+        fn window_state(&self) -> WindowState {
+            WindowState {
+                sidebar_width: 34,
+                last_view: None,
+                dispatch_cwd: String::new(),
+                grouping: Grouping::State,
+                projects: self
+                    .disk
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            }
+        }
+
+        fn save_window(&self, _item: WindowItem<'_>) {}
+
+        fn store_projects(&self, next: &[String]) -> Vec<String> {
+            let mut disk = self
+                .disk
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut baseline = self
+                .baseline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let written = merge_and_advance_baseline(disk.clone(), &mut baseline, next);
+            *disk = written.clone();
+            written
+        }
+
+        fn spawn_pollers(&self, _sinks: PollSinks) {}
+
+        fn spawns_sessions(&self) -> bool {
+            false // テストが実プロセス（claude --bg）を起こさない
+        }
+
+        fn accounts(&self) -> Vec<Account> {
+            Vec::new()
+        }
+
+        fn apply_account(&self, _action: AccountAction<'_>) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// ディスクに他インスタンスの登録が居る App。自分の一覧は起動時の読み込みと
+    /// 同じく「そのとき読んだディスクの内容」＝ 基準と揃えておく
+    fn app_with_disk(mine: &[&str], from_other: &[&str]) -> App {
+        let mine: Vec<String> = mine.iter().map(|p| p.to_string()).collect();
+        let mut disk = mine.clone();
+        disk.extend(from_other.iter().map(|p| p.to_string()));
+        App {
+            projects: mine.clone(),
+            source: Box::new(MemoryDiskSource {
+                disk: Mutex::new(disk),
+                baseline: Mutex::new(mine),
+            }),
+            ..test_app(34, TERM)
+        }
+    }
+
+    /// ディスクに載った一覧（テストの検査用に読み直す）
+    fn disk_projects(app: &App) -> Vec<String> {
+        app.source.window_state().projects
+    }
+
+    /// **保存された一覧をそのまま自分の一覧にする（画面とディスクをずらさない）。**
+    /// 上限まで埋まった状態で他インスタンスの登録がディスクに居ると、マージ後に
+    /// 上限がかかるので**保存された内容は渡した一覧と違う**。取り込まないと、
+    /// 上限で落ちた自分の最古の登録が画面には出続けて再起動で消え、しかも
+    /// 保存するたび同じことが起き続ける（他インスタンスの登録も一覧に入らない）
+    #[test]
+    fn saving_projects_takes_up_what_was_actually_persisted() {
+        let mine: Vec<String> = (0..PROJECTS_LIMIT).map(|i| format!("C:\\dev\\p{i}")).collect();
+        let mine_refs: Vec<&str> = mine.iter().map(String::as_str).collect();
+        let mut app = app_with_disk(&mine_refs, &["C:\\dev\\from-b"]);
+        // 登録済みフォルダの使い直し ＝ 自分の一覧の件数は変わらないまま保存が走る
+        register_project(&mut app, "C:\\dev\\p3");
+        assert_eq!(
+            app.projects,
+            disk_projects(&app),
+            "保存された一覧を取り込んでいない ＝ 画面とディスクがずれている"
+        );
+        assert!(
+            app.projects.iter().any(|p| p == "C:\\dev\\from-b"),
+            "他インスタンスの登録が自分の一覧に入っていない"
+        );
+    }
+
+    /// **他インスタンスの登録が「恒久的に最近使った」扱いにならない（LRU の逆転を防ぐ）。**
+    /// 取り込まないと、その登録は毎回マージで末尾（＝最後に使った位置）へ足し直されるので、
+    /// 自分の本当に新しい登録より後に追い出される。取り込めば自分の一覧の一員として
+    /// 普通に古くなる
+    #[test]
+    fn a_registration_from_another_instance_does_not_stay_the_most_recent() {
+        let mut app = app_with_disk(&["C:\\dev\\mine"], &["C:\\dev\\from-b"]);
+        register_project(&mut app, "C:\\dev\\mine"); // 1 度目の保存で取り込む
+        register_project(&mut app, "C:\\dev\\fresh"); // その後で自分が新しく登録
+        assert_eq!(
+            disk_projects(&app).last().map(String::as_str),
+            Some("C:\\dev\\fresh"),
+            "他インスタンスの登録が最後に使った位置へ積み直されている"
+        );
+        assert_eq!(
+            app.projects,
+            ["C:\\dev\\mine", "C:\\dev\\from-b", "C:\\dev\\fresh"],
+            "取り込んだ登録が最近使った順に並んでいない"
         );
     }
 

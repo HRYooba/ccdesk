@@ -106,11 +106,6 @@ pub(crate) enum WindowItem<'a> {
     SidebarWidth(u16),
     LastFolder(&'a str),
     Grouping(Grouping),
-    /// 登録プロジェクトの一覧。**差分ではなく全量で渡す**（App から見た正本は
-    /// メモリ上の一覧で、「今の全量」を渡す形にしておけば追加と削除で保存経路が
-    /// 分かれない）。ディスクへ載せるときの突き合わせは live 側の責務
-    /// （[`merge_projects`] ＝ 複数インスタンスで登録を消し合わない）
-    Projects(&'a [String]),
 }
 
 /// アカウント保管への変更要求。[`WindowItem`] と同じ「1 つの enum を受ける
@@ -164,6 +159,18 @@ pub(crate) trait DataSource {
     /// ウィンドウ状態の保存（demo は書かない）
     fn save_window(&self, item: WindowItem<'_>);
 
+    /// 登録プロジェクト一覧の保存。**差分ではなく全量で渡し、永続化された一覧を返す**。
+    ///
+    /// [`WindowItem`] から外して独立したメソッドにしてあるのは**戻り値がある**ため:
+    /// 保存はディスクとのマージと上限の適用を通るので、渡した一覧と保存された一覧は
+    /// 一致しない（他インスタンスの登録が増え、上限を超えた分は落ちる）。返さないと
+    /// App 側の一覧がディスクとずれ、**画面には出続けるのに再起動で消える**登録が
+    /// できてしまう（[`LiveSource::store_projects`]）。呼び手はこれを自分の一覧として
+    /// 取り込む ＝ 登録一覧の正本は state.json 1 つのまま。
+    /// メソッドである以上 demo 側の実装もコンパイラが要求するので、
+    /// 保存先の指定漏れが起きない点は [`WindowItem`] と同じ
+    fn store_projects(&self, next: &[String]) -> Vec<String>;
+
     /// バックグラウンド取得の開始。**demo は 1 本も起こさない**
     fn spawn_pollers(&self, sinks: PollSinks);
 
@@ -209,15 +216,6 @@ fn apply_account_action(store: &AccountStore, action: AccountAction<'_>) -> anyh
 /// - `baseline` に居て `next` に居ないフォルダは**このインスタンスが外した**ので、
 ///   ディスクに残っていても落とす（remove project が**このインスタンスの以降の
 ///   書き込み**で復活しない）
-///
-/// **守れないこと**: 「外した登録が二度と復活しない」保証は無い。他インスタンスが
-/// 古い写しを持っていれば、その写しに残っている登録はそのインスタンスの次の書き込みで
-/// ディスクへ戻る（A・B が `[P,Q]` を読んだ状態で A が P を外す → B が別のフォルダを
-/// 登録すると、B の `next` にまだ居る P が書き戻り、再起動で見出しも戻る）。
-/// ここで持てる材料はディスクと**自分の**写しだけで、他インスタンスの写しを更新する
-/// 経路は無いため（相手の写しを直すには ccdesk 側にディスク一覧の周期取り込みが要る ＝
-/// 「登録一覧の正本は state.json」の単純さを崩す。復活したら remove project を
-/// もう一度押せば済む頻度の問題なので、この保証は持たない）
 /// - どちらにも居ない ＝ ディスクにしか居ないフォルダは他インスタンスの登録。
 ///   **`next` の後ろへ足す**: 自分が baseline を取った後に書かれた登録なので、
 ///   自分が知っている登録より新しいと見なすのが妥当で、上限で追い出されるのも
@@ -227,6 +225,17 @@ fn apply_account_action(store: &AccountStore, action: AccountAction<'_>) -> anyh
 ///
 /// 単独起動なら `disk` は `baseline` と一致するので、結果は `next` そのもの
 /// （＝ マージが入っても通常の 1 プロセス動作は何も変わらない）
+///
+/// **守れないこと**: 「外した登録が二度と復活しない」保証は無い。他インスタンスも
+/// 書くときにディスクの内容を取り込むが（[`DataSource::store_projects`] の戻り値）、
+/// 取り込みは**足す方向だけ**で、相手の一覧に居るフォルダは落ちない。よって A が
+/// 外した登録は、それを一覧に持ったままの B の次の書き込みでディスクへ戻る
+/// （A・B が `[P,Q]` を読んだ状態で A が P を外す → B が別のフォルダを登録すると、
+/// B の `next` にまだ居る P が書き戻り、再起動で見出しも戻る）。止めるには
+/// ディスクの一覧を周期的に読んで**一覧から消す**方向の反映が要るが、それは
+/// 「登録はこのインスタンスのユーザー操作の記録」という扱いを崩す（他インスタンスの
+/// remove project が自分の一覧を黙って削る）ので持たない ＝ 復活したら
+/// remove project をもう一度押せば済む頻度の問題として割り切っている
 fn merge_projects(disk: &[String], baseline: &[String], next: &[String]) -> Vec<String> {
     let mut merged: Vec<String> = next.to_vec();
     for entry in disk {
@@ -242,6 +251,27 @@ fn merge_projects(disk: &[String], baseline: &[String], next: &[String]) -> Vec<
     merged
 }
 
+/// 保存 1 回分: 読み直した `disk` から**書く内容**を決め、次のマージの基準を
+/// **実際に書く内容**へ進める（[`merge_projects`] の結果 ＝ 上限適用後）。
+///
+/// **基準を「上限適用前の `next`」にしないのが要点**: 上限で削った分はディスクから
+/// 消えるのに基準には残る ＝ 「こう書いた」の記録が実際と食い違い、
+/// 保存するたび同じ登録が落ち続ける（呼び手の一覧にだけ残る）。
+/// 他インスタンスの登録を含む書いた内容が次の `next` から落ちないのは、
+/// 呼び手が戻り値を取り込むため（[`DataSource::store_projects`]）。
+///
+/// **crate 内へ出しているのはテスト用の供給元も同じ手順を通すため**
+/// （保存の意味論をテスト側へ写し取ると、live だけが壊れても気づけない）
+pub(crate) fn merge_and_advance_baseline(
+    disk: Vec<String>,
+    baseline: &mut Vec<String>,
+    next: &[String],
+) -> Vec<String> {
+    let written = merge_projects(&disk, baseline, next);
+    *baseline = written.clone();
+    written
+}
+
 /// 実データ。~/.claude と ~/.ccdesk を読み、ポーラーで claude CLI と
 /// 公式配布エンドポイントを叩く
 pub(crate) struct LiveSource {
@@ -249,7 +279,7 @@ pub(crate) struct LiveSource {
     usage_display: bool,
     /// 「ディスク上の登録プロジェクトはこうなっている」とこのインスタンスが最後に
     /// 判断した一覧。**書き込みのマージの基準**（[`merge_projects`]）で、
-    /// 起動時の読み込みと、自分が書いた内容で更新する
+    /// 起動時の読み込みと、**実際にディスクへ書いた内容**で更新する
     projects_baseline: Mutex<Vec<String>>,
 }
 
@@ -259,20 +289,6 @@ impl LiveSource {
             usage_display,
             projects_baseline: Mutex::new(Vec::new()),
         }
-    }
-
-    /// 登録プロジェクトの保存。**書く前にディスクを読み直してマージする**
-    /// （意味論は [`merge_projects`]）
-    fn store_projects(&self, next: &[String]) {
-        let mut baseline = self
-            .projects_baseline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        update_state_list("projects", |disk| merge_projects(&disk, &baseline, next));
-        // 次のマージの基準は**このインスタンスが書いた内容**（マージ結果ではない）:
-        // マージ結果を基準にすると、App 側の一覧に無い他インスタンスの登録が
-        // 次の書き込みで「このインスタンスが外した」と読めて消えてしまう
-        *baseline = next.to_vec();
     }
 }
 
@@ -342,9 +358,38 @@ impl DataSource for LiveSource {
                     Grouping::State => "state",
                 },
             ),
-            // 全量を渡されるが**そのまま上書きしない**（[`Self::store_projects`]）
-            WindowItem::Projects(projects) => self.store_projects(projects),
         }
+    }
+
+    /// **書く前にディスクを読み直してマージし、書いた内容を返す**
+    /// （マージの意味論は [`merge_projects`]）。
+    ///
+    /// 返すのは**実際にディスクへ書いた一覧**そのもの。これがそのまま次のマージの
+    /// 基準（`baseline`）にもなり、呼び手の一覧にもなるので、**3 者が常に一致する**
+    /// ＝ 「上限で削られた登録が App 側にだけ残る」ずれが起きない。
+    ///
+    /// 呼び手が取り込むことが前提の形で、これは以前の判断（`baseline` を
+    /// マージ結果で更新すると、App の一覧に無い他インスタンスの登録が次の書き込みで
+    /// 「このインスタンスが外した」と読めて消える）と矛盾しない: 他インスタンスの登録は
+    /// 戻り値に入るので呼び手の一覧にも入り、次の `next` から落ちないため。
+    ///
+    /// 書かなかったとき（ホームが取れず `update_state_list` がマージを呼ばない）は
+    /// `baseline` を動かさず渡された一覧を返す ＝ ディスクを触っていないので
+    /// 「こう書いた」と記録しない
+    fn store_projects(&self, next: &[String]) -> Vec<String> {
+        let mut baseline = self
+            .projects_baseline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut written: Option<Vec<String>> = None;
+        update_state_list("projects", |disk| {
+            let merged = merge_and_advance_baseline(disk, &mut baseline, next);
+            written = Some(merged.clone());
+            merged
+        });
+        // 書かなかったなら基準も動いていない（[`merge_and_advance_baseline`] を
+        // 通っていない）ので、渡された一覧をそのまま返す
+        written.unwrap_or_else(|| next.to_vec())
     }
 
     fn spawns_sessions(&self) -> bool {
@@ -405,7 +450,14 @@ impl DataSource for DemoSource {
 
     fn save_window(&self, _item: WindowItem<'_>) {
         // 撮影が開発者の state.json / config.json を書き換えない
-        // （サイドバー幅・最後に開いた画面・グルーピング・プロジェクト一覧を踏み潰さない）
+        // （サイドバー幅・最後に開いた画面・グルーピングを踏み潰さない）
+    }
+
+    fn store_projects(&self, next: &[String]) -> Vec<String> {
+        // 撮影は開発者の登録プロジェクトも踏み潰さない。書かない ＝ ディスクとの
+        // マージも上限の適用も起きないので、渡された一覧をそのまま返す
+        // （呼び手の一覧は変わらない ＝ 撮影中の見出しが保存の有無で動かない）
+        next.to_vec()
     }
 
     fn spawns_sessions(&self) -> bool {
@@ -577,13 +629,18 @@ mod tests {
         );
     }
 
-    /// 撮影はプロジェクト一覧も書かない（開発者の登録を踏み潰さない）
+    /// 撮影はプロジェクト一覧も書かない（開発者の登録を踏み潰さない）。
+    /// 書かない ＝ マージも上限も起きないので、戻り値は渡した一覧そのまま
+    /// （呼び手の一覧が撮影中に動かない）
     #[test]
     fn demo_does_not_persist_projects() {
         let before = load_state_list("projects");
-        DemoSource.save_window(WindowItem::Projects(&[
-            "C:\\demo-must-not-write".to_string()
-        ]));
+        let asked = paths(&["C:\\demo-must-not-write"]);
+        assert_eq!(
+            DemoSource.store_projects(&asked),
+            asked,
+            "demo が渡した一覧と違うものを返している"
+        );
         assert_eq!(
             load_state_list("projects"),
             before,
@@ -660,6 +717,25 @@ mod tests {
             Some("C:\\dev\\from-b"),
             "他インスタンスの登録が追い出されている"
         );
+    }
+
+    /// **保存はディスクを落ち着かせる（同じ状態で 2 度保存してもディスクが動かない）。**
+    /// 基準も呼び手の一覧も「実際に書いた内容」になるので、2 度目のマージは同じ一覧を
+    /// 返す ＝ 上限で落ちた自分の登録が毎回落ち直したり、他インスタンスの登録が毎回
+    /// 末尾へ積み直されたりしない。**取り込んだ他インスタンスの登録を、次の保存で
+    /// 「自分が外した」と読ませない**ことも同時に固定している
+    /// （基準に他インスタンスの登録が入るので、呼び手が取り込まないと消える）
+    #[test]
+    fn a_second_save_of_the_same_state_leaves_the_disk_unchanged() {
+        let mut baseline = paths(&["C:\\dev\\mine"]);
+        let mine = paths(&["C:\\dev\\mine"]);
+        let disk = paths(&["C:\\dev\\mine", "C:\\dev\\from-b"]);
+        let first = merge_and_advance_baseline(disk, &mut baseline, &mine);
+        assert_eq!(first, ["C:\\dev\\mine", "C:\\dev\\from-b"]);
+        assert_eq!(baseline, first, "基準が実際に書いた内容になっていない");
+        // 2 度目: ディスクも自分の一覧も 1 度目に書いた内容（呼び手が取り込んだ後）
+        let second = merge_and_advance_baseline(first.clone(), &mut baseline, &first);
+        assert_eq!(second, first, "保存するたびディスクが書き換わる");
     }
 
     /// このテストしか書き得ない番人の値。**「実ファイルが変わっていないこと」を
