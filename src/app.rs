@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{
-    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
 
@@ -17,7 +17,8 @@ use crate::session::{Launch, Session};
 use crate::sessions::{SessionId, SessionRow, TitleSource};
 use crate::source::{AccountAction, DataSource, PollSinks, WindowItem, PROJECTS_LIMIT};
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
-use crate::ui::{draw, popup_rect, row_at, sidebar_layout};
+use crate::ui::text_field::TextField;
+use crate::ui::{draw, popup_rect, row_at, row_y, sidebar_layout};
 
 /// サイドバー幅の下限（ドラッグで詰められる限界）。**描画のテストが「一番狭い状態」を
 /// 作るのに使う**ので、この値は ui 側からも読める（同じ 12 をテストへ書き写さない）
@@ -33,7 +34,7 @@ const LIVE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const USAGE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// ペインフォーカス。キー入力はフォーカス中のペインにだけ流す
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Focus {
     Sidebar,
     Terminal,
@@ -41,7 +42,7 @@ pub(crate) enum Focus {
 
 /// サイドバー行のクリック動作。セッションは [`SessionId`] で参照する。
 /// 一覧は 2 秒毎に読み直され並びも変わるため、描画時の生 index を
-/// 保持すると実行時に別セッションを stop/delete し得る
+/// 保持すると実行時に別セッションを閉じたり消したりし得る
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum RowAction {
     New, // 新規セッション画面を開く
@@ -71,7 +72,9 @@ pub(crate) enum SelfUpdate {
 
 /// メニュー枠が食う桁数: 左右の枠線 2 + 項目行の先頭空白 1（描画が `" {label}"` を出す）
 const POPUP_CHROME: u16 = 3;
-/// メニュー幅の下限。stop/delete・grouping 切替の見た目を従来（14 桁）から動かさないため
+/// メニュー幅の下限。短い項目だけのメニュー（grouping 切替）が細く痩せて
+/// 押しにくくならないようにするための床で、**広げる側の判断ではない**
+/// （項目が長ければ [`PopupKind::width`] がそちらを採る）
 const POPUP_MIN_WIDTH: u16 = 14;
 
 /// ポップアップに並べるアカウント 1 件。表示名と識別子を分けて持つ:
@@ -96,7 +99,20 @@ pub(crate) struct AccountItem {
 /// 2 つの match に閉じる（幅は項目から導くので触らない）
 #[derive(Debug, PartialEq)]
 pub(crate) enum PopupKind {
-    Session { id: SessionId, stopped: bool },
+    /// セッション 1 行への二次操作。**`pinned` / `archived` / `open` は開いた時点の
+    /// 写し**（他のメニューと同じ作り）で、項目の表示名（ピン留めか解除か）と
+    /// 実行可能かの判断に使う。
+    ///
+    /// 写しにするのは、メニューが開いている間に一覧の読み直し（2 秒周期）や
+    /// 他インスタンスの操作で行が変わっても、**見えている項目と押した結果が
+    /// ずれないようにする**ため。行が消えていた場合は実行側が何もしない
+    Session {
+        id: SessionId,
+        pinned: bool,
+        archived: bool,
+        /// 窓が開いていて子プロセスが生きているか（`close` を出せるかの判断）
+        open: bool,
+    },
     Group,
     /// アカウント一覧。開いた時点の写しを持つ（一覧の供給はデータ層の責務で、
     /// メニューは受け取った並びをそのまま出す）。保管 0 件でも
@@ -120,7 +136,17 @@ pub(crate) enum PopupKind {
 /// 副作用は持たず、実行は [`run_popup_action`] だけが行う
 #[derive(Debug, PartialEq)]
 enum PopupAction {
-    Stop(SessionId),
+    /// ピン留めの入切（ピンした行は各グループの先頭へ）
+    TogglePin(SessionId),
+    /// 未読を消す（`last_opened_at` を今にする）
+    MarkRead(SessionId),
+    /// 行の上でインライン入力を始める（確定は [`commit_rename`]）
+    StartRename(SessionId),
+    /// 窓を閉じる ＝ 子プロセスを終わらせる。**行は残す**
+    Close(SessionId),
+    /// アーカイブの入切（通常の一覧から隠す）
+    ToggleArchive(SessionId),
+    /// 一覧から行を消す（transcript は消さない）
     Delete(SessionId),
     SetGrouping(Grouping),
     /// 2 階層目のメニューへ遷移する
@@ -142,9 +168,28 @@ impl PopupKind {
     /// 項目を足すときは両方を同じ順で直す
     pub(crate) fn entries(&self, grouping: Grouping) -> Vec<(String, bool)> {
         match self {
-            // delete は稼働中でも選べる（実行側が stop → rm の 2 段で処理する）
-            PopupKind::Session { stopped, .. } => vec![
-                ("stop".to_string(), !stopped),
+            // 二次操作はここに集約する（ショートカットキーを併設しない ＝
+            // 入口を 2 つ持たない。`docs/foreground-migration.md`）。
+            //
+            // **`close` だけが窓の有無で落ちる**: 窓が無い行は既に止まっているので、
+            // 押せるのに何も起きない項目になる（`remove project` と同じ扱い）。
+            // 他の 5 つは窓の有無に関係なく行に効く ＝ 停止中でも選べる。
+            // 入切する 2 つは**今の状態の逆を出す**（`● ` 印だとどちらが起きるか
+            // 読めない。ここは選択ではなく動作の名前）
+            PopupKind::Session {
+                pinned,
+                archived,
+                open,
+                ..
+            } => vec![
+                (if *pinned { "unpin" } else { "pin" }.to_string(), true),
+                ("mark as read".to_string(), true),
+                ("rename".to_string(), true),
+                ("close".to_string(), *open),
+                (
+                    if *archived { "unarchive" } else { "archive" }.to_string(),
+                    true,
+                ),
                 ("delete".to_string(), true),
             ],
             PopupKind::Group => {
@@ -169,7 +214,7 @@ impl PopupKind {
             // **セッションが残っているフォルダは登録解除させない。** 見出しの一覧は
             // 「登録リスト ∪ セッションの cwd」なので、登録を外してもセッション由来で
             // 見出しは出続ける。押せるのに表示が変わらないのは嘘なので、
-            // stop と同じ仕組み（実行可能フラグ）で落とす
+            // close と同じ仕組み（実行可能フラグ）で落とす
             PopupKind::Project { has_sessions, .. } => vec![
                 ("new session".to_string(), true),
                 ("remove project".to_string(), !has_sessions),
@@ -196,8 +241,12 @@ impl PopupKind {
     fn action(&self, index: usize) -> Option<PopupAction> {
         match self {
             PopupKind::Session { id, .. } => match index {
-                0 => Some(PopupAction::Stop(id.clone())),
-                1 => Some(PopupAction::Delete(id.clone())),
+                0 => Some(PopupAction::TogglePin(id.clone())),
+                1 => Some(PopupAction::MarkRead(id.clone())),
+                2 => Some(PopupAction::StartRename(id.clone())),
+                3 => Some(PopupAction::Close(id.clone())),
+                4 => Some(PopupAction::ToggleArchive(id.clone())),
+                5 => Some(PopupAction::Delete(id.clone())),
                 _ => None,
             },
             PopupKind::Group => match index {
@@ -241,7 +290,7 @@ impl PopupKind {
 /// 「選べる項目の列」を返す形なので情報行を入れる素直な手段が無く、候補は
 /// (a) 実行不可の項目として混ぜる (b) 2 階層目の `switch` のラベルへ埋める
 /// (c) メニューの描画経路を分ける の 3 つだった。(a) にしたのは、実行不可の項目が
-/// 既に存在し（停止済みセッションの `stop`。dim 表示で Enter・クリックとも
+/// 既に存在し（窓が開いていない行の `close`。dim 表示で Enter・クリックとも
 /// 発火しない）**幅計算・クリック判定・キー操作の既存の仕組みがそのまま効く**ため。
 /// (b) は 1 つのラベルに動作名と影響範囲の 2 つの意味を持たせることになり、
 /// (c) は幅と当たり判定の知識が 2 箇所に増える。
@@ -261,6 +310,20 @@ pub(crate) struct Popup {
     pub(crate) kind: PopupKind,
     pub(crate) anchor_y: u16, // 開いた元の画面行（矩形はこの 1 つ下に出る）
     pub(crate) selected: usize,
+}
+
+/// 名前の変更中の状態（メニューの `rename` で始まり、Enter で確定 / Esc で取り消し）。
+///
+/// **入力欄を別の場所に開かず、その行そのものをインライン入力に化けさせる**:
+/// 名前は行の中身なので、直す場所と見える場所が違うと「どれを直しているのか」を
+/// 対応づける手間が増える。行の identity（[`SessionId`]）で結ぶので、
+/// 編集中に一覧の並びが変わっても（2 秒毎の読み直し・状態の変化）追従する。
+///
+/// 打った内容は**確定するまで行に入らない**（[`commit_rename`] が 1 度だけ書く）。
+/// 打鍵のたびに保存すると、共有ファイルへの書き込みが 1 文字ごとに走る
+pub(crate) struct Rename {
+    pub(crate) id: SessionId,
+    pub(crate) field: TextField,
 }
 
 /// 右ペインの表示内容
@@ -340,8 +403,9 @@ pub(crate) struct App {
     // 以降ここを通る限り「今 demo か」を問う必要が無い。
     // **`Arc` なのはアカウント操作を別スレッドへ渡すため**（[`AccountJob`]）
     pub(crate) source: Arc<dyn DataSource>,
-    // Ctrl+X の 2 度押し削除（対象と 1 回目 stop の時刻。2 秒以内の再押下 = delete）
-    pub(crate) pending_delete: Option<(SessionId, std::time::Instant)>,
+    // 名前の変更中（メニューの `rename`）。Some の間はその行がインライン入力に化け、
+    // サイドバーのキーは全部この入力が受ける（[`handle_rename_key`]）
+    pub(crate) rename: Option<Rename>,
     // 起動した子がまだ端末を掴んでいない間だけ Some（起こした時刻）。
     // 降ろす契機は「子が最初の出力を出した」（run ループ）と期限切れ
     // （[`expire_input_gate`]）の 2 つで、**降ろすのは [`lift_input_gate`] だけ**
@@ -419,7 +483,7 @@ impl Default for App {
             // テストが開発者の設定を踏まない
             account_job: None,
             source: Arc::new(crate::source::DemoSource),
-            pending_delete: None,
+            rename: None,
             input_gate: None,
             notice: None,
             grouping: Grouping::State,
@@ -490,6 +554,11 @@ impl App {
         if focus == Focus::Sidebar {
             self.last_scan = instant_ago(SCAN_INTERVAL);
             self.last_live_scan = instant_ago(LIVE_SCAN_INTERVAL);
+        } else {
+            // 名前の入力はサイドバーの行そのものなので、フォーカスが離れたら取り消す。
+            // **残すと入力欄が見えないまま打鍵を待つ状態**になり、次にサイドバーへ
+            // 戻ったとき ↑↓ が効かない理由が画面から読めない
+            self.rename = None;
         }
     }
 
@@ -757,81 +826,18 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         force_draw = true; // イベントを処理したら必ず描画
         match crossterm::event::read()? {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                // 緊急脱出（マウスが効かない環境向け）。他は全部アクティブ PTY へ
-                if key.code == KeyCode::Char('q')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    return Ok(());
-                }
-                // グローバルキー: Alt+← = サイドバーへ / Alt+→ = ターミナルへ
-                if key.modifiers.contains(KeyModifiers::ALT) {
-                    match key.code {
-                        KeyCode::Left => {
-                            app.set_focus(Focus::Sidebar);
-                            continue;
-                        }
-                        KeyCode::Right => {
-                            app.set_focus(Focus::Terminal);
-                            continue;
-                        }
-                        _ => {}
-                    }
-                }
-                // サイドバーフォーカス中のキー操作（公式 Agent View 準拠、入力欄なし）:
-                // ↑↓ = 行選択 / Enter・→ = 開く / Ctrl+X = stop→delete / Ctrl+S = グルーピング
-                if app.focus == Focus::Sidebar {
-                    // モーダル表示中はモーダルがキーを受ける
-                    if app.popup.is_some() {
-                        handle_popup_key(app, key.code);
+                // 予約キー（claude へ渡さない唯一の打鍵）は [`reserved_key`] が答える
+                match reserved_key(&key) {
+                    Some(Reserved::Quit) => return Ok(()),
+                    Some(Reserved::Focus(to)) => {
+                        app.set_focus(to);
                         continue;
                     }
-                    match key.code {
-                        KeyCode::Up => move_selection(app, -1),
-                        KeyCode::Down => move_selection(app, 1),
-                        // Ctrl+S = グルーピング切替（公式 Agent View と同じ）
-                        KeyCode::Char('s')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            toggle_grouping(app);
-                        }
-                        KeyCode::Enter | KeyCode::Right => {
-                            match app.sidebar_rows.get(app.selected_row).cloned().flatten() {
-                                Some(RowAction::New) => {
-                                    app.open_new_view();
-                                    app.set_focus(Focus::Terminal);
-                                }
-                                Some(RowAction::ToggleGroup) => {
-                                    app.popup = Some(Popup {
-                                        kind: PopupKind::Group,
-                                        anchor_y: selected_row_y(app),
-                                        selected: 0,
-                                    });
-                                }
-                                // 見出し行はメニューを開くだけ（セッションは起動しない）
-                                Some(RowAction::Project(cwd)) => {
-                                    let y = selected_row_y(app);
-                                    open_project_popup(app, cwd, y);
-                                }
-                                Some(RowAction::Open(id)) => {
-                                    open_session(app, &id);
-                                    app.set_focus(Focus::Terminal);
-                                }
-                                Some(RowAction::UpdateCcdesk) => start_ccdesk_update(app),
-                                Some(RowAction::UpdateClaude) => start_claude_update(app),
-                                None => {}
-                            }
-                        }
-                        KeyCode::Char('x')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            if let Some(RowAction::Open(id)) =
-                                app.sidebar_rows.get(app.selected_row).cloned().flatten()
-                            {
-                                ctrl_x_session(app, &id);
-                            }
-                        }
-                        _ => {}
-                    }
+                    None => {}
+                }
+                // サイドバーフォーカス中のキー操作（入力欄は名前の変更中だけ）
+                if app.focus == Focus::Sidebar {
+                    handle_sidebar_key(app, &key);
                     continue;
                 }
                 // 新規セッション画面のキー操作
@@ -936,6 +942,122 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
     }
 }
 
+/// **ccdesk が横取りする打鍵。ここに無いキーは 1 つ残らず claude へ渡る。**
+///
+/// 予約を 2 つだけに絞ったのは、二次操作をポップアップへ集めたから
+/// （`docs/foreground-migration.md`）。入口が「メニュー」と「ショートカット」の
+/// 2 つあると、どちらが正なのか読む側にも実装側にも分岐が生まれるうえ、
+/// **予約キーの数だけ claude 本体のキーバインドが死ぬ**（`Ctrl+S` / `Ctrl+X` は
+/// 実際に claude 側の打鍵だった）。
+///
+/// 判定を 1 つの純関数にしてあるので、「素通しするはずのキーを増やしていないか」を
+/// テストで固定できる（run ループの中に条件を散らすと検査できない）
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Reserved {
+    /// 緊急脱出（マウスが効かない環境向け）
+    Quit,
+    /// ペインフォーカスの移動
+    Focus(Focus),
+}
+
+fn reserved_key(key: &KeyEvent) -> Option<Reserved> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        // Shift の付いた `Ctrl+Shift+Q` は予約しない（1 打鍵でも減らす）
+        KeyCode::Char('q') if ctrl => Some(Reserved::Quit),
+        KeyCode::Left if alt => Some(Reserved::Focus(Focus::Sidebar)),
+        KeyCode::Right if alt => Some(Reserved::Focus(Focus::Terminal)),
+        _ => None,
+    }
+}
+
+/// サイドバーにフォーカスがあるときのキー操作。
+///
+/// **ここは claude と打鍵を取り合わない**: サイドバーへ流れるのはフォーカスが
+/// こちらにあるときだけで、端末側にフォーカスがあれば同じキーは PTY へ行く
+/// （[`reserved_key`] に載っていないキーは横取りされない）。
+///
+/// 受け手の優先順は 名前の入力 → メニュー → 一覧。前の 2 つは開いている間
+/// **すべてのキーを飲む**（開いたまま裏の一覧が動くと、見えているものと
+/// 効くものがずれる）
+fn handle_sidebar_key(app: &mut App, key: &KeyEvent) {
+    if app.rename.is_some() {
+        handle_rename_key(app, key);
+        return;
+    }
+    if app.popup.is_some() {
+        handle_popup_key(app, key.code);
+        return;
+    }
+    match key.code {
+        KeyCode::Up => move_selection(app, -1),
+        KeyCode::Down => move_selection(app, 1),
+        KeyCode::Enter | KeyCode::Right => {
+            match app.sidebar_rows.get(app.selected_row).cloned().flatten() {
+                Some(RowAction::New) => {
+                    app.open_new_view();
+                    app.set_focus(Focus::Terminal);
+                }
+                Some(RowAction::ToggleGroup) => {
+                    app.popup = Some(Popup {
+                        kind: PopupKind::Group,
+                        anchor_y: selected_row_y(app),
+                        selected: 0,
+                    });
+                }
+                // 見出し行はメニューを開くだけ（セッションは起動しない）
+                Some(RowAction::Project(cwd)) => {
+                    let y = selected_row_y(app);
+                    open_project_popup(app, cwd, y);
+                }
+                Some(RowAction::Open(id)) => {
+                    open_session(app, &id);
+                    app.set_focus(Focus::Terminal);
+                }
+                Some(RowAction::UpdateCcdesk) => start_ccdesk_update(app),
+                Some(RowAction::UpdateClaude) => start_claude_update(app),
+                None => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 名前の入力中のキー（Enter = 確定 / Esc = 取り消し / それ以外は入力欄が受ける）。
+///
+/// 入力欄が受けないキー（↑↓ など）は**何もしない**: 編集中に裏の選択が動くと、
+/// 確定した瞬間に別の行を見ていることになる
+fn handle_rename_key(app: &mut App, key: &KeyEvent) {
+    match key.code {
+        KeyCode::Enter => commit_rename(app),
+        KeyCode::Esc => app.rename = None,
+        _ => {
+            if let Some(rename) = app.rename.as_mut() {
+                rename.field.handle_key(key);
+            }
+        }
+    }
+}
+
+/// 名前の変更を確定する。**空白だけの名前は付けない**（行から名前が消えると
+/// どのセッションか指せなくなる）ので、その場合は変更せずに閉じる
+fn commit_rename(app: &mut App) {
+    let Some(rename) = app.rename.take() else {
+        return;
+    };
+    let title = rename.field.text.trim().to_string();
+    if title.is_empty() {
+        return;
+    }
+    // ユーザーが付けた名前は `customTitle` の位置に入る ＝ あとから来る
+    // AI 生成の名前に踏まれない（優先順は `docs/foreground-migration.md`）
+    edit_row(app, &rename.id, Unread::Keep, |row| {
+        row.title = title;
+        row.title_source = TitleSource::Custom;
+    });
+}
+
 /// New 画面からの起動。**セッションの実体は ccdesk の子プロセス**になり、
 /// ccdesk を閉じると終わる（行は `sessions.json` に残り `claude -r` で再開できる）
 pub(crate) fn start_new_session(app: &mut App) -> anyhow::Result<()> {
@@ -1025,6 +1147,15 @@ fn refresh_sessions(app: &mut App) {
         app.sessions.extend(dropped);
         save_sessions(app);
     }
+    // 読み直しで行が消えた（他インスタンスの delete）なら名前の入力も畳む。
+    // 直す対象が無いまま入力欄だけが残ると、確定しても何も起きない打鍵になる
+    if app
+        .rename
+        .as_ref()
+        .is_some_and(|r| !app.sessions.iter().any(|row| row.session_id == r.id))
+    {
+        app.rename = None;
+    }
 }
 
 /// 読み直しで落ちてしまった「窓が開いている行」（[`refresh_sessions`] の判断。
@@ -1054,7 +1185,10 @@ fn now_ms() -> u64 {
 }
 
 /// 行の状態を書き換えて保存する（行が無ければ何もしない）。
-/// **プロセスが死んでも行は残す**ので、窓を閉じる側はここで状態だけを残す
+/// **プロセスが死んでも行は残す**ので、窓を閉じる側はここで状態だけを残す。
+///
+/// **未読になってよい**のがユーザー操作（[`edit_row`]）との違い: 状態が動いたのは
+/// セッションの側で起きたことなので、見ていない間に変わったなら未読が正しい
 fn mark_state(app: &mut App, id: &SessionId, state: &str) {
     let Some(row) = app.sessions.iter_mut().find(|r| &r.session_id == id) else {
         return;
@@ -1065,6 +1199,37 @@ fn mark_state(app: &mut App, id: &SessionId, state: &str) {
     row.last_state = state.to_string();
     // 行の内容を変えたら `updated_at` を進める（マージの後勝ち判定の材料）
     row.updated_at = now_ms();
+    save_sessions(app);
+}
+
+/// [`edit_row`] が未読（`updated_at > last_opened_at`）をどう扱うか
+#[derive(Clone, Copy, PartialEq)]
+enum Unread {
+    /// 変えない（ピン留め・アーカイブ・名前の変更）
+    Keep,
+    /// 消す（`mark as read`）
+    Clear,
+}
+
+/// **メニューからの行操作を保存する唯一の口**（ピン留め・既読・名前・アーカイブ）。
+/// 行が無ければ何もしない（メニューを開いたまま他インスタンスが消した場合）。
+///
+/// `updated_at` を進めるのはマージの後勝ち判定に要るから
+/// （[`crate::sessions`] の `merge_sessions`）。ただし進めるだけだと
+/// **ピン留めや改名で未読が生える**: 未読は「見ていない間に新しいことが起きた」の
+/// 意味なので、自分が今その行を触ったことで付くのは嘘になる。だから
+/// [`Unread::Keep`] は操作前の未読／既読をそのまま持ち越す
+/// （未読だった行は未読のまま ＝ 既読にする操作は [`Unread::Clear`] だけが行う）
+fn edit_row(app: &mut App, id: &SessionId, unread: Unread, edit: impl FnOnce(&mut SessionRow)) {
+    let Some(row) = app.sessions.iter_mut().find(|r| &r.session_id == id) else {
+        return;
+    };
+    let was_read = !row.unread();
+    edit(row);
+    row.updated_at = now_ms();
+    if unread == Unread::Clear || was_read {
+        row.last_opened_at = row.updated_at;
+    }
     save_sessions(app);
 }
 
@@ -1166,15 +1331,15 @@ fn open_project_popup(app: &mut App, cwd: String, anchor_y: u16) {
     });
 }
 
-/// キーボード選択行の画面 y。固定ヘッダーより下はスクロール分を引く。
-/// メニューの矩形はこの 1 つ下に出るので、Enter でメニューを開く行は全部この式を使う
+/// キーボード選択行の画面 y。**式そのものは描画側（[`row_y`]）が持つ**
+/// （行 index → 画面 y の対応が 2 つあると、メニューが行からずれて出る）。
+/// メニューの矩形はこの 1 つ下に出るので、Enter でメニューを開く行は全部これを使う
 fn selected_row_y(app: &App) -> u16 {
-    let row = if app.selected_row < app.sidebar_header_rows {
-        app.selected_row
-    } else {
-        app.selected_row.saturating_sub(app.sidebar_scroll)
-    };
-    row as u16 + 1
+    row_y(
+        app.selected_row,
+        app.sidebar_header_rows,
+        app.sidebar_scroll,
+    )
 }
 
 /// 表示名に使うプロンプトの桁数。**行に出す名前の長さの正本はここ 1 箇所**
@@ -1340,21 +1505,16 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             // サイドバー内クリックはサイドバーへフォーカス。
             // 行クリックは右ペインの内容だけ切り替える（フォーカス移動は右ペインクリック or Enter）
             app.set_focus(Focus::Sidebar);
+            // 名前の入力中に他所を押したら取り消す（クリックでは確定させない ＝
+            // 押し間違いで名前が変わらない。確定は Enter だけ）
+            app.rename = None;
             if action.is_some() {
                 app.selected_row = row;
             }
             // 行頭の ☰ クリック → コンテキストメニューを開く
             if let Some(RowAction::Open(id)) = &action
                 && mouse.column <= 2 {
-                    let stopped = session_stopped(app, id);
-                    app.popup = Some(Popup {
-                        kind: PopupKind::Session {
-                            id: id.clone(),
-                            stopped,
-                        },
-                        anchor_y: mouse.row,
-                        selected: 0,
-                    });
+                    open_session_popup(app, &id.clone(), mouse.row);
                     return Ok(false);
                 }
             // セッション行・new session クリックは右ペインへフォーカスを移す
@@ -1475,12 +1635,30 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
     Ok(false)
 }
 
-/// 対象が停止済みかどうか。**前景では自分の子プロセスが唯一の真実**なので、
-/// 生きた窓を持たない行はすべて停止済み（`claude -r` で再開できる）
-fn session_stopped(app: &mut App, id: &SessionId) -> bool {
-    !app.windows
+/// 窓が開いていて子プロセスが生きているか。**前景では自分の子プロセスが
+/// 唯一の真実**なので、生きた窓を持たない行はすべて停止済み
+/// （`claude -r` で再開できる ＝ メニューの `close` は出せない）
+fn session_open(app: &mut App, id: &SessionId) -> bool {
+    app.windows
         .iter_mut()
         .any(|w| &w.session_id == id && w.alive())
+}
+
+/// セッション行のメニューを開く（行頭の ☰ クリック）。
+/// 項目の見た目に効く 3 つ（ピン留め・アーカイブ・窓の有無）は開いた時点の写し
+fn open_session_popup(app: &mut App, id: &SessionId, anchor_y: u16) {
+    let open = session_open(app, id);
+    let row = app.sessions.iter().find(|r| &r.session_id == id);
+    app.popup = Some(Popup {
+        kind: PopupKind::Session {
+            id: id.clone(),
+            pinned: row.is_some_and(|r| r.pinned),
+            archived: row.is_some_and(|r| r.archived),
+            open,
+        },
+        anchor_y,
+        selected: 0,
+    });
 }
 
 /// モーダル表示中のキー操作（Esc = 全閉 / ↑↓ = 選択 / Enter = 実行）
@@ -1517,7 +1695,7 @@ fn handle_popup_click(app: &mut App, col: u16, row: u16) {
         app.popup = None; // 外クリックで閉じる（階層を持たないので全閉）
         return;
     }
-    // 枠線上のクリックは何もしない（上枠が先頭項目 "stop" に化けて誤発火しない）
+    // 枠線上のクリックは何もしない（上枠が先頭項目に化けて誤発火しない）
     if row == rect.y
         || row == rect.y + rect.height - 1
         || col == rect.x
@@ -1551,7 +1729,15 @@ fn activate_popup(app: &mut App, index: usize) {
 /// 判定は [`PopupKind::action`]（純関数）に置く
 fn run_popup_action(app: &mut App, action: PopupAction, anchor_y: u16) {
     match action {
-        PopupAction::Stop(id) => menu_stop(app, &id),
+        PopupAction::TogglePin(id) => {
+            edit_row(app, &id, Unread::Keep, |row| row.pinned = !row.pinned)
+        }
+        PopupAction::MarkRead(id) => edit_row(app, &id, Unread::Clear, |_| {}),
+        PopupAction::StartRename(id) => start_rename(app, &id),
+        PopupAction::Close(id) => menu_close(app, &id),
+        PopupAction::ToggleArchive(id) => {
+            edit_row(app, &id, Unread::Keep, |row| row.archived = !row.archived)
+        }
         PopupAction::Delete(id) => menu_delete(app, &id),
         PopupAction::SetGrouping(next) => {
             if app.grouping != next {
@@ -1843,7 +2029,7 @@ fn apply_account_result(app: &mut App, result: anyhow::Result<AccountChange>, wh
     }
 }
 
-/// グルーピング切替（UI クリック / Ctrl+S 共通）。選択は ~/.ccdesk/config.json に永続化
+/// グルーピング切替（入口は ⊞ group 行のメニューだけ）。選択は ~/.ccdesk/config.json に永続化
 /// （撮影用の供給元は保存しない ＝ 開発者の設定を踏まない）
 fn toggle_grouping(app: &mut App) {
     app.grouping = match app.grouping {
@@ -1853,12 +2039,28 @@ fn toggle_grouping(app: &mut App) {
     app.source.save_window(WindowItem::Grouping(app.grouping));
 }
 
-/// メニュー: stop（セッションのプロセスを終わらせる）。
+/// メニュー: rename（行の上でインライン入力を始める）。
+/// 初期値は今の名前（`docs/foreground-migration.md` の title の優先順で決まった値）。
+/// 行が無ければ始めない（メニューを開いたまま他インスタンスが消した場合）
+fn start_rename(app: &mut App, id: &SessionId) {
+    let Some(row) = app.sessions.iter().find(|r| &r.session_id == id) else {
+        return;
+    };
+    let mut field = TextField::default();
+    // カーソルは末尾（付け足す方が多い）。全部消したいなら Backspace が続く
+    field.set_text(&row.title);
+    app.rename = Some(Rename {
+        id: id.clone(),
+        field,
+    });
+}
+
+/// メニュー: close（セッションのプロセスを終わらせる）。
 ///
-/// **行は消さない。** 前景セッションは ccdesk の子なので、止める ＝ 窓を閉じること
-/// そのもの。行は最後に観測した状態（`stopped`）のまま一覧に残り、`claude -r` で
+/// **行は消さない。** 前景セッションは ccdesk の子なので、閉じる ＝ プロセスが
+/// 終わること。行は最後に観測した状態（`stopped`）のまま一覧に残り、`claude -r` で
 /// 再開できる（窓を閉じる ≠ 行を消す）
-fn menu_stop(app: &mut App, id: &SessionId) {
+fn menu_close(app: &mut App, id: &SessionId) {
     if id.is_empty() {
         return;
     }
@@ -1867,7 +2069,9 @@ fn menu_stop(app: &mut App, id: &SessionId) {
 }
 
 /// メニュー: delete（一覧から行を消す）。**消えるのは ccdesk の一覧だけ**で、
-/// transcript（`~/.claude/projects/**/*.jsonl`）は残す。
+/// transcript（`~/.claude/projects/**/*.jsonl`）は残す
+/// （`claude -r` の記録は claude 側の持ち物で、ccdesk の一覧はその索引ではない ＝
+/// 一覧から外したいだけの操作で会話の記録まで消してはいけない）。
 /// 動いていれば先にプロセスを終わらせる（窓の無い行になってプロセスだけが残らない）
 fn menu_delete(app: &mut App, id: &SessionId) {
     if id.is_empty() {
@@ -1878,6 +2082,10 @@ fn menu_delete(app: &mut App, id: &SessionId) {
     app.sessions.retain(|row| &row.session_id != id);
     if app.sessions.len() != before {
         save_sessions(app);
+    }
+    // 消した行の名前を編集中だったら畳む（行が無いのに入力欄だけ残らない）
+    if app.rename.as_ref().is_some_and(|r| &r.id == id) {
+        app.rename = None;
     }
 }
 
@@ -1907,24 +2115,6 @@ fn remove_window(app: &mut App, idx: usize) {
     if app.windows.is_empty() || was_active {
         app.open_new_view();
     }
-}
-
-/// Ctrl+X: 1 回目 = stop、2 秒以内の 2 回目 or 停止済み = delete
-fn ctrl_x_session(app: &mut App, id: &SessionId) {
-    if id.is_empty() {
-        return;
-    }
-    let recent = app
-        .pending_delete
-        .as_ref()
-        .is_some_and(|(pending, t)| pending == id && t.elapsed() < Duration::from_secs(2));
-    if !session_stopped(app, id) && !recent {
-        menu_stop(app, id);
-        app.pending_delete = Some((id.clone(), std::time::Instant::now()));
-        return;
-    }
-    app.pending_delete = None;
-    menu_delete(app, id);
 }
 
 /// サイドバーの選択行を、クリック可能な行へ上下に移動する
@@ -2221,39 +2411,69 @@ mod tests {
         }
     }
 
-    fn session(id: &str, stopped: bool) -> PopupKind {
+    /// 窓が開いているセッションのメニュー（ピン留めもアーカイブもされていない行）。
+    /// 写しを 1 つだけ変えたいテストは `PopupKind::Session { .. }` を直接組む
+    fn session(id: &str, open: bool) -> PopupKind {
         PopupKind::Session {
             id: SessionId::new(id),
-            stopped,
+            pinned: false,
+            archived: false,
+            open,
         }
     }
 
-    /// 稼働中は stop・delete の両方が選べ、停止済みは stop だけ選べない（従来どおり）
+    /// **メニューは 6 項目。** 落ちるのは `close` だけで、それは窓が開いていない行で
+    /// 押しても何も起きないから（他の 5 つは停止中の行にも効く）
     #[test]
-    fn session_menu_disables_stop_only_when_the_session_is_stopped() {
-        assert_eq!(
-            session("s1", false).entries(Grouping::State),
-            [("stop".to_string(), true), ("delete".to_string(), true)]
-        );
+    fn session_menu_disables_close_only_when_no_window_is_open() {
         assert_eq!(
             session("s1", true).entries(Grouping::State),
-            [("stop".to_string(), false), ("delete".to_string(), true)]
+            [
+                ("pin".to_string(), true),
+                ("mark as read".to_string(), true),
+                ("rename".to_string(), true),
+                ("close".to_string(), true),
+                ("archive".to_string(), true),
+                ("delete".to_string(), true),
+            ]
+        );
+        assert_eq!(
+            session("s1", false)
+                .entries(Grouping::State)
+                .into_iter()
+                .map(|(_, enabled)| enabled)
+                .collect::<Vec<_>>(),
+            [true, true, true, false, true, true],
+            "窓が無い行で close 以外が落ちている / close が押せてしまう"
         );
     }
 
-    /// stop / delete は行 index から引く（ラベル文字列で分岐しない）
+    /// 入切する 2 つは**今の状態の逆**を出す（押したら何が起きるかがラベルになる）
+    #[test]
+    fn session_menu_labels_the_toggles_with_what_they_will_do() {
+        let marked = PopupKind::Session {
+            id: SessionId::new("s1"),
+            pinned: true,
+            archived: true,
+            open: false,
+        };
+        let labels = labels(&marked, Grouping::State);
+        assert_eq!(labels[0], "unpin", "ピン留め済みの行に pin が出ている");
+        assert_eq!(labels[4], "unarchive", "アーカイブ済みの行に archive が出ている");
+    }
+
+    /// 6 項目それぞれの動作は行 index から引く（ラベル文字列で分岐しない）
     #[test]
     fn session_menu_maps_each_row_index_to_its_action() {
-        let kind = session("abc123", false);
-        assert_eq!(
-            kind.action(0),
-            Some(PopupAction::Stop(SessionId::new("abc123")))
-        );
-        assert_eq!(
-            kind.action(1),
-            Some(PopupAction::Delete(SessionId::new("abc123")))
-        );
-        assert_eq!(kind.action(2), None, "項目の無い index は何も起こさない");
+        let kind = session("abc123", true);
+        let id = || SessionId::new("abc123");
+        assert_eq!(kind.action(0), Some(PopupAction::TogglePin(id())));
+        assert_eq!(kind.action(1), Some(PopupAction::MarkRead(id())));
+        assert_eq!(kind.action(2), Some(PopupAction::StartRename(id())));
+        assert_eq!(kind.action(3), Some(PopupAction::Close(id())));
+        assert_eq!(kind.action(4), Some(PopupAction::ToggleArchive(id())));
+        assert_eq!(kind.action(5), Some(PopupAction::Delete(id())));
+        assert_eq!(kind.action(6), None, "項目の無い index は何も起こさない");
     }
 
     /// grouping メニューは現在の選択に ● を付け、各行はその grouping を指す
@@ -2278,17 +2498,33 @@ mod tests {
         assert_eq!(PopupKind::Group.action(2), None);
     }
 
-    /// セッション行の ☰ クリックで stop / delete のメニューが開く（従来の入口）
+    /// セッション行の ☰ クリックでメニューが開く（**二次操作の唯一の入口**）。
+    /// 開いた時点の行の状態（ピン留め・アーカイブ・窓の有無）が写る
     #[test]
     fn clicking_the_hamburger_opens_the_session_menu() {
         let mut app = test_app(34, TERM);
+        app.sessions = vec![SessionRow {
+            pinned: true,
+            ..session_row("abc123", "C:\\dev\\api", 1)
+        }];
         app.sidebar_rows = vec![Some(RowAction::Open(SessionId::new("abc123")))];
         app.sidebar_header_rows = 1;
         handle_mouse(&mut app, &click(0, 1)).unwrap();
         let popup = app.popup.as_ref().expect("メニューが開いていない");
-        // 生きた窓が無い = 停止済み扱い
-        assert_eq!(popup.kind, session("abc123", true));
-        assert_eq!(labels(&popup.kind, app.grouping), ["stop", "delete"]);
+        assert_eq!(
+            popup.kind,
+            PopupKind::Session {
+                id: SessionId::new("abc123"),
+                pinned: true,
+                archived: false,
+                // 生きた窓が無い = 閉じるものが無い
+                open: false,
+            }
+        );
+        assert_eq!(
+            labels(&popup.kind, app.grouping),
+            ["unpin", "mark as read", "rename", "close", "archive", "delete"]
+        );
         assert_eq!(popup.anchor_y, 1, "クリックした行の下に出る");
     }
 
@@ -2473,11 +2709,15 @@ mod tests {
         assert_eq!(app.popup.as_ref().unwrap().selected, 0);
     }
 
-    /// 実行できない項目（停止済みの stop）は Enter でも動かず、メニューも閉じない
+    /// 実行できない項目（窓の無い行の close）は Enter でも動かず、メニューも閉じない
     #[test]
     fn disabled_item_is_not_executed() {
         let mut app = test_app(34, TERM);
-        open(&mut app, session("s1", true), 3);
+        open(&mut app, session("s1", false), 3);
+        for _ in 0..3 {
+            handle_popup_key(&mut app, KeyCode::Down); // close を選ぶ
+        }
+        assert_eq!(app.popup.as_ref().unwrap().selected, 3);
         handle_popup_key(&mut app, KeyCode::Enter);
         assert!(
             app.popup.is_some(),
@@ -2510,12 +2750,25 @@ mod tests {
         }
     }
 
-    /// stop/delete・grouping 切替の幅は従来（14 桁）から動かさない
+    /// **幅の下限は「短い項目しか無いメニューが痩せない」ための床**で、
+    /// grouping 切替（最長 `  directory` = 11 桁）がそれに当たる。
+    /// セッションのメニューは項目が増えて床を越えたので、最長項目から決まる
     #[test]
-    fn menu_width_keeps_the_static_menus_at_the_previous_size() {
-        assert_eq!(session("s1", false).width(Grouping::State), 14);
-        assert_eq!(PopupKind::Group.width(Grouping::State), 14);
-        assert_eq!(PopupKind::Group.width(Grouping::Directory), 14);
+    fn menu_width_is_the_longest_entry_but_never_below_the_floor() {
+        use unicode_width::UnicodeWidthStr;
+        assert_eq!(PopupKind::Group.width(Grouping::State), POPUP_MIN_WIDTH);
+        assert_eq!(PopupKind::Group.width(Grouping::Directory), POPUP_MIN_WIDTH);
+        let kind = session("s1", true);
+        let widest = labels(&kind, Grouping::State)
+            .iter()
+            .map(|label| label.width())
+            .max()
+            .unwrap() as u16;
+        assert_eq!(kind.width(Grouping::State), widest + POPUP_CHROME);
+        assert!(
+            kind.width(Grouping::State) > POPUP_MIN_WIDTH,
+            "床が最長項目を切っている"
+        );
     }
 
     /// 幅は最長項目の表示幅から決まる（email やアカウント表示名が切れない）。
@@ -3647,7 +3900,7 @@ mod tests {
 
     /// **セッションが残っているプロジェクトは登録解除できない。** 一覧は
     /// 「登録リスト ∪ セッションの cwd」なので、外しても見出しは出続ける ＝
-    /// 押せるのに何も変わらないことになる。stop と同じ実行可能フラグで落とす
+    /// 押せるのに何も変わらないことになる。close と同じ実行可能フラグで落とす
     #[test]
     fn project_menu_disables_remove_while_sessions_remain() {
         assert_eq!(
@@ -3913,7 +4166,7 @@ mod tests {
     }
 
     /// **見出しメニューの new session はフォーカスを端末へ移す。** 起動したのに
-    /// キーがサイドバーへ行き続けると、↑↓ で選択が動き Ctrl+X で止まる ＝
+    /// キーがサイドバーへ行き続けると、↑↓ で選択だけが動く ＝
     /// クリックか Alt+→ を押すまでタイプできない。窓を出す側
     /// （[`App::show_session`]）はフォーカスを動かさない契約なので、
     /// ディスパッチの時点で移す（New 画面の起動ボタンと同じ挙動）
@@ -4261,5 +4514,226 @@ mod tests {
         // 引きすぎても 0 未満にならない
         app.sidebar_scroll = 99;
         assert_eq!(selected_row_y(&app), 1);
+    }
+
+    // ── 二次操作（ポップアップの 6 項目）と、撤去したショートカット ──────────
+
+    /// 行 1 本だけを持ち、その行を選択しているサイドバー
+    fn app_with_row(id: &str) -> App {
+        let mut app = test_app(34, TERM);
+        app.sessions = vec![session_row(id, "C:\\dev\\api", 1)];
+        app.sidebar_rows = vec![Some(RowAction::Open(SessionId::new(id)))];
+        app.sidebar_header_rows = 1;
+        app
+    }
+
+    /// サイドバーへの打鍵（本番と同じ [`handle_sidebar_key`] を通す）
+    fn press(app: &mut App, code: KeyCode) {
+        handle_sidebar_key(app, &KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn only_row(app: &App) -> &SessionRow {
+        app.sessions.first().expect("行が消えている")
+    }
+
+    /// ピン留めとアーカイブは入切する（同じ項目をもう一度選べば戻る）
+    #[test]
+    fn the_menu_toggles_pin_and_archive_on_the_row() {
+        let mut app = app_with_row("s");
+        let id = SessionId::new("s");
+        assert!(!only_row(&app).pinned && !only_row(&app).archived, "初期状態が立っている");
+
+        run_popup_action(&mut app, PopupAction::TogglePin(id.clone()), 0);
+        run_popup_action(&mut app, PopupAction::ToggleArchive(id.clone()), 0);
+        assert!(only_row(&app).pinned && only_row(&app).archived, "1 度目で立たない");
+
+        run_popup_action(&mut app, PopupAction::TogglePin(id.clone()), 0);
+        run_popup_action(&mut app, PopupAction::ToggleArchive(id), 0);
+        assert!(
+            !only_row(&app).pinned && !only_row(&app).archived,
+            "2 度目で戻らない"
+        );
+    }
+
+    /// **自分の操作で未読を作らない・消さない。** 未読は「見ていない間に新しいことが
+    /// 起きた」の意味なので、ピン留めやアーカイブで `●` が生えるのは嘘になる。
+    /// 消せるのは `mark as read` だけ
+    #[test]
+    fn row_edits_leave_unread_alone_and_only_mark_as_read_clears_it() {
+        let mut app = app_with_row("s");
+        let id = SessionId::new("s");
+        // 未読の行（応答が届いたのにまだ開いていない）
+        app.sessions[0].last_opened_at = 1_000;
+        app.sessions[0].updated_at = 2_000;
+        assert!(only_row(&app).unread(), "前提（未読）が崩れている");
+
+        run_popup_action(&mut app, PopupAction::TogglePin(id.clone()), 0);
+        assert!(only_row(&app).unread(), "ピン留めで未読が消えている");
+        run_popup_action(&mut app, PopupAction::ToggleArchive(id.clone()), 0);
+        assert!(only_row(&app).unread(), "アーカイブで未読が消えている");
+
+        run_popup_action(&mut app, PopupAction::MarkRead(id.clone()), 0);
+        assert!(!only_row(&app).unread(), "既読にしても未読のまま");
+
+        // 既読の行を触っても未読は生えない（`updated_at` はマージのために進む）
+        let before = only_row(&app).updated_at;
+        run_popup_action(&mut app, PopupAction::TogglePin(id), 0);
+        assert!(!only_row(&app).unread(), "自分の操作で未読が生えている");
+        assert!(
+            only_row(&app).updated_at >= before,
+            "マージの後勝ち判定の材料が進んでいない"
+        );
+    }
+
+    /// **削除は ccdesk の一覧からだけ消す。** transcript
+    /// （`~/.claude/projects/**/*.jsonl`）は claude 側の持ち物で `claude -r` の材料。
+    /// 一覧から外したいだけの操作で会話の記録まで消してはいけない
+    #[test]
+    fn deleting_a_row_leaves_its_transcript_on_disk() {
+        let id = "8a1c0f52-0b3e-4a6d-9f11-2c7d5e8b0a34";
+        // 記録のファイル名は session_id（`claude --session-id` へ渡した UUID そのもの）
+        let dir = std::env::temp_dir().join(format!(
+            "ccdesk-transcript-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join(format!("{id}.jsonl"));
+        std::fs::write(&transcript, "{}").unwrap();
+
+        let mut app = app_with_row(id);
+        run_popup_action(&mut app, PopupAction::Delete(SessionId::new(id)), 0);
+
+        assert!(app.sessions.is_empty(), "行が一覧から消えていない");
+        assert!(transcript.exists(), "削除が transcript まで消している");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// rename はその行のインライン入力で始まり、**Enter で初めて行に入る**。
+    /// ユーザーが付けた名前は `custom`（あとから来る AI 生成の名前に踏まれない）
+    #[test]
+    fn renaming_writes_a_custom_title_when_the_input_is_confirmed() {
+        let mut app = app_with_row("s");
+        run_popup_action(&mut app, PopupAction::StartRename(SessionId::new("s")), 0);
+        let field = &app.rename.as_ref().expect("入力が始まっていない").field;
+        assert_eq!(field.text, "session", "今の名前が初期値になっていない");
+
+        for _ in 0..field.text.chars().count() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        for c in "支払いの型".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(only_row(&app).title, "session", "確定前に行が書き換わっている");
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.rename.is_none(), "確定しても入力が残っている");
+        assert_eq!(only_row(&app).title, "支払いの型");
+        assert_eq!(only_row(&app).title_source, TitleSource::Custom);
+    }
+
+    /// 取り消す道が 3 つある（Esc / 空にして確定 / フォーカスが離れる）。
+    /// **どれも行を書き換えない**（押し間違いで名前が変わらない）
+    #[test]
+    fn renaming_can_be_abandoned_without_touching_the_row() {
+        let start = |app: &mut App| {
+            run_popup_action(app, PopupAction::StartRename(SessionId::new("s")), 0);
+            press(app, KeyCode::Char('!'));
+        };
+        let mut app = app_with_row("s");
+
+        start(&mut app);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.rename.is_none(), "Esc で閉じていない");
+        assert_eq!(only_row(&app).title, "session");
+
+        // 空白だけの名前は付けない（行から名前が消えるとどれか指せなくなる）
+        start(&mut app);
+        for _ in 0..20 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.rename.is_none());
+        assert_eq!(only_row(&app).title, "session", "空の名前が入った");
+
+        // 入力欄はサイドバーの行そのものなので、フォーカスが離れたら畳む
+        start(&mut app);
+        app.set_focus(Focus::Terminal);
+        assert!(app.rename.is_none(), "見えない入力欄が残っている");
+        assert_eq!(only_row(&app).title, "session");
+        assert_eq!(only_row(&app).title_source, TitleSource::Derived);
+    }
+
+    /// 入力中は一覧のキー操作を全部飲む（確定した瞬間に別の行を見ていない）
+    #[test]
+    fn the_rename_input_swallows_the_list_keys() {
+        let mut app = app_with_row("s");
+        app.sidebar_rows.push(Some(RowAction::New));
+        run_popup_action(&mut app, PopupAction::StartRename(SessionId::new("s")), 0);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_row, 0, "編集中に裏の選択が動いている");
+        assert!(app.rename.is_some(), "↑↓ で入力が閉じている");
+    }
+
+    /// **撤去した打鍵は claude のものへ戻った。** 予約キーに載っていないので
+    /// run ループは PTY へ流す（流れるバイト列も固定する）
+    #[test]
+    fn the_removed_shortcuts_reach_claude_untouched() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let parser = ccdesk::new_parser(24, 80, 0);
+        for (c, byte) in [('s', 0x13u8), ('x', 0x18)] {
+            assert_eq!(reserved_key(&ctrl(c)), None, "Ctrl+{c} をまだ予約している");
+            assert_eq!(
+                encode_key(&ctrl(c), &parser),
+                [byte],
+                "Ctrl+{c} が claude へ渡らない"
+            );
+        }
+    }
+
+    /// **予約はこの 3 つだけ。** ここに増やすと、その打鍵ぶんだけ claude 側の
+    /// キーバインドが死ぬ（二次操作はポップアップに集約した）
+    #[test]
+    fn only_quit_and_pane_focus_are_reserved() {
+        let alt = |code| KeyEvent::new(code, KeyModifiers::ALT);
+        assert_eq!(
+            reserved_key(&KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            Some(Reserved::Quit)
+        );
+        assert_eq!(
+            reserved_key(&alt(KeyCode::Left)),
+            Some(Reserved::Focus(Focus::Sidebar))
+        );
+        assert_eq!(
+            reserved_key(&alt(KeyCode::Right)),
+            Some(Reserved::Focus(Focus::Terminal))
+        );
+        // 修飾が違えば claude のもの（素の ←→ / 素の q / Ctrl+←→）
+        for key in [
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        ] {
+            assert_eq!(reserved_key(&key), None, "{key:?} を予約している");
+        }
+    }
+
+    /// サイドバーにフォーカスがあっても、撤去した打鍵はもう何も起こさない
+    /// （グルーピングは ⊞ group のメニュー、stop→delete は ☰ のメニューへ移った）
+    #[test]
+    fn the_sidebar_no_longer_answers_the_removed_shortcuts() {
+        let mut app = app_with_row("s");
+        for c in ['s', 'x'] {
+            handle_sidebar_key(
+                &mut app,
+                &KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+            );
+        }
+        assert_eq!(
+            app.grouping,
+            Grouping::State,
+            "Ctrl+S がグルーピングを切り替えている"
+        );
+        assert_eq!(app.sessions.len(), 1, "Ctrl+X が行を消している");
+        assert!(app.popup.is_none(), "撤去した打鍵でメニューが開いている");
     }
 }

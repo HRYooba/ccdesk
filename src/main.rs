@@ -1,5 +1,5 @@
 // ccdesk: Claude Desktop の TUI 版。portable-pty で claude を起動 → vt100 でパース → tui-term で描画
-// マウス主体の操作: クリックでセッション切替・フォーカス / ☰ = stop・delete メニュー /
+// マウス主体の操作: クリックでセッション切替・フォーカス / ☰ = 行への二次操作のメニュー /
 // 境界線ドラッグで幅変更。ターミナルフォーカス中のキーは PTY へ素通し。
 // 予約は Ctrl+Q（終了）と Alt+←→（ペインフォーカス移動）のみ
 
@@ -153,7 +153,7 @@ fn main() -> anyhow::Result<()> {
         usage_display,
         usage: None,
         last_usage_read: instant_ago(Duration::from_secs(60)),
-        pending_delete: None,
+        rename: None,
         account_job: None,
         input_gate: None,
         notice: None,
