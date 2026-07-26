@@ -225,6 +225,7 @@ const LOCK_MAX_STEALS: u32 = 3;
 /// 上の所有権確認があるので他者のロックを消すことはなく、こちらの書き込みが
 /// 失敗するだけで済む（touch スレッドを足しても「奪われた後に消す」経路は
 /// 消えないので、守りとしては所有権確認の方が単純かつ確実）
+#[derive(Debug)] // 取れなかったことをテストで `expect_err` するため
 struct Lock {
     path: PathBuf,
     /// 取得した瞬間の mtime＝所有権の印。取れなかった（None）ときは所有を
@@ -269,8 +270,15 @@ impl Lock {
                 continue;
             }
             if Instant::now() >= deadline {
+                // **打つ手まで書く。** 時計の巻き戻し・スリープ復帰・ネットワーク
+                // ドライブの skew でロックの mtime が未来に付くと [`lock_age`] は
+                // 永久に stale と判定しないので、"try again" は何度やっても通らない。
+                // ロックの実体が空ディレクトリで、保持者が居なければ消してよいことは
+                // ここでしか伝わらない（未ログイン行が `run /login` まで書くのと同じ方針）
                 return Err(anyhow!(
-                    "another process is holding the Claude credentials lock ({}); try again",
+                    "another process is holding the lock at {}; \
+                     if no claude session and no other ccdesk window is running, \
+                     this leftover lock is an empty directory and can be deleted",
                     path.display()
                 ));
             }
@@ -294,7 +302,13 @@ fn lock_mtime(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-/// ロックの経過時間。mtime が未来のとき（時刻のずれ）は None＝stale ではない扱い
+/// ロックの経過時間。mtime が未来のとき（時刻のずれ）は None＝stale ではない扱い。
+///
+/// **未来の mtime を「十分古い」側に倒さない。** 未来に付くのは保持者の時計ではなく
+/// ファイルシステム側の時刻がずれているときで、そうなると経過時間そのものが
+/// 信用できない ＝ 生きている claude のロックを奪う判断材料にはできない。
+/// 代わりに、取得できなかったときのエラー文が「消してよい」ことを案内する
+/// （[`Lock::acquire`]）
 fn lock_age(path: &Path) -> Option<Duration> {
     lock_mtime(path)?.elapsed().ok()
 }
@@ -1264,6 +1278,30 @@ pub(crate) mod tests {
             .expect("stale ロックを奪えていない");
         drop(stolen);
         assert!(!path.exists(), "解放されていない");
+    }
+
+    /// ロックが取れなかったときのエラーは **打つ手まで言う**。
+    /// 時計のずれで mtime が未来に付いたロックは stale 判定に掛からず、
+    /// 「もう一度試す」では永久に通らない（[`lock_age`]）。実体が空ディレクトリで
+    /// 保持者が居なければ消してよいことは、この文面でしか伝わらない
+    #[test]
+    fn a_lock_we_cannot_take_says_how_to_recover() {
+        let home = TempHome::new("a_lock_we_cannot_take_says_how_to_recover");
+        let path = home.paths().lock;
+        std::fs::create_dir(&path).unwrap();
+
+        let err = Lock::acquire(&path, Duration::from_millis(20), LOCK_STALE)
+            .expect_err("取れてしまっている")
+            .to_string();
+
+        assert!(
+            err.contains(&path.display().to_string()),
+            "どのロックか分からない: {err}"
+        );
+        assert!(
+            err.contains("empty directory") && err.contains("deleted"),
+            "打つ手（消してよいこと）が書かれていない: {err}"
+        );
     }
 
     /// **切替は「新しい持ち主」を返す。** 自分が書いた値なので確定しており、
