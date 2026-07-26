@@ -136,6 +136,8 @@ fn main() -> anyhow::Result<()> {
         agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         sessions,
         hook_states,
+        // 起動時の見え方を先に控える（run ループの 1 周目が「変わった」と誤解しない）
+        hook_stamp: source.hook_stamp(),
         titles: title::Titles::default(),
         last_scan: std::time::Instant::now(),
         last_live_scan: std::time::Instant::now(),
@@ -152,6 +154,8 @@ fn main() -> anyhow::Result<()> {
         sidebar_follow_sel: false,
         hovered: None,
         selection: app::SidebarPos::Row(0),
+        // 起動時の復元でペインが指す行へは最初の描画で揃う（None ＝ まだ揃えていない）
+        pane_shown: None,
         dispatch_cwd: window.dispatch_cwd,
         right_view: RightView::Sessions,
         footer,

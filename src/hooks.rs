@@ -52,6 +52,19 @@ const STATES_KEY: &str = "states";
 /// 項目のキー。**読みと書きで同じ定数を使う**（片側だけ直した状態を作らない）
 const STATE_KEY: &str = "state";
 const AT_KEY: &str = "at";
+const PID_KEY: &str = "pid";
+
+/// **claude が hook の子へ渡すプロセス ID の環境変数。**
+///
+/// 実測（v2.1.220）: hook のコマンドは claude の子として走り、環境に
+/// `CLAUDE_PID=<claude の pid>` が入る。ccdesk は自分が起こした子の pid を
+/// 知っているので、これが **hook の記録と窓を突き合わせる鍵**になる
+/// （[`HookStates::session_of`]）。
+///
+/// **ccdesk 自身が子へ渡さない印**（[`crate::session`] の `INHERITED_MARKERS`）に
+/// この名前が入っているのは、ccdesk を claude の配下から起動したときに親の値が
+/// 子へ流れないようにするため ＝ ここで読む値は必ず「その hook を呼んだ claude」
+const CLAUDE_PID_ENV: &str = "CLAUDE_PID";
 
 /// 受けた state を保つ期間。**動いているセッションは毎 turn 書き直す**ので、
 /// これを過ぎた項目は既に終わったセッションのもの ＝ 読んでも意味が無い。
@@ -74,6 +87,10 @@ struct Entry {
     state: String,
     /// 受けた時刻（epoch ms）。**書き手（[`record`]）と同じ時計**
     at: u64,
+    /// その hook を呼んだ claude のプロセス ID（[`CLAUDE_PID_ENV`]）。
+    /// 取れない環境では None ＝ pid での引き当て（[`HookStates::session_of`]）に
+    /// 出てこないだけで、state の受け渡しには影響しない
+    pid: Option<u32>,
 }
 
 /// hook が書いた state の写し（`session_id` → [`Entry`]）
@@ -100,19 +117,44 @@ impl HookStates {
         (entry.at >= launched?).then_some(entry.state.as_str())
     }
 
+    /// **その claude プロセスが今動かしているセッション。** hook はどのイベントでも
+    /// 「その時点の `session_id`」と「呼び出した claude の pid」を一緒に書くので、
+    /// その pid で一番新しい記録が答えになる。
+    ///
+    /// `launched` は**その pid の窓を起こした時刻**。それより古い記録は前回の実行
+    /// （pid の使い回しを含む）なので採らない ＝ 判断の材料は [`Self::get`] と同じ。
+    ///
+    /// **ペイン内の `/resume` `/clear` に周期を待たずに気づく口**がこれで、
+    /// `claude agents --json`（1 回 ~900ms のプロセス起動）を待たずに済む
+    pub(crate) fn session_of(&self, pid: u32, launched: u64) -> Option<&SessionId> {
+        self.0
+            .iter()
+            .filter(|(_, entry)| entry.pid == Some(pid) && entry.at >= launched)
+            .max_by_key(|(_, entry)| entry.at)
+            .map(|(id, _)| id)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_entries<'a>(
         entries: impl IntoIterator<Item = (&'a str, &'a str, u64)>,
     ) -> Self {
+        Self::from_records(entries.into_iter().map(|(id, state, at)| (id, state, at, None)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_records<'a>(
+        entries: impl IntoIterator<Item = (&'a str, &'a str, u64, Option<u32>)>,
+    ) -> Self {
         Self(
             entries
                 .into_iter()
-                .map(|(id, state, at)| {
+                .map(|(id, state, at, pid)| {
                     (
                         SessionId::new(id),
                         Entry {
                             state: state.to_string(),
                             at,
+                            pid,
                         },
                     )
                 })
@@ -140,18 +182,32 @@ fn state_of(event: &str) -> Option<&'static str> {
 /// ここが何か書くと ccdesk がユーザーの会話に割り込むことになる
 pub(crate) fn run_hook(event: &str) -> anyhow::Result<()> {
     use std::io::Read as _;
-    let Some(state) = state_of(event) else {
-        return Ok(());
-    };
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
-    let Some(session_id) = session_id_of(&input) else {
+    let Some((session_id, state, pid)) = hook_entry(event, &input) else {
         return Ok(());
     };
     if let Some(path) = ccdesk::hook_states_path() {
-        record(&path, &session_id, state, now_ms());
+        record(&path, &session_id, state, now_ms(), pid);
     }
     Ok(())
+}
+
+/// hook 1 回で保管へ載せるもの（イベント名・stdin・環境から決まる）。
+/// **[`run_hook`] が持つ判断はこれだけ**で、残りはファイルの読み書き ＝
+/// 環境から pid を拾う経路も含めて、保管を触らずに検査できる。
+///
+/// 知らないイベント / `session_id` が読めない入力は None（何も書かない）
+fn hook_entry(event: &str, input: &str) -> Option<(SessionId, &'static str, Option<u32>)> {
+    let state = state_of(event)?;
+    let session_id = session_id_of(input)?;
+    Some((session_id, state, claude_pid()))
+}
+
+/// この hook を呼んだ claude の pid（[`CLAUDE_PID_ENV`]）。
+/// **読めなければ None**（記録は載るが pid での引き当てには出てこない）
+fn claude_pid() -> Option<u32> {
+    std::env::var(CLAUDE_PID_ENV).ok()?.trim().parse().ok()
 }
 
 /// hook 入力から `session_id` を取る。**読みは寛容**（形が変わっても落ちない:
@@ -169,25 +225,36 @@ fn session_id_of(input: &str) -> Option<SessionId> {
 ///
 /// 古い項目はここで落とす（[`KEEP`]）。掃除の契機を別に持たないのは、
 /// 書くのがこの 1 箇所だけで、**書くたびに掃除すれば積もらない**ため
-fn record(path: &Path, session_id: &SessionId, state: &str, now: u64) {
+fn record(path: &Path, session_id: &SessionId, state: &str, now: u64, pid: Option<u32>) {
     let Ok(_guard) = Lock::acquire(&lock_path_for(path), LOCK_WAIT, LOCK_STALE) else {
         return;
     };
     let mut entries = read_entries(path);
-    entries.retain(|_, (_, at)| now.saturating_sub(*at) < KEEP.as_millis() as u64);
-    entries.insert(session_id.to_string(), (state.to_string(), now));
+    entries.retain(|_, entry| now.saturating_sub(entry.at) < KEEP.as_millis() as u64);
+    entries.insert(
+        session_id.to_string(),
+        Entry {
+            state: state.to_string(),
+            at: now,
+            pid,
+        },
+    );
     let document = json!({
         STATES_KEY: entries
             .iter()
-            .map(|(id, (state, at))| (id.clone(), json!({ STATE_KEY: state, AT_KEY: at })))
+            .map(|(id, entry)| (id.clone(), json!({
+                STATE_KEY: entry.state,
+                AT_KEY: entry.at,
+                PID_KEY: entry.pid,
+            })))
             .collect::<serde_json::Map<_, _>>()
     });
     let _ = write_json_atomically(path, &document);
 }
 
-/// 保管ファイルの項目（`session_id` → (state, 受けた時刻 ms)）。
+/// 保管ファイルの項目（`session_id` → [`Entry`]）。
 /// **無い・壊れている・書き換え途中はすべて空**（起動も turn も止めない）
-fn read_entries(path: &Path) -> BTreeMap<String, (String, u64)> {
+fn read_entries(path: &Path) -> BTreeMap<String, Entry> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return BTreeMap::new();
     };
@@ -204,7 +271,21 @@ fn read_entries(path: &Path) -> BTreeMap<String, (String, u64)> {
             // state を持たない項目は捨てる（state が無い項目は何も答えられない）。
             // 時刻は既定 0 で読む ＝ 次の書き込みで古い項目として落ちる
             let at = entry.get(AT_KEY).and_then(Value::as_u64).unwrap_or(0);
-            (!id.is_empty() && !state.is_empty()).then(|| (id.clone(), (state.to_string(), at)))
+            // pid は桁が u32 に収まる値だけ採る（読めなければ pid 無しの記録として扱う）
+            let pid = entry
+                .get(PID_KEY)
+                .and_then(Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok());
+            (!id.is_empty() && !state.is_empty()).then(|| {
+                (
+                    id.clone(),
+                    Entry {
+                        state: state.to_string(),
+                        at,
+                        pid,
+                    },
+                )
+            })
         })
         .collect()
 }
@@ -222,9 +303,17 @@ fn states_at(path: &Path) -> HookStates {
     HookStates(
         read_entries(path)
             .into_iter()
-            .map(|(id, (state, at))| (SessionId::new(id), Entry { state, at }))
+            .map(|(id, entry)| (SessionId::new(id), entry))
             .collect(),
     )
+}
+
+/// 保管ファイルの見え方（長さ・更新時刻）。**中身を読まずに「変わったか」だけを
+/// 見る口**で、run ループがこれを毎周見て変化した周だけ読み直す
+/// （hook が来た瞬間に一覧へ反映するための合図。ファイルを開かないので安い）
+pub(crate) fn states_stamp() -> Option<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(ccdesk::hook_states_path()?).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
 }
 
 /// 起動時の掃除: rename の前に死んだ hook プロセスが残した `.tmp` を回収する
@@ -387,15 +476,15 @@ mod tests {
         let temp = TempStore::new("a_recorded_state_reaches_the_reader");
         assert_eq!(states_at(&temp.path()), HookStates::default(), "not empty for a missing file");
 
-        record(&temp.path(), &id("s-1"), "working", 1_000);
-        record(&temp.path(), &id("s-2"), "blocked", 1_000);
+        record(&temp.path(), &id("s-1"), "working", 1_000, None);
+        record(&temp.path(), &id("s-2"), "blocked", 1_000, None);
         assert_eq!(
             states_at(&temp.path()),
             HookStates::from_entries([("s-1", "working", 1_000), ("s-2", "blocked", 1_000)])
         );
 
         // 同じセッションの次のイベントは上書き（状態は最後に受けたものが正しい）
-        record(&temp.path(), &id("s-1"), "done", 2_000);
+        record(&temp.path(), &id("s-1"), "done", 2_000, None);
         let states = states_at(&temp.path());
         assert_eq!(stored(&states, &id("s-1")).as_deref(), Some("done"));
         assert_eq!(
@@ -427,6 +516,101 @@ mod tests {
         assert_eq!(states.get(&id("other"), Some(0)), None);
     }
 
+    /// **pid は claude が hook の子へ渡す環境変数から読む**（実測: v2.1.220 の
+    /// hook は `CLAUDE_PID=<claude の pid>` を持つ子として走る）。
+    ///
+    /// **親のプロセス環境を一時的に触る**（そうしないと、この名前が居ない環境で
+    /// 検査が空振りする）。触るのはこの 1 つだけで、復元は読み取りの直後に行う
+    #[test]
+    fn the_pid_comes_from_the_environment_claude_gives_the_hook() {
+        let input = r#"{"session_id":"s-1","source":"clear"}"#;
+        unsafe { std::env::set_var(CLAUDE_PID_ENV, " 4242 ") };
+        let padded = hook_entry("SessionStart", input);
+        let bare = claude_pid();
+        unsafe { std::env::set_var(CLAUDE_PID_ENV, "not a number") };
+        let broken = hook_entry("SessionStart", input);
+        unsafe { std::env::remove_var(CLAUDE_PID_ENV) };
+        let missing = hook_entry("SessionStart", input);
+
+        // **記録に pid まで載る**（載らないと pid での引き当てが黙って効かなくなる）
+        assert_eq!(
+            padded,
+            Some((id("s-1"), "blocked", Some(4242))),
+            "the pid did not reach the record"
+        );
+        assert_eq!(bare, Some(4242), "the pid is not read from the environment");
+        assert_eq!(
+            broken,
+            Some((id("s-1"), "blocked", None)),
+            "built a pid out of something that is not a number"
+        );
+        assert_eq!(
+            missing,
+            Some((id("s-1"), "blocked", None)),
+            "answered with a pid when the variable is not set"
+        );
+        // 知らないイベント / 読めない入力は何も書かない
+        assert_eq!(hook_entry("PreToolUse", input), None);
+        assert_eq!(hook_entry("SessionStart", "not json"), None);
+    }
+
+    /// **pid は保管を往復する。** ここが落ちると、ペイン内の `/resume` `/clear` に
+    /// 気づく口（[`HookStates::session_of`]）が黙って効かなくなる
+    #[test]
+    fn the_pid_of_the_calling_claude_survives_a_round_trip() {
+        let temp = TempStore::new("the_pid_of_the_calling_claude_survives_a_round_trip");
+        record(&temp.path(), &id("s"), "working", 1_000, Some(4242));
+        assert_eq!(
+            states_at(&temp.path()),
+            HookStates::from_records([("s", "working", 1_000, Some(4242))])
+        );
+        // pid の無い記録も読める（環境変数が取れなかった場合）
+        record(&temp.path(), &id("s"), "done", 2_000, None);
+        assert_eq!(
+            states_at(&temp.path()),
+            HookStates::from_records([("s", "done", 2_000, None)])
+        );
+    }
+
+    /// **その pid が今動かしているセッション ＝ その pid の一番新しい記録。**
+    ///
+    /// `/clear` は「古いセッションの `SessionEnd`」と「新しいセッションの
+    /// `SessionStart`」を同じ pid で続けて書く（実測）ので、新しい方を採らないと
+    /// 張り替え先が前のセッションのままになる
+    #[test]
+    fn the_newest_record_of_a_pid_names_the_session_it_is_running() {
+        let states = HookStates::from_records([
+            ("old", "stopped", 2_000, Some(7)),
+            ("new", "blocked", 2_001, Some(7)),
+            ("other-process", "working", 9_000, Some(8)),
+            ("no-pid", "working", 9_000, None),
+        ]);
+        assert_eq!(states.session_of(7, 1_000), Some(&id("new")));
+        assert_eq!(states.session_of(8, 1_000), Some(&id("other-process")));
+        // 窓の起動より古い記録は前回の実行のもの（pid の使い回しを含む）
+        assert_eq!(states.session_of(7, 2_001), Some(&id("new")));
+        assert_eq!(states.session_of(7, 2_002), None);
+        // 知らない pid には答えない
+        assert_eq!(states.session_of(9, 0), None);
+    }
+
+    /// **保管の見え方は中身を読まずに取れる**（run ループが毎周見る合図）。
+    /// 書き込みのたびに変わり、無いファイルには答えない
+    #[test]
+    fn the_store_stamp_changes_when_something_is_recorded() {
+        let temp = TempStore::new("the_store_stamp_changes_when_something_is_recorded");
+        let stamp = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|m| (m.len(), m.modified().ok()))
+        };
+        assert_eq!(stamp(&temp.path()), None, "answered for a missing file");
+        record(&temp.path(), &id("s"), "working", 1_000, Some(1));
+        let before = stamp(&temp.path()).expect("no stamp after a write");
+        record(&temp.path(), &id("s-2"), "blocked", 2_000, Some(2));
+        assert_ne!(stamp(&temp.path()), Some(before), "the stamp did not move");
+    }
+
     /// **古い項目は書くたびに落ちる**（1 セッション 1 項目で永久に積もらない）。
     /// 落ちるのは保つ期間を過ぎたものだけで、動いているセッションは毎 turn
     /// 書き直されるので落ちない
@@ -434,10 +618,10 @@ mod tests {
     fn recording_drops_entries_older_than_the_keep_window() {
         let temp = TempStore::new("recording_drops_entries_older_than_the_keep_window");
         let keep = KEEP.as_millis() as u64;
-        record(&temp.path(), &id("old"), "done", 0);
-        record(&temp.path(), &id("fresh"), "working", keep);
+        record(&temp.path(), &id("old"), "done", 0, None);
+        record(&temp.path(), &id("fresh"), "working", keep, None);
         // old は keep をちょうど過ぎた時点で落ちる
-        record(&temp.path(), &id("now"), "blocked", keep + 1);
+        record(&temp.path(), &id("now"), "blocked", keep + 1, None);
         let states = states_at(&temp.path());
         assert_eq!(stored(&states, &id("old")), None, "an entry past the keep window remains");
         assert_eq!(
@@ -497,7 +681,7 @@ mod tests {
     #[test]
     fn writes_land_atomically_without_leaving_a_tmp_or_a_lock() {
         let temp = TempStore::new("writes_land_atomically_without_leaving_a_tmp_or_a_lock");
-        record(&temp.path(), &id("s"), "working", 1_000);
+        record(&temp.path(), &id("s"), "working", 1_000, None);
         let leftovers: Vec<_> = std::fs::read_dir(&temp.0)
             .unwrap()
             .flatten()
@@ -513,19 +697,19 @@ mod tests {
     #[test]
     fn a_held_lock_makes_the_hook_give_up_instead_of_waiting() {
         let temp = TempStore::new("a_held_lock_makes_the_hook_give_up_instead_of_waiting");
-        record(&temp.path(), &id("s"), "working", 1_000);
+        record(&temp.path(), &id("s"), "working", 1_000, None);
         let before = std::fs::read(temp.path()).unwrap();
 
         let held = Lock::acquire(&lock_path_for(&temp.path()), Duration::ZERO, LOCK_STALE).unwrap();
         let started = std::time::Instant::now();
-        record(&temp.path(), &id("s"), "done", 2_000);
+        record(&temp.path(), &id("s"), "done", 2_000, None);
         let waited = started.elapsed();
         drop(held);
 
         assert!(waited < Duration::from_secs(5), "wait was not bounded: {waited:?}");
         assert_eq!(std::fs::read(temp.path()).unwrap(), before, "wrote even though the lock wasn't acquired");
         // 解放後は通常どおり載る（ロックが理由で壊れているわけではない）
-        record(&temp.path(), &id("s"), "done", 2_000);
+        record(&temp.path(), &id("s"), "done", 2_000, None);
         assert_eq!(stored(&states_at(&temp.path()), &id("s")).as_deref(), Some("done"));
     }
 }

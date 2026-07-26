@@ -196,6 +196,12 @@ pub(crate) trait DataSource: Send + Sync {
     /// `claude agents --json` の `status` へ落ちる（[`crate::hooks`]）
     fn hook_states(&self) -> HookStates;
 
+    /// hook の受け渡しファイルの見え方（長さ・更新時刻）。**中身を読まずに
+    /// 「変わったか」だけを答える**口で、run ループが毎周見て、変わった周だけ
+    /// 一覧を読み直す（ペイン内の `/resume` `/clear` に周期を待たずに気づく）。
+    /// 追いかけるものが無い供給元は None
+    fn hook_stamp(&self) -> Option<(u64, std::time::SystemTime)>;
+
     /// フッター（アカウント・バージョン）の初期値。
     /// live はポーラーが後から埋めるので既定値でよい
     fn footer(&self) -> FooterInfo;
@@ -429,6 +435,10 @@ impl DataSource for LiveSource {
         crate::hooks::read_states()
     }
 
+    fn hook_stamp(&self) -> Option<(u64, std::time::SystemTime)> {
+        crate::hooks::states_stamp()
+    }
+
     fn footer(&self) -> FooterInfo {
         FooterInfo::default() // 実値は spawn_footer_poller が書く
     }
@@ -567,6 +577,11 @@ impl DataSource for DemoSource {
         // 撮影は実セッションの hook を読まない。空 ＝ 行の状態は
         // [`demo_sessions`] が持つ `last_state` だけで決まる（固定の画面になる）
         HookStates::default()
+    }
+
+    fn hook_stamp(&self) -> Option<(u64, std::time::SystemTime)> {
+        // 撮影は hook を読まないので、追いかけるファイルも無い
+        None
     }
 
     fn footer(&self) -> FooterInfo {

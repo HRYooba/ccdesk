@@ -20,21 +20,17 @@ use crate::source::{AccountAction, DataSource, PollSinks, WindowItem, PROJECTS_L
 use crate::title::{title_text, Titles, UNTITLED};
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
 use crate::ui::text_field::TextField;
-use crate::ui::{draw, popup_rect, row_at, row_y, sidebar_layout};
+use crate::ui::{draw, menu_zone, popup_rect, row_at, row_y, sidebar_layout};
 
 /// サイドバー幅の下限（ドラッグで詰められる限界）。
 ///
-/// **根拠は行頭が食う桁**: セッション行は `= ● ✻ ` ＝ メニュー記号 1 + 空白 1 +
-/// 未読の桁 2 + 状態アイコン 1 + 空白 1 の 6 桁を名前より前に使う。枠が左右 1 桁ずつ
-/// なので、12 なら内側 10 桁 ＝ 行頭の 6 桁を引いて 4 桁が名前に残る
+/// **根拠は 1 行が固定で食う桁**（`ui::mod` の `MIN_ROW_COLS` ＝ 行頭の印と
+/// 状態アイコン + 名前の下限 + 行末のメニュー記号）に、枠の左右 1 桁ずつを足したもの。
+/// **足し算の正本は ui 側**なので、行頭や行末に何かを足せばこの下限も一緒に動く
 /// （0 桁にすると、詰め切ったサイドバーがどの行も見分けられない帯になる）。
-/// **6 という桁数はテストが固定する**（`ui::mod` の
-/// `the_unread_mark_sits_next_to_the_menu_mark_without_shifting_the_name`）ので、
-/// 行頭に何かを足したらこの下限の検算もそこで落ちる。
 ///
-/// **描画のテストが「一番狭い状態」を作るのにも使う**ので、この値は ui 側からも
-/// 読める（同じ 12 をテストへ書き写さない）
-pub(crate) const MIN_SIDEBAR: u16 = 12;
+/// **描画のテストが「一番狭い状態」を作るのにも使う**ので、この値は ui 側からも読める
+pub(crate) const MIN_SIDEBAR: u16 = crate::ui::MIN_ROW_COLS + 2;
 const MIN_PANE: u16 = 40;
 
 // 一覧の正本（~/.ccdesk/sessions.json）を読み直す周期。**他インスタンスが起こした
@@ -401,6 +397,11 @@ pub(crate) struct App {
     /// **生きている行の state はこれが主**で、hook が一度も来ていない行だけ
     /// `agents --json` の `status` へ落ちる（[`crate::hooks`]）
     pub(crate) hook_states: HookStates,
+    /// 最後に見た hook 受け渡しファイルの見え方（長さ・更新時刻）。
+    /// **中身ではなく「変わったか」だけを持つ**ので、run ループが毎周見ても安い。
+    /// 変わった周は周期を待たずに一覧を読み直す ＝ ペイン内の `/resume` `/clear` が
+    /// 立てた新しいセッションが即座にサイドバーへ出る
+    pub(crate) hook_stamp: Option<(u64, std::time::SystemTime)>,
     /// transcript から表示名を追う道具。**読んだ transcript の見え方を覚えている**
     /// ので、追記されていないファイルは読み直さない（[`crate::title`]）
     pub(crate) titles: Titles,
@@ -427,6 +428,10 @@ pub(crate) struct App {
     pub(crate) hovered: Option<SidebarPos>,
     // サイドバーフォーカス時のキーボード選択位置（一覧の行 or フッターのアカウント行）
     pub(crate) selection: SidebarPos,
+    // **最後に選択を揃えたペインのセッション。** ペインが指すセッションが
+    // これと違うフレームだけ選択を寄せる（`ui::follow_pane`）ので、
+    // `↑↓` で選択だけを動かしている間は勝手に戻らない
+    pub(crate) pane_shown: Option<SessionId>,
     pub(crate) dispatch_cwd: String,
     pub(crate) right_view: RightView,
     // サイドバー下部のアカウント・バージョン表示（バックグラウンド取得）
@@ -515,6 +520,7 @@ impl Default for App {
             agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Vec::new(),
             hook_states: HookStates::default(),
+            hook_stamp: None,
             titles: Titles::default(),
             last_scan: std::time::Instant::now(),
             last_live_scan: std::time::Instant::now(),
@@ -528,6 +534,7 @@ impl Default for App {
             sidebar_follow_sel: false,
             hovered: None,
             selection: SidebarPos::Row(0),
+            pane_shown: None,
             dispatch_cwd: String::new(),
             right_view: RightView::Sessions,
             footer: FooterInfo::default(),
@@ -647,7 +654,7 @@ impl App {
 
     /// **今ペインに出ているセッション**（右ペインがセッション表示でないなら None）。
     /// 「キー入力の宛先」と「ユーザーが見ている行」がどちらもこの 1 つの判断から出る
-    fn shown_session(&self) -> Option<&SessionId> {
+    pub(crate) fn shown_session(&self) -> Option<&SessionId> {
         matches!(self.right_view, RightView::Sessions)
             .then(|| self.windows.get(self.active).map(|w| &w.session_id))
             .flatten()
@@ -763,16 +770,24 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             }
             app.last_live_scan = std::time::Instant::now();
         }
+        // **hook の書き込みに気づいたら周期を待たずに読み直す。** ペインの中で
+        // `/resume` `/clear` すると claude は新しいセッションの `SessionStart` を
+        // その場で撃つので、これが「一覧に新しい行を出す合図」になる。
+        // 見るのはファイルの長さと更新時刻だけ（中身は読まない）ので毎周でも安い
+        if hook_store_changed(&mut app.hook_stamp, app.source.hook_stamp()) {
+            app.last_scan = instant_ago(SCAN_INTERVAL);
+        }
         if app.last_scan.elapsed() > SCAN_INTERVAL {
             refresh_sessions(app);
-            // ペインの中で `/resume` された窓を新しいセッションの行へ張り替える。
-            // **一覧の読み直しの後・名前の読み直しの前**に置く: 張り替えで作った行の
-            // 表示名は transcript から来るので、同じ周期の refresh_titles が拾う
-            follow_session_switches(app);
-            // 一覧を読み直した直後に、hook の state と transcript の表示名を載せる。
-            // **順序に意味がある**: 読み直しは丸ごとの置き換えなので、先に載せると
-            // その場で上書きされる
+            // 一覧を読み直した直後に hook の state を載せる。**順序に意味がある**:
+            // 読み直しは丸ごとの置き換えなので、先に載せるとその場で上書きされる。
+            // **張り替えより前**でもある: ペインの中で切り替わったことに気づく材料が
+            // hook の写しなので、古い写しのまま張り替えを判断させない
             adopt_hook_states(app);
+            // ペインの中で `/resume` された窓を新しいセッションの行へ張り替える。
+            // **名前の読み直しの前**に置く: 張り替えで作った行の表示名は
+            // transcript から来るので、同じ周期の refresh_titles が拾う
+            follow_session_switches(app);
             refresh_titles(app);
             app.last_scan = std::time::Instant::now();
             force_draw = true; // 並びが変わったら即描画（表示と行データのずれを残さない）
@@ -1358,14 +1373,45 @@ fn rows_dropped_while_open<'a>(
         .collect()
 }
 
-/// その pid が**今**動かしているセッション（`claude agents --json` の
-/// `~/.claude/sessions/<pid>.json` 由来）。前景（interactive）のエントリだけを見る。
+/// hook の受け渡しファイルが前回見たときから変わったか（一覧の読み直しを
+/// 周期より前へ倒す判断。副作用は「見え方を覚え直す」だけなので単体で検査できる）。
 ///
-/// pid が分からない / その pid のエントリがまだ来ていない / `sessionId` が空なら None
+/// **見え方が取れないときは前倒ししない**: 追いかけるファイルを持たない供給元
+/// （撮影用）と、まだ hook が一度も書いていない状態を同じに扱う ＝
+/// 「無い」が毎周「変わった」に化けない
+fn hook_store_changed(
+    seen: &mut Option<(u64, std::time::SystemTime)>,
+    now: Option<(u64, std::time::SystemTime)>,
+) -> bool {
+    if now.is_none() || now == *seen {
+        return false;
+    }
+    *seen = now;
+    true
+}
+
+/// その pid が**今**動かしているセッション。材料は 2 つあり、**hook が主**:
+///
+/// - **hook**（[`crate::hooks::HookStates::session_of`]）: claude は hook の子へ
+///   `CLAUDE_PID` を渡すので、記録は「どの claude が」「どのセッションで」起きたかを
+///   持っている。**turn が動いた瞬間に届く**ので、`/resume` `/clear` の張り替えを
+///   周期で待たない
+/// - **`claude agents --json`**（`~/.claude/sessions/<pid>.json` 由来）: hook を
+///   注入できていないセッションのための従経路。2 秒周期のプロセス起動で届く
+///
+/// pid が分からない / どちらにもエントリが無い / `sessionId` が空なら None
 /// （＝ 何も張り替えない。npm 版のように `claude` が中間プロセス越しに起動する
 /// 環境では自分の子の pid が載らないので、この機能は黙って効かないだけになる）
-fn live_session_of(pid: Option<u32>, agents: &[AgentInfo]) -> Option<SessionId> {
+fn live_session_of(
+    pid: Option<u32>,
+    launched_at: u64,
+    hooks: &HookStates,
+    agents: &[AgentInfo],
+) -> Option<SessionId> {
     let pid = pid?;
+    if let Some(id) = hooks.session_of(pid, launched_at) {
+        return Some(id.clone());
+    }
     agents
         .iter()
         .filter(|a| a.is_interactive() && a.pid == Some(pid))
@@ -1389,7 +1435,12 @@ fn follow_session_switches(app: &mut App) {
         .iter()
         .enumerate()
         .filter_map(|(i, window)| {
-            let next = live_session_of(window.child.process_id(), &app.agents)?;
+            let next = live_session_of(
+                window.child.process_id(),
+                window.started_at,
+                &app.hook_states,
+                &app.agents,
+            )?;
             (next != window.session_id).then_some((i, next))
         })
         .collect();
@@ -1946,10 +1997,11 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             if hit.as_ref().is_some_and(SidebarRow::selectable) {
                 app.selection = SidebarPos::Row(row);
             }
-            // 行頭の `=` クリック → コンテキストメニューを開く（記号 1 桁 +
-            // 続く空白まで当たり判定にする ＝ 1 桁だけだと突きにくい）
+            // 行末の `=` クリック → コンテキストメニューを開く。
+            // **当たり判定は描画と同じ導出**（[`menu_zone`]）なので、
+            // サイドバー幅を変えても見えている記号と押せる場所がずれない
             if let Some(RowAction::Open(id)) = &action
-                && mouse.column <= 2 {
+                && menu_zone(drawn).contains(&mouse.column) {
                     open_session_popup(app, &id.clone(), mouse.row);
                     return Ok(false);
                 }
@@ -2573,7 +2625,7 @@ fn remove_window(app: &mut App, idx: usize) {
 /// **フッターを描いていないときは一覧の中だけで巡回する** ＝ 判断はマウスの
 /// 当たり判定と同じ [`sidebar_layout`] の `footer_visible`。
 /// 触れる行が 1 つも無ければ何も動かさない（無限に回らない）
-fn move_selection(app: &mut App, dir: i32) {
+pub(crate) fn move_selection(app: &mut App, dir: i32) {
     let len = app.sidebar_rows.len() as i32;
     let account = sidebar_layout(app).footer_visible;
     // アカウント行は「一覧の末尾の 1 つ先」に居る扱い。輪の長さはその 1 行を含む
@@ -3004,7 +3056,7 @@ mod tests {
         assert_eq!(PopupKind::Group.action(2), None);
     }
 
-    /// セッション行の行頭 `=` クリックでメニューが開く（二次操作の入口）。
+    /// セッション行の**行末** `=` クリックでメニューが開く（二次操作の入口）。
     /// 開いた時点の行の状態（ピン留め・窓の有無）が写る
     #[test]
     fn clicking_the_hamburger_opens_the_session_menu() {
@@ -3015,7 +3067,8 @@ mod tests {
         }];
         app.sidebar_rows = vec![SidebarRow::Action(RowAction::Open(SessionId::new("abc123")))];
         app.sidebar_header_rows = 1;
-        handle_mouse(&mut app, &click(0, 1)).unwrap();
+        let mark_x = *menu_zone(sidebar_cols(&app)).end();
+        handle_mouse(&mut app, &click(mark_x, 1)).unwrap();
         let popup = app.popup.as_ref().expect("menu must be open");
         assert_eq!(
             popup.kind,
@@ -3906,6 +3959,11 @@ mod tests {
         // 実ファイル（`~/.ccdesk/hook-states.json`）は読まない
         fn hook_states(&self) -> HookStates {
             self.hooks.clone()
+        }
+
+        fn hook_stamp(&self) -> Option<(u64, std::time::SystemTime)> {
+            // テストの供給元はファイルを持たない（周期の前倒しは起きない）
+            None
         }
 
         fn footer(&self) -> FooterInfo {
@@ -4980,6 +5038,32 @@ mod tests {
         assert_eq!(only_row(&app).title_source, TitleSource::Custom);
     }
 
+    /// **hook が何か書いたら周期を待たずに一覧を読み直す。**
+    ///
+    /// ペインの中で `/resume` `/clear` すると claude は新しいセッションの
+    /// `SessionStart` をその場で撃つので、受け渡しファイルの見え方が変わったことが
+    /// 「一覧に新しい行を出す合図」になる。**変わっていない周は何もしない**ので、
+    /// 毎周 `claude agents --json` を起こし直すことにはならない
+    #[test]
+    fn a_hook_write_pulls_the_next_list_refresh_forward() {
+        let older = std::time::SystemTime::UNIX_EPOCH;
+        let newer = older + Duration::from_secs(1);
+        let mut seen = None;
+
+        // 初回に見えた時点で「変わった」（起動時の値は main が先に控える）
+        assert!(hook_store_changed(&mut seen, Some((10, older))));
+        assert_eq!(seen, Some((10, older)));
+        // 同じ見え方の周は何も起こさない
+        assert!(!hook_store_changed(&mut seen, Some((10, older))));
+        // 長さが動いた / 時刻が動いた のどちらでも気づく
+        assert!(hook_store_changed(&mut seen, Some((11, older))));
+        assert!(hook_store_changed(&mut seen, Some((11, newer))));
+        // 見え方が取れない供給元では前倒ししない（覚えた値も捨てない）
+        assert!(!hook_store_changed(&mut seen, None));
+        assert_eq!(seen, Some((11, newer)), "forgot the stamp when the file went missing");
+    }
+
+
     /// **`/resume` の追従は pid → sessionId の 1 つの写像で決まる。**
     /// 自分の子の pid はこちらが知っているので、その pid が今動かしている
     /// セッションと窓の指す行がずれたら張り替えの合図になる
@@ -4997,15 +5081,28 @@ mod tests {
             agent(Some(12), "bg", "a-background-job"),
             agent(Some(13), "interactive", ""),
         ];
+        // hook が何も知らない間は `agents --json` が答える（従経路）
+        let none = HookStates::default();
+        let of = |pid, hooks: &HookStates| live_session_of(pid, 0, hooks, &agents);
+        assert_eq!(of(Some(10), &none), Some(SessionId::new("after-resume")));
+        // pid が分からない / 載っていない / bg / sessionId が空 は追従しない
+        assert_eq!(of(None, &none), None);
+        assert_eq!(of(Some(99), &none), None);
+        assert_eq!(of(Some(12), &none), None, "a bg entry answered for a pane");
+        assert_eq!(of(Some(13), &none), None, "an empty id became a row");
+
+        // **hook が主。** 同じ pid について hook が別のセッションを知っていれば
+        // そちらを採る（hook は turn の瞬間に届くので `agents --json` より新しい）
+        let hooks = HookStates::from_records([("just-cleared", "blocked", 5_000, Some(10))]);
+        assert_eq!(of(Some(10), &hooks), Some(SessionId::new("just-cleared")));
+        // 窓の起動より古い hook は前回の実行のもの ＝ 従経路へ落ちる
         assert_eq!(
-            live_session_of(Some(10), &agents),
+            live_session_of(Some(10), 5_001, &hooks, &agents),
             Some(SessionId::new("after-resume"))
         );
-        // pid が分からない / 載っていない / bg / sessionId が空 は追従しない
-        assert_eq!(live_session_of(None, &agents), None);
-        assert_eq!(live_session_of(Some(99), &agents), None);
-        assert_eq!(live_session_of(Some(12), &agents), None, "a bg entry answered for a pane");
-        assert_eq!(live_session_of(Some(13), &agents), None, "an empty id became a row");
+        // hook しか知らない pid にも答える（`agents --json` が pid を載せない環境）
+        let only_hook = HookStates::from_records([("hook-only", "working", 1, Some(77))]);
+        assert_eq!(of(Some(77), &only_hook), Some(SessionId::new("hook-only")));
     }
 
     /// 張り替えたら**新しいセッションの行を用意し、次に開く画面もそれにする**。
@@ -5097,7 +5194,7 @@ mod tests {
         assert_eq!(app.sessions.len(), 1, "a row appeared without a switch");
         // 「切り替わっていない」の判定そのもの（窓が指す ID と pid の現在の ID が同じ）
         assert_eq!(
-            live_session_of(Some(4242), &app.agents),
+            live_session_of(Some(4242), 0, &app.hook_states, &app.agents),
             Some(SessionId::new("same")),
             "the pid no longer resolves to the session it was started with"
         );

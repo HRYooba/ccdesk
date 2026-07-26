@@ -36,10 +36,14 @@ Claude Desktop も同じ構造（独自の JSON ストアを一覧の正本に�
 |:--|:--|
 | 起動 | PTY で `claude --session-id <uuid> [prompt]`。**`-n <title>` は渡さない**（claude が `-n` の名前を transcript の `custom-title` として残すので、ccdesk が組んだ名前を渡すと表示名がそこで凍る）。`CLAUDE_CODE_CHILD_SESSION` / `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID` / `CLAUDECODE` / `CLAUDE_JOB_DIR` 等の継承環境変数を除去（継承すると transcript 保存が無効になる実測あり） |
 | 一覧の正本 | `~/.ccdesk/sessions.json` |
-| title の正本 | **transcript**（`custom-title` > `ai-title` > `last-prompt`）。ccdesk のリネームも同じ 1 箇所へ行く: **動いているセッションは PTY へ `/rename <名前>` を送って claude 自身に書かせ**（ペイン内の表示名も同時に変わる）、止まっているセッションだけ ccdesk が `custom-title` を追記する。ストアの `title` は表示用キャッシュ |
+| title の正本 | **transcript**（`custom-title` > `ai-title` > `last-prompt`）。ccdesk のリネームも同じ 1 箇所へ行く: **動いているセッションは PTY へ `/rename <名前>` を送って claude 自身に書かせ**（ペイン内の表示名も同時に変わる）、止まっているセッションだけ ccdesk が `custom-title` を追記する。ストアの `title` は表示用キャッシュ。**読みは初回だけ全体・以降は増えたぶんだけ**（`custom-title` は 1 度しか書かれず末尾に居るとは限らないので、末尾だけ読むと `/resume` のピッカーと名前が食い違う）|
 | state | **hooks が主・`claude agents --json` の `status` が従**。どのイベントがどの state を意味するかは `src/hooks.rs` の `HOOK_EVENTS` が正本。**要約文は出さない**（Working / Needs input / Done / Stopped の 4 つだけ） |
-| 未読 | `updated_at > last_opened_at`。行頭のメニュー記号の右に `●` |
+| ペイン内の切り替え | `/resume` `/clear` は claude の中で起きるので ccdesk は関与しない。**気づく口は hook**: hook の記録に「その時点の `session_id`」と「呼んだ claude の pid（`CLAUDE_PID`）」が載るので、自分の子の pid で引けば今どの会話を動かしているかが分かる。受け渡しファイルの更新に気づいたら周期を待たずに一覧を読み直す。pid が載らない環境では `claude agents --json` の従経路へ落ちる |
+| 未読 | `updated_at > last_opened_at`。行頭 2 桁目に `●` |
+| 行の見た目 | 行頭 1 桁目 `❯` ＝ **ペインに出ている行**（名前も太字）、2 桁目 `●` ＝ 未読、次が状態アイコン。行末が `=`（メニュー）。**帯（背景）は選択とホバー、前景の強調は選択だけ**なので、選択・ホバー・ペインに出ているの 3 つが重なっても読める（印は色ではなく文字なので配色に依らない） |
+| 選択とペイン | **開く操作のときだけ選択がペインへ揃う**（クリック・メニューの `open`・新規起動・ペイン内の `/resume`）。`↑↓` で選択だけを動かしてもペインは変わらない |
 | メニュー | `open` / `pin` / `mark as read` / `rename` / `stop`（プロセスを止める・行は残る）/ `close`（一覧から外す・会話ログは残る） |
+| pin | 行を**一覧先頭の `pinned` 節へ移す**（元のグループには残らない ＝ 同じ行が 2 箇所に出ない）。0 本なら節ごと出ない。グルーピング（state / directory）に関係なく同じ位置。**行にアイコンは足さない**（節に入っていること自体が表示）。集計（`N awaiting input · …`）には数える ＝ pin は隠す操作ではないので、見えている行と数が合う |
 | ショートカット | `Ctrl+S` `Ctrl+X` を撤去。予約は `Ctrl+Q` と `Alt+←→` のみ |
 | `close` の意味 | ccdesk の一覧から外すだけ。`~/.claude/projects/**/*.jsonl` は消さない（だから「削除」とは呼ばない） |
 | 失うもの | ccdesk 終了で全セッション終了（行は残り再開できる）/ 外部からの `claude attach` 不可 / PR番号による Ready for review |
@@ -73,9 +77,10 @@ flowchart LR
     end
     ccdesk -->|PTY: claude --session-id uuid --settings 注入| child[claude 前景プロセス]
     child --> jsonl[(~/.claude/projects/**/*.jsonl<br/>transcript / 削除しない)]
-    child -->|hooks: ccdesk hook イベント| hookstates[(~/.ccdesk/hook-states.json<br/>state の受け渡し)]
+    child -->|hooks: ccdesk hook イベント<br/>session_id + CLAUDE_PID| hookstates[(~/.ccdesk/hook-states.json<br/>state の受け渡し)]
     hookstates --> rows
     hookstates --> store
+    hookstates -->|pid → 今動かしている会話| rows
     jsonl -->|title| store
     agents[claude agents --json] -->|status: hook が来ない行だけ| rows
     store --> rows

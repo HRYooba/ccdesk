@@ -26,21 +26,48 @@ use crate::theme::{
 };
 use crate::ui::new_view::draw_new_view;
 
-/// 未読マーカー（行頭のメニュー記号の右）。**既読も同じ幅を取る**ので、
-/// 未読が付いたり消えたりしても名前の開始桁が動かない。
+/// **セッション行の行頭に縦に並ぶ 2 つの印。** どちらも「点いているか」を答えるだけの
+/// 1 桁で、消えている側も同じ幅の空白を取る ＝ 印が付いたり消えたりしても
+/// 名前の開始桁が動かない。
 ///
-/// **状態ラベルの前ではなく行頭に置く**のが判断: 未読は「この行に新しいことが
-/// あるか」の印なので、行を縦に流し読みするときに 1 つの桁に揃っている方が拾える
-/// （状態ラベルの前だと名前の長さで印の位置が毎行変わる）
-const UNREAD_MARK: &str = "● ";
-const READ_MARK: &str = "  ";
+/// **状態ラベルの前ではなく行頭に置く**のが判断: 印が答えるのは「この行はどうか」
+/// なので、行を縦に流し読みするときに 1 つの桁へ揃っている方が拾える
+/// （名前の後ろに置くと名前の長さで印の位置が毎行変わる）。
+///
+/// **ピン留めはここに印を持たない**: pin した行は [`PINNED_TITLE`] の節へ移るので、
+/// 節に入っていること自体が表示になる（同じ知識を印と並びの 2 箇所に持たない）。
+///
+/// **記号は East Asian Width が Ambiguous でないものを選ぶ**（[`MENU_MARK`] の判断と
+/// 同じ理由: 幅が端末次第で 1 桁にも 2 桁にもなる記号を桁の前提に乗せない）。
+/// 幅 1 桁であることはテストが固定する。
+///
+/// 1 桁目: **その行が今ペインに出ているか**（`❯` U+276F ＝ ペインが指している行）
+const OPEN_MARK: &str = "❯";
+const CLOSED_MARK: &str = " ";
+/// 2 桁目: 未読（見ていない間にその行が動いた）
+const UNREAD_MARK: &str = "●";
+const READ_MARK: &str = " ";
 
-fn unread_mark(unread: bool) -> &'static str {
-    if unread {
-        UNREAD_MARK
-    } else {
-        READ_MARK
-    }
+/// ピン留めした行を集める節の見出し。**グルーピング（state / directory）に
+/// 関係なく同じ位置（一覧の先頭）に出る**ので、pin の効き方が
+/// 「どう並べているか」で変わらない
+const PINNED_TITLE: &str = "pinned";
+
+/// 行頭が食う桁 ＝ 印 2 つ + 状態アイコン + 名前との間の空白。
+/// **[`row_body`] の予算と [`crate::app::MIN_SIDEBAR`] の根拠がこの値に乗る**ので、
+/// 行頭に何かを足したらテスト（`the_row_head_marks_are_one_column_wide`）が落ちる
+const HEAD_COLS: usize = 4;
+
+/// 名前に最低限残す桁（詰め切ったサイドバーでも行を見分けられる下限）
+const MIN_NAME_COLS: usize = 4;
+
+/// **セッション行 1 本が要る内側の桁数**（行頭 + 名前の下限 + 行末のメニュー）。
+/// [`crate::app::MIN_SIDEBAR`] はこれに枠の 2 桁を足したもの ＝
+/// **桁の予算を持っているのはこの 1 箇所だけ**で、下限の値を別に書き写さない
+pub(crate) const MIN_ROW_COLS: u16 = (HEAD_COLS + MIN_NAME_COLS + MENU_COLS) as u16;
+
+fn mark(on: bool, yes: &'static str, no: &'static str) -> &'static str {
+    if on { yes } else { no }
 }
 
 /// 1 行に出す状態を決める。**hook が主、`agents --json` が従**
@@ -162,7 +189,12 @@ fn separator_text(inner_width: u16) -> String {
     "─".repeat(inner_width as usize)
 }
 
-/// 行頭のメニュー記号（クリックで二次操作のメニューが開く）。
+/// **行末のメニュー記号**（クリックで二次操作のメニューが開く）。
+///
+/// **右端に置くのが判断**: 行頭は「その行がどうか」を答える印
+/// （[`OPEN_MARK`] 他）の場所で、押すと別の画面が出る入口を同じ並びに混ぜると、
+/// 読む場所と押す場所が同じ桁に重なる。当たり判定は [`menu_zone`] が
+/// 描画と同じ桁から導く。
 ///
 /// **ASCII を選んだのは桁の曖昧さを消すため。** 以前使っていたハンバーガー記号
 /// （U+2630）は East Asian Ambiguous ＝ 幅の判定が端末とフォント設定で
@@ -171,10 +203,20 @@ fn separator_text(inner_width: u16) -> String {
 /// **行全体が横へずれる**。`=` なら常に 1 桁で、前提そのものが消える
 const MENU_MARK: &str = "=";
 
-/// 名前の変更中の行の先頭。**通常の行と同じ「記号 + 空白」から始める**ので、
-/// 編集に入っても名前の桁が横へ動かない（[`MENU_MARK`] と対であることと
-/// 表示幅 2 桁であることはテストで固定する ＝ カーソル位置がこれに乗っている）
-const RENAME_PREFIX: &str = "= ";
+/// 行末のメニューが食う桁（記号 + その左の空白）。
+/// **左の空白まで数えるのは、記号 1 桁だけだと突きにくいため**で、
+/// 当たり判定（[`menu_zone`]）も同じ 2 桁を取る
+const MENU_COLS: usize = 2;
+
+/// 行末のメニュー記号の当たり判定（画面の桁）。**描画と同じ導出**なので、
+/// 見えている記号と押せる場所がずれない。
+///
+/// 記号は枠の内側の右端 ＝ サイドバーの右枠線の 1 桁手前で、その左の空白も含める
+/// （[`MENU_COLS`]）。サイドバー幅を変えるつかみ代（右枠線の 2 桁）とは重ならない
+pub(crate) fn menu_zone(sidebar_cols: u16) -> std::ops::RangeInclusive<u16> {
+    let right = sidebar_cols.saturating_sub(2);
+    right.saturating_sub(MENU_COLS as u16 - 1)..=right
+}
 
 /// 更新マーカー。**表示幅は実測 1 桁**（U+27F3 / unicode-width 0.2.2 で `1`）。
 /// 1 桁だと分かっているので、更新が無い行はスペース 1 個で同じ桁を確保できる。
@@ -448,6 +490,154 @@ fn clip_to_width(s: &str, width: u16) -> String {
         used += w;
     }
     out
+}
+
+/// **サイドバーの行がどう光るか。** 3 つの状態を 1 つの型に集めてあるので、
+/// 行の種類ごとに「どこが光るか」を書き分けない（判定は [`Look::at`] 1 箇所）。
+///
+/// 見分け方は 3 つとも別の手段に割り当ててある:
+///
+/// - ホバー ＝ 帯（背景 `hl_bg`）
+/// - 選択 ＝ 帯 + 前景 `emph`
+/// - ペインに出ている ＝ 行頭 1 桁目の [`OPEN_MARK`] と名前の太字
+///
+/// **帯と印は別の軸**なので、開いている行を選択してホバーした場合も
+/// 「帯 + 前景の強調 + `❯` + 太字」で 3 つとも同時に読める。
+/// 色だけに頼らない区別（記号・太字）を入れてあるのは、帯の色差は
+/// 端末の配色によっては潰れるため
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Look {
+    /// 選択かホバーが指している ＝ 「今ここ」の帯
+    band: bool,
+    /// 選択（帯の中でホバーと区別する前景の強調）
+    selected: bool,
+    /// 今ペインに出ている行
+    open: bool,
+}
+
+impl Look {
+    /// その位置の見た目。`open` は一覧の行だけが持つ（飾りやアカウント行は false）
+    fn at(app: &App, pos: SidebarPos, open: bool) -> Self {
+        Self {
+            band: app.selection == pos || app.hovered == Some(pos),
+            selected: app.selection == pos,
+            open,
+        }
+    }
+
+    /// 帯をスタイルへ載せる。**どこがどう光るかの規則はここ 1 箇所**
+    fn band(self, style: Style) -> Style {
+        if !self.band {
+            return style;
+        }
+        let style = style.bg(ui().hl_bg);
+        if self.selected {
+            style.fg(ui().emph)
+        } else {
+            style
+        }
+    }
+}
+
+/// 一覧に積むセッション行 1 本ぶんの表示材料（[`draw`] が行データから組む）。
+///
+/// **描画に要るものだけを持つ**ので、行の見た目は [`session_row_line`] だけで
+/// 決まる ＝ 窓（PTY）を起こさずに見た目を検査できる
+struct RowData {
+    action: RowAction,
+    group: Group,
+    cwd: String,
+    glyph: &'static str,
+    color: Color,
+    label: String,
+    /// 今ペインに出ている行（[`Look::open`] の材料）
+    is_active_window: bool,
+    /// 未読（[`crate::sessions::SessionRow::unread`]）＝ 行頭 2 桁目の `●`
+    unread: bool,
+    status_label: &'static str,
+    age: String,
+    bucket: Bucket,
+    /// ピン留め（[`PINNED_TITLE`] の節へ移す）
+    pinned: bool,
+    /// 名前の変更中なら入力中の文字列。**行そのものが入力欄に化ける**
+    /// （[`crate::app::Rename`]）ので、ここが Some の行は通常の描画をしない
+    editing: Option<String>,
+}
+
+/// セッション行 1 本の見た目。**行の組み立てはここ 1 箇所**なので、
+/// 帯（選択・ホバー）と印（ペインに出ている）の重なり方も含めて
+/// [`Frame`] を用意せずに検査できる
+fn session_row_line(d: &RowData, look: Look, inner_width: u16) -> Line<'static> {
+    // 行頭の 2 つの印 + 状態アイコン + 空白（消えている側も同じ幅を取る）
+    let head = vec![
+        Span::styled(
+            mark(look.open, OPEN_MARK, CLOSED_MARK),
+            Style::default().fg(ui().emph).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            mark(d.unread, UNREAD_MARK, READ_MARK),
+            Style::default().fg(ui().emph),
+        ),
+        Span::styled(d.glyph, Style::default().fg(d.color)),
+        Span::raw(" "),
+    ];
+    // 名前の変更中は行そのものが入力欄。**行頭は通常の行と同じものを描く**ので
+    // 名前の桁が編集の出入りで動かない
+    if let Some(text) = &d.editing {
+        let mut spans = head;
+        spans.push(Span::raw(text.clone()));
+        return Line::from(spans).style(Style::default().bg(ui().hl_bg).fg(ui().emph));
+    }
+    let name_style = if look.open {
+        Style::default().fg(ui().emph).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let (name, gap, tail) = row_body(&d.label, d.status_label, &d.age, inner_width);
+    let mut spans = head;
+    spans.push(Span::styled(name, name_style));
+    spans.push(Span::raw(gap));
+    // 狭い行では右で切れる（[`row_body`]）ので、区切りが残っているときだけ
+    // 状態と経過を別の色で出す。切れた断片はまとめて状態の色で出す
+    match tail.split_once(" · ") {
+        Some((status, age)) => {
+            spans.push(Span::styled(status.to_string(), Style::default().fg(d.color)));
+            spans.push(Span::raw(" · "));
+            spans.push(Span::styled(age.to_string(), Style::default().fg(ui().dim)));
+        }
+        None => spans.push(Span::styled(tail, Style::default().fg(d.color))),
+    }
+    // 行末のメニュー記号（当たり判定は [`menu_zone`] が同じ桁から導く）
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        MENU_MARK,
+        Style::default().fg(if look.band { ui().emph } else { MUTED_FG }),
+    ));
+    Line::from(spans).style(look.band(Style::default()))
+}
+
+/// セッション行の桁割り（名前・詰め物・右寄せの状態ラベル）。
+/// **行の予算はここ 1 箇所**で決まり、描画もテストも同じ答えを読む。
+///
+/// 予算は「内側の幅 - 行頭 [`HEAD_COLS`] - 行末のメニュー [`MENU_COLS`]」。
+///
+/// **桁の取り合いは名前が先**（メニュー記号を右端へ移す前と同じ優先）。
+/// 名前は必ず隙間 1 桁を残し、`<状態> · <経過>` は残った桁に収める ＝
+/// 長い名前の行では経過・状態の側が右で切れる。名前を先に切ると
+/// **どの行なのかが読めなくなる**ので、削るのは常に右側から。
+///
+/// 3 つを合わせると必ず予算ちょうどの桁になるので、**メニュー記号は常に
+/// 内側の右端に来る**（[`menu_zone`] の当たり判定が成り立つ前提）
+fn row_body(label: &str, status: &str, age: &str, inner_width: u16) -> (String, String, String) {
+    use unicode_width::UnicodeWidthStr;
+    let body = (inner_width as usize).saturating_sub(HEAD_COLS + MENU_COLS);
+    let name = clip_to_width(label, body as u16);
+    // 残りに `<状態> · <経過>` を入れる（名前との間に隙間 1 桁を必ず挟む）。
+    // 隙間ぶんも取れない幅なら状態は出さず、名前が予算を使い切る
+    let left = body - name.width();
+    let tail = clip_to_width(&format!("{status} · {age}"), left.saturating_sub(1) as u16);
+    let gap = body - name.width() - tail.width();
+    (name, " ".repeat(gap), tail)
 }
 
 /// 未保管警告のマーカー。**表示幅は実測 1 桁**（U+26A0 / unicode-width 0.2.2 で `1`。
@@ -730,25 +920,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     let active = app.active;
 
     // ---- 行データを先に組み立てる（State / Directory 両グルーピング対応）----
-    struct RowData {
-        action: RowAction,
-        group: Group,
-        cwd: String,
-        glyph: &'static str,
-        color: Color,
-        label: String,
-        is_active_window: bool,
-        /// 未読（[`crate::sessions::SessionRow::unread`]）＝ 行頭のメニュー記号の右に `●`
-        unread: bool,
-        status_label: &'static str,
-        age: String,
-        bucket: Bucket,
-        /// ピン留め（グループ内で先頭へ寄せる）
-        pinned: bool,
-        /// 名前の変更中なら入力中の文字列。**行そのものが入力欄に化ける**
-        /// （[`crate::app::Rename`]）ので、ここが Some の行は通常の描画をしない
-        editing: Option<String>,
-    }
     // 公式の Working スピナーは点滅アニメ
     let spinner = if (now_ms / 400).is_multiple_of(2) { "✽" } else { "✻" };
     // 公式準拠: 形状 = プロセス生死（✻ 生存 / ∙ 終了）、Working は点滅
@@ -826,65 +997,19 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     }
 
     // ---- 描画 ----
-    // ハイライトの規則はこれ 1 つ: 選択かホバーがその位置を指していれば光る。
+    // 行の見え方の規則は [`Look`] 1 つ（帯 = 選択・ホバー / 印 = ペインに出ている）。
     // **一覧の行（下）とフッターのアカウント行（末尾）が同じ規則を読む**ので、
     // 「どこが光るか」の知識が 2 箇所に分かれない
-    let (selection, hovered) = (app.selection, app.hovered);
-    let is_highlighted = |pos: SidebarPos| selection == pos || hovered == Some(pos);
+    let inner_width = chunks[0].width.saturating_sub(2);
     let mut items: Vec<ListItem> = Vec::new();
     let mut rows: Vec<SidebarRow> = Vec::new();
 
-    let push_data_row =
-        |items: &mut Vec<ListItem>, rows: &mut Vec<SidebarRow>, d: &RowData| {
-            let cur = rows.len();
-            let highlighted = is_highlighted(SidebarPos::Row(cur));
-            let mut line_style = Style::default();
-            if highlighted {
-                line_style = line_style.bg(ui().hl_bg).fg(ui().emph);
-            }
-            // 名前の変更中は行そのものが入力欄。**アクションは残す**
-            // （行数と当たり判定を通常時と揃える ＝ 編集中に一覧の座標がずれない）
-            if let Some(text) = &d.editing {
-                items.push(ListItem::new(
-                    Line::from(format!("{RENAME_PREFIX}{text}"))
-                        .style(line_style.bg(ui().hl_bg).fg(ui().emph)),
-                ));
-                rows.push(SidebarRow::Action(d.action.clone()));
-                return;
-            }
-            let name_style = if d.is_active_window {
-                Style::default().fg(ui().emph).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            let mut spans = vec![
-                Span::styled(
-                    MENU_MARK,
-                    Style::default().fg(if highlighted {
-                        ui().emph
-                    } else {
-                        MUTED_FG
-                    }),
-                ),
-                Span::raw(" "),
-                // 未読マーカー。既読も同じ幅なので**名前の開始桁は動かない**
-                Span::styled(unread_mark(d.unread), Style::default().fg(ui().emph)),
-                Span::styled(d.glyph, Style::default().fg(d.color)),
-                Span::raw(" "),
-                Span::styled(d.label.clone(), name_style),
-                Span::raw(" "),
-                Span::styled(d.status_label, Style::default().fg(d.color)),
-            ];
-            spans.push(Span::raw(" · "));
-            spans.push(Span::styled(
-                d.age.clone(),
-                Style::default().fg(ui().dim),
-            ));
-            items.push(ListItem::new(Line::from(spans).style(line_style)));
-            rows.push(SidebarRow::Action(d.action.clone()));
-        };
-
-    let inner_width = chunks[0].width.saturating_sub(2);
+    let push_data_row = |items: &mut Vec<ListItem>, rows: &mut Vec<SidebarRow>, d: &RowData| {
+        let cur = rows.len();
+        let look = Look::at(app, SidebarPos::Row(cur), d.is_active_window);
+        items.push(ListItem::new(session_row_line(d, look, inner_width)));
+        rows.push(SidebarRow::Action(d.action.clone()));
+    };
 
     // 先頭: ccdesk / claude の版行と区切り線。更新があるときだけ行全体がクリック可
     for (text, style, row) in version_rows(
@@ -897,8 +1022,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         let mut style = style;
         // ハイライトの条件は他の行と同じ「実体のある行か」だけ
         // （更新が無い版行も選択・ホバーできる ＝ 触れる行と光る行がずれない）
-        if row.selectable() && is_highlighted(SidebarPos::Row(cur)) {
-            style = style.bg(ui().hl_bg).fg(ui().emph);
+        if row.selectable() {
+            style = Look::at(app, SidebarPos::Row(cur), false).band(style);
         }
         items.push(ListItem::new(Line::from(text).style(style)));
         rows.push(row);
@@ -907,11 +1032,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // 新規セッション
     {
         let cur = rows.len();
-        let highlighted = is_highlighted(SidebarPos::Row(cur));
-        let mut style = Style::default();
-        if highlighted {
-            style = style.bg(ui().hl_bg).fg(ui().emph);
-        }
+        let style = Look::at(app, SidebarPos::Row(cur), false).band(Style::default());
         items.push(ListItem::new(Line::from("+ new session").style(style)));
         rows.push(SidebarRow::Action(RowAction::New));
     }
@@ -923,11 +1044,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // グルーピング切替（クリックで state ⇔ directory）
     {
         let cur = rows.len();
-        let highlighted = is_highlighted(SidebarPos::Row(cur));
-        let mut style = Style::default().fg(ui().dim);
-        if highlighted {
-            style = style.bg(ui().hl_bg).fg(ui().emph);
-        }
+        let style = Look::at(app, SidebarPos::Row(cur), false).band(Style::default().fg(ui().dim));
         let chosen = if app.grouping == Grouping::State {
             "state"
         } else {
@@ -954,60 +1071,71 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // （ヒットテストとスクロール計算が読む。定数と二重管理にしない）
     let header_n = rows.len();
 
-    // 見出しの下に並べる順。**ピン留めが先頭**で、それ以外は元の並びのまま
-    // （安定ソートなので、ピン留め以外の相対順は動かない ＝ 並び替えの知識を
-    // 増やさずに「ピンは上」だけを足す）
-    fn ordered(mut members: Vec<&RowData>) -> Vec<&RowData> {
-        members.sort_by_key(|d| !d.pinned);
-        members
-    }
+    // 節 1 つ（空行 + 見出し + 行）を積む。**節の積み方はここ 1 箇所**なので、
+    // pin の節もグループの節も見出しの見え方と行数が揃う
+    let push_section = |items: &mut Vec<ListItem>,
+                            rows: &mut Vec<SidebarRow>,
+                            title: &str,
+                            members: &[&RowData]| {
+        if members.is_empty() {
+            return;
+        }
+        items.push(ListItem::new(Line::from("")));
+        rows.push(SidebarRow::Decoration);
+        items.push(ListItem::new(
+            Line::from(title.to_string()).style(Style::default().fg(ui().dim)),
+        ));
+        rows.push(SidebarRow::Decoration);
+        for d in members {
+            push_data_row(items, rows, d);
+        }
+    };
+
+    // **ピン留めした行は一覧の先頭の節へ「移す」**（グループには残さない ＝
+    // 同じ行が 2 箇所に出ない）。行に印を足すのではなく節ごと分けるのは
+    // Claude Desktop と同じ形で、**pin が 0 本なら節ごと出ない**。
+    //
+    // グルーピング（state / directory）より先に分けるので、**どちらの並べ方でも
+    // pin の節は同じ位置**に出る（pin の効き方が並べ方で変わらない）
+    let (pinned, unpinned): (Vec<&RowData>, Vec<&RowData>) =
+        data.iter().partition(|d| d.pinned);
+    push_section(&mut items, &mut rows, PINNED_TITLE, &pinned);
     match app.grouping {
         Grouping::State => {
             for group in [Group::NeedsInput, Group::Working, Group::Completed] {
-                let members = ordered(data.iter().filter(|d| d.group == group).collect());
-                if members.is_empty() {
-                    continue;
-                }
-                items.push(ListItem::new(Line::from("")));
-                rows.push(SidebarRow::Decoration);
-                items.push(ListItem::new(
-                    Line::from(group.title()).style(Style::default().fg(ui().dim)),
-                ));
-                rows.push(SidebarRow::Decoration);
-                for d in members {
-                    push_data_row(&mut items, &mut rows, d);
-                }
+                let members: Vec<&RowData> = unpinned
+                    .iter()
+                    .copied()
+                    .filter(|d| d.group == group)
+                    .collect();
+                push_section(&mut items, &mut rows, group.title(), &members);
             }
         }
         Grouping::Directory => {
             // 見出しに出すフォルダと並びの決定は project_rows に閉じている。
             // 選択・stop・close 等の操作では並び替えない
-            let cwds: Vec<&str> = data.iter().map(|d| d.cwd.as_str()).collect();
+            // **見出しに出すのは pin の節へ移していない行の cwd**（pin した行は
+            // 上の節に出ているので、その行だけのためにフォルダの見出しは作らない）
+            let cwds: Vec<&str> = unpinned.iter().map(|d| d.cwd.as_str()).collect();
             // セッション行の振り分けキーも**行ごとに 1 度だけ**作る（見出し × 行の
             // 総当たりになるので、突き合わせのたびに作ると描画 1 回で数千の String に
             // なる。見出し側のキーは project_rows が持っている）
-            let data_keys: Vec<String> = data.iter().map(|d| dir_key_of(&d.cwd)).collect();
+            let data_keys: Vec<String> = unpinned.iter().map(|d| dir_key_of(&d.cwd)).collect();
             for row in project_rows(&app.projects, &cwds) {
                 items.push(ListItem::new(Line::from("")));
                 rows.push(SidebarRow::Decoration);
                 let cur = rows.len();
-                let highlighted = is_highlighted(SidebarPos::Row(cur));
-                let mut style = Style::default().fg(ui().dim);
-                if highlighted {
-                    style = style.bg(ui().hl_bg).fg(ui().emph);
-                }
+                let style =
+                    Look::at(app, SidebarPos::Row(cur), false).band(Style::default().fg(ui().dim));
                 items.push(ListItem::new(Line::from(row.heading).style(style)));
                 rows.push(SidebarRow::Action(RowAction::Project(row.cwd)));
                 // 配下のセッション行。見出しの一覧と同じ同一判定キーで振り分ける
                 // （ここだけ厳密一致にすると大小違いのセッションが行き場を失う）
-                let members = ordered(
-                    data.iter()
-                        .zip(&data_keys)
-                        .filter(|(_, key)| **key == row.key)
-                        .map(|(d, _)| d)
-                        .collect(),
-                );
-                for d in members {
+                for (d, _) in unpinned
+                    .iter()
+                    .zip(&data_keys)
+                    .filter(|(_, key)| **key == row.key)
+                {
                     push_data_row(&mut items, &mut rows, d);
                 }
             }
@@ -1020,6 +1148,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     let capacity = sl.capacity;
     app.sidebar_rows = rows;
     app.sidebar_header_rows = header_n;
+    follow_pane(app, app.shown_session().cloned());
     // 選択が浮いたら（行構成が変わった / 狭くてフッターが消えた）先頭の
     // 触れる行へ寄せる。**実体の無い位置に選択を残さない**
     let selection_lost = match app.selection {
@@ -1079,10 +1208,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // （スクロールで見えていない行の位置へカーソルだけが飛ぶと、IME の変換窓が
     // 無関係な場所に開く。判断は描画の絞り込みと同じ [`row_visible`]）
     let rename_cursor = app.rename.as_ref().and_then(|rename| {
-        use unicode_width::UnicodeWidthStr;
         let row = row_of_session(&app.sidebar_rows, &rename.id)?;
         row_visible(row, header_n, scroll, tail_capacity).then(|| {
-            let x = chunks[0].x + 1 + RENAME_PREFIX.width() as u16;
+            // 入力欄は通常の行と同じ行頭の後ろから始まる（[`HEAD_COLS`]）
+            let x = chunks[0].x + 1 + HEAD_COLS as u16;
             FrameCursor::shown_at(Position::new(
                 // 入力が枠を越えたらカーソルは内側の右端で止める（枠の外へ出さない）
                 x.saturating_add(rename.field.cursor_x())
@@ -1116,9 +1245,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         );
         // 選択中・ホバー中は一覧の行とまったく同じ見え方にする
         // （キーボードで降りてもマウスを乗せても「今ここ」が同じ帯で分かる）
-        if is_highlighted(SidebarPos::Account) {
-            account_style = account_style.bg(ui().hl_bg).fg(ui().emph);
-        }
+        account_style = Look::at(app, SidebarPos::Account, false).band(account_style);
         // **スタイルは `Line` ではなく `Paragraph` へ載せる。** `Paragraph` は
         // 自分のスタイルを矩形全体へ塗ってから文字を書くので、帯が一覧の行と同じ
         // 行幅いっぱいまで伸びる。`Line` に載せると塗られるのは文字が占める桁だけで、
@@ -1147,6 +1274,40 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     draw_popup(frame, app);
     // 名前の入力中はそこが打鍵の宛先なので、右ペインのカーソルより優先する
     rename_cursor.unwrap_or(cursor)
+}
+
+/// **ペインが指すセッションの行へ選択を寄せる。**
+///
+/// 揃えるのは「開く操作が起きたとき」だけ ＝ ペインが指すセッションが**変わった
+/// フレーム**でしか動かさないので、`↑↓` で選択だけを動かしている間は触らない
+/// （選択とペインは別物のまま。逆向き ＝ 選択がペインを動かすことも無い）。
+///
+/// **判断をここ 1 箇所に置けるのが要点**: 開く経路は 4 つある（行のクリック /
+/// 選択行のメニューの `open` / `+ new session` からの起動 / ペインの中の
+/// `/resume` による張り替え）が、どれも最後は「ペインが指すセッション」に
+/// 集まるので、経路ごとに選択を動かす処理を足さなくていい。
+///
+/// **名前の入力中は動かさない**（確定の宛先である行から選択が離れると、
+/// 何を編集しているのかが画面から読めなくなる）。行がまだ積まれていない周期
+/// （一覧の読み直しが追いついていない）も見送り、次のフレームで揃える。
+///
+/// `shown` は今ペインが指しているセッション（[`App::shown_session`]）。引数で
+/// 受けるのは**窓（PTY）を起こさずに追従の規則そのものを検査できる**ようにするため
+fn follow_pane(app: &mut App, shown: Option<SessionId>) {
+    if shown == app.pane_shown || app.rename.is_some() {
+        return;
+    }
+    let Some(id) = &shown else {
+        // ペインがセッションを出していない（新規セッション画面）＝ 揃える先が無い
+        app.pane_shown = None;
+        return;
+    };
+    if let Some(row) = row_of_session(&app.sidebar_rows, id) {
+        app.selection = SidebarPos::Row(row);
+        // 選択が表示窓の外にあってもスクロールで見える位置まで連れてくる
+        app.sidebar_follow_sel = true;
+        app.pane_shown = shown;
+    }
 }
 
 /// そのセッションの行 index（[`RowAction::Open`] を持つ行）。
@@ -1325,50 +1486,91 @@ mod tests {
     /// 既定のサイドバー幅（34 桁）の内側。版行の幅の予算はこの桁数
     const DEFAULT_INNER: u16 = 32;
 
-    /// 行頭に置く記号の表示幅は 1 桁。**この 1 という実測値に設計が乗っている**:
-    /// 更新が無い版行はスペース 1 個でマーカー桁を確保しており、2 桁なら桁がずれる。
+    /// **行の桁の前提はすべて「記号 1 桁」に乗っている。**
     ///
-    /// メニュー記号が ASCII なのはこの前提を測らずに済ませるため
-    /// （U+2630 は East Asian Ambiguous で、端末によって 1 桁にも 2 桁にもなる）。
-    /// 名前の変更中の行頭はその記号と対で、通常の行と同じ桁から名前が始まる
+    /// 行頭の 2 つの印は消えている側を同じ幅の空白で確保しており、行末の
+    /// メニュー記号は内側の右端に置く（当たり判定がその桁を指す）。どれかが
+    /// 2 桁になると行全体が横へずれるので、幅はここで実測して固定する。
+    /// East Asian Ambiguous な記号は端末とフォント設定で 1 桁にも 2 桁にもなるため
+    /// 選ばない（`=` が ASCII なのはこの前提を測らずに済ませるため）。
+    ///
+    /// **[`HEAD_COLS`] / [`MENU_COLS`] / [`MIN_SIDEBAR`] の足し算もここで検算する**
+    /// ので、行頭や行末に何かを足したらこのテストが落ちる
     #[test]
     fn the_row_head_marks_are_one_column_wide() {
+        use crate::app::MIN_SIDEBAR;
         use unicode_width::UnicodeWidthStr;
-        assert_eq!(UPDATE_MARK.width(), 1, "⟳ is not 1 column wide");
+        assert_eq!(UPDATE_MARK.width(), 1, "the update mark is not 1 column wide");
         assert_eq!(MENU_MARK.width(), 1, "the menu mark is not 1 column wide");
         assert!(MENU_MARK.is_ascii(), "reverted to an ambiguous-width mark");
+        // 行頭の印は点/消の両方が同じ 1 桁
+        for (on, off) in [(OPEN_MARK, CLOSED_MARK), (UNREAD_MARK, READ_MARK)] {
+            assert_eq!(on.width(), 1, "{on:?} is not 1 column wide");
+            assert_eq!(off.width(), 1, "{off:?} is not 1 column wide");
+            assert!(off.trim().is_empty(), "a character is showing in the empty slot: {off:?}");
+        }
+        // 行頭 = 印 2 つ + 状態アイコン 1 + 空白 1
         assert_eq!(
-            RENAME_PREFIX,
-            format!("{MENU_MARK} "),
-            "the renaming row head is out of step with a normal row"
+            HEAD_COLS,
+            OPEN_MARK.width() + UNREAD_MARK.width() + 1 + 1,
+            "the row head budget is out of step with the marks"
         );
-        assert_eq!(RENAME_PREFIX.width(), 2);
+        // 行末 = 空白 1 + メニュー記号
+        assert_eq!(MENU_COLS, 1 + MENU_MARK.width(), "the menu budget changed");
+        // 一番狭いサイドバーでも名前に [`MIN_NAME_COLS`] 桁が残る（下限の根拠）
+        assert_eq!(
+            usize::from(MIN_ROW_COLS),
+            HEAD_COLS + MIN_NAME_COLS + MENU_COLS,
+            "the row budget is out of step with its parts"
+        );
+        assert_eq!(MIN_SIDEBAR, MIN_ROW_COLS + 2, "the sidebar floor lost the border columns");
+        // 下限の幅で描いても名前に [`MIN_NAME_COLS`] 桁が残る（式ではなく実物で見る）
+        let (name, _, _) = row_body(
+            &"n".repeat(30),
+            "Working",
+            "3m",
+            MIN_SIDEBAR - 2,
+        );
+        assert_eq!(name.width(), MIN_NAME_COLS, "the narrowest sidebar lost the name column");
     }
 
-    /// **未読マーカーは既読と同じ幅を取る。** 幅が違うと、未読が付いたり消えたり
-    /// するたびに名前が横へずれる（行が変わったこと自体が読み取りにくくなる）
+    /// **メニュー記号は内側の右端で、当たり判定はそこと左隣の空白。**
+    /// 描画とヒットテストが別々の桁を持つと「見えているのに押せない」が起きる
     #[test]
-    fn the_unread_marker_and_its_empty_slot_are_the_same_width() {
+    fn the_menu_mark_sits_at_the_right_edge_where_the_click_lands() {
         use unicode_width::UnicodeWidthStr;
-        assert_eq!(unread_mark(true), UNREAD_MARK);
-        assert_eq!(unread_mark(false), READ_MARK);
+        let mut app = App {
+            term_size: (60, 40),
+            sidebar_width: 34,
+            sessions: vec![named_session("a", "C:\\dev\\api", "some-session")],
+            ..Default::default()
+        };
+        let line = session_lines(&mut app)
+            .into_iter()
+            .find(|line| line.contains("some-session"))
+            .expect("no session row");
+        assert!(line.ends_with(MENU_MARK), "the menu mark is not at the end: {line:?}");
+        // 行は内側の幅ちょうど（＝ 記号は内側の右端の桁に来る）
+        let drawn = crate::app::sidebar_cols(&app);
         assert_eq!(
-            UNREAD_MARK.width(),
-            READ_MARK.width(),
-            "unread and read marks differ in width: {UNREAD_MARK:?} / {READ_MARK:?}"
+            line.width(),
+            usize::from(drawn - 2),
+            "the row does not fill the inner width: {line:?}"
         );
-        assert!(READ_MARK.trim().is_empty(), "a character is showing in the read slot");
+        // 当たり判定はその桁（枠の 1 桁内側から数えて内側の右端）と左隣を含む
+        let zone = menu_zone(drawn);
+        assert_eq!(*zone.end(), drawn - 2, "the click zone is not where the mark is drawn");
+        // 幅を変えるつかみ代（右枠線の 2 桁）とは重ならない
+        assert!(*zone.end() < drawn - 1, "the menu zone overlaps the resize grip");
+        assert_eq!(zone.count(), MENU_COLS, "the click zone is not the drawn width");
     }
 
-    /// **未読の印は行頭のメニュー記号の右**（状態ラベルの前ではない）で、
-    /// **名前の開始桁は未読／既読で動かない**。
+    /// **行頭の印は名前の開始桁を動かさない。**
     ///
-    /// 比べるのは 2 本の行そのもの（未読 1 本・既読 1 本を同じフレームに描く）で、
-    /// 桁数を式で書き写さない ＝ 行の組み立てを変えたらここが落ちる。
-    /// 行頭が食う桁は [`MIN_SIDEBAR`] の下限の根拠でもあるので、同時に固定する
+    /// 比べるのは行そのもの（印の有無で 2 本を同じフレームに描く）で、
+    /// 桁数を式で書き写さない ＝ 行の組み立てを変えたらここが落ちる
     #[test]
-    fn the_unread_mark_sits_next_to_the_menu_mark_without_shifting_the_name() {
-        use crate::app::MIN_SIDEBAR;
+    fn the_row_head_marks_never_shift_the_name_column() {
         use unicode_width::UnicodeWidthStr;
         let mut app = App {
             term_size: (60, 40),
@@ -1393,26 +1595,13 @@ mod tests {
                 .clone()
         };
         let (unread, read) = (at("fresh-row"), at("seen-row"));
-
-        // 行頭は `= ` の次が未読の桁（既読はそこが空白）
-        let head = format!("{MENU_MARK} ");
-        assert!(unread.starts_with(&format!("{head}{}", UNREAD_MARK.trim())), "{unread:?}");
-        assert!(read.starts_with(&format!("{head}{READ_MARK}")), "{read:?}");
-        // 名前の開始桁は 2 本で同じ（未読の桁が空白でも確保されている）
+        // 印はそれぞれ決まった桁に出る（ペインに出ていないので 1 桁目は空白）
+        assert!(unread.starts_with(&format!("{CLOSED_MARK}{UNREAD_MARK}")), "{unread:?}");
+        assert!(read.starts_with(&format!("{CLOSED_MARK}{READ_MARK}")), "{read:?}");
+        // 名前の開始桁は 2 本とも同じ（消えている印の桁も確保されている）
         let name_col = |line: &str, name: &str| line[..line.find(name).unwrap()].width();
-        assert_eq!(
-            name_col(&unread, "fresh-row"),
-            name_col(&read, "seen-row"),
-            "the unread mark shifted the name column: {unread:?} / {read:?}"
-        );
-        // 行頭が食う桁 = メニュー記号 + 空白 + 未読の桁 + 状態アイコン + 空白
-        let head_cols = MENU_MARK.width() + 1 + UNREAD_MARK.width() + 1 + 1;
-        assert_eq!(name_col(&read, "seen-row"), head_cols, "the row head changed width");
-        // 一番狭いサイドバー（[`MIN_SIDEBAR`]）でも行頭 + 名前 1 桁は残る
-        assert!(
-            usize::from(MIN_SIDEBAR - 2) > head_cols,
-            "the narrowest sidebar no longer fits the row head ({head_cols} columns)"
-        );
+        assert_eq!(name_col(&unread, "fresh-row"), HEAD_COLS);
+        assert_eq!(name_col(&read, "seen-row"), HEAD_COLS);
     }
 
     /// **生きている行の状態は hook が主、`agents --json` が従。**
@@ -2119,8 +2308,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("{needle} is not on any row: {lines:?}"))
                 .clone()
         };
-        assert!(line("fresh").ends_with("· 12s"), "{:?}", line("fresh"));
-        assert!(line("older").ends_with("· 3m"), "{:?}", line("older"));
+        // 行末はメニュー記号なので、経過はその手前に出る
+        assert!(line("fresh").ends_with(&format!("12s {MENU_MARK}")), "{:?}", line("fresh"));
+        assert!(line("older").ends_with(&format!("3m {MENU_MARK}")), "{:?}", line("older"));
     }
 
     /// **止めた行は `Stopped`（Completed グループ・dim・停止形のアイコン）。**
@@ -2147,7 +2337,7 @@ mod tests {
         assert!(row.contains("Stopped"), "{row:?}");
         assert!(!row.contains("Needs input"), "a dead row is asking for input: {row:?}");
         // アイコンは生死を表すので停止形（生きている行の `✻` ではない）
-        assert!(row.starts_with(&format!("{MENU_MARK} {READ_MARK}∙")), "{row:?}");
+        assert!(row.starts_with(&format!("{CLOSED_MARK}{READ_MARK}∙")), "{row:?}");
         // 集計もその 1 本を Completed 側で数える
         let counts = texts
             .iter()
@@ -2192,32 +2382,315 @@ mod tests {
         assert_eq!(border_x(&mut app), 34, "the sidebar stayed narrow after there was room again");
     }
 
-    /// **ピン留めした行はグループ内の先頭へ。** 並べ替えは安定なので、
-    /// ピン留め以外の相対順は動かない（どちらのグルーピングでも同じ規則）
+    /// 見た目を比べるためのセッション行 1 本ぶんの材料
+    fn look_fixture() -> RowData {
+        RowData {
+            action: RowAction::Open(SessionId::new("a")),
+            group: Group::Completed,
+            cwd: "C:\\dev\\api".to_string(),
+            glyph: "∙",
+            color: MUTED_FG,
+            label: "the-row".to_string(),
+            is_active_window: false,
+            unread: false,
+            status_label: "Stopped",
+            age: "3m".to_string(),
+            bucket: Bucket::Completed,
+            pinned: false,
+            editing: None,
+        }
+    }
+
+    /// 行を「1 文字ずつの (文字, スタイル)」へ均す（色の値を書き写さずに比べるため）
+    fn cells(line: &Line<'_>) -> Vec<(String, Style)> {
+        line.spans
+            .iter()
+            .flat_map(|span| {
+                let style = line.style.patch(span.style);
+                span.content
+                    .chars()
+                    .map(move |ch| (ch.to_string(), style))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// **選択・ホバー・ペインに出ている の 3 つが、重なっても見分けられる。**
+    ///
+    /// 帯（選択・ホバー）と印（ペインに出ている）は別の手段なので、重なっても
+    /// 互いを消さない。色を書き写さず**組んだ行どうしを比べる**ので、
+    /// 帯の色や記号を変えてもこの関係が保たれていれば通る
     #[test]
-    fn a_pinned_row_comes_first_inside_its_group() {
+    fn the_three_row_states_stay_distinguishable_even_when_they_overlap() {
+        let row = |open: bool, band: bool, selected: bool| {
+            let mut d = look_fixture();
+            d.is_active_window = open;
+            cells(&session_row_line(&d, Look { band, selected, open }, DEFAULT_INNER))
+        };
+        let plain = row(false, false, false);
+        let hovered = row(false, true, false);
+        let selected = row(false, true, true);
+        let open = row(true, false, false);
+        // 3 つとも素の行とは違い、互いにも違う
+        for (name, drawn) in [("hover", &hovered), ("selection", &selected), ("open", &open)] {
+            assert_ne!(*drawn, plain, "{name} is invisible");
+        }
+        assert_ne!(hovered, selected, "hover and selection look the same");
+        assert_ne!(selected, open, "selection and the open row look the same");
+        assert_ne!(hovered, open, "hover and the open row look the same");
+
+        // 帯（背景）は選択もホバーも同じ ＝ 「今ここ」の示し方は 1 つ
+        let bg = |drawn: &[(String, Style)]| drawn.iter().map(|c| c.1.bg).collect::<Vec<_>>();
+        assert_eq!(bg(&hovered), bg(&selected), "hover and selection use different bands");
+        // **開いている行は帯を使わない**（別の軸）ので、素の行と背景が同じ
+        assert_eq!(bg(&open), bg(&plain), "the open row stole the band");
+        // 印は行頭 1 桁目 ＝ 色ではなく文字で読める
+        assert_eq!(open[0].0, OPEN_MARK, "the open row has no mark at its head");
+        assert_eq!(plain[0].0, CLOSED_MARK);
+        assert_eq!(selected[0].0, CLOSED_MARK);
+
+        // **3 つが重なっても全部読める**（帯 + 前景の強調 + 印）
+        let all = row(true, true, true);
+        assert_eq!(all[0].0, OPEN_MARK, "the open mark is lost when selected and hovered");
+        assert_eq!(bg(&all), bg(&selected), "the band is lost on an open row");
+        assert_ne!(all, selected, "the open mark makes no difference while selected");
+        assert_ne!(all, open, "the band makes no difference on an open row");
+    }
+
+    /// **未読とペインの印は別の桁**（同じ行で両方点いても互いを消さない）。
+    /// 名前の開始桁も動かない
+    #[test]
+    fn the_head_marks_do_not_compete_for_the_same_column() {
+        let mut d = look_fixture();
+        d.unread = true;
+        d.is_active_window = true;
+        let look = Look { band: false, selected: false, open: true };
+        let drawn = cells(&session_row_line(&d, look, DEFAULT_INNER));
+        assert_eq!(drawn[0].0, OPEN_MARK);
+        assert_eq!(drawn[1].0, UNREAD_MARK);
+    }
+
+    /// ペイン追従を見るための一覧（セッション 3 本）。**窓（PTY）は起こさない**ので、
+    /// 「ペインが指すセッション」は [`App::pane_shown`] の突き合わせ相手として
+    /// 直接与える（[`follow_pane`] の入口は 1 つなので、経路の違いは問わない）
+    fn follow_fixture() -> App {
+        App {
+            term_size: (60, 40),
+            sidebar_width: 34,
+            sessions: vec![
+                named_session("a", "C:\\dev\\api", "row-a"),
+                named_session("b", "C:\\dev\\api", "row-b"),
+                named_session("c", "C:\\dev\\api", "row-c"),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// その行の index（描画が積んだ一覧から引く）
+    fn row_index(app: &App, id: &str) -> usize {
+        row_of_session(&app.sidebar_rows, &SessionId::new(id)).expect("no row")
+    }
+
+    /// **ペインが指すセッションが変わったら、選択もその行へ移る。**
+    ///
+    /// 開く経路（クリック / メニューの `open` / 新規起動 / ペイン内の `/resume`）は
+    /// どれも「ペインが指すセッション」に集まるので、追従の判断は 1 箇所で足りる。
+    /// ここではその 1 箇所（[`follow_pane`]）が経路を問わずに揃えることを見る
+    #[test]
+    fn the_selection_moves_to_whatever_the_pane_shows() {
+        let mut app = follow_fixture();
+        let _ = sidebar_texts(&mut app); // 行を積む
+        app.selection = SidebarPos::Row(0);
+
+        // ペインが row-c を指した（どの経路で開いたかは問わない）
+        app.pane_shown = None;
+        let target = SessionId::new("c");
+        follow_pane(&mut app, Some(target.clone()));
+        assert_eq!(
+            app.selection,
+            SidebarPos::Row(row_index(&app, "c")),
+            "the selection did not follow the pane"
+        );
+        assert!(app.sidebar_follow_sel, "the scroll does not bring the row into view");
+
+        // 同じセッションを指したままなら、選択は動かせる（`↑↓` を邪魔しない）
+        app.selection = SidebarPos::Row(row_index(&app, "a"));
+        follow_pane(&mut app, Some(target));
+        assert_eq!(
+            app.selection,
+            SidebarPos::Row(row_index(&app, "a")),
+            "the selection was dragged back while the pane did not change"
+        );
+    }
+
+    /// **名前の入力中は追従しない**（確定の宛先である行から選択が離れると、
+    /// 何を編集しているのかが画面から読めなくなる）。入力が終われば揃う
+    #[test]
+    fn the_selection_does_not_follow_while_a_name_is_being_typed() {
+        let mut app = follow_fixture();
+        let _ = sidebar_texts(&mut app);
+        app.selection = SidebarPos::Row(row_index(&app, "a"));
+        app.rename = Some(crate::app::Rename {
+            id: SessionId::new("a"),
+            field: {
+                let mut field = crate::ui::text_field::TextField::default();
+                field.set_text("new name");
+                field
+            },
+        });
+        let before = app.selection;
+        follow_pane(&mut app, Some(SessionId::new("c")));
+        assert_eq!(app.selection, before, "the selection moved out from under the editor");
+
+        // 入力を終えたら次のフレームで揃う（見送りであって取りこぼしではない）
+        app.rename = None;
+        follow_pane(&mut app, Some(SessionId::new("c")));
+        assert_eq!(app.selection, SidebarPos::Row(row_index(&app, "c")));
+    }
+
+    /// **ペインがセッションを出していない（新規セッション画面）なら揃える先が無い。**
+    /// 戻ってきたときにまた揃う
+    #[test]
+    fn a_pane_without_a_session_leaves_the_selection_alone() {
+        let mut app = follow_fixture();
+        let _ = sidebar_texts(&mut app);
+        follow_pane(&mut app, Some(SessionId::new("b")));
+        let at_b = app.selection;
+        // 新規セッション画面へ移った
+        follow_pane(&mut app, None);
+        assert_eq!(app.selection, at_b, "the selection jumped when the pane left the sessions");
+        // 同じセッションへ戻ると、もう一度揃う
+        follow_pane(&mut app, Some(SessionId::new("b")));
+        assert_eq!(app.selection, at_b);
+    }
+
+
+    fn pinned_fixture(grouping: Grouping, pinned: bool) -> App {
+        App {
+            term_size: (60, 40),
+            sidebar_width: 34,
+            grouping,
+            sessions: vec![
+                named_session("a", "C:\\dev\\api", "first"),
+                named_session("b", "C:\\dev\\api", "second"),
+                crate::sessions::SessionRow {
+                    pinned,
+                    ..named_session("c", "C:\\dev\\api", "chosen")
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// **ピン留めした行は上部の `pinned` 節へ「移る」**（グループには残らない）。
+    ///
+    /// 行に印を足すのではなく節ごと分けるのが判断で、固定するのは
+    /// 「同じ行が 2 箇所に出ない」こと ＝ pin の表示が節と印の 2 箇所に
+    /// 分かれていない
+    #[test]
+    fn a_pinned_row_moves_into_the_pinned_section() {
         for grouping in [Grouping::State, Grouping::Directory] {
-            let mut app = App {
-                term_size: (60, 40),
-                sidebar_width: 34,
-                grouping,
-                sessions: vec![
-                    named_session("a", "C:\\dev\\api", "first"),
-                    named_session("b", "C:\\dev\\api", "second"),
-                    crate::sessions::SessionRow {
-                        pinned: true,
-                        ..named_session("c", "C:\\dev\\api", "pinned")
-                    },
-                ],
-                ..Default::default()
-            };
+            let mut app = pinned_fixture(grouping, true);
+            let texts = sidebar_texts(&mut app);
+            let section = texts
+                .iter()
+                .position(|t| t == PINNED_TITLE)
+                .unwrap_or_else(|| panic!("{grouping:?}: no pinned section: {texts:?}"));
+            // 節の直後がその行（節に入っていること自体が pin の表示）
+            assert!(texts[section + 1].contains("chosen"), "{grouping:?}: {texts:?}");
+            // **一覧全体で 1 度だけ**（元のグループに複製されていない）
+            assert_eq!(
+                texts.iter().filter(|t| t.contains("chosen")).count(),
+                1,
+                "{grouping:?}: the pinned row is in two places: {texts:?}"
+            );
+            // 残りの行は元のグループのまま（節に吸い込まれていない）
             let lines = session_lines(&mut app);
-            assert_eq!(lines.len(), 3, "{grouping:?}: a row is missing");
-            assert!(lines[0].contains("pinned"), "{grouping:?}: {lines:?}");
-            // 残りは元の並びのまま（ピン留めが並べ替えの規則を増やしていない）
+            assert_eq!(lines.len(), 3, "{grouping:?}: a row is missing: {lines:?}");
+            assert!(lines[0].contains("chosen"), "{grouping:?}: {lines:?}");
             assert!(lines[1].contains("first"), "{grouping:?}: {lines:?}");
             assert!(lines[2].contains("second"), "{grouping:?}: {lines:?}");
         }
+    }
+
+    /// **pin が 0 本なら節ごと出ない**（見出しだけが残らない）。
+    /// unpin すれば行は元のグループへ戻る
+    #[test]
+    fn the_pinned_section_disappears_when_nothing_is_pinned() {
+        for grouping in [Grouping::State, Grouping::Directory] {
+            let mut app = pinned_fixture(grouping, false);
+            let texts = sidebar_texts(&mut app);
+            assert!(
+                !texts.iter().any(|t| t == PINNED_TITLE),
+                "{grouping:?}: an empty pinned section is drawn: {texts:?}"
+            );
+            // 行は元のグループの中に居る（pin を外したら戻る）
+            let at = |needle: &str| texts.iter().position(|t| t.contains(needle));
+            assert!(at("chosen") > at("Completed"), "{grouping:?}: {texts:?}");
+        }
+    }
+
+    /// **pin の節はどちらのグルーピングでも同じ位置**（一覧の先頭）に出る。
+    /// pin の効き方が「どう並べているか」で変わらないことの固定
+    #[test]
+    fn the_pinned_section_sits_at_the_same_place_in_both_groupings() {
+        let mut places = Vec::new();
+        for grouping in [Grouping::State, Grouping::Directory] {
+            let mut app = pinned_fixture(grouping, true);
+            let texts = sidebar_texts(&mut app);
+            let at = texts.iter().position(|t| t == PINNED_TITLE).expect("no section");
+            // 固定ヘッダーのすぐ下（＝ 一覧の先頭の節）。空行 1 本を挟む
+            assert_eq!(at, app.sidebar_header_rows + 1, "{grouping:?}: {texts:?}");
+            places.push(at);
+        }
+        assert_eq!(places[0], places[1], "the pinned section moved with the grouping");
+    }
+
+    /// **`↑↓` は pin の節の行も通る。** 節を作ったせいで触れなくなる行があると、
+    /// キーボードだけでは pin した行を開けなくなる
+    #[test]
+    fn the_arrow_keys_reach_the_rows_in_the_pinned_section() {
+        let mut app = pinned_fixture(Grouping::State, true);
+        // 行の構成は描画が積む（選択の巡回はその結果を読む）
+        let _ = sidebar_texts(&mut app);
+        let row_of = |app: &App, id: &str| {
+            row_of_session(&app.sidebar_rows, &SessionId::new(id)).expect("no row")
+        };
+        let pinned_row = row_of(&app, "c");
+        // 節の中の行は選択できる（飾りではない）
+        assert!(app.sidebar_rows[pinned_row].selectable());
+        app.selection = SidebarPos::Row(pinned_row);
+        // 下へ進むと節の外の行へ抜ける（節の中で止まらない）
+        let reached: Vec<usize> = (0..app.sidebar_rows.len())
+            .scan(pinned_row, |_, _| {
+                crate::app::move_selection(&mut app, 1);
+                app.selection.row()
+            })
+            .collect();
+        for id in ["a", "b"] {
+            let row = row_of(&app, id);
+            assert!(reached.contains(&row), "{id} is not reachable with the arrow keys");
+        }
+    }
+
+    /// **集計は pin した行も数える。** pin は「隠す」操作ではなく「上へ寄せる」
+    /// 操作なので、数えないと一覧に見えている行と数が合わなくなる
+    #[test]
+    fn the_summary_counts_pinned_rows_too() {
+        let mut app = App {
+            // 集計行が切られない幅の端末（このテストの関心は数だけ）
+            term_size: (120, 40),
+            ..pinned_fixture(Grouping::State, true)
+        };
+        let texts = sidebar_texts(&mut app);
+        let counts = texts
+            .iter()
+            .find(|t| t.contains("awaiting input"))
+            .expect("the summary row is missing");
+        assert!(
+            counts.starts_with("0 awaiting input · 0 working · 3"),
+            "the pinned row was not counted: {counts:?}"
+        );
     }
 
     /// **一覧に隠し区画は無い。** アーカイブを廃止したので、行はどちらの
@@ -2304,14 +2777,12 @@ mod tests {
             .collect();
         assert!(text.contains("new name"), "the text being typed is not on the row: {text:?}");
         assert!(!text.contains("old name"), "the old name is still on the row before the rename is committed: {text:?}");
-        // カーソルはその行の、入力の末尾（行頭 2 桁 + 8 桁）に立つ
+        // カーソルはその行の、入力の末尾に立つ（入力欄は通常の行と同じ
+        // 行頭 [`HEAD_COLS`] の後ろから始まる ＝ 編集の出入りで桁が動かない）
         assert!(cursor.visible, "the cursor is hidden while a name is being typed");
         assert_eq!(
             cursor.pos,
-            Position::new(
-                1 + RENAME_PREFIX.width() as u16 + "new name".width() as u16,
-                y
-            )
+            Position::new(1 + HEAD_COLS as u16 + "new name".width() as u16, y)
         );
     }
 
@@ -2618,14 +3089,18 @@ mod tests {
             .collect()
     }
 
-    /// **アカウント行はマウスを乗せると一覧の行と同じ帯でハイライトされる。**
+    /// **アカウント行はマウスを乗せても帯でハイライトされる。**
     /// フッターに描かれる行なので一覧の行 index では表せず、以前はホバーから
     /// 除外されていた（[`SidebarPos::Account`] を指せるようになったことの固定）。
     ///
-    /// 「同じ見た目」は帯の色を書き写さずに**キーボード選択中の描画と突き合わせて**
-    /// 見る（選択の見え方が変われば、ホバーも一緒に追う）
+    /// **選択とホバーは同じ帯だが同じ見た目ではない**（[`Look`]）: 帯は
+    /// 「今ここを指している」で共通、前景の強調が付くのは選択だけ。
+    /// 帯の色は書き写さず、**3 つの描画を突き合わせて**関係だけを見る
     #[test]
     fn the_account_row_is_highlighted_while_hovered() {
+        let bg_of = |row: &[(String, Color, Color)]| {
+            row.iter().map(|(_, _, bg)| *bg).collect::<Vec<_>>()
+        };
         let mut app = app_with_account_row(vec![active_account()]);
         let plain = drawn_account_row(&mut app);
 
@@ -2635,11 +3110,12 @@ mod tests {
 
         app.selection = SidebarPos::Row(0);
         app.hovered = Some(SidebarPos::Account);
-        assert_eq!(
-            drawn_account_row(&mut app),
-            selected,
-            "hovering the account row does not look like the selected row"
-        );
+        let hovered = drawn_account_row(&mut app);
+        assert_ne!(hovered, plain, "hovering the account row does not highlight it");
+        // 帯（背景）は選択と同じ ＝ 「今ここ」は同じ手段で示す
+        assert_eq!(bg_of(&hovered), bg_of(&selected), "hover uses a different band");
+        // 前景の強調は選択だけ ＝ 選択とホバーが見分けられる
+        assert_ne!(hovered, selected, "hover and selection are indistinguishable");
 
         // 外れたら消える（帯が残らない）
         app.hovered = Some(SidebarPos::Row(0));
