@@ -530,7 +530,7 @@ pub fn update_state_list(key: &str, merge: impl FnOnce(Vec<String>) -> Vec<Strin
 /// （登録リストの重複排除・登録解除の対象照合・セッション行をどの見出しへ入れるかの
 /// 振り分けが別々の答えを出すと、見出しが 2 つに割れたり登録解除が空振りする）。
 ///
-/// 大小・区切りの種類・末尾の区切りを無視するのは、突き合わせる文字列の出自が違うため:
+/// 大小・区切りの種類・区切りの重複を無視するのは、突き合わせる文字列の出自が違うため:
 /// 登録リストは ccdesk が保存した文字列、セッションの cwd は claude が記録した文字列、
 /// 新規セッションのフォルダはユーザーが打った文字列。Windows 専用ツールなので
 /// `C:\dev\api` と `c:/dev/api\` は同じフォルダであり、別扱いにする理由が無い
@@ -552,20 +552,47 @@ pub fn same_dir(a: &str, b: &str) -> bool {
 /// `C:\` のようなルートは末尾の区切りを落とさない（落とすと
 /// ドライブ指定 `C:` になり、Windows では「そのドライブのカレント」を指す別物になる）。
 ///
-/// **残すのは区切り 1 個だけ**で、`C:\\` のように重複した表記も同じキーへ丸める
-/// （素朴な join で作られ得る形で、別扱いにすると見出しが 2 つに割れて登録解除も
-/// 空振りする ＝ [`same_dir`] が 1 箇所で持つ不変条件が崩れる）。区切りが元から
-/// 無い `C:` は丸めない ＝ ドライブ指定はドライブ直下と別物のまま
+/// **連続する区切りは末尾でも内部でも 1 個へ畳む**（`C:\\` `C:\dev\\api` は
+/// `C:\` `C:\dev\api` と同じキー）。素朴な join・貼り付け・ドラッグ&ドロップで
+/// 入ってくる形で、Windows はこれを同じフォルダとして開く（`Path::is_dir` も通る ＝
+/// 新規セッション画面の存在確認では弾かれない）。別扱いにすると見出しが 2 つに割れて
+/// 登録解除も空振りする ＝ [`same_dir`] が 1 箇所で持つ不変条件が崩れる。
+/// 区切りが元から無い `C:` は丸めない ＝ ドライブ指定はドライブ直下と別物のまま。
+///
+/// **例外は先頭の `\\`（UNC = `\\server\share`）**: Windows では区切りの重複ではなく
+/// 「ネットワーク上」を表す記号なので、1 個に畳むと `\server\share`
+/// ＝ ローカルのルート直下の別フォルダを指してしまう。記号として働くのは後ろに
+/// サーバー名が続くときだけなので、続かない `\\` は畳めるルート表記として扱う
 pub fn dir_key(path: &str) -> String {
     let unified = path.replace('/', "\\").to_lowercase();
-    let trimmed = unified.trim_end_matches('\\');
-    // trimmed は unified の先頭からの部分なので、長さの差 = 落とした区切りの個数
-    let root_with_separator = (trimmed.is_empty() || trimmed.ends_with(':'))
-        && trimmed.len() < unified.len();
-    if root_with_separator {
-        format!("{trimmed}\\")
+    let body = unified.trim_start_matches('\\');
+    // 先頭の区切りだけは畳み方が違う（UNC は 2 個で意味を持つ）ので、本体と分けて持つ
+    let head = match unified.len() - body.len() {
+        0 => "",
+        // 2 個以上でもサーバー名が続かなければ UNC ではない ＝ ルートとして 1 個へ
+        1 => "\\",
+        _ if body.is_empty() => "\\",
+        _ => "\\\\",
+    };
+    if body.is_empty() {
+        // ルートだけの表記（`\` `\\`）。空入力はそのまま空のキーになる
+        return head.to_string();
+    }
+    let mut collapsed = String::with_capacity(body.len());
+    for ch in body.chars() {
+        if ch == '\\' && collapsed.ends_with('\\') {
+            continue;
+        }
+        collapsed.push(ch);
+    }
+    // 畳んだ後の末尾の区切りは 1 個以下。trimmed は collapsed の先頭からの部分なので、
+    // 長さの差が「末尾に区切りがあった」ことを表す
+    let trimmed = collapsed.trim_end_matches('\\');
+    if trimmed.ends_with(':') && trimmed.len() < collapsed.len() {
+        // ドライブ直下は区切りを落とさない（上記のとおり `C:` は別物）
+        format!("{head}{trimmed}\\")
     } else {
-        trimmed.to_string()
+        format!("{head}{trimmed}")
     }
 }
 
@@ -733,5 +760,45 @@ mod tests {
         assert!(!same_dir("C:", "C:\\\\"), "ドライブ指定がドライブ直下と同一視された");
         // 末端まであるパスは従来どおり（重複区切りは落ちる）
         assert_eq!(dir_key("C:\\dev\\api\\\\"), "c:\\dev\\api");
+    }
+
+    /// **パスの内部**の重複区切り（`C:\dev\\api`）も同じフォルダ。貼り付けや
+    /// ドラッグ&ドロップで入ってくる形で、Windows はこれを同じフォルダとして開く
+    /// （`Path::is_dir` も通る ＝ 新規セッション画面の存在確認では弾かれない）。
+    /// 別扱いにすると同じフォルダの見出しが 2 つ出て、片方の登録解除が空振りする
+    #[test]
+    fn same_dir_collapses_repeated_separators_inside_the_path() {
+        assert_eq!(dir_key("C:\\dev\\\\api"), "c:\\dev\\api");
+        assert_eq!(dir_key("C:\\\\dev\\api"), "c:\\dev\\api");
+        assert!(same_dir("C:\\dev\\\\api", "C:\\dev\\api"), "内部の重複区切りが別扱いになった");
+        assert!(same_dir("C://dev///api//", "c:\\dev\\api"), "区切りの種類と個数が混ざると別扱いになる");
+        // 畳むのは区切りだけ。区切りを消して階層を潰したりはしない
+        assert!(!same_dir("C:\\dev\\\\api", "C:\\api"), "重複区切りの畳み込みで親が消えた");
+        assert!(!same_dir("C:\\dev\\\\api", "C:\\devapi"), "区切りごと消えている");
+        // ルートの丸めは変えない（区切り 1 個を残す / 区切りが元から無い
+        // ドライブ指定は別物のまま ＝ 内部を畳んでも同じ判断になる）
+        assert_eq!(dir_key("C://"), "c:\\");
+        assert_eq!(dir_key("C:///"), "c:\\");
+        assert_eq!(dir_key("C:"), "c:");
+    }
+
+    /// UNC（`\\server\share`）の**先頭 2 個は畳まない**。Windows では区切りの重複ではなく
+    /// 「ネットワーク上」を表す記号で、1 個に畳むと `\server\share`
+    /// ＝ ローカルのルート直下の別フォルダを指してしまう
+    #[test]
+    fn same_dir_keeps_the_unc_prefix() {
+        assert_eq!(dir_key("\\\\server\\share"), "\\\\server\\share");
+        assert_eq!(dir_key("//server/share/"), "\\\\server\\share", "区切りの種類と末尾は揃える");
+        assert!(
+            !same_dir("\\\\server\\share", "\\server\\share"),
+            "UNC がローカルのパスと同一視された"
+        );
+        assert!(same_dir("\\\\server\\share\\", "//SERVER/share"), "同じ UNC パスが別扱いになった");
+        // 先頭より後ろの重複は畳む（UNC でも「同じフォルダか」の判断は 1 つ）
+        assert!(same_dir("\\\\server\\\\share", "\\\\server\\share"), "UNC の内部の重複区切りが残った");
+        // サーバー名が続かない `\\` は UNC の記号として働かないので、ルートとして丸める
+        // （既存の `same_dir("\\\\", "\\")` と同じ判断）
+        assert_eq!(dir_key("\\\\"), "\\");
+        assert_eq!(dir_key("//"), "\\");
     }
 }
