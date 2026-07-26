@@ -1777,7 +1777,7 @@ fn apply_account(app: &mut App, action: AccountAction) {
     });
 }
 
-/// 別スレーッドのアカウント操作の結果を取り込む（run ループが毎周見る）。
+/// 別スレッドのアカウント操作の結果を取り込む（run ループが毎周見る）。
 /// 取り込んだら `true`（＝即描画する）
 fn take_account_result(app: &mut App) -> bool {
     let Some(job) = app.account_job.take() else {
@@ -2214,7 +2214,7 @@ mod tests {
         }
     }
 
-    /// 別スレーッドで走るアカウント操作（[`apply_account`]）の完了を待って反映する。
+    /// 別スレッドで走るアカウント操作（[`apply_account`]）の完了を待って反映する。
     ///
     /// **反映は本番と同じ [`take_account_result`] を通す**（待つ点だけが違う）ので、
     /// 「操作 → 結果が状態へ入る」の順序はテストと実運用で同じ。走っていなければ

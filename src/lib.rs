@@ -441,7 +441,16 @@ const LOCK_RETRY: Duration = Duration::from_millis(100);
 /// それは正当な競合なので、以降は通常の待ちに落とす（奪い合いで回り続けない）
 const LOCK_MAX_STEALS: u32 = 3;
 
-/// claude と共有する advisory lock（RAII）。
+/// ファイル 1 本を守る advisory lock（RAII）。
+///
+/// 用途は 2 つあり、**プロトコルは claude 側に合わせた 1 つだけ**を持つ:
+/// - `~/.claude/.credentials.json`（claude と**共有する**ロック `~/.claude.lock`）
+/// - ccdesk 自身のファイル（`accounts.json` / `state.json` / `config.json`。
+///   claude は触らないが、ccdesk を複数起動すると読み書きが交差する）
+///
+/// 後者に別の仕組みを作らないのは、「どう排他するか」の知識を 2 通り持つと
+/// 片方だけ直した状態が生まれるため。違いは**どのファイルを守り、どれだけ待つか**
+/// だけで、それは呼び手（守る対象を知っている側）が決める。
 ///
 /// claude Code は OAuth トークン更新を npm `proper-lockfile` で保護している。
 /// 合わせる必要があるプロトコル:
