@@ -13,7 +13,7 @@ use tui_term::widget::PseudoTerminal;
 use ccdesk::dir_key;
 
 use crate::app::{
-    active_unstored, App, Focus, Popup, RightView, RowAction, Selection, SelfUpdate,
+    active_unstored, App, Focus, Popup, RightView, RowAction, SelfUpdate, SidebarPos,
 };
 use crate::poll::{
     classify, foreground_state, AccountStatus, Bucket, Group, Grouping, StateView,
@@ -800,16 +800,18 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     }
 
     // ---- 描画 ----
-    let hovered = app.hovered_row;
-    // 一覧のハイライトが見るのは行の選択だけ（アカウント行はフッター側で描く）
-    let selected = app.selection.row();
+    // ハイライトの規則はこれ 1 つ: 選択かホバーがその位置を指していれば光る。
+    // **一覧の行（下）とフッターのアカウント行（末尾）が同じ規則を読む**ので、
+    // 「どこが光るか」の知識が 2 箇所に分かれない
+    let (selection, hovered) = (app.selection, app.hovered);
+    let is_highlighted = |pos: SidebarPos| selection == pos || hovered == Some(pos);
     let mut items: Vec<ListItem> = Vec::new();
     let mut rows: Vec<Option<RowAction>> = Vec::new();
 
     let push_data_row =
         |items: &mut Vec<ListItem>, rows: &mut Vec<Option<RowAction>>, d: &RowData| {
             let cur = rows.len();
-            let highlighted = hovered == Some(cur) || selected == Some(cur);
+            let highlighted = is_highlighted(SidebarPos::Row(cur));
             let mut line_style = Style::default();
             if highlighted {
                 line_style = line_style.bg(ui().hl_bg).fg(ui().emph);
@@ -867,7 +869,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     ) {
         let cur = rows.len();
         let mut style = style;
-        if action.is_some() && (hovered == Some(cur) || selected == Some(cur)) {
+        if action.is_some() && is_highlighted(SidebarPos::Row(cur)) {
             style = style.bg(ui().hl_bg).fg(ui().emph);
         }
         items.push(ListItem::new(Line::from(text).style(style)));
@@ -877,7 +879,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // 新規セッション
     {
         let cur = rows.len();
-        let highlighted = hovered == Some(cur) || selected == Some(cur);
+        let highlighted = is_highlighted(SidebarPos::Row(cur));
         let mut style = Style::default();
         if highlighted {
             style = style.bg(ui().hl_bg).fg(ui().emph);
@@ -893,7 +895,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // グルーピング切替（クリックで state ⇔ directory）
     {
         let cur = rows.len();
-        let highlighted = hovered == Some(cur) || selected == Some(cur);
+        let highlighted = is_highlighted(SidebarPos::Row(cur));
         let mut style = Style::default().fg(ui().dim);
         if highlighted {
             style = style.bg(ui().hl_bg).fg(ui().emph);
@@ -972,7 +974,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 items.push(ListItem::new(Line::from("")));
                 rows.push(None);
                 let cur = rows.len();
-                let highlighted = hovered == Some(cur) || selected == Some(cur);
+                let highlighted = is_highlighted(SidebarPos::Row(cur));
                 let mut style = Style::default().fg(ui().dim);
                 if highlighted {
                     style = style.bg(ui().hl_bg).fg(ui().emph);
@@ -1024,15 +1026,15 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // 選択が浮いたら（行構成が変わった / 狭くてフッターが消えた）先頭の
     // クリック可能行へ寄せる。**押せない位置に選択を残さない**
     let selection_lost = match app.selection {
-        Selection::Row(row) => app
+        SidebarPos::Row(row) => app
             .sidebar_rows
             .get(row)
             .map(|r| r.is_none())
             .unwrap_or(true),
-        Selection::Account => !sl.footer_visible,
+        SidebarPos::Account => !sl.footer_visible,
     };
     if selection_lost {
-        app.selection = Selection::Row(
+        app.selection = SidebarPos::Row(
             app.sidebar_rows
                 .iter()
                 .position(|r| r.is_some())
@@ -1113,14 +1115,15 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         // アカウント行（表示名 · 組織名）。文面の判断は account_row に閉じる。
         // **この行はクリックでもキーボードでも押せる**（アカウントメニューの入口。
         // 当たり判定は handle_mouse 側が同じ `sidebar_layout` の account_y で持ち、
-        // キーボードの選択は [`Selection::Account`]）
+        // キーボードの選択は [`SidebarPos::Account`]）
         let (account, mut account_style) = account_row(
             &app.footer.account,
             active_unstored(app),
             app.account_job.as_ref().map(|job| job.progress),
         );
-        // 選択中は一覧の行と同じ見え方にする（↓ で降りたとき選択が消えて見えない）
-        if app.selection == Selection::Account {
+        // 選択中・ホバー中は一覧の行とまったく同じ見え方にする
+        // （キーボードで降りてもマウスを乗せても「今ここ」が同じ帯で分かる）
+        if is_highlighted(SidebarPos::Account) {
             account_style = account_style.bg(ui().hl_bg).fg(ui().emph);
         }
         frame.render_widget(
@@ -2368,21 +2371,11 @@ mod tests {
     /// 保管に加えた瞬間に消えることまで含めて固定する
     #[test]
     fn the_drawn_account_row_warns_until_the_active_account_is_stored() {
-        use crate::accounts::{Account, ActiveAccount};
-        use crate::poll::FooterInfo;
+        use crate::accounts::Account;
 
-        let active = Account::new("you@example.com", "you · Acme, Inc.");
+        let active = active_account();
         let drawn = |accounts: Vec<Account>| -> String {
-            let mut app = App {
-                term_size: (120, 30),
-                footer: FooterInfo {
-                    account: AccountStatus::LoggedIn(ActiveAccount::unseen(active.clone())),
-                    current: "2.1.220".to_string(),
-                    latest: None,
-                },
-                accounts,
-                ..Default::default()
-            };
+            let mut app = app_with_account_row(accounts);
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
             terminal
@@ -2409,6 +2402,84 @@ mod tests {
             !stored.contains(WARN_MARK) && stored.contains("you · Acme, Inc."),
             "the warning is still there after the active account was stored: {stored:?}"
         );
+    }
+
+    /// アカウント行に出るアクティブなアカウント
+    fn active_account() -> crate::accounts::Account {
+        crate::accounts::Account::new("you@example.com", "you · Acme, Inc.")
+    }
+
+    /// [`active_account`] でログイン済みの `App`。保管の写し（⚠ の出方を決める）は
+    /// テストごとに変わるので引数で受ける
+    fn app_with_account_row(accounts: Vec<crate::accounts::Account>) -> App {
+        use crate::accounts::ActiveAccount;
+        use crate::poll::FooterInfo;
+
+        App {
+            term_size: (120, 30),
+            footer: FooterInfo {
+                account: AccountStatus::LoggedIn(ActiveAccount::unseen(active_account())),
+                current: "2.1.220".to_string(),
+                latest: None,
+            },
+            accounts,
+            ..Default::default()
+        }
+    }
+
+    /// アカウント行の描画（文字と色）を 1 フレーム描いて取り出す。
+    /// **見た目が同じか**を突き合わせたいので、帯の色を式で持たずに実描画を比べる
+    fn drawn_account_row(app: &mut App) -> Vec<(String, Color, Color)> {
+        let (w, h) = app.term_size;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw(frame, app);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let y = sidebar_layout(app).account_y;
+        (0..w)
+            .map(|x| {
+                let cell = &buffer[(x, y)];
+                (cell.symbol().to_string(), cell.fg, cell.bg)
+            })
+            .collect()
+    }
+
+    /// **アカウント行はマウスを乗せると一覧の行と同じ帯でハイライトされる。**
+    /// フッターに描かれる行なので一覧の行 index では表せず、以前はホバーから
+    /// 除外されていた（[`SidebarPos::Account`] を指せるようになったことの固定）。
+    ///
+    /// 「同じ見た目」は帯の色を書き写さずに**キーボード選択中の描画と突き合わせて**
+    /// 見る（選択の見え方が変われば、ホバーも一緒に追う）
+    #[test]
+    fn the_account_row_is_highlighted_while_hovered() {
+        let mut app = app_with_account_row(vec![active_account()]);
+        let plain = drawn_account_row(&mut app);
+
+        app.selection = SidebarPos::Account;
+        let selected = drawn_account_row(&mut app);
+        assert_ne!(plain, selected, "the premise broke — selection no longer highlights the row");
+
+        app.selection = SidebarPos::Row(0);
+        app.hovered = Some(SidebarPos::Account);
+        assert_eq!(
+            drawn_account_row(&mut app),
+            selected,
+            "hovering the account row does not look like the selected row"
+        );
+
+        // 外れたら消える（帯が残らない）
+        app.hovered = Some(SidebarPos::Row(0));
+        assert_eq!(
+            drawn_account_row(&mut app),
+            plain,
+            "the highlight stays after the mouse left the account row"
+        );
+        app.hovered = None;
+        assert_eq!(drawn_account_row(&mut app), plain);
     }
 
     /// 端末を 1 フレーム描いて、指定行の文字列を返す
