@@ -56,6 +56,79 @@ impl Account {
     }
 }
 
+/// 認証情報ファイルが書き換わっていないかを見るための印（mtime とサイズ）。
+/// 無い・読めないときは `None`（「消えた」も変化として検出できる）。
+///
+/// **内容のハッシュではない。** 見たいのは「ある時点で観測した状態から動いたか」
+/// だけで、ポーラーが再取得の契機に使う signal（[`crate::poll`]）と同じ材料。
+/// 同じ知識を 2 箇所に持たないよう、認証情報ファイルを扱うこのモジュールに置く。
+///
+/// **見分けられない書き換え**: 同じ時刻刻み（Windows のシステムクロックは ~15.6ms
+/// 更新）の中で同サイズに書き換わった場合。認証情報の書き換えは claude の
+/// トークン更新（ネットワーク往復を挟む）と `/login` しか無く、2 回が 15ms に
+/// 収まることは実運用では起きない。内容ハッシュにすれば閉じるが、
+/// 毎秒の signal を stat から読み込みへ変える対価に見合わないと判断した
+pub(crate) type CredentialsFp = Option<(std::time::SystemTime, u64)>;
+
+/// 認証情報ファイルの指紋。無い・読めないときは None
+pub(crate) fn credentials_fingerprint(path: &Path) -> CredentialsFp {
+    let md = std::fs::metadata(path).ok()?;
+    Some((md.modified().ok()?, md.len()))
+}
+
+/// 「今 `.credentials.json` の持ち主はこのアカウント」という **いつの観測か付きの**
+/// 判断。
+///
+/// **email とラベルだけでは足りない。** 持ち主の判定材料は
+/// `claude auth status --json`（子プロセス。数百 ms かかる）か過去の切替結果なので、
+/// **判定した瞬間と、それを使って書き込む瞬間がずれる**。ずれている間に認証情報が
+/// 差し替わっていると（別端末での `/login`・claude のトークンローテーション・
+/// ccdesk 自身の直前の切替）、**別アカウントのトークンをこの email の保管へ
+/// 書き込む**。refreshToken は使い捨てなので、それは復旧不能な破壊になる
+/// （保管された側は元のトークンを二度と得られない）。
+///
+/// そこで「何を見てそう判断したか」（[`Self::seen`]）を同一性と対で持ち、ドメイン側は
+/// **ロックを取った後に読み直して一致を確かめてから**しか巻き取らない。
+/// 対にして 1 つの値にしてあるのは、片方だけ更新される形を作らないため
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActiveAccount {
+    /// 持ち主だと判断したアカウント
+    pub(crate) account: Account,
+    /// その判断の材料にした認証情報ファイルの指紋
+    pub(crate) seen: CredentialsFp,
+}
+
+impl ActiveAccount {
+    pub(crate) fn new(account: Account, seen: CredentialsFp) -> Self {
+        Self { account, seen }
+    }
+
+    /// 指紋を持たない観測。**撮影用の固定データと、照合に関心が無いテスト**のため。
+    /// ドメイン側の照合では「認証情報ファイルが無い状態を見た」と同じ扱いになるので、
+    /// 実ファイルがある環境では必ず不一致になり巻き取りは起きない
+    /// （＝実データを黙って壊す方向へは倒れない）
+    pub(crate) fn unseen(account: Account) -> Self {
+        Self::new(account, None)
+    }
+}
+
+/// 保管への変更が「今の持ち主」に何をしたか。
+///
+/// **「何もしなかった」を成功と区別するために enum で返す。** 区別しないと、
+/// 判断材料が古くて no-op になった場合と本当に切り替えた場合が呼び出し側で同じ形になり、
+/// UI は「切替に成功した」と表示してしまう（実際に起きていた: 切替直後に元の
+/// アカウントへ戻す操作が黙って無反応になり、現行は切替先のまま残る）
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AccountChange {
+    /// 現行の認証情報を差し替えた。新しい持ち主はこの観測。
+    /// **ccdesk 自身が書いた値なので、ポーラーの追いつきを待つ必要が無い**
+    Switched(ActiveAccount),
+    /// 切替を求められたが既にそのアカウントだった（現行トークンには触っていない）
+    AlreadyActive,
+    /// 保管一覧だけを変えた（登録・登録解除）。[`AccountStore::switch_to`] は返さない
+    StoreOnly,
+}
+
 /// 依存するファイルの位置。既定値の解決は [`Paths::detect`] だけが持つ
 #[derive(Clone, Debug)]
 pub(crate) struct Paths {
@@ -248,7 +321,8 @@ impl AccountStore {
     ///
     /// **未登録のアカウントは何もしない。** 明示登録するまで認証情報を勝手に
     /// コピーしない（ユーザーの決定）
-    pub(crate) fn sync_active(&self, account: &Account) -> anyhow::Result<bool> {
+    pub(crate) fn sync_active(&self, active: &ActiveAccount) -> anyhow::Result<bool> {
+        let account = &active.account;
         if account.email.is_empty() || !self.is_registered(&account.email) {
             return Ok(false);
         }
@@ -258,6 +332,13 @@ impl AccountStore {
         let Ok(_lock) = Lock::acquire(&self.paths.lock, Duration::ZERO, self.lock_stale) else {
             return Ok(false);
         };
+        // **「誰のトークンか」の判定はロックの外・数百 ms 前**（`claude auth status`
+        // が認証情報を読んだ時点）に済んでいる。その後に差し替わっていたら、
+        // 新しいアカウントのトークンを古い email の保管へ書くことになる。
+        // 追従更新はもともと「次の機会がある」処理なので、疑わしければ落とす
+        if !self.still_current(active) {
+            return Ok(false);
+        }
         // 読めない（消えた・書き換え途中）ならエラーにしない。追従更新は
         // 「次の機会がある」処理で、失敗を報告しても打つ手が無い
         let Some(oauth) = read_oauth(&self.paths.credentials) else {
@@ -271,19 +352,36 @@ impl AccountStore {
         !email.is_empty() && read_accounts(&self.paths.store).contains_key(email)
     }
 
+    /// 現行の認証情報の指紋。呼び出し側は「持ち主を判定した時点の状態」として持ち回り、
+    /// 巻き取りの直前に照合させる（[`ActiveAccount`]）
+    pub(crate) fn credentials_fingerprint(&self) -> CredentialsFp {
+        credentials_fingerprint(&self.paths.credentials)
+    }
+
+    /// 呼び出し側の観測が **今もそのまま** か。**ロックを保持している間に呼ぶ**
+    /// （呼んだ後に差し替わらないことがロックで保証されている区間でしか意味を持たない）
+    fn still_current(&self, active: &ActiveAccount) -> bool {
+        self.credentials_fingerprint() == active.seen
+    }
+
     /// 現行の認証情報をロック下で読んで保管する。ロックを取るのは、claude の
     /// トークン更新の途中（読む → ネットワーク → 保存）の値を保管しないため。
     /// 使い捨ての refreshToken を古い値で保管すると、そのアカウントは切替時に
     /// 復元できない
-    fn capture_current(&self, account: &Account) -> anyhow::Result<()> {
+    fn capture_current(&self, active: &ActiveAccount) -> anyhow::Result<()> {
         let _lock = Lock::acquire(&self.paths.lock, self.lock_wait, self.lock_stale)?;
+        // 観測が古いなら **別アカウントの現行トークンをこの email として保管しうる**
+        // （切替直後の `register current` で実際に起きていた）。書かずに失敗させる
+        if !self.still_current(active) {
+            return Err(stale_active_error(&self.paths.credentials));
+        }
         let oauth = read_oauth(&self.paths.credentials).ok_or_else(|| {
             anyhow!(
                 "no {OAUTH_KEY} in {} (not logged in?)",
                 self.paths.credentials.display()
             )
         })?;
-        self.upsert(account, &oauth, false)?;
+        self.upsert(&active.account, &oauth, false)?;
         Ok(())
     }
 
@@ -295,9 +393,7 @@ impl AccountStore {
         oauth: &Value,
         only_if_present: bool,
     ) -> anyhow::Result<bool> {
-        let _guard = STORE_LOCK
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _guard = STORE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let mut accounts = read_accounts(&self.paths.store);
         if only_if_present && !accounts.contains_key(&account.email) {
             return Ok(false);
@@ -309,6 +405,18 @@ impl AccountStore {
         write_json_atomically(&self.paths.store, &json!({ ACCOUNTS_KEY: accounts }))?;
         Ok(true)
     }
+
+}
+
+/// 観測が古かったときのエラー。**打つ手を書く**: もう一度メニューを開けば
+/// ポーラーが取り直した新しい観測で通る（＝ ccdesk 側が誰の認証情報かを
+/// 確かめられる状態に戻る）
+fn stale_active_error(credentials: &Path) -> anyhow::Error {
+    anyhow!(
+        "{} changed since ccdesk last checked which account is logged in; \
+         reopen the account menu and try again",
+        credentials.display()
+    )
 }
 
 /// UI（アカウント切替ポップアップ）向けの公開 API。
@@ -320,35 +428,27 @@ impl AccountStore {
     pub(crate) fn list(&self) -> Vec<Account> {
         read_accounts(&self.paths.store)
             .iter()
-            .map(|(email, entry)| {
-                let label = entry
-                    .get(LABEL_KEY)
-                    .and_then(|l| l.as_str())
-                    .filter(|l| !l.is_empty())
-                    // ラベルが失われていても空行にはしない（識別子で代替する）
-                    .unwrap_or(email);
-                Account::new(email.clone(), label)
-            })
+            .map(|(email, entry)| Account::new(email.clone(), entry_label(entry, email)))
             .collect()
     }
 
-    /// 登録: 現行の認証情報の `claudeAiOauth` を email をキーに保管する
-    pub(crate) fn register(&self, account: &Account) -> anyhow::Result<()> {
-        if account.email.is_empty() {
+    /// 登録: 現行の認証情報の `claudeAiOauth` を email をキーに保管する。
+    /// `active` は「今ログイン中のアカウント」の観測で、**保管する前に
+    /// ロック下で照合する**（古ければ別アカウントのトークンを保管しかねない）
+    pub(crate) fn register(&self, active: &ActiveAccount) -> anyhow::Result<()> {
+        if active.account.email.is_empty() {
             // 表示ラベルで代用してはいけない（同一性の判定に表示ロジックが混ざる）
             return Err(anyhow!(
                 "this account has no email, so there is no stable key to store it under"
             ));
         }
-        self.capture_current(account)
+        self.capture_current(active)
     }
 
     /// 登録解除: 保管を消すだけ。**ログイン自体は外さない**
     /// （現行の `.credentials.json` には触らない）
     pub(crate) fn unregister(&self, email: &str) -> anyhow::Result<()> {
-        let _guard = STORE_LOCK
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _guard = STORE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let mut accounts = read_accounts(&self.paths.store);
         if accounts.remove(email).is_none() {
             return Ok(()); // 既に無い＝目的は達成されている
@@ -359,33 +459,50 @@ impl AccountStore {
     /// 切替: 保管した `claudeAiOauth` を現行ファイルへ書き戻す。
     /// `mcpOAuth` と未知のトップレベルキーは保つ（[`OAUTH_KEY`] 参照）。
     ///
-    /// `active` は今ログイン中のアカウント（分からなければ None）。**出ていく
+    /// `active` は今ログイン中のアカウントの観測（分からなければ None）。**出ていく
     /// アカウントの認証情報を、上書きする前に同じロックの下で保管へ取り込む**:
     /// 追従更新（[`AccountStore::sync_active`]）はポーリング契機なので直前の
     /// トークン更新を取り逃す窓があり、使い捨ての refreshToken をそこで落とすと
-    /// そのアカウントには戻れなくなる
-    pub(crate) fn switch_to(&self, email: &str, active: Option<&Account>) -> anyhow::Result<()> {
-        // 同じアカウントへの「切替」は何もしない。書き戻すと、保管より新しい
-        // 可能性のある現行トークンを古い写しで上書きしてしまい、使い捨ての
-        // refreshToken が無効な値に戻って **今のログインを壊す**
-        if active.is_some_and(|a| !a.email.is_empty() && a.email == email) {
-            return Ok(());
-        }
+    /// そのアカウントには戻れなくなる。
+    ///
+    /// **観測が古ければ書かずに失敗する。** 巻き取り先を決める材料が古いと
+    /// 「A の保管に B のトークンを書く」＝ A も B も復旧不能、という壊し方をする
+    /// （[`ActiveAccount`]）。切替自体を諦めるのは、諦めれば次の操作で必ず正しく
+    /// やり直せるのに対し、書いてしまうと取り返しがつかないため
+    pub(crate) fn switch_to(
+        &self,
+        email: &str,
+        active: Option<&ActiveAccount>,
+    ) -> anyhow::Result<AccountChange> {
         // 保管の読みは **意図的にロックの外**。`~/.claude.lock` が守るのは claude と
         // 共有する認証情報ファイルで、こちらの保管ファイルはその対象ではない
         // （ロック下に入れると、claude の保持時間ぶん自分の読みも待つことになる）。
         // 許容している穴: ccdesk を複数起動していると、読んだ後に別インスタンスが
         // `unregister` する窓がある。書き込みは tmp + rename で原子的なので、
         // 最悪でも「登録解除したはずのアカウントに切り替わる」だけでファイルは壊れない
-        let stored = read_accounts(&self.paths.store)
-            .get(email)
-            .and_then(|entry| entry.get(CREDENTIALS_KEY))
-            .filter(|c| c.is_object())
-            .cloned()
-            .ok_or_else(|| anyhow!("no stored credentials for {email}"))?;
+        let (label, stored) = self.stored_entry(email)?;
         let _lock = Lock::acquire(&self.paths.lock, self.lock_wait, self.lock_stale)?;
+        let outgoing = match active {
+            // 判断材料が古い（ccdesk が見た後に claude か別端末が書き換えた）。
+            // 今の持ち主が誰かを言えないので、巻き取りも上書きもしない
+            Some(active) if !self.still_current(active) => {
+                return Err(stale_active_error(&self.paths.credentials))
+            }
+            // 同じアカウントへの「切替」は何もしない。書き戻すと、保管より新しい
+            // 可能性のある現行トークンを古い写しで上書きしてしまい、使い捨ての
+            // refreshToken が無効な値に戻って **今のログインを壊す**
+            Some(active) if !active.account.email.is_empty() && active.account.email == email => {
+                return Ok(AccountChange::AlreadyActive)
+            }
+            // email を持たないアカウント（email を返さない認証方式）は保管の
+            // キーが無いので巻き取れない。切替自体は通す
+            Some(active) => Some(&active.account).filter(|a| !a.email.is_empty()),
+            // 呼び出し側が持ち主を知らない（起動直後・未ログイン）。巻き取れないが、
+            // 何も主張していないので切替は通す
+            None => None,
+        };
         let mut current = self.current_document()?;
-        if let Some(outgoing) = active.filter(|a| !a.email.is_empty())
+        if let Some(outgoing) = outgoing
             && let Some(oauth) = current.get(OAUTH_KEY).filter(|o| o.is_object()).cloned()
         {
             // 未登録のアカウントには何もしない（`only_if_present`）。
@@ -399,7 +516,28 @@ impl AccountStore {
         // stale 判定は 10 分経過のみなので、消さないと切替後も前アカウントの残量を
         // 最大 10 分表示して嘘になる
         let _ = std::fs::remove_file(&self.paths.usage_cache);
-        Ok(())
+        // **新しい持ち主はここで確定する。** 書いたのは自分なので、ポーラーが
+        // `claude auth status` で追いつくのを待つ必要が無い（待つと、その 1〜2 秒に
+        // 入った次の操作が古い持ち主を材料に走る）。ラベルは保管のものなので、
+        // ポーラーが追いついた時点で live の表記へ揃う
+        Ok(AccountChange::Switched(ActiveAccount::new(
+            Account::new(email, label),
+            self.credentials_fingerprint(),
+        )))
+    }
+
+    /// 保管 1 件の (ラベル, `claudeAiOauth`)
+    fn stored_entry(&self, email: &str) -> anyhow::Result<(String, Value)> {
+        let entry = read_accounts(&self.paths.store)
+            .get(email)
+            .cloned()
+            .ok_or_else(|| anyhow!("no stored credentials for {email}"))?;
+        let credentials = entry
+            .get(CREDENTIALS_KEY)
+            .filter(|c| c.is_object())
+            .cloned()
+            .ok_or_else(|| anyhow!("no stored credentials for {email}"))?;
+        Ok((entry_label(&entry, email).to_string(), credentials))
     }
 
     /// 差し替えの土台になる現行ファイル。無い・空なら新規（`{}`）から作る。
@@ -432,6 +570,16 @@ fn read_json(path: &Path) -> Option<Value> {
 fn read_oauth(path: &Path) -> Option<Value> {
     let value = read_json(path)?;
     value.get(OAUTH_KEY).filter(|o| o.is_object()).cloned()
+}
+
+/// 保管 1 件の表示ラベル。**ラベルが失われていても空にはしない**
+/// （識別子で代替する。空行はメニューで選べない行に見える）
+fn entry_label<'a>(entry: &'a Value, email: &'a str) -> &'a str {
+    entry
+        .get(LABEL_KEY)
+        .and_then(|l| l.as_str())
+        .filter(|l| !l.is_empty())
+        .unwrap_or(email)
 }
 
 /// 保管ファイルの `accounts`（無い・壊れていれば空）
@@ -514,10 +662,23 @@ pub(crate) mod tests {
         }
 
         /// 待ち時間を詰めたストア（ロック競合を有界時間でテストするため）
-        fn store_with_short_wait(&self) -> AccountStore {
+        pub(crate) fn store_with_short_wait(&self) -> AccountStore {
             let mut store = self.store();
             store.lock_wait = Duration::from_millis(50);
             store
+        }
+
+        /// 「今の持ち主はこのアカウント」という観測を **今のファイル状態で** 作る。
+        ///
+        /// 実運用ではポーラーが `claude auth status` の**前**に指紋を読んで作る値
+        /// （[`ActiveAccount`]）で、テストからは「UI がその状態を見ていた」に相当する。
+        /// **これを取った後に `write_credentials` すると観測は古くなる** ＝
+        /// 別端末での `/login` やトークンローテーションと同じ状況が作れる
+        pub(crate) fn active(&self, email: &str, label: &str) -> ActiveAccount {
+            ActiveAccount::new(
+                Account::new(email, label),
+                credentials_fingerprint(&self.paths().credentials),
+            )
         }
 
         pub(crate) fn write_credentials(&self, value: &Value) {
@@ -562,8 +723,20 @@ pub(crate) mod tests {
         })
     }
 
-    /// 保管された `claudeAiOauth`（トークン比較用）
-    fn stored_oauth(store: &AccountStore, email: &str) -> Option<Value> {
+    /// 認証情報を「外から」書き換える前に挟む待ち。
+    ///
+    /// 指紋は (mtime, サイズ) なので、**同じ時刻刻みの中で同サイズに書き換えると
+    /// 変化として見えない**（[`CredentialsFp`]）。実運用の書き換え（トークン更新・
+    /// 別端末での `/login`）は必ず刻みを跨ぐので、テストでも同じ条件を作る。
+    /// これを省くとテストが「たまたま検出できない」で落ちる
+    fn wait_for_a_new_mtime() {
+        std::thread::sleep(Duration::from_millis(40));
+    }
+
+    /// 保管された `claudeAiOauth`（トークン比較用）。
+    /// **他モジュールのテストからも使う**（[`crate::app`] の操作列テストが
+    /// 「保管が別アカウントのトークンで潰れていないか」を見る）
+    pub(crate) fn stored_oauth(store: &AccountStore, email: &str) -> Option<Value> {
         read_accounts(&store.paths.store)
             .get(email)?
             .get(CREDENTIALS_KEY)
@@ -579,7 +752,7 @@ pub(crate) mod tests {
 
         // A でログイン中に A を登録
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&Account::new(EMAIL_A, "taro")).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
 
         // B へログインし直した状態（mcpOAuth は claude 側が更新した別の値）
         let mut with_b = credentials_doc("access-b", "refresh-b");
@@ -607,7 +780,7 @@ pub(crate) mod tests {
         let home = TempHome::new("switch_preserves_unknown_top_level_keys");
         let store = home.store();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&Account::new(EMAIL_A, "taro")).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
 
         let mut future = credentials_doc("access-b", "refresh-b");
         future["someFutureKey"] = json!({ "nested": [1, 2, 3] });
@@ -633,7 +806,7 @@ pub(crate) mod tests {
         let home = TempHome::new("register_stores_only_the_account_scoped_key");
         let store = home.store();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&Account::new(EMAIL_A, "taro")).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
 
         let stored = stored_oauth(&store, EMAIL_A).expect("保管されていない");
         assert_eq!(stored, oauth("access-a", "refresh-a"));
@@ -647,7 +820,7 @@ pub(crate) mod tests {
         let home = TempHome::new("register_requires_an_email_as_the_key");
         let store = home.store();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        assert!(store.register(&Account::new("", "claude.ai")).is_err());
+        assert!(store.register(&home.active("", "claude.ai")).is_err());
         assert!(store.list().is_empty());
     }
 
@@ -656,9 +829,9 @@ pub(crate) mod tests {
     fn register_fails_without_current_credentials() {
         let home = TempHome::new("register_fails_without_current_credentials");
         let store = home.store();
-        assert!(store.register(&Account::new(EMAIL_A, "taro")).is_err());
+        assert!(store.register(&home.active(EMAIL_A, "taro")).is_err());
         home.write_credentials(&json!({ "mcpOAuth": {} }));
-        assert!(store.register(&Account::new(EMAIL_A, "taro")).is_err());
+        assert!(store.register(&home.active(EMAIL_A, "taro")).is_err());
         assert!(store.list().is_empty());
     }
 
@@ -668,10 +841,10 @@ pub(crate) mod tests {
         let home = TempHome::new("list_returns_stored_accounts_by_email");
         let store = home.store();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&Account::new(EMAIL_A, "taro")).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
         home.write_credentials(&credentials_doc("access-b", "refresh-b"));
         store
-            .register(&Account::new(EMAIL_B, "hanako · Acme, Inc."))
+            .register(&home.active(EMAIL_B, "hanako · Acme, Inc."))
             .unwrap();
 
         assert_eq!(
@@ -692,9 +865,9 @@ pub(crate) mod tests {
         let home = TempHome::new("unregister_removes_the_store_entry_but_not_the_login");
         let store = home.store();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&Account::new(EMAIL_A, "taro")).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
         home.write_credentials(&credentials_doc("access-b", "refresh-b"));
-        store.register(&Account::new(EMAIL_B, "hanako")).unwrap();
+        store.register(&home.active(EMAIL_B, "hanako")).unwrap();
         let before = std::fs::read(home.paths().credentials).unwrap();
 
         store.unregister(EMAIL_A).unwrap();
@@ -716,7 +889,7 @@ pub(crate) mod tests {
         let home = TempHome::new("switch_clears_the_usage_cache");
         let store = home.store();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&Account::new(EMAIL_A, "taro")).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
         std::fs::write(home.paths().usage_cache, r#"{"written_at":1}"#).unwrap();
 
         store.switch_to(EMAIL_A, None).unwrap();
@@ -733,7 +906,7 @@ pub(crate) mod tests {
         let home = TempHome::new("switch_creates_the_credentials_file_when_missing");
         let store = home.store();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&Account::new(EMAIL_A, "taro")).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
         std::fs::remove_file(home.paths().credentials).unwrap();
 
         store.switch_to(EMAIL_A, None).unwrap();
@@ -750,14 +923,14 @@ pub(crate) mod tests {
         let store = home.store();
         // A と B を登録（登録時点の写しが保管に入る）
         home.write_credentials(&credentials_doc("access-b", "refresh-b"));
-        store.register(&Account::new(EMAIL_B, "hanako")).unwrap();
+        store.register(&home.active(EMAIL_B, "hanako")).unwrap();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&Account::new(EMAIL_A, "taro")).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
         // A で作業してトークンが更新された（追従更新はまだ走っていない）
         home.write_credentials(&credentials_doc("access-a3", "refresh-a3"));
 
         store
-            .switch_to(EMAIL_B, Some(&Account::new(EMAIL_A, "taro")))
+            .switch_to(EMAIL_B, Some(&home.active(EMAIL_A, "taro")))
             .unwrap();
 
         assert_eq!(
@@ -778,12 +951,12 @@ pub(crate) mod tests {
         let home = TempHome::new("switch_does_not_capture_an_unregistered_outgoing_account");
         let store = home.store();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&Account::new(EMAIL_A, "taro")).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
         // 未登録の B でログイン中に A へ切り替える
         home.write_credentials(&credentials_doc("access-b", "refresh-b"));
 
         store
-            .switch_to(EMAIL_A, Some(&Account::new(EMAIL_B, "hanako")))
+            .switch_to(EMAIL_A, Some(&home.active(EMAIL_B, "hanako")))
             .unwrap();
 
         assert_eq!(store.list(), vec![Account::new(EMAIL_A, "taro")]);
@@ -796,13 +969,17 @@ pub(crate) mod tests {
         let home = TempHome::new("switch_to_the_active_account_leaves_the_live_tokens_alone");
         let store = home.store();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&Account::new(EMAIL_A, "taro")).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
         home.write_credentials(&credentials_doc("access-a4", "refresh-a4"));
         std::fs::write(home.paths().usage_cache, r#"{"written_at":1}"#).unwrap();
 
-        store
-            .switch_to(EMAIL_A, Some(&Account::new(EMAIL_A, "taro")))
-            .unwrap();
+        assert_eq!(
+            store
+                .switch_to(EMAIL_A, Some(&home.active(EMAIL_A, "taro")))
+                .unwrap(),
+            AccountChange::AlreadyActive,
+            "何もしていないのに切替として返している"
+        );
 
         assert_eq!(
             home.read_credentials()[OAUTH_KEY],
@@ -834,7 +1011,7 @@ pub(crate) mod tests {
         let home = TempHome::new("switch_refuses_to_clobber_an_unreadable_credentials_file");
         let store = home.store();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&Account::new(EMAIL_A, "taro")).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
         std::fs::write(home.paths().credentials, "{ this is not json").unwrap();
 
         assert!(store.switch_to(EMAIL_A, None).is_err());
@@ -851,13 +1028,15 @@ pub(crate) mod tests {
     fn sync_follows_a_rotated_refresh_token_for_a_registered_account() {
         let home = TempHome::new("sync_follows_a_rotated_refresh_token_for_a_registered_account");
         let store = home.store();
-        let account = Account::new(EMAIL_A, "taro");
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&account).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
 
         // claude がトークンを更新した（refreshToken が新しい値に置き換わる）
         home.write_credentials(&credentials_doc("access-a2", "refresh-a2"));
-        assert!(store.sync_active(&account).unwrap(), "追従していない");
+        assert!(
+            store.sync_active(&home.active(EMAIL_A, "taro")).unwrap(),
+            "追従していない"
+        );
 
         assert_eq!(
             stored_oauth(&store, EMAIL_A),
@@ -872,10 +1051,10 @@ pub(crate) mod tests {
         let home = TempHome::new("sync_updates_the_stored_label");
         let store = home.store();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&Account::new(EMAIL_A, "taro")).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
 
         store
-            .sync_active(&Account::new(EMAIL_A, "taro · Acme, Inc."))
+            .sync_active(&home.active(EMAIL_A, "taro · Acme, Inc."))
             .unwrap();
 
         assert_eq!(
@@ -892,9 +1071,9 @@ pub(crate) mod tests {
         let store = home.store();
         home.write_credentials(&credentials_doc("access-b", "refresh-b"));
 
-        assert!(!store.sync_active(&Account::new(EMAIL_B, "hanako")).unwrap());
+        assert!(!store.sync_active(&home.active(EMAIL_B, "hanako")).unwrap());
         // email を持たないアカウントも同じ（キーが無いので保管できない）
-        assert!(!store.sync_active(&Account::new("", "claude.ai")).unwrap());
+        assert!(!store.sync_active(&home.active("", "claude.ai")).unwrap());
 
         assert!(store.list().is_empty());
         assert!(
@@ -908,13 +1087,12 @@ pub(crate) mod tests {
     fn sync_leaves_the_store_intact_when_credentials_are_unreadable() {
         let home = TempHome::new("sync_leaves_the_store_intact_when_credentials_are_unreadable");
         let store = home.store();
-        let account = Account::new(EMAIL_A, "taro");
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&account).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
 
         // 書き換え途中（壊れた JSON）を読んだケース
         std::fs::write(home.paths().credentials, "{ partial").unwrap();
-        assert!(!store.sync_active(&account).unwrap());
+        assert!(!store.sync_active(&home.active(EMAIL_A, "taro")).unwrap());
         assert_eq!(
             stored_oauth(&store, EMAIL_A),
             Some(oauth("access-a", "refresh-a")),
@@ -929,7 +1107,7 @@ pub(crate) mod tests {
         let home = TempHome::new("switch_fails_without_writing_while_another_holder_has_the_lock");
         let store = home.store();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&Account::new(EMAIL_A, "taro")).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
         home.write_credentials(&credentials_doc("access-b", "refresh-b"));
         let before = std::fs::read(home.paths().credentials).unwrap();
 
@@ -950,9 +1128,9 @@ pub(crate) mod tests {
             "取れなかったのに書いている（壊れた状態を残している）"
         );
         // 登録も同じ（現行の認証情報をロック下で読む）
-        assert!(short.register(&Account::new(EMAIL_B, "hanako")).is_err());
+        assert!(short.register(&home.active(EMAIL_B, "hanako")).is_err());
         // 追従更新は待たずに諦める（ポーラーを止めない）
-        assert!(!short.sync_active(&Account::new(EMAIL_A, "taro")).unwrap());
+        assert!(!short.sync_active(&home.active(EMAIL_A, "taro")).unwrap());
 
         drop(held);
         // 解放後は通常どおり書ける
@@ -966,7 +1144,7 @@ pub(crate) mod tests {
         let home = TempHome::new("switch_releases_the_lock_afterwards");
         let store = home.store();
         home.write_credentials(&credentials_doc("access-a", "refresh-a"));
-        store.register(&Account::new(EMAIL_A, "taro")).unwrap();
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
         assert!(!home.paths().lock.exists(), "登録がロックを残している");
 
         store.switch_to(EMAIL_A, None).unwrap();
@@ -1051,5 +1229,149 @@ pub(crate) mod tests {
             .expect("stale ロックを奪えていない");
         drop(stolen);
         assert!(!path.exists(), "解放されていない");
+    }
+
+    /// **切替は「新しい持ち主」を返す。** 自分が書いた値なので確定しており、
+    /// 呼び出し側は `claude auth status` の追いつき（1〜2 秒）を待たずに
+    /// 次の操作の材料にできる。返る観測は書いた直後のファイルと一致する
+    #[test]
+    fn switch_returns_the_new_owner_with_a_fresh_view() {
+        let home = TempHome::new("switch_returns_the_new_owner_with_a_fresh_view");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-b", "refresh-b"));
+        store.register(&home.active(EMAIL_B, "hanako")).unwrap();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+
+        let change = store
+            .switch_to(EMAIL_B, Some(&home.active(EMAIL_A, "taro")))
+            .unwrap();
+
+        assert_eq!(
+            change,
+            AccountChange::Switched(home.active(EMAIL_B, "hanako")),
+            "切替後の持ち主が確定値で返っていない"
+        );
+    }
+
+    /// **古い観測で巻き取ってはいけない**（バグの本体）。ccdesk が持ち主を判定した
+    /// 後に認証情報が差し替わっていると、`active` に入っている email の保管へ
+    /// **別アカウントの現行トークン**を書き込む。refreshToken は使い捨てなので、
+    /// 保管された側は二度と復元できず、両者が同じ refreshToken を指すため
+    /// どちらか一方を使った瞬間に他方も死ぬ。
+    ///
+    /// 検出できる（ロック下で指紋を読み直せば一致しない）ので、書かずに失敗させる
+    #[test]
+    fn switch_refuses_to_act_on_a_stale_view_of_the_active_account() {
+        let home = TempHome::new("switch_refuses_to_act_on_a_stale_view_of_the_active_account");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-b", "refresh-b"));
+        store.register(&home.active(EMAIL_B, "hanako")).unwrap();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+        // ccdesk が「今は A」と判定した時点の観測
+        let stale = home.active(EMAIL_A, "taro");
+        // その後 B へ切り替わった（ccdesk 自身の切替でも、別端末の /login でも同じ）
+        wait_for_a_new_mtime();
+        home.write_credentials(&credentials_doc("access-b2", "refresh-b2"));
+
+        let err = store
+            .switch_to(EMAIL_B, Some(&stale))
+            .expect_err("古い観測のまま切替が通っている");
+
+        assert!(
+            err.to_string().contains("try again"),
+            "やり直せることが伝わらない: {err}"
+        );
+        assert_eq!(
+            stored_oauth(&store, EMAIL_A),
+            Some(oauth("access-a", "refresh-a")),
+            "A の保管が B のトークンで潰れている（A は復旧不能）"
+        );
+        assert_eq!(
+            home.read_credentials()[OAUTH_KEY],
+            oauth("access-b2", "refresh-b2"),
+            "確認できていないのに現行の認証情報を書き換えている"
+        );
+    }
+
+    /// 登録も同じ根。切替直後（ccdesk の表示がまだ前のアカウント）に
+    /// `register current` を押すと、**現行 = B のトークンを A として保管**していた
+    #[test]
+    fn register_refuses_a_stale_view_of_the_active_account() {
+        let home = TempHome::new("register_refuses_a_stale_view_of_the_active_account");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+        let stale = home.active(EMAIL_A, "taro");
+        wait_for_a_new_mtime();
+        home.write_credentials(&credentials_doc("access-b", "refresh-b"));
+
+        assert!(
+            store.register(&stale).is_err(),
+            "古い観測のまま登録が通っている"
+        );
+        assert_eq!(
+            stored_oauth(&store, EMAIL_A),
+            Some(oauth("access-a", "refresh-a")),
+            "A の保管が B のトークンで潰れている"
+        );
+    }
+
+    /// 追従更新も同じ根だが、こちらは **失敗ではなく見送り**（次の機会がある）。
+    /// `claude auth status`（子プロセス、数百 ms）が認証情報を読んだ後にトークンが
+    /// 差し替わると、新しいアカウントのトークンを古い email の保管へ書きうる
+    #[test]
+    fn sync_skips_the_upsert_when_the_credentials_changed_after_the_fetch() {
+        let home = TempHome::new("sync_skips_the_upsert_when_the_credentials_changed_after_the_fetch");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+        // 「今は A」と判定した時点の観測（ポーラーは取得の前に指紋を読む）
+        let stale = home.active(EMAIL_A, "taro");
+        // 取得中に別アカウントへ切り替わった
+        wait_for_a_new_mtime();
+        home.write_credentials(&credentials_doc("access-b", "refresh-b"));
+
+        assert!(
+            !store.sync_active(&stale).unwrap(),
+            "古い観測のまま追従更新している"
+        );
+        assert_eq!(
+            stored_oauth(&store, EMAIL_A),
+            Some(oauth("access-a", "refresh-a")),
+            "A の保管が B のトークンで潰れている"
+        );
+    }
+
+    /// 認証情報ファイルの指紋: 書き換えと消滅を検出できる。
+    /// **ポーラーの再取得契機と、観測がまだ有効かの照合が同じ値を使う**ので、
+    /// この性質はここ 1 箇所で固定する
+    #[test]
+    fn the_credentials_fingerprint_detects_writes_and_deletion() {
+        let home = TempHome::new("the_credentials_fingerprint_detects_writes_and_deletion");
+        let path = home.paths().credentials;
+        assert_eq!(credentials_fingerprint(&path), None, "無いファイルは None");
+
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        let first = credentials_fingerprint(&path);
+        assert!(first.is_some());
+
+        // 長さが変わればサイズで検出できる（時刻の刻みに依存しない）
+        home.write_credentials(&credentials_doc("access-a-longer", "refresh-a-longer"));
+        let second = credentials_fingerprint(&path);
+        assert_ne!(second, first, "サイズの変化を検出できていない");
+
+        // 同じ長さでも刻みを跨げば mtime で検出できる（トークン入れ替えがこの形）
+        wait_for_a_new_mtime();
+        home.write_credentials(&credentials_doc("access-b-longer", "refresh-b-longer"));
+        assert_ne!(
+            credentials_fingerprint(&path),
+            second,
+            "同サイズの書き換えを検出できていない"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(credentials_fingerprint(&path), None, "消滅を検出できていない");
     }
 }

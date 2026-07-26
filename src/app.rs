@@ -10,7 +10,7 @@ use ratatui::layout::{Position, Rect};
 
 use ccdesk::{log_error, same_dir, BgJob};
 
-use crate::accounts::Account;
+use crate::accounts::{Account, AccountChange, ActiveAccount};
 use crate::keys::{encode_key, forward_mouse};
 use crate::poll::{AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo};
 use crate::session::Session;
@@ -1473,13 +1473,32 @@ const ACTIVE_MARK: &str = "● ";
 /// [`ACTIVE_MARK`] と同じ桁を確保する空白（印の有無で名前の桁が動かない）
 const NO_MARK: &str = "  ";
 
-/// 今ログイン中のアカウント（未取得・未ログインなら None）。
-/// **アカウント操作が `footer.account` を読む唯一の場所**にしてある
-fn active_account(app: &App) -> Option<&Account> {
+/// 今ログイン中のアカウントの観測（未取得・未ログインなら None）。
+/// **アカウント操作が `footer.account` を読む唯一の場所**にしてある。
+///
+/// 返すのが [`ActiveAccount`]（同一性 + いつの認証情報を見た判断か）なのは、
+/// 保管への書き込みがこの値を材料にするため。**「誰が今のアカウントか」の正本は
+/// この 1 箇所**で、書き手はポーラーの取り込みと [`publish_active_account`] の 2 つ
+fn active_account(app: &App) -> Option<&ActiveAccount> {
     match &app.footer.account {
-        AccountStatus::LoggedIn(account) => Some(account),
+        AccountStatus::LoggedIn(active) => Some(active),
         AccountStatus::LoggedOut | AccountStatus::Unknown => None,
     }
+}
+
+/// 「今の持ち主」の表示を確定値へ置き換える。
+///
+/// **ポーラーの共有側にも書く。** run ループは `footer_dirty` を見て
+/// `footer_shared` を**丸ごと**取り込むので、手元（`app.footer`）だけ更新すると
+/// 次の更新（バージョン取得など）で古い値へ巻き戻る。
+/// ポーラー自身の持ち越し（`shown`）は触らない: 認証ファイルが変わったことは
+/// ポーラーも指紋で気づいて取り直すので、放っておけば同じ値に収束する
+fn publish_active_account(app: &mut App, status: AccountStatus) {
+    app.footer.account = status.clone();
+    app.footer_shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .account = status;
 }
 
 /// アクティブなアカウントが保管されていないか（アカウント行の ⚠ の判定）。
@@ -1490,7 +1509,8 @@ fn active_account(app: &App) -> Option<&Account> {
 /// ＝ そもそも保管できないので、警告しても打つ手が無い
 pub(crate) fn active_unstored(app: &App) -> bool {
     active_account(app).is_some_and(|active| {
-        !active.email.is_empty() && !app.accounts.iter().any(|a| a.email == active.email)
+        let email = &active.account.email;
+        !email.is_empty() && !app.accounts.iter().any(|a| &a.email == email)
     })
 }
 
@@ -1503,7 +1523,9 @@ fn refresh_accounts(app: &mut App) {
 /// 保管一覧 → メニューの行。アクティブな 1 件にだけ [`ACTIVE_MARK`] を前置する。
 /// id は email（表示ラベルは組織名の抑制で変わるので同一性判定に使えない）
 fn account_items(app: &App) -> Vec<AccountItem> {
-    let active = active_account(app).map(|a| a.email.as_str()).unwrap_or("");
+    let active = active_account(app)
+        .map(|a| a.account.email.as_str())
+        .unwrap_or("");
     app.accounts
         .iter()
         .map(|account| AccountItem {
@@ -1549,16 +1571,16 @@ fn open_account_popup(app: &mut App, anchor_y: u16) {
 
 /// `register current`: 今ログイン中のアカウントを保管へ加える
 fn register_current(app: &mut App) {
-    let Some(account) = active_account(app).cloned() else {
+    let Some(active) = active_account(app).cloned() else {
         // 未取得・未ログインでは保管する対象が無い（押しても無反応に見せない）
         set_notice(app, "ログイン中のアカウントが取得できていない".to_string());
         return;
     };
-    apply_account(app, AccountAction::Register(&account), "登録");
+    apply_account(app, AccountAction::Register(&active), "登録");
 }
 
 /// `switch`: 保管アカウントへ切り替える。
-/// **`active` は `footer.account` のアクティブアカウントをそのまま渡す**
+/// **`active` は `footer.account` のアクティブアカウントの観測をそのまま渡す**
 /// （出ていくアカウントのトークンを同じロック下で保管へ巻き取るために必須。
 /// 渡さないと、切替の直前に更新された使い捨ての refreshToken を落として
 /// そのアカウントへ戻れなくなる）
@@ -1574,13 +1596,26 @@ fn switch_account(app: &mut App, email: &str) {
     );
 }
 
+/// 「既にそのアカウント」で切替が何もしなかったときの通知。
+/// **成功と同じ無反応にはしない**（メニューの `●` と同じ事実を言葉でも出す）
+const ALREADY_ACTIVE_NOTICE: &str = "既にこのアカウントを使っている";
+
 /// 保管への変更を供給元へ流す。成功したら写しを取り直し（⚠ と一覧が即座に追従する）、
 /// 失敗は下部バーへ出す。**エラー文はそのまま載せてよい**: ドメイン側の失敗は
 /// パスとロックの事情だけを述べ、トークンを含まない
 fn apply_account(app: &mut App, action: AccountAction<'_>, what: &str) {
-    let result = app.source.apply_account(action);
-    match result {
-        Ok(()) => refresh_accounts(app),
+    match app.source.apply_account(action) {
+        // **切替が成功した時点で「今の持ち主」は確定している**（ccdesk 自身が
+        // 書いた値）。ポーラーの追いつき（認証ファイルの変化検出 → 子プロセス起動で
+        // 1〜2 秒）を待つと、その間の操作が切替前の持ち主を材料に走り、
+        // 出ていったはずのアカウントの保管を別アカウントのトークンで潰す
+        Ok(AccountChange::Switched(active)) => {
+            publish_active_account(app, AccountStatus::LoggedIn(active));
+            refresh_accounts(app);
+        }
+        // 何もしなかったことを伝える（無反応と成功を見分けられるようにする）
+        Ok(AccountChange::AlreadyActive) => set_notice(app, ALREADY_ACTIVE_NOTICE.to_string()),
+        Ok(AccountChange::StoreOnly) => refresh_accounts(app),
         Err(e) => set_notice(app, format!("アカウントの{what}に失敗: {e}")),
     }
 }
@@ -2399,16 +2434,20 @@ mod tests {
     /// （特に switch の `active`。落とすと出ていくアカウントへ戻れなくなる）
     #[derive(Debug, PartialEq)]
     enum Recorded {
-        Register(Account),
+        Register(ActiveAccount),
         Switch {
             email: String,
-            active: Option<Account>,
+            active: Option<ActiveAccount>,
         },
         Unregister(String),
     }
 
     /// 保管一覧を固定値で返し、変更要求を記録するだけの供給元。
-    /// `fails` を立てると変更が失敗する（下部バーへの通知経路を見るため）
+    /// `fails` を立てると変更が失敗する（下部バーへの通知経路を見るため）。
+    ///
+    /// **切替の結果は「実際に切り替わった」で返す**（`switched_to`）。ドメイン側は
+    /// 成功時に新しい持ち主を返す契約なので、記録用でも同じ形にしないと
+    /// 「成功後にアカウント行が確定値へ更新される」経路を見られない
     struct RecordingSource {
         stored: Vec<Account>,
         recorded: Arc<Mutex<Vec<Recorded>>>,
@@ -2452,12 +2491,30 @@ mod tests {
             self.stored.clone()
         }
 
-        fn apply_account(&self, action: AccountAction<'_>) -> anyhow::Result<()> {
+        fn apply_account(&self, action: AccountAction<'_>) -> anyhow::Result<AccountChange> {
+            let change = match &action {
+                // 切替先のラベルは保管一覧から引く（実物と同じく、確定値は
+                // 保管の側から来る）。ここでは指紋を持たない観測で足りる:
+                // 記録用の供給元はファイルを読まないので照合の相手が無い
+                AccountAction::Switch { email, .. } => AccountChange::Switched(
+                    ActiveAccount::unseen(Account::new(
+                        *email,
+                        self.stored
+                            .iter()
+                            .find(|a| a.email == *email)
+                            .map(|a| a.label.as_str())
+                            .unwrap_or(email),
+                    )),
+                ),
+                AccountAction::Register(_) | AccountAction::Unregister(_) => {
+                    AccountChange::StoreOnly
+                }
+            };
             self.recorded
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(match action {
-                    AccountAction::Register(account) => Recorded::Register(account.clone()),
+                    AccountAction::Register(active) => Recorded::Register(active.clone()),
                     AccountAction::Switch { email, active } => Recorded::Switch {
                         email: email.to_string(),
                         active: active.cloned(),
@@ -2468,7 +2525,7 @@ mod tests {
                 // 実際に返り得る失敗（ロック競合）と同じ形。トークンは含まない
                 return Err(anyhow::anyhow!("lock is held by another process"));
             }
-            Ok(())
+            Ok(change)
         }
     }
 
@@ -2483,7 +2540,7 @@ mod tests {
         let app = App {
             footer: FooterInfo {
                 account: match active {
-                    Some(account) => AccountStatus::LoggedIn(account),
+                    Some(account) => AccountStatus::LoggedIn(ActiveAccount::unseen(account)),
                     None => AccountStatus::Unknown,
                 },
                 ..FooterInfo::default()
@@ -2604,7 +2661,10 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             [Recorded::Switch {
                 email: "x-personal@example.com".to_string(),
-                active: Some(Account::new("other@example.com", "other")),
+                active: Some(ActiveAccount::unseen(Account::new(
+                    "other@example.com",
+                    "other"
+                ))),
             }],
             "クリックした行と別のアカウントが対象になっている"
         );
@@ -2636,10 +2696,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             [
-                Recorded::Register(active.clone()),
+                Recorded::Register(ActiveAccount::unseen(active.clone())),
                 Recorded::Switch {
                     email: "b@example.com".to_string(),
-                    active: Some(active),
+                    active: Some(ActiveAccount::unseen(active)),
                 },
                 Recorded::Unregister("b@example.com".to_string()),
             ]
@@ -2666,7 +2726,7 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             [Recorded::Switch {
                 email: "a@example.com".to_string(),
-                active: Some(active),
+                active: Some(ActiveAccount::unseen(active)),
             }]
         );
         assert!(app.notice.is_none(), "no-op が失敗として扱われている");
@@ -2709,6 +2769,224 @@ mod tests {
             msg.contains("lock is held by another process"),
             "ドメインのエラー文が落ちている: {msg:?}"
         );
+    }
+
+    // ── アカウント操作の「操作列」テスト ────────────────────────────────
+    //
+    // ここから下は **実物の保管ストア（一時ディレクトリ）へ繋いで UI の操作列を
+    // そのまま流す**。記録用の供給元（[`RecordingSource`]）は引数を見るだけなので、
+    // 「切替の後に、まだ切替前の持ち主を材料に次の操作を走らせる」形のバグ
+    // ＝ 別アカウントの保管を使い捨ての refreshToken で潰す破壊は、そこでは
+    // 再現できない（実際にこの形で見落とされていた）
+
+    // フィクスチャは [`crate::accounts::tests`] のものを借りる（「実ホームを
+    // 触らない」境界の知識を複製しない）
+    use crate::accounts::tests::{credentials_doc, oauth, stored_oauth, TempHome};
+
+    const STORE_A: &str = "a@example.com";
+    const STORE_B: &str = "b@example.com";
+    const STORE_C: &str = "c@example.com";
+
+    /// 実物の [`AccountStore`] を引く供給元。対応表は本番と同じ
+    /// [`crate::source::apply_account_action`] を通す（テスト用の写しを作らない）
+    struct StoreSource(crate::accounts::AccountStore);
+
+    impl DataSource for StoreSource {
+        fn jobs(&self) -> Vec<BgJob> {
+            Vec::new()
+        }
+
+        fn footer(&self) -> FooterInfo {
+            FooterInfo::default()
+        }
+
+        fn usage(&self) -> Option<UsageInfo> {
+            None
+        }
+
+        fn window_state(&self) -> WindowState {
+            WindowState {
+                sidebar_width: 34,
+                last_view: None,
+                dispatch_cwd: String::new(),
+                grouping: Grouping::State,
+                projects: Vec::new(),
+            }
+        }
+
+        fn save_window(&self, _item: WindowItem<'_>) {}
+
+        fn spawn_pollers(&self, _sinks: PollSinks) {}
+
+        fn spawns_sessions(&self) -> bool {
+            false
+        }
+
+        fn accounts(&self) -> Vec<Account> {
+            self.0.list()
+        }
+
+        fn apply_account(&self, action: AccountAction<'_>) -> anyhow::Result<AccountChange> {
+            crate::source::apply_account_action(&self.0, action)
+        }
+    }
+
+    /// A・B・C を保管済みで、**A でログイン中かつ A のトークンが更新済み**
+    /// （保管は `access-a`、現行は `access-a2`）の App。
+    ///
+    /// 「保管より現行が新しい」状態にしてあるのは、切替の巻き取りが効いているかが
+    /// この差でしか見えないため（使い捨ての refreshToken を落とすと戻れなくなる）
+    fn app_with_real_store(test: &str) -> (App, TempHome, crate::accounts::AccountStore) {
+        let home = TempHome::new(test);
+        let store = home.store();
+        for (email, label, token) in [
+            (STORE_C, "carol", "c"),
+            (STORE_B, "bob", "b"),
+            (STORE_A, "alice", "a"),
+        ] {
+            home.write_credentials(&credentials_doc(
+                &format!("access-{token}"),
+                &format!("refresh-{token}"),
+            ));
+            store.register(&home.active(email, label)).unwrap();
+        }
+        // A で作業してトークンが更新された（追従更新はまだ走っていない）
+        home.write_credentials(&credentials_doc("access-a2", "refresh-a2"));
+        let app = App {
+            footer: FooterInfo {
+                // ポーラーが「今は A」と判定した時点の観測
+                account: AccountStatus::LoggedIn(home.active(STORE_A, "alice")),
+                ..FooterInfo::default()
+            },
+            accounts: store.list(),
+            source: Box::new(StoreSource(crate::accounts::AccountStore::new(home.paths()))),
+            ..test_app(34, TERM)
+        };
+        (app, home, store)
+    }
+
+    /// メニューから switch を選ぶ 1 操作
+    fn switch(app: &mut App, email: &str) {
+        run_popup_action(app, PopupAction::SwitchAccount(email.to_string()), 0);
+    }
+
+    /// アカウント行が「今の持ち主」として持っている email
+    fn active_email(app: &App) -> &str {
+        active_account(app)
+            .map(|a| a.account.email.as_str())
+            .unwrap_or("")
+    }
+
+    /// 保管された `claudeAiOauth`（トークンが潰れていないかを見る）
+    fn stored(store: &crate::accounts::AccountStore, email: &str) -> Option<serde_json::Value> {
+        stored_oauth(store, email)
+    }
+
+    /// **切替が成功したら、次の操作はもう新しい持ち主を材料にする。**
+    /// A→B の後に B→C を押すと、以前は `switch_to(C, active=A)` が渡り、現行ファイル
+    /// （もう B）の `claudeAiOauth` を **A の保管へ** 書き込んでいた。refreshToken は
+    /// 使い捨てなので A は復旧不能になり、A と B の保管が同じ refreshToken を指すため
+    /// どちらか一方を使った瞬間に他方も死ぬ
+    #[test]
+    fn switching_again_does_not_overwrite_the_previous_account() {
+        let (mut app, home, store) =
+            app_with_real_store("switching_again_does_not_overwrite_the_previous_account");
+
+        switch(&mut app, STORE_B);
+        assert_eq!(
+            active_email(&app),
+            STORE_B,
+            "切替に成功したのにアカウント行が前の持ち主のまま（次の操作の材料が古い）"
+        );
+
+        switch(&mut app, STORE_C);
+
+        assert_eq!(app.notice, None, "失敗している: {:?}", app.notice);
+        assert_eq!(
+            stored(&store, STORE_A),
+            Some(oauth("access-a2", "refresh-a2")),
+            "A の保管が B のトークンで潰れている（A は復旧不能）"
+        );
+        assert_eq!(
+            stored(&store, STORE_B),
+            Some(oauth("access-b", "refresh-b")),
+            "出ていく B のトークンを巻き取れていない"
+        );
+        assert_eq!(
+            home.read_credentials()["claudeAiOauth"],
+            oauth("access-c", "refresh-c"),
+            "C へ切り替わっていない"
+        );
+    }
+
+    /// 同じアカウントへの switch をもう一度押しても壊れない。
+    /// 以前は `●` が前の持ち主に付いたままだったので「効いていない」と見えて
+    /// もう一度押され、`switch_to(B, active=A)` で A の保管が潰れていた
+    #[test]
+    fn pressing_switch_twice_on_the_same_account_changes_nothing() {
+        let (mut app, home, store) =
+            app_with_real_store("pressing_switch_twice_on_the_same_account_changes_nothing");
+
+        switch(&mut app, STORE_B);
+        switch(&mut app, STORE_B);
+
+        assert_eq!(
+            stored(&store, STORE_A),
+            Some(oauth("access-a2", "refresh-a2")),
+            "A の保管が B のトークンで潰れている"
+        );
+        assert_eq!(
+            home.read_credentials()["claudeAiOauth"],
+            oauth("access-b", "refresh-b"),
+            "現行トークンを古い写しで上書きしている"
+        );
+        // 何もしなかったことは伝える（無反応と成功を見分けられるようにする）
+        let (msg, _) = app.notice.as_ref().expect("no-op が無反応になっている");
+        assert_eq!(msg, ALREADY_ACTIVE_NOTICE);
+    }
+
+    /// 切替直後の `register current` も同じ根。以前は `capture_current(A)` が
+    /// **現行 = B のトークンを A として保管**していた
+    #[test]
+    fn register_current_after_a_switch_stores_the_new_account() {
+        let (mut app, _home, store) =
+            app_with_real_store("register_current_after_a_switch_stores_the_new_account");
+
+        switch(&mut app, STORE_B);
+        run_popup_action(&mut app, PopupAction::RegisterCurrent, 0);
+
+        assert_eq!(app.notice, None, "失敗している: {:?}", app.notice);
+        assert_eq!(
+            stored(&store, STORE_A),
+            Some(oauth("access-a2", "refresh-a2")),
+            "A の保管が B のトークンで潰れている"
+        );
+        assert_eq!(
+            stored(&store, STORE_B),
+            Some(oauth("access-b", "refresh-b")),
+            "今ログイン中のアカウントを保管できていない"
+        );
+    }
+
+    /// **「間違えた、戻す」が効く。** 以前はアカウント行がまだ A だったので
+    /// `switch_to(A, active=A)` が渡り、同一アカウントの no-op ガードで黙って
+    /// 何もせず成功を返していた（現行は B のまま。稼働中セッションは次の
+    /// メッセージから B で喋り続ける）
+    #[test]
+    fn switching_back_to_the_previous_account_restores_it() {
+        let (mut app, home, _store) =
+            app_with_real_store("switching_back_to_the_previous_account_restores_it");
+
+        switch(&mut app, STORE_B);
+        switch(&mut app, STORE_A);
+
+        assert_eq!(app.notice, None, "失敗している: {:?}", app.notice);
+        assert_eq!(
+            home.read_credentials()["claudeAiOauth"],
+            oauth("access-a2", "refresh-a2"),
+            "A へ戻れていない（黙って no-op になっている）"
+        );
+        assert_eq!(active_email(&app), STORE_A);
     }
 
     /// 切替の影響範囲（稼働セッション数）は**選べない情報行**として末尾に出る。
