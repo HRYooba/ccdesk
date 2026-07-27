@@ -6,7 +6,9 @@ use ratatui::style::Color;
 
 use ccdesk::{claude_settings_channel, version_newer};
 
-use crate::accounts::{Account, AccountStore, ActiveAccount, CredentialsFp, Owner};
+use crate::accounts::{
+    Account, AccountStore, ActiveAccount, CredentialsFp, Owner, CREDENTIALS_SETTLE,
+};
 // `agents --json` の項目の綴りは文書化されていないので
 // [`crate::claude_format`] が持つ（外れたときに直す場所を 1 つにするため）
 use crate::claude_format::{
@@ -520,6 +522,15 @@ struct AccountPollState {
     age: u64,
     /// 直前の取得が失敗（`Unknown`）だったか。次の待ち時間を選ぶのに使う
     last_failed: bool,
+    /// 認証情報の変化を見てからの経過秒（取り直したら `None`）。
+    ///
+    /// **変化の窓（[`CREDENTIALS_SETTLE`]）が閉じた直後に、もう 1 回だけ
+    /// 取り直すためだけに持つ。** 変化の直後に掴んだ持ち主は claude 側の
+    /// 遅延キャッシュ由来でありうるのに、次の契機は周期フォールバック（60 秒）
+    /// しか無い ＝ **遅れた答えが最大 1 分ぶん表示と手動操作の材料に残る**
+    /// （その材料で保管へ書くと、別アカウントのトークンがこの email の保管に入る。
+    ///  ドメイン側の窓は「観測がいつ作られたか」を知らないので、そこでは止まらない）
+    since_change: Option<u64>,
 }
 
 impl AccountPollState {
@@ -530,6 +541,16 @@ impl AccountPollState {
             last_fp: None,
             age: u64::MAX / 2,
             last_failed: false,
+            since_change: None,
+        }
+    }
+
+    /// 1 秒進める。**進めるのはループで、判断は [`account_step`]**
+    /// （`age` を 0 に戻すのは取得した側 ＝ 状態の進み方を 2 箇所に分けない）
+    fn tick(&mut self) {
+        self.age += 1;
+        if let Some(since) = self.since_change.as_mut() {
+            *since += 1;
         }
     }
 
@@ -554,7 +575,12 @@ impl AccountPollState {
 ///
 /// **その fingerprint を `fetch` へ渡す。** 取得結果は「その状態のファイルを見て
 /// 決めた持ち主」なので、再取得の契機に使う値と観測の日付は同じ 1 回の読みで足りる
-/// （2 回読むと、間に入った書き換えで「古い判断に新しい日付」が付きうる）
+/// （2 回読むと、間に入った書き換えで「古い判断に新しい日付」が付きうる）。
+///
+/// **変化を見たら 2 回取る。** 1 回目は変化の直後で、`claude auth status` は
+/// 遅延キャッシュからまだ前のアカウントを答えうる（[`CREDENTIALS_SETTLE`]）。
+/// その答えは表示に載るだけでなく、ユーザーがメニューから押す操作の材料にもなるので、
+/// **窓が閉じた頃にもう 1 回取り直して置き換える**（[`AccountPollState::since_change`]）
 fn account_step(
     state: &mut AccountPollState,
     shown: &AccountStatus,
@@ -565,7 +591,23 @@ fn account_step(
     let fp = read_fp();
     let auth_changed = fp != state.last_fp;
     state.last_fp = fp;
-    if !refetch_due(state.age, state.interval(), auth_changed, forced) {
+    if auth_changed {
+        state.since_change = Some(0);
+    }
+    // 窓が閉じた ＝ 遅れていたキャッシュが追いついている頃。取り直すのは 1 回だけ
+    // （閉じた後も毎周叩くと、変化のたびに子プロセスが増える）
+    let window_closed = state
+        .since_change
+        .is_some_and(|since| since >= CREDENTIALS_SETTLE.as_secs());
+    if window_closed {
+        state.since_change = None;
+    }
+    if !refetch_due(
+        state.age,
+        state.interval(),
+        auth_changed || window_closed,
+        forced,
+    ) {
         return None;
     }
     state.age = 0;
@@ -645,7 +687,7 @@ pub(crate) fn spawn_footer_poller(
                 dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             std::thread::sleep(Duration::from_secs(1));
-            account.age += 1;
+            account.tick();
             version_age += 1;
         }
     });
@@ -1182,6 +1224,58 @@ mod tests {
             second,
             Some(new),
             "a login that landed during the fetch is not picked up on the next cycle"
+        );
+    }
+
+    /// **変化を見たら、窓が閉じた頃にもう 1 回取り直す**
+    /// （[`AccountPollState::since_change`]）。
+    ///
+    /// `/login` の直後に掴む持ち主は claude 側の遅延キャッシュ由来でありうる。
+    /// それを置き換える契機が周期フォールバック（60 秒）しか無いと、遅れた答えが
+    /// **最大 1 分ぶんユーザー操作の材料に残る**（その材料で `register current` を
+    /// 押すと、別アカウントのトークンがこの email の保管へ入る）。
+    /// ドメイン側の窓は「観測がいつ作られたか」を知らないので、そこでは止まらない
+    #[test]
+    fn a_credentials_change_is_refetched_once_the_change_window_closes() {
+        let fp = std::cell::Cell::new(fp_of(1));
+        let mut state = AccountPollState::new();
+        let lagging = logged_in("taro");
+        let settled = logged_in_as("hanako@example.com", "hanako");
+
+        // 変化を見た周（遅れた答えを掴みうる）
+        assert_eq!(
+            account_step(&mut state, &AccountStatus::Unknown, false, || fp.get(), |_| {
+                lagging.clone()
+            }),
+            Some(lagging.clone())
+        );
+
+        // 窓が閉じるまでは叩き直さない（毎周子プロセスを起こさない）
+        for _ in 0..CREDENTIALS_SETTLE.as_secs() - 1 {
+            state.tick();
+        }
+        assert_eq!(
+            account_step(&mut state, &lagging, false, || fp.get(), |_| panic!(
+                "refetched before the change window closed"
+            )),
+            None
+        );
+
+        // 閉じた周で取り直す（周期フォールバックを待たない）
+        state.tick();
+        assert_eq!(
+            account_step(&mut state, &lagging, false, || fp.get(), |_| settled.clone()),
+            Some(settled.clone()),
+            "the lagging answer stays until the periodic fallback"
+        );
+
+        // 取り直すのは 1 回だけ
+        state.tick();
+        assert_eq!(
+            account_step(&mut state, &settled, false, || fp.get(), |_| panic!(
+                "kept refetching after the recheck"
+            )),
+            None
         );
     }
 
