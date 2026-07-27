@@ -9,7 +9,7 @@ a foreground `claude` session that ccdesk owns, and the list itself lives in
 `~/.ccdesk/sessions.json`, so closing ccdesk ends the processes while the rows stay —
 reopen one and it resumes from its transcript.
 
-![ccdesk](docs/screenshot.png)
+![ccdesk](assets/screenshot.png)
 
 ## Features
 

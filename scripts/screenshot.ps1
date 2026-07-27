@@ -1,8 +1,8 @@
-# Regenerate docs/screenshot.png from ccdesk --demo, rendered by Windows Terminal.
+# Regenerate assets/screenshot.png from ccdesk --demo, rendered by Windows Terminal.
 #
 # Usage (from the repository root, after a release build):
 #
-#   .\docs\screenshot.ps1 -Exe .\target\release\ccdesk.exe -Out .\docs\screenshot.png
+#   .\scripts\screenshot.ps1 -Exe .\target\release\ccdesk.exe -Out .\assets\screenshot.png
 #
 # Run this whenever the sidebar or the new-session screen changes shape, so the
 # README image keeps matching the current version. Check the result before
