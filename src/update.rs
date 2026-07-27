@@ -1,8 +1,13 @@
 //! ccdesk 自身の更新: リリースタグの取得・アセットのダウンロード・SHA-256 検証・
 //! 実行ファイルの差し替え。更新の知識はこのモジュールに閉じる:
 //! 呼び出し口は `ccdesk update`（CLI）と、サイドバー上部の版行のクリック
-//! （[`install`] をバックグラウンドスレッドで呼ぶ）の 2 つ。TUI は起動時に
-//! [`newer_tag`] で新しい版を調べ、あればその行に更新マーカーを出す。
+//! （[`install`] をバックグラウンドスレッドで呼ぶ）の 2 つ。
+//!
+//! 新しい版があるかの周期チェックは [`crate::poll`] が持つ（claude の版チェックと
+//! **同じゲートで回す**ため）。ここが提供するのは [`latest_tag`] と
+//! [`tag_is_newer`] の 2 つで、**組み合わせない**: 「取得できなかった」と
+//! 「新しい版が無い」を呼び手が区別できる必要があるため（1 回の通信失敗で
+//! 更新マーカーを 1 時間消してはいけない）。
 //!
 //! Windows では**動いている実行ファイルを上書きできない**（`Device or resource
 //! busy`）が、**別名へ改名することはできる**（実測）。そのため差し替えは
@@ -82,12 +87,6 @@ fn is_plausible_tag(tag: &str) -> bool {
 /// 「更新できます」と誤案内しないためのガードでもある
 pub(crate) fn tag_is_newer(tag: &str) -> bool {
     ccdesk::version_newer(tag.trim_start_matches('v'), env!("CARGO_PKG_VERSION"))
-}
-
-/// このビルドより新しいリリースタグ。同版・古い・取得失敗なら None
-pub(crate) fn newer_tag() -> Option<String> {
-    let tag = latest_tag()?;
-    tag_is_newer(&tag).then_some(tag)
 }
 
 /// 直前の自己更新で退避した `<exe>.old` を消す。更新した当のプロセスが生きている

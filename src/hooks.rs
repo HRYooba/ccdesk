@@ -18,9 +18,13 @@
 //! 状態（[`HookStates::get`]）・未読（[`HookStates::unread`]）・
 //! 行が今の姿になった時刻（[`HookStates::changed_at`]）。
 //!
-//! **注入する settings はここが 1 箇所で組む**（[`inject_settings`]）。使用率表示の
-//! statusLine も同じファイルに載るため（`--settings` は 1 つしか渡せない）で、
-//! statusLine コマンドの中身だけは [`crate::cli::statusline_hook`] にある。
+//! **注入する settings はここが 1 箇所で組む**（[`inject_settings`]）。載るのは hook だけ。
+//!
+//! **`statusLine` を載せてはいけない。** `--settings` の値はキー単位でユーザー設定を
+//! 上書きする（公式仕様）ので、書いた瞬間にそのセッションのユーザー自身の statusline が
+//! 消える。奪ってから代理実行で返す形は実際に試して壊れており（返す側が環境差で失敗し、
+//! 使用率表示を使っていない人の statusline まで空にした）、**代理実行に戻さないこと**。
+//! 使用率は statusLine に相乗りせず [`crate::usage`] が独立に取る。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -355,28 +359,29 @@ pub(crate) fn cleanup_leftover_tmp() {
 
 /// 子の claude へ `--settings` で渡す注入ファイルを書き、そのパスを返す。
 ///
-/// 載るのは 2 つ: **hook（常に）** と、使用率表示が opt-in のときだけ statusLine。
-/// 1 ファイルに束ねてあるのは `--settings` を 1 つしか渡せないためで、
-/// **何を注入するかの判断はここ 1 箇所**（呼び出し側は opt-in の可否だけを渡す）。
+/// 載るのは **hook だけ**。`--settings` を 1 つしか渡せない以上、ここに何を書くかは
+/// そのセッションのユーザー設定を上書きするかどうかの判断そのもので、
+/// **何を注入するかの判断はここ 1 箇所**にある。
 ///
-/// コマンドのパスは `/` 区切り必須: claude は hook / statusline を bash 経由で
+/// コマンドのパスは `/` 区切り必須: claude は hook を bash 経由で
 /// 実行するため `\` 区切りはエスケープとして食われる（実測）。
 ///
 /// **前提**: `--settings` の hook はユーザー自身の設定（`~/.claude/settings.json`）の
-/// hook と併存する（claude は設定ソースごとの hook を合成する）。仮に置き換えだった
-/// 場合、ccdesk が起こしたセッションではユーザーの hook が動かなくなる
-pub(crate) fn inject_settings(usage_display: bool) -> Option<PathBuf> {
+/// hook と併存する（claude は設定ソースごとの hook を合成する。公式に文書化）。
+/// スカラーのキーは併存せず上書きになるので、**hook 以外は載せない**
+/// （[`settings_document`] のテストがそれを固定する）
+pub(crate) fn inject_settings() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = ccdesk::ccdesk_dir()?;
     let exe_fwd = exe.to_string_lossy().replace('\\', "/");
     let path = dir.join("inject-settings.json");
-    std::fs::write(&path, settings_document(&exe_fwd, usage_display).to_string()).ok()?;
+    std::fs::write(&path, settings_document(&exe_fwd).to_string()).ok()?;
     Some(path)
 }
 
 /// 注入ファイルの中身（[`inject_settings`] の判断だけを取り出したもの。
 /// ファイルを書かずに検査できる）
-fn settings_document(exe_fwd: &str, usage_display: bool) -> Value {
+fn settings_document(exe_fwd: &str) -> Value {
     let mut settings = serde_json::Map::new();
     settings.insert(
         "hooks".to_string(),
@@ -397,15 +402,6 @@ fn settings_document(exe_fwd: &str, usage_display: bool) -> Value {
                 .collect(),
         ),
     );
-    if usage_display {
-        settings.insert(
-            "statusLine".to_string(),
-            json!({
-                "type": "command",
-                "command": format!("\"{exe_fwd}\" statusline-hook"),
-            }),
-        );
-    }
     Value::Object(settings)
 }
 
@@ -456,7 +452,7 @@ mod tests {
     /// 注入したのに何も起きない（または登録されていない口が残る）
     #[test]
     fn every_injected_event_is_understood_by_the_receiver() {
-        let document = settings_document("C:/bin/ccdesk.exe", false);
+        let document = settings_document("C:/bin/ccdesk.exe");
         let hooks = document.get("hooks").and_then(Value::as_object).unwrap();
         assert_eq!(hooks.len(), HOOK_EVENTS.len(), "number of injected hooks differs from the table");
         for (event, state) in HOOK_EVENTS {
@@ -483,20 +479,19 @@ mod tests {
         }
     }
 
-    /// hook は常に注入し、statusLine は opt-in のときだけ載る
-    /// （使用率表示を切っていても state は取れる）
+    /// **注入するのは `hooks` だけ。** `hooks` は claude が設定ソースを跨いで合成するので
+    /// 併存する（公式に文書化）が、スカラーのキーは併存せず上書きになる ＝ hook 以外を
+    /// 載せた瞬間にそのセッションのユーザー設定が消える（経緯はモジュールの doc）
     #[test]
-    fn hooks_are_always_injected_and_the_status_line_is_opt_in() {
-        let off = settings_document("C:/bin/ccdesk.exe", false);
-        assert!(off.get("hooks").is_some(), "hooks were not injected");
-        assert!(off.get("statusLine").is_none(), "injected statusLine even though not opt-in");
-
-        let on = settings_document("C:/bin/ccdesk.exe", true);
-        assert_eq!(on.get("hooks"), off.get("hooks"), "hook shape changed under opt-in");
-        assert_eq!(
-            on["statusLine"]["command"].as_str(),
-            Some("\"C:/bin/ccdesk.exe\" statusline-hook")
-        );
+    fn only_hooks_are_injected() {
+        let document = settings_document("C:/bin/ccdesk.exe");
+        let keys: Vec<&str> = document
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["hooks"], "injected a key other than hooks");
     }
 
     /// 受けた state は保管へ載り、TUI 側の読みで同じ値が返る

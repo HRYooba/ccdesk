@@ -221,7 +221,7 @@ fn build_command(
     for key in INHERITED_MARKERS {
         cmd.env_remove(key);
     }
-    // 使用率表示（opt-in）の statusline フック注入
+    // state を戻す hook の注入（中身は [`crate::hooks::inject_settings`]）
     if let Some(path) = settings {
         cmd.arg("--settings");
         cmd.arg(path);
@@ -544,9 +544,9 @@ mod tests {
         assert_eq!(argv(&cmd), ["-r", id().as_str()]);
     }
 
-    /// 使用率表示（opt-in）の settings は起動の種類に関係なく前に付く
+    /// 注入する settings（state を戻す hook）は起動の種類に関係なく前に付く
     #[test]
-    fn the_injected_settings_are_passed_when_usage_display_is_on() {
+    fn the_injected_settings_are_passed_before_the_launch_arguments() {
         let path = std::path::Path::new("C:\\Users\\me\\.ccdesk\\inject-settings.json");
         let cmd = build_command(&id(), "C:\\dev\\app", Launch::Resume, Some(path));
         assert_eq!(

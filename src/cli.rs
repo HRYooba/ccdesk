@@ -1,4 +1,4 @@
-//! CLI サブコマンド（doctor / logs / update / statusline-hook）。
+//! CLI サブコマンド（doctor / logs / update）。
 
 use crate::poll::{fetch_account, AccountStatus};
 use crate::update;
@@ -49,90 +49,6 @@ pub(crate) fn update_self() -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION"),
         installed.old.display()
     );
-    Ok(())
-}
-
-/// statusline フック（使用率表示 opt-in 時に --settings で注入される。ユーザーは直接使わない）。
-/// claude が statusline へ渡す公式 JSON から rate_limits を ~/.ccdesk/usage.json に保存し、
-/// ユーザー自身の statusline 設定があれば同じ入力でそのまま実行して出力を透過する。
-/// fail-open: フック側で何が起きてもユーザー statusline の実行と出力は必ず通す
-pub(crate) fn statusline_hook() -> anyhow::Result<()> {
-    use std::io::Read as _;
-    let mut input = String::new();
-    let _ = std::io::stdin().read_to_string(&mut input);
-
-    // rate_limits の保存は best-effort（失敗しても透過実行へ進む）
-    let _ = std::panic::catch_unwind(|| {
-        let Some(v) = serde_json::from_str::<serde_json::Value>(&input).ok() else {
-            return;
-        };
-        let Some(rl) = v.get("rate_limits") else {
-            return;
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let out = serde_json::json!({
-            "rate_limits": rl,
-            "written_at": now,
-        });
-        if let Some(path) = ccdesk::usage_cache_path() {
-            // 読み手が中途半端な JSON を見ないよう tmp → rename で置く
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, out.to_string()).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
-        }
-    });
-
-    // ユーザー自身の statusline 設定（ユーザースコープのみ）へ透過する。
-    // プロジェクトローカルの .claude/settings.json は読まない: リポジトリ由来の
-    // コマンドを信頼確認なしに実行すると、悪意あるリポジトリを開くだけで
-    // 任意コマンド実行になるため（claude 本体の信頼プロンプト相当を持たないうちは
-    // ユーザースコープに限定する）
-    let read_statusline = |path: std::path::PathBuf| -> Option<String> {
-        let s = std::fs::read_to_string(path).ok()?;
-        let v = serde_json::from_str::<serde_json::Value>(&s).ok()?;
-        let sl = v.get("statusLine")?;
-        if sl.get("type").and_then(|t| t.as_str()) != Some("command") {
-            return None;
-        }
-        sl.get("command").and_then(|c| c.as_str()).map(str::to_string)
-    };
-    let user_cmd = ccdesk::claude_dir().and_then(|d| read_statusline(d.join("settings.json")));
-    if let Some(cmd) = user_cmd {
-        // 自己参照ガード: 誤って自分自身が設定されていても無限再帰させない
-        if cmd.contains("statusline-hook") {
-            return Ok(());
-        }
-        use std::io::Write as _;
-        // claude 本体と同じく bash で実行する（bash 前提のコマンドを壊さない）。
-        // bash が無い環境だけ cmd /C にフォールバックし、~/ は手動でホームへ展開
-        let child = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(&cmd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .or_else(|_| {
-                let home = std::env::var("USERPROFILE").unwrap_or_default();
-                let cmd = cmd.replace("~/", &format!("{}/", home.replace('\\', "/")));
-                std::process::Command::new("cmd")
-                    .args(["/C", &cmd])
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::inherit())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-            });
-        if let Ok(mut child) = child {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(input.as_bytes());
-            }
-            let _ = child.wait();
-        }
-    }
     Ok(())
 }
 
@@ -200,6 +116,52 @@ pub(crate) fn run_doctor() -> anyhow::Result<()> {
         }
         AccountStatus::Unknown => {
             println!("warn  claude account: could not determine (`claude auth status --json`)");
+        }
+    }
+
+    // 使用率の取得（**opt-in を切っていても実際に 1 回叩く** ＝ 入れる前に
+    // 何が返るか確かめられる。取得は課金ゼロ・枠を消費しない。[`crate::usage`]）。
+    //
+    // **これが無いと「opt-in したのに出ない」人へ渡せる情報が無い。** 以前の方式は
+    // 開発者の環境でだけ通る 1 本を踏んでいて、他人の環境で無言に空になっていた。
+    // 環境差でしか壊れないものは、他人自身が 1 コマンドで確かめられる必要がある
+    {
+        let opt_in = if ccdesk::load_setting("usage_display").as_deref() == Some("on") {
+            "on"
+        } else {
+            "off"
+        };
+        match crate::usage::diagnose() {
+            Ok(crate::usage::Usage::Ready(info)) => {
+                let show = |label: &str, w: Option<&crate::usage::UsageWindow>| {
+                    w.map_or_else(
+                        || format!("{label} -"),
+                        |w| format!("{label} {}%", w.pct.round() as u32),
+                    )
+                };
+                let mut parts = vec![show("5h", info.five.as_ref()), show("7d", info.seven.as_ref())];
+                parts.extend(
+                    info.models
+                        .iter()
+                        .map(|(name, w)| format!("{name} {}%", w.pct.round() as u32)),
+                );
+                println!("ok    usage ({opt_in}): {}", parts.join(" · "));
+            }
+            // 枠の概念が無いアカウント（API キー・Bedrock・Vertex 等）。
+            // ccdesk は動くので FAIL ではない。**恒久的に取れないことを言う**
+            Ok(crate::usage::Usage::Unavailable) => {
+                println!(
+                    "warn  usage ({opt_in}): this account has no rate-limit windows \
+                     (subscription plans only); the gauge stays hidden"
+                );
+            }
+            Ok(_) => {
+                println!(
+                    "warn  usage ({opt_in}): claude answered but no window could be read \
+                     (its shape may have changed)"
+                );
+            }
+            Err(e) => println!("warn  usage ({opt_in}): {e}"),
         }
     }
 

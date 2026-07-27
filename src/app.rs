@@ -12,7 +12,8 @@ use ccdesk::{log_error, now_ms, same_dir};
 
 use crate::hooks::HookStates;
 use crate::keys::{encode_key, forward_mouse};
-use crate::poll::{AgentInfo, FooterInfo, Grouping, UsageInfo};
+use crate::poll::{AgentInfo, FooterInfo, Grouping};
+use crate::usage::Usage;
 use crate::session::{Launch, Session};
 use crate::sessions::{SessionId, SessionRow};
 use crate::source::{DataSource, PollSinks, WindowItem, PROJECTS_LIMIT};
@@ -36,8 +37,6 @@ const MIN_PANE: u16 = 40;
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 // 自分の PTY の生死を見る周期（前景では `child.try_wait()` が生死の唯一の真実）
 const LIVE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
-/// 使用率の読み取り周期（statusline フックが書くキャッシュを見に行く間隔）
-const USAGE_INTERVAL: Duration = Duration::from_secs(5);
 /// イベント待ちの上限（＝ 何も起きないときの周回間隔）
 const POLL_IDLE: Duration = Duration::from_millis(33);
 /// 何も変わっていなくても描き直す間隔（スピナー・経過時間が動くため）
@@ -393,12 +392,16 @@ pub(crate) struct App {
     pub(crate) ccdesk_latest: Option<String>,
     pub(crate) ccdesk_latest_shared: Arc<Mutex<Option<String>>>,
     pub(crate) ccdesk_latest_dirty: Arc<std::sync::atomic::AtomicBool>,
-    // 使用率表示（opt-in: config.json の usage_display = "on"）。
-    // 表示するかどうかの判断は供給元（DataSource::usage）が持つので、ここは
-    // dispatch 時に statusline フックを注入するかの判断だけに使う
-    pub(crate) usage_display: bool,
-    pub(crate) usage: Option<UsageInfo>,
-    pub(crate) last_usage_read: std::time::Instant,
+    // 使用率（5h / 7d / モデル別週次）。**取るかどうかの判断は供給元**
+    // （`DataSource::usage`）が持つので、ここは受け取った値だけを持つ。
+    // 注入する settings には一切関係しない（[`crate::hooks::inject_settings`]）
+    pub(crate) usage: Usage,
+    /// 使用率が更新されたことを取得スレッドが立てる合図（フッターと同じ作法）。
+    /// **周期で読みに行かない**ので、使用率を切った環境ではこの旗が一度も立たない
+    pub(crate) usage_dirty: Arc<std::sync::atomic::AtomicBool>,
+    /// 今まさに取得中か。1 回 3 秒前後かかるので、**クリックしたことを画面に出す**
+    /// ためだけに持つ（値そのものは [`Self::usage`]）
+    pub(crate) usage_fetching: Arc<std::sync::atomic::AtomicBool>,
     // 画面に出す値の供給元（実データ / 撮影用の固定データ）。起動時に 1 度だけ選ばれ、
     // 以降ここを通る限り「今 demo か」を問う必要が無い
     pub(crate) source: Arc<dyn DataSource>,
@@ -475,9 +478,9 @@ impl Default for App {
             ccdesk_latest: None,
             ccdesk_latest_shared: Arc::new(Mutex::new(None)),
             ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            usage_display: false,
-            usage: None,
-            last_usage_read: std::time::Instant::now(),
+            usage: Usage::default(),
+            usage_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            usage_fetching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // 撮影用の供給元は state.json / config.json を書かないので、
             // テストが開発者の設定を踏まない
             source: Arc::new(crate::source::DemoSource),
@@ -741,10 +744,13 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         if expire_input_gate(app) {
             force_draw = true;
         }
-        // 使用率を 5 秒毎に取り込む（実データなら statusline フックが書いた
-        // キャッシュ、撮影用なら固定値。どちらを読むかは供給元が決める）
-        if app.last_usage_read.elapsed() > USAGE_INTERVAL {
-            app.last_usage_read = std::time::Instant::now();
+        // 使用率の更新を取り込む（取得スレッドが旗を立てたときだけ。
+        // 実データなら [`crate::usage`] の取得結果、撮影用なら固定値で、
+        // どちらを読むかは供給元が決める）
+        if app
+            .usage_dirty
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
             let usage = app.source.usage();
             if usage != app.usage {
                 app.usage = usage;
@@ -1549,8 +1555,9 @@ fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
 /// **行を足すのは起動できてから**（起動できなかったセッションを一覧に残さない）
 fn start_foreground(app: &mut App, cwd: &str, prompt: &str) -> Launched {
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-    // state を取る hook と、使用率表示（opt-in）の statusline を注入する
-    let settings = crate::hooks::inject_settings(app.usage_display);
+    // state を取る hook を注入する（statusLine は載せない ＝ ユーザーの
+    // statusline を奪わない。[`crate::hooks::inject_settings`]）
+    let settings = crate::hooks::inject_settings();
     let (rows, cols) = app.pane_size();
     let window = Session::spawn(
         &session_id,
@@ -1653,6 +1660,20 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         }
         _ if app.dragging => return Ok(false),
         _ => {}
+    }
+
+    // 下部バーの使用率をクリックしたらその場で取り直す（周期を待たない）。
+    // **サイドバー／右ペインの振り分けより先**に見るのが要点で、使用率は右端 ＝
+    // 右ペインの列範囲に描かれるため、後回しにするとペインのクリックに食われる。
+    // 当たり判定は描画と同じ導出（[`crate::ui::usage_hit`]）なので、
+    // 出していないとき（notice 表示中・狭い端末・使用率を切っている）は当たらない
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+        && let Some(hit) = crate::ui::usage_hit(app)
+        && mouse.row == hit.row
+        && hit.columns.contains(&mouse.column)
+    {
+        app.source.refresh_usage();
+        return Ok(false);
     }
 
     if mouse.column < drawn {
@@ -2274,7 +2295,7 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) {
     };
     let (launch, cwd) = relaunch(&app.titles, row);
     let cwd = cwd.into_owned();
-    let settings = crate::hooks::inject_settings(app.usage_display);
+    let settings = crate::hooks::inject_settings();
     let (rows, cols) = app.pane_size();
     match Session::spawn(id, &cwd, rows, cols, launch, settings.as_deref()) {
         Ok(window) => {
@@ -2339,6 +2360,83 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    /// 使用率が出ている App と、取り直しが呼ばれた回数の記録
+    fn usage_app() -> (App, Arc<std::sync::atomic::AtomicUsize>) {
+        let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let usage = Usage::Ready(crate::usage::UsageInfo {
+            five: Some(crate::usage::UsageWindow {
+                pct: 18.0,
+                resets_at: Some(now + 3600),
+            }),
+            seven: Some(crate::usage::UsageWindow {
+                pct: 55.0,
+                resets_at: Some(now + 4 * 86400),
+            }),
+            models: Vec::new(),
+            fetched_at: now,
+        });
+        let mut app = test_app(34, TERM);
+        app.source = Arc::new(TestSource::for_usage(usage.clone(), Arc::clone(&refreshes)));
+        app.usage = usage;
+        (app, refreshes)
+    }
+
+    /// **右下の使用率を押すとその場で取り直す**（周期を待たない）。
+    /// 当たり判定は描画と同じ導出（`ui::usage_hit`）なので、見えている場所と
+    /// 押せる場所がずれない
+    #[test]
+    fn clicking_the_usage_gauge_refetches_it() {
+        let (mut app, refreshes) = usage_app();
+        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
+        assert_eq!(hit.row, TERM.1 - 1, "the gauge is on the bottom bar");
+
+        // 領域の左端・右端どちらを押しても当たる
+        for column in [hit.columns.start, hit.columns.end - 1] {
+            let before = refreshes.load(std::sync::atomic::Ordering::Relaxed);
+            handle_mouse(&mut app, &click(column, hit.row)).unwrap();
+            assert_eq!(
+                refreshes.load(std::sync::atomic::Ordering::Relaxed),
+                before + 1,
+                "clicking column {column} did not refetch"
+            );
+        }
+    }
+
+    /// **使用率の外を押しても取り直さない。** 右ペイン側の列に描かれるので、
+    /// 1 桁ずれただけでペインのクリックへ落ちることを固定する
+    #[test]
+    fn clicking_outside_the_usage_gauge_does_not_refetch() {
+        let (mut app, refreshes) = usage_app();
+        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
+        // 領域の 1 桁左、そして同じ列の 1 行上
+        for (column, row) in [(hit.columns.start - 1, hit.row), (hit.columns.start, hit.row - 1)] {
+            handle_mouse(&mut app, &click(column, row)).unwrap();
+        }
+        assert_eq!(refreshes.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// **出ていないものは押せない。** 使用率を切っている（`Unknown`）ときは
+    /// 当たり判定そのものが無い ＝ 見えない場所を押して claude が起きない
+    #[test]
+    fn a_hidden_usage_gauge_has_no_hit_area() {
+        let app = test_app(34, TERM);
+        assert!(matches!(app.usage, Usage::Unknown), "the fixture's premise broke");
+        assert!(crate::ui::usage_hit(&app).is_none());
+    }
+
+    /// notice を出している間は下部バーが notice に置き換わるので、当たり判定も無い
+    #[test]
+    fn a_notice_takes_the_bottom_bar_and_the_hit_area_with_it() {
+        let (mut app, _) = usage_app();
+        assert!(crate::ui::usage_hit(&app).is_some(), "the fixture's premise broke");
+        app.notice = Some(("something happened".to_string(), std::time::Instant::now()));
+        assert!(crate::ui::usage_hit(&app).is_none());
     }
 
     /// プロジェクトメニューが指すフォルダ
@@ -3104,6 +3202,12 @@ mod tests {
         /// [`WindowItem::LastView`] として保存された値の記録（**保存された回数まで
         /// 見たい**ので Vec）。実ファイル（`~/.ccdesk/state.json`）は書かない
         views: Arc<Mutex<Vec<String>>>,
+        /// [`DataSource::refresh_usage`] が呼ばれた回数（claude は起こさない）。
+        /// **回数まで見る**のは、押していないのに取り直す経路が生えたら気づくため
+        usage_refreshes: Arc<std::sync::atomic::AtomicUsize>,
+        /// [`DataSource::usage`] が返す値（当たり判定は「今出ているか」で決まるので、
+        /// 出ている状態を作れる必要がある）
+        usage: Usage,
     }
 
     /// プロジェクト永続化側の振る舞い
@@ -3132,6 +3236,17 @@ mod tests {
                 projects: ProjectsBackend::Absent,
                 hooks: HookStates::default(),
                 views: Arc::new(Mutex::new(Vec::new())),
+                usage_refreshes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                usage: Usage::Unknown,
+            }
+        }
+
+        /// 使用率が出ている供給元（クリック当たり判定の検査）
+        fn for_usage(usage: Usage, usage_refreshes: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                usage,
+                usage_refreshes,
+                ..Self::plain()
             }
         }
 
@@ -3197,8 +3312,14 @@ mod tests {
             FooterInfo::default()
         }
 
-        fn usage(&self) -> Option<UsageInfo> {
-            None
+        fn usage(&self) -> Usage {
+            // テスト用の供給元は claude を起こさない（値は仕込まれたものを返すだけ）
+            self.usage.clone()
+        }
+
+        fn refresh_usage(&self) {
+            self.usage_refreshes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         fn window_state(&self) -> WindowState {

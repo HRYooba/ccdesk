@@ -1,4 +1,7 @@
-//! バックグラウンド取得（agents --json / フッター / 使用率）と状態分類。
+//! バックグラウンド取得（agents --json / フッター）と状態分類。
+//!
+//! 使用率は [`crate::usage`] が取得から解釈まで一手に持つ（取得の作法をここと
+//! 2 箇所に分けない）。
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -88,41 +91,6 @@ pub(crate) fn spawn_agents_poller(
     });
 }
 
-/// 使用率（5h/7d 枠）の表示用データ。statusline フックが書いた
-/// ~/.ccdesk/usage.json（公式 statusline JSON の rate_limits 由来）を読む
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) struct UsageInfo {
-    pub(crate) five: Option<(f64, u64)>,  // (使用率 %, resets_at unix 秒)
-    pub(crate) seven: Option<(f64, u64)>, // 同上（7 日枠・全モデル集計）
-    // 最終更新から 10 分超（rate_limits はセッションの活動時レンダーにしか
-    // 載らないため、活動が無いだけで古くなる）。消さずに薄く表示する
-    pub(crate) stale: bool,
-}
-
-/// usage.json を読む。無い・壊れているときだけ None（古いデータは stale 付きで返す）
-pub(crate) fn read_usage() -> Option<UsageInfo> {
-    let text = std::fs::read_to_string(ccdesk::usage_cache_path()?).ok()?;
-    let v = serde_json::from_str::<serde_json::Value>(&text).ok()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let written = v.get("written_at").and_then(|w| w.as_u64()).unwrap_or(0);
-    let window = |key: &str| -> Option<(f64, u64)> {
-        let w = v.pointer(&format!("/rate_limits/{key}"))?;
-        Some((
-            w.get("used_percentage").and_then(|p| p.as_f64())?,
-            w.get("resets_at").and_then(|r| r.as_u64()).unwrap_or(0),
-        ))
-    };
-    let info = UsageInfo {
-        five: window("five_hour"),
-        seven: window("seven_day"),
-        stale: now.saturating_sub(written) > 600,
-    };
-    (info.five.is_some() || info.seven.is_some()).then_some(info)
-}
-
 /// アカウント行の状態。「未取得」と「未ログイン」を区別する
 /// （取得失敗を "not logged in" と誤表示しないため）。
 ///
@@ -152,8 +120,9 @@ pub(crate) enum AccountStatus {
 /// バージョンは上部の claude 版行に出る（`latest` は「更新がある」の有無だけを
 /// 決め、新しい番号そのものは幅の都合で表示しない）。
 /// アカウントは `claude auth status --json`（公式サブコマンド）、
-/// 現行版は `claude --version`、最新版は Anthropic 公式配布の npm パッケージ
-/// メタデータ（registry.npmjs.org/@anthropic-ai/claude-code/latest）から取る
+/// 現行版は `claude --version`、最新版は claude 本体の更新チェックと同じ
+/// 配布エンドポイント（**取得元の正本は [`fetch_version`]**。ここに URL を
+/// 書き写すと、変えたときに片方だけ古いままになる）
 #[derive(Clone, Default)]
 pub(crate) struct FooterInfo {
     pub(crate) account: AccountStatus, // ログイン状態 + 表示ラベル
@@ -170,19 +139,18 @@ pub(crate) struct FooterInfo {
 /// 必要なので 1 起動につき 1 回で足りる（claude のバージョン監視＝
 /// [`spawn_footer_poller`] の 1 時間周期とは別物なので混ぜない）。
 /// 通信に数百 ms かかるため起動はブロックしない
-pub(crate) fn spawn_ccdesk_version_check(
-    shared: Arc<Mutex<Option<String>>>,
-    dirty: Arc<std::sync::atomic::AtomicBool>,
-) {
-    std::thread::spawn(move || {
-        let Some(tag) = crate::update::newer_tag() else {
-            return;
-        };
-        *shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tag);
-        dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-    });
+/// 版行 2 本（claude と ccdesk）の更新チェックの書き込み先。
+///
+/// **2 本を 1 つの構造体で受けるのは、周期を分けないため**（[`spawn_footer_poller`] が
+/// 同じゲートで両方を取る）。片方だけ「起動時 1 回」にしていた頃は、ccdesk を
+/// 開いたままにしていると自分の更新に何日も気づけなかった
+pub(crate) struct VersionSinks {
+    /// claude 側（現行版と、新しい配布版があればその番号）
+    pub(crate) claude: Arc<Mutex<FooterInfo>>,
+    pub(crate) claude_dirty: Arc<std::sync::atomic::AtomicBool>,
+    /// ccdesk 側（自分より新しいリリースタグ。無ければ None）
+    pub(crate) ccdesk: Arc<Mutex<Option<String>>>,
+    pub(crate) ccdesk_dirty: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// `claude auth status --json` の出力 → アカウント行。
@@ -513,12 +481,19 @@ fn account_step(
 /// - アカウント: 認証ファイルの変化で即時 + 60s フォールバック
 ///   （ログイン・ログアウトを 1 時間待たずに反映するため。取得失敗の直後だけ
 ///   5s で再試行する）
-/// - バージョン: 1 時間毎 + `claude update` 完了時の再取得要求
+/// - バージョン: **claude と ccdesk の 2 本を同じゲートで**、1 時間毎 +
+///   `claude update` 完了時の再取得要求。どちらも**起動時に 1 度取る**
+///   （`version_age` の初期値が周期を超えているため）
 pub(crate) fn spawn_footer_poller(
-    shared: Arc<Mutex<FooterInfo>>,
-    dirty: Arc<std::sync::atomic::AtomicBool>,
+    versions: VersionSinks,
     refresh: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    let VersionSinks {
+        claude: shared,
+        claude_dirty: dirty,
+        ccdesk,
+        ccdesk_dirty,
+    } = versions;
     std::thread::spawn(move || {
         let mut account = AccountPollState::new();
         let mut fetcher = AccountFetcher::default();
@@ -547,6 +522,8 @@ pub(crate) fn spawn_footer_poller(
                 updated = true;
             }
 
+            // **版行 2 本を同じゲートで取る。** 周期を 2 つ持つと、片方だけ
+            // 「起動時 1 回」のような別の規則へ流れる（実際そうなっていた）
             if refetch_due(version_age, VERSION_INTERVAL_SECS, false, forced) {
                 version_age = 0;
                 let (current, latest) = fetch_version();
@@ -560,6 +537,19 @@ pub(crate) fn spawn_footer_poller(
                         guard.current = current;
                         guard.latest = latest;
                         updated = true;
+                    }
+                }
+                // ccdesk 自身の版。**取得できなかった回は書かない**（claude 側と
+                // 同じ判断。1 回の空振りで版行の ⟳ が 1 時間消えるのを防ぐ）。
+                // 更新済みで新しい版が無くなったときは None を書いて ⟳ を消す
+                if let Some(next) = crate::update::latest_tag() {
+                    let next = crate::update::tag_is_newer(&next).then_some(next);
+                    let mut guard = ccdesk
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if *guard != next {
+                        *guard = next;
+                        ccdesk_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }

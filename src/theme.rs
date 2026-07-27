@@ -61,7 +61,8 @@ pub(crate) type HostColor = Option<[u16; 3]>;
 /// 照会失敗（WT 1.22 未満・旧 ConHost 等）は Dark+ 相当の固定値で応答する
 pub(crate) static HOST_COLORS: std::sync::OnceLock<(HostColor, HostColor)> = std::sync::OnceLock::new();
 
-/// 使用率の色（statusline と同じグラデーション: 緑 → 黄 → 赤）
+/// 使用率の色（緑 → 黄 → 赤の連続グラデーション。しきい値を持たないので
+/// 「何 % で色が変わるか」という設定を増やさずに済む）
 pub(crate) fn usage_color(pct: f64) -> Color {
     if pct < 50.0 {
         Color::Rgb((pct * 5.1) as u8, 200, 80)

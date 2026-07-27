@@ -1,10 +1,10 @@
-// ccdesk: Claude Desktop の TUI 版。portable-pty で claude を起動 → vt100 でパース → tui-term で描画
+// ccdesk: Claude Code 用のセッション管理 TUI。portable-pty で claude を起動 →
+// vt100 でパース → tui-term で描画。
 // マウス主体の操作: クリックでセッション切替・フォーカス / 行頭の = で二次操作のメニュー /
 // 境界線ドラッグで幅変更。ターミナルフォーカス中のキーは PTY へ素通し。
 // 予約は Ctrl+Q（終了）と Alt+←→（ペインフォーカス移動）のみ
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -26,9 +26,10 @@ mod theme;
 mod title;
 mod ui;
 mod update;
+mod usage;
 
-use app::{instant_ago, open_session, run, App, Focus, RightView, SelfUpdate};
-use cli::{print_usage, run_doctor, show_logs, statusline_hook, update_self};
+use app::{open_session, run, App, Focus, RightView, SelfUpdate};
+use cli::{print_usage, run_doctor, show_logs, update_self};
 use poll::FooterInfo;
 use source::{DataSource, DemoSource, LiveSource};
 use theme::HOST_COLORS;
@@ -51,8 +52,6 @@ fn main() -> anyhow::Result<()> {
         }
         Some("doctor") => return run_doctor(),
         Some("logs") => return show_logs(),
-        // 使用率表示（opt-in）が起こしたセッションへ注入する内部フック
-        Some("statusline-hook") => return statusline_hook(),
         // セッションの状態を受け取る内部フック（`--settings` で注入し、
         // 子の claude が turn ごとに `ccdesk hook <event>` として起こす）
         Some("hook") => {
@@ -79,15 +78,32 @@ fn main() -> anyhow::Result<()> {
     // TUI 初期化より前に済ませて画面に影響させない
     update::cleanup_old_exe();
 
-    // 使用率表示の opt-in。使用率そのものを読むかは供給元が判断し、
-    // ここでは dispatch 時の statusline フック注入の可否として使う
+    // 使用率表示の opt-in（`~/.ccdesk/config.json` の `"usage_display": "on"`）。
+    //
+    // **既定で取らないのは資源の話ではない。** 取得は課金ゼロ・枠を消費せず、周期 2 分は
+    // 既存の `claude agents --json`（2 秒ごと）の 1/60 なので、負荷を理由に切る意味は無い。
+    // 切ってあるのは、これが **ccdesk で唯一「無人で Anthropic のサーバーへ出る」経路**
+    // だから（他のポーリングはローカルのファイルとプロセスしか見ない）。Consumer Terms
+    // 第 3 節は API キー以外での自動アクセスを禁じており、公式 CLI の文書化された機能を
+    // 本人のサブスクで本人のために使う形は「explicitly permit」側に収まると読めるが、
+    // **断定はできない**。であれば、無人の通信を始めるかどうかは利用者が決めるべきで、
+    // ccdesk が全員に代わって決めてよいものではない。
+    //
+    // **判断はここ 1 箇所**で、以降は供給元の中に閉じる
     let usage_display = load_setting("usage_display").as_deref() == Some("on");
+    // 使用率の更新を run ループへ伝える旗と、取得中かどうか。供給元と App が同じものを持つ
+    let usage_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let usage_fetching = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // demo / 実データの選択はこの 1 箇所だけ。以降のコードは供給元を通すので
     // 「今 demo か」を問う分岐を持たない（＝分岐の書き漏らしで実データが漏れない）
     let source: Arc<dyn DataSource> = if demo {
         Arc::new(DemoSource)
     } else {
-        Arc::new(LiveSource::new(usage_display))
+        Arc::new(LiveSource::new(
+            usage_display,
+            Arc::clone(&usage_dirty),
+            Arc::clone(&usage_fetching),
+        ))
     };
     // セッション一覧・フッター・ウィンドウ状態はすべて供給元から受け取る
     let sessions = source.sessions();
@@ -177,9 +193,11 @@ fn main() -> anyhow::Result<()> {
         ccdesk_latest: None,
         ccdesk_latest_shared: Arc::new(Mutex::new(None)),
         ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        usage_display,
-        usage: None,
-        last_usage_read: instant_ago(Duration::from_secs(60)),
+        // 起動時の値は供給元から 1 度受け取る（撮影用は固定値、実データは
+        // まだ取れていないので Unknown ＝ 何も描かない）
+        usage: source.usage(),
+        usage_dirty,
+        usage_fetching,
         input_gate: None,
         notice: None,
         grouping: window.grouping,

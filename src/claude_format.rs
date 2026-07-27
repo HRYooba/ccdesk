@@ -164,6 +164,57 @@ pub(crate) const AGENT_PID: &str = "pid";
 /// 前景セッションを表す [`AGENT_KIND`] の値
 pub(crate) const AGENT_KIND_INTERACTIVE: &str = "interactive";
 
+// ---------------------------------------------------------------------------
+// SDK 制御チャンネルの `get_usage`（**非公開**）
+//
+// `-p` / `--input-format stream-json` / `--output-format stream-json` /
+// `--settings` は公式に文書化されているが、**制御リクエストのワイヤー形式と
+// `get_usage` というサブタイプは文書化されていない**（公式 SDK の公開 API にも
+// 見当たらない）。実測で得た綴りなのでここに置く。
+//
+// **statusline の JSON とは綴りが違う。** 公式に文書化された statusline 側は
+// `rate_limits.five_hour.used_percentage`（0-100）と `resets_at`（unix 秒）だが、
+// こちらは `utilization`（0-100）と `resets_at`（ISO8601 文字列）。混ぜてはいけない。
+//
+// 縮退: 綴りが外れると使用率が取れなくなり、フッターの使用率行が消える
+// （[`crate::usage`] が None を返す）。ccdesk の他の機能は影響を受けない。
+// ---------------------------------------------------------------------------
+
+/// 制御リクエスト 1 行（stdin へ書いて control_response を待つ）。
+/// `request_id` は 1 回のプロセスで 1 往復しかしないので固定値でよい
+pub(crate) const USAGE_REQUEST_LINE: &str =
+    r#"{"type":"control_request","request_id":"ccdesk-usage","request":{"subtype":"get_usage"}}"#;
+
+/// 応答行を見分ける `type` の値
+pub(crate) const CONTROL_RESPONSE: &str = "control_response";
+/// 応答の中身までの道（`/response/response` の 2 段。外側が制御プロトコルの
+/// 封筒で、内側が `get_usage` の戻り値）
+pub(crate) const USAGE_BODY_POINTER: &str = "/response/response";
+/// 封筒の成否（`"success"` 以外はエラー応答）
+pub(crate) const CONTROL_SUBTYPE_POINTER: &str = "/response/subtype";
+/// [`CONTROL_SUBTYPE_POINTER`] が成功を表す値
+pub(crate) const CONTROL_SUCCESS: &str = "success";
+
+/// 枠の一覧が載るオブジェクト
+pub(crate) const USAGE_RATE_LIMITS: &str = "rate_limits";
+/// 枠が取れるアカウントかどうか（サブスク以外では false）。
+/// **「取れない」と「壊れている」を区別する唯一の手がかり**
+pub(crate) const USAGE_AVAILABLE: &str = "rate_limits_available";
+/// 5 時間枠のキー
+pub(crate) const USAGE_FIVE_HOUR: &str = "five_hour";
+/// 7 日枠（全モデル集計）のキー
+pub(crate) const USAGE_SEVEN_DAY: &str = "seven_day";
+/// モデル別の週次枠の配列。**`seven_day_opus` のような枠名を決め打ちしない**:
+/// 実測では未公開の枠名（`tangelo` 等）が null で多数並んでおり、名前を並べると
+/// claude 側の増減で黙って腐る
+pub(crate) const USAGE_MODEL_SCOPED: &str = "model_scoped";
+/// [`USAGE_MODEL_SCOPED`] の要素が持つモデル名
+pub(crate) const USAGE_DISPLAY_NAME: &str = "display_name";
+/// 使用率（0-100）
+pub(crate) const USAGE_UTILIZATION: &str = "utilization";
+/// 枠のリセット時刻（**ISO8601 文字列**。statusline 側の unix 秒とは違う）
+pub(crate) const USAGE_RESETS_AT: &str = "resets_at";
+
 #[cfg(test)]
 mod tests {
     use super::*;
