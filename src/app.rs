@@ -39,6 +39,14 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const LIVE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// 使用率の読み取り周期（statusline フックが書くキャッシュを見に行く間隔）
 const USAGE_INTERVAL: Duration = Duration::from_secs(5);
+/// イベント待ちの上限（＝ 何も起きないときの周回間隔）
+const POLL_IDLE: Duration = Duration::from_millis(33);
+/// 何も変わっていなくても描き直す間隔（スピナー・経過時間が動くため）
+const IDLE_REDRAW: Duration = Duration::from_millis(250);
+/// 描画を見送っている間のイベント待ちの上限。子が静まったことに早く気づくため
+/// 短くする（見送りは [`crate::session::REDRAW_HOLD_MAX`] で打ち切られるので、
+/// この短い周回が続くのは出力が途切れない間だけ）
+const POLL_HELD: Duration = Duration::from_millis(8);
 
 /// ペインフォーカス。キー入力はフォーカス中のペインにだけ流す
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -733,6 +741,18 @@ fn draw_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow:
     Ok(())
 }
 
+/// この周に描くか。**再描画は「PTY に新出力」「UI イベント」「無変化でも
+/// [`IDLE_REDRAW`] 周期（スピナー・経過時間）」のときだけ**（無条件 60fps は
+/// claude 画面全体の再構築が毎フレーム走り重い）。
+///
+/// `holding` は**すべてに優先する**: 子が画面を作り替えている最中に掴んだ
+/// フレームはカーソルが中間位置で確定し、IME の変換窓がそこへ飛ぶ
+/// （判断は [`crate::session::Session::holds_frame`]、上限も向こうが持つので
+/// ここが false を返し続けることはない）
+fn should_draw(holding: bool, force: bool, pty_dirty: bool, since_draw: Duration) -> bool {
+    !holding && (force || pty_dirty || since_draw > IDLE_REDRAW)
+}
+
 pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
     let mut last_draw = std::time::Instant::now();
     let mut force_draw = true;
@@ -859,19 +879,35 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 .clone();
             force_draw = true;
         }
-        // 再描画は「PTY に新出力」「UI イベント」「250ms 周期（スピナー等）」のときだけ。
-        // 無条件 60fps 再描画は claude 画面全体の再構築が毎フレーム走り重い
+        // claude が画面を作り替えている最中は掴まない（[`Session::holds_frame`]）。
+        // 途中で掴むとカーソルが中間位置で確定し、IME の変換窓がそこへ飛ぶ。
+        // 見るのは右ペインに出ている窓だけ ＝ New 画面は自前のカーソルなので待たせない
+        let holding = !matches!(app.right_view, RightView::New(_))
+            && app
+                .windows
+                .get(app.active)
+                .is_some_and(|w| w.holds_frame(last_draw.elapsed()));
+        // **合図（dirty）を降ろすのは実際に描く周だけ**なので、読むのはここ。
+        // 見送る周で降ろすと、次の出力が来るまで画面が古いままになる
         let pty_dirty = app
             .windows
             .iter()
-            .any(|w| w.dirty.swap(false, std::sync::atomic::Ordering::Relaxed));
-        if force_draw || pty_dirty || last_draw.elapsed() > Duration::from_millis(250) {
+            .any(|w| w.dirty.load(std::sync::atomic::Ordering::Relaxed));
+        if should_draw(holding, force_draw, pty_dirty, last_draw.elapsed()) {
+            for window in &app.windows {
+                window
+                    .dirty
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             draw_frame(terminal, app)?;
             last_draw = std::time::Instant::now();
             force_draw = false;
         }
 
-        if !crossterm::event::poll(Duration::from_millis(33))? {
+        // 見送った周は短く待ち直す。通常の周期のまま待つと、子が静まった直後ではなく
+        // 次の周まで描画がずれ、保留の分だけ打鍵の反映が遅れて見える
+        let wait = if holding { POLL_HELD } else { POLL_IDLE };
+        if !crossterm::event::poll(wait)? {
             continue;
         }
         force_draw = true; // イベントを処理したら必ず描画
@@ -4023,6 +4059,35 @@ mod tests {
             app.hovered,
             app.hovered
         ));
+    }
+
+    /// **見送りはすべてに勝つ。** 子が画面を作り替えている最中は、打鍵でも
+    /// PTY の新出力でも無変化の周期でも描かない（掴むとカーソルが中間位置で
+    /// 確定し、IME の変換窓がそこへ飛ぶ）。
+    ///
+    /// 見送った周が `dirty` を降ろさないことは構造で担保する（降ろすのは
+    /// この関数が true を返した側の枝だけ）。上限は
+    /// [`crate::session::Session::holds_frame`] が持つのでここには無い
+    #[test]
+    fn a_frame_the_child_is_still_writing_is_not_grabbed_for_any_reason() {
+        let fresh = Duration::from_millis(0);
+        for (force, pty_dirty, since_draw) in [
+            (true, false, fresh),
+            (false, true, fresh),
+            (false, false, IDLE_REDRAW * 10),
+        ] {
+            assert!(
+                should_draw(false, force, pty_dirty, since_draw),
+                "nothing asked for a redraw: force={force} dirty={pty_dirty}"
+            );
+            assert!(
+                !should_draw(true, force, pty_dirty, since_draw),
+                "a frame was grabbed while the child was mid-redraw: \
+                 force={force} dirty={pty_dirty}"
+            );
+        }
+        // 何も起きていない周は描かない（無条件 60fps にしない）
+        assert!(!should_draw(false, false, false, fresh));
     }
 
     /// **一覧とアカウント行は 1 つの輪。** 下端の先がアカウント行で、その先は
