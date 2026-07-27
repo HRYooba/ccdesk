@@ -194,6 +194,10 @@ fn main() -> anyhow::Result<()> {
     // 見出しが、最後のセッションを消した時点で消えないように）。一覧を読んだ後・
     // 画面を組む前のこの位置に置く: 埋め戻しは初回の一覧に効く必要がある
     app::backfill_projects(&mut app);
+    // **最初の描画より前に transcript を解決して名前を読む。** 走査の結果を持つのは
+    // Titles のキャッシュだけなので、ここで 1 度走らせないと最初の周期（2 秒）まで
+    // 全部の行が `new session` に見える。未記録の行の解決し直しも同じ 1 回で済む
+    app::refresh_transcripts(&mut app);
     // バックグラウンド取得の起動。撮影用の供給元は 1 本も起こさないので、
     // ここに `if !demo` は要らない
     app.source.spawn_pollers(app.poll_sinks());

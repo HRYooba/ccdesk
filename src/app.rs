@@ -1370,8 +1370,13 @@ fn adopt_hook_states(app: &mut App) {
 ///
 /// **保存するのは解決が動いた周だけ。** 解決結果は再起動後も使う値なので
 /// `sessions.json` に載せるが、`updated_at` は進めない（行の中身が変わったわけでは
-/// なく、同じ会話の在り処が分かっただけ）
-fn refresh_transcripts(app: &mut App) {
+/// なく、同じ会話の在り処が分かっただけ）。
+///
+/// **起動直後にも 1 度呼ぶ**（`main.rs` の起動列）。走査の結果を持っているのは
+/// [`Titles`] のキャッシュだけなので、呼ばないと最初の周期（2 秒）が来るまで
+/// **全部の行が `new session` に見える**うえ、未記録の行が解決し直されるのも
+/// その周期まで遅れる
+pub(crate) fn refresh_transcripts(app: &mut App) {
     let mut titles = std::mem::take(&mut app.titles);
     let mut changed = false;
     for row in &mut app.sessions {
@@ -4754,6 +4759,42 @@ mod tests {
             app.titles.of(only_row(&app)),
             "renamed in the session",
             "the name given inside the session did not reach the row"
+        );
+    }
+
+    /// **未記録の行は解決し直され、解決した場所が行に載る。**
+    ///
+    /// **これは起動直後にも 1 度走る**（`main.rs` の起動列が呼ぶ）。走らせないと
+    /// 最初の周期（2 秒）まで Titles のキャッシュが空 ＝ 全部の行が `new session` に
+    /// 見えるうえ、未記録の行の解決も同じだけ遅れる。
+    ///
+    /// **会話がまだ無い行は未記録のまま**なのが正しい姿（実データの
+    /// `8d162272` は 1 ターンも終わらずに終了したセッションで、transcript が
+    /// そもそも存在しない ＝ 名前が `new session` なのも記録が無いのも仕様どおり）
+    #[test]
+    fn refreshing_transcripts_records_the_path_of_a_row_that_had_none() {
+        let temp = crate::title::tests::TempProjects::new("refreshing_transcripts_records_path");
+        let mut app = app_with_row("s");
+        app.titles = temp.titles();
+        app.sessions[0].updated_at = 1_234;
+
+        // 1 ターンも終わっていない行は解決できない（会話が無い ＝ 記録も無い）
+        refresh_transcripts(&mut app);
+        assert_eq!(only_row(&app).transcript, None, "recorded a path with no conversation");
+        assert_eq!(app.titles.of(only_row(&app)), crate::title::UNTITLED);
+
+        app.titles.write_transcript(
+            &app.sessions[0].clone(),
+            "{\"type\":\"ai-title\",\"aiTitle\":\"a generated name\"}\n",
+        );
+        refresh_transcripts(&mut app);
+
+        assert!(only_row(&app).transcript.is_some(), "the resolved path was not recorded");
+        assert_eq!(app.titles.of(only_row(&app)), "a generated name");
+        assert_eq!(
+            only_row(&app).updated_at,
+            1_234,
+            "resolving a path moved the age of the row"
         );
     }
 
