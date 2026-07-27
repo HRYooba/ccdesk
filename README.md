@@ -13,7 +13,7 @@ processes while the rows stay — reopen one and it resumes from its transcript.
 ## Features
 
 - **Persistent sidebar** — every session ccdesk knows about, across all projects,
-  grouped by state (Needs input / Working / Completed) or by directory
+  grouped by state (Waiting / Working / Completed / Stopped) or by directory
 - **Foreground sessions ccdesk owns** — a row starts or resumes a real `claude`
   process in the pane; `stop` ends the process and keeps the row, `close` drops the
   row. Your transcripts in `~/.claude/projects/` are never removed
@@ -86,8 +86,8 @@ feature is gone, and ccdesk deletes the file (and its lock) once at startup,
 noting it in the error log.
 
 ccdesk passes the official `--settings` flag to the `claude` sessions it starts
-to install turn-level hooks that report each session's state (working / waiting
-for input / done) back to ccdesk — that is what the sidebar shows. The hooks
+to install turn-level hooks that report each session's state (waiting / working /
+completed / stopped) back to ccdesk — that is what the sidebar shows. The hooks
 run `ccdesk hook <event>`, so no external scripts are installed, and they write
 only to `~/.ccdesk/hook-states.json`. **`hooks` is the only key ccdesk injects**:
 Claude Code merges hooks across settings sources, so yours keep running, and no
@@ -101,10 +101,14 @@ rate-limit usage at the bottom right: the 5-hour window, the 7-day window, and
 each per-model weekly window, with time until reset. Narrow terminals drop the
 reset times first, then the per-model windows.
 
-**Click it to refresh right away** instead of waiting for the next poll — the
-numbers dim while the fetch is in flight. Otherwise ccdesk refreshes every two
-minutes, and stops polling entirely on accounts that have no rate-limit windows
-(a click still re-checks, in case you signed in elsewhere).
+It refreshes **when a session finishes a turn** — the moment the numbers actually
+move — so nothing runs while you are idle. **Click it to refresh right away**;
+the numbers dim while the fetch is in flight. A slow 15-minute poll backs that up,
+because two things no event can report: the 5-hour window resetting on a timer,
+and usage from outside ccdesk (another terminal, claude.ai, another device).
+Bursts of finished turns collapse into one fetch, and accounts with no rate-limit
+windows stop polling entirely (a click still re-checks, in case you signed in
+elsewhere).
 
 ccdesk gets the numbers by running the official `claude` CLI headless for a
 moment and sending one `get_usage` request over the Agent SDK control channel.

@@ -17,7 +17,8 @@ use crate::app::{
     SelfUpdate, SidebarPos, SidebarRow,
 };
 use crate::poll::{
-    classify, foreground_state, AccountStatus, Bucket, Group, Grouping, StateView, STOPPED,
+    classify, foreground_state, AccountStatus, Group, Grouping, StateView, STOPPED, WAITING,
+    WORKING,
 };
 use crate::session::SessionStatus;
 use crate::sessions::SessionId;
@@ -104,7 +105,7 @@ struct Run<'a> {
 ///
 /// 実行があるときの中身は **hook が主、`agents --json` が従**:
 /// hook は turn 単位で届くので
-/// Working / Needs input / Done を取り違えない。hook が一度も来ていない行
+/// Working / Waiting / Completed を取り違えない。hook が一度も来ていない行
 /// （ccdesk が起こしていないセッション・注入が効かなかった場合）だけ `status` へ落ち、
 /// `status` も無い間は出力の変化から推す
 fn row_state(run: Option<Run<'_>>) -> StateView {
@@ -113,8 +114,8 @@ fn row_state(run: Option<Run<'_>>) -> StateView {
     };
     match (run.hook, run.status, run.heuristic) {
         (Some(state), _, _) => classify(state, true),
-        (None, "", Some(SessionStatus::Working)) => classify("working", true),
-        (None, "", _) => classify("blocked", true),
+        (None, "", Some(SessionStatus::Working)) => classify(WORKING, true),
+        (None, "", _) => classify(WAITING, true),
         (None, status, _) => classify(foreground_state(status), true),
     }
 }
@@ -756,7 +757,6 @@ struct RowData {
     unread: bool,
     status_label: &'static str,
     age: String,
-    bucket: Bucket,
     /// ピン留め（[`PINNED_TITLE`] の節へ移す）
     pinned: bool,
 }
@@ -1127,23 +1127,17 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             is_active_window: window.is_some_and(|(i, _)| i == active)
                 && matches!(app.right_view, RightView::Sessions),
             unread: app.hook_states.unread(row),
-            status_label: view.label,
+            status_label: view.label(),
             age: fmt_age(age_secs),
-            bucket: view.bucket,
             pinned: row.pinned,
         });
     }
-    // ヘッダー集計は表示行そのものから数える（分岐の複製をしない = 行数と必ず一致）
-    let mut awaiting = 0usize;
-    let mut working = 0usize;
-    let mut completed = 0usize;
-    for d in data.iter() {
-        match d.bucket {
-            Bucket::Awaiting => awaiting += 1,
-            Bucket::Working => working += 1,
-            Bucket::Completed => completed += 1,
-        }
-    }
+    // 集計は表示行そのものから数える（分岐の複製をしない = 行数と必ず一致）。
+    // **節と同じ [`Group::ORDER`] を回す**ので、並びと語が集計行とずれない
+    let counts: Vec<(Group, usize)> = Group::ORDER
+        .iter()
+        .map(|group| (*group, data.iter().filter(|d| d.group == *group).count()))
+        .collect();
 
     // ---- 描画 ----
     // 行の見え方の規則は [`Look`] 1 つ（帯 = 選択・ホバー / 印 = ペインに出ている）。
@@ -1208,11 +1202,20 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         ));
         rows.push(SidebarRow::Action(RowAction::ToggleGroup));
     }
-    // ヘッダー集計行（公式ヘッダー相当）
+    // 集計行。**語は節の見出しの小文字**（[`Group::title`] が唯一の綴り）なので、
+    // 見出し・行ラベル・集計で別の語が出ることがない。
+    //
+    // **0 件の項目は出さない。** 語が 4 つになって行が長くなったので、
+    // `0 stopped` のような情報を持たない項目で幅を使わない（1 本も無ければ空行）
     items.push(ListItem::new(
-        Line::from(format!(
-            "{awaiting} awaiting input · {working} working · {completed} completed"
-        ))
+        Line::from(
+            counts
+                .iter()
+                .filter(|(_, n)| *n > 0)
+                .map(|(group, n)| format!("{n} {}", group.title().to_lowercase()))
+                .collect::<Vec<_>>()
+                .join(" · "),
+        )
         .style(Style::default().fg(ui().dim)),
     ));
     rows.push(SidebarRow::Decoration);
@@ -1251,7 +1254,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     push_section(&mut items, &mut rows, PINNED_TITLE, &pinned);
     match app.grouping {
         Grouping::State => {
-            for group in [Group::NeedsInput, Group::Working, Group::Completed] {
+            for group in Group::ORDER {
                 let members: Vec<&RowData> = unpinned
                     .iter()
                     .copied()
@@ -1958,19 +1961,22 @@ mod tests {
                 status,
                 heuristic,
             }))
-            .label
+            .label()
         };
         // hook が居れば status も出力ヒューリスティックも見ない
-        assert_eq!(label(Some("done"), "busy", Some(SessionStatus::Working)), "Done");
-        assert_eq!(label(Some("working"), "idle", None), "Working");
-        assert_eq!(label(Some("blocked"), "busy", None), "Needs input");
+        assert_eq!(
+            label(Some(crate::poll::COMPLETED), "busy", Some(SessionStatus::Working)),
+            "Completed"
+        );
+        assert_eq!(label(Some(WORKING), "idle", None), "Working");
+        assert_eq!(label(Some(WAITING), "busy", None), "Waiting");
         // hook が一度も来ていない行は status から導く
         assert_eq!(label(None, "busy", None), "Working");
-        assert_eq!(label(None, "idle", None), "Needs input");
+        assert_eq!(label(None, "idle", None), "Waiting");
         // status も無い間は出力の変化から推す
         assert_eq!(label(None, "", Some(SessionStatus::Working)), "Working");
-        assert_eq!(label(None, "", Some(SessionStatus::NeedsInput)), "Needs input");
-        assert_eq!(label(None, "", None), "Needs input");
+        assert_eq!(label(None, "", Some(SessionStatus::NeedsInput)), "Waiting");
+        assert_eq!(label(None, "", None), "Waiting");
     }
 
     /// **動かしているものが無い行は、hook が何を言っていても Stopped。**
@@ -1983,8 +1989,8 @@ mod tests {
     #[test]
     fn a_row_with_no_run_is_stopped_whatever_the_hooks_say() {
         let view = row_state(None);
-        assert_eq!(view.label, "Stopped");
-        assert!(view.group == Group::Completed, "a stopped row is not in the last group");
+        assert_eq!(view.label(), "Stopped");
+        assert!(view.group == Group::Stopped, "a stopped row is not in the last group");
         assert!(!view.spinning);
         // **`Stopped` なのに生存形（✻）という矛盾が作れない**
         assert!(!view.alive, "a stopped row claims its process is alive");
@@ -2028,7 +2034,7 @@ mod tests {
             status: "idle",
             heuristic: Some(SessionStatus::NeedsInput),
         }));
-        assert_eq!(view.label, "Stopped", "a fresh stopped was thrown away");
+        assert_eq!(view.label(), "Stopped", "a fresh stopped was thrown away");
         assert!(!view.alive, "the shape says the process is alive on a stopped row");
         assert!(!view.spinning);
         // 他の state はそのまま生きている実行として出る（形は生存形）
@@ -2651,6 +2657,20 @@ mod tests {
         render_sidebar(app).into_iter().map(|(_, t)| t).collect()
     }
 
+    /// 集計行を探す。**語で探さない**（語を変えるたびにテストを直す形にしない）:
+    /// 集計行は「数字 + 空白 + 語」で始まる唯一の行
+    fn summary_row(texts: &[String]) -> String {
+        texts
+            .iter()
+            .find(|t| {
+                let mut chars = t.chars();
+                chars.next().is_some_and(|c| c.is_ascii_digit())
+                    && chars.next() == Some(' ')
+            })
+            .expect("the summary row is missing")
+            .clone()
+    }
+
     /// **行に出る経過時間は「その行が今の姿になってから」の時間**
     /// （[`crate::hooks::HookStates::changed_at`]）。材料は行の側と hook の側の
     /// 新しい方で、**行に関係のない出来事では動かない**（以前は動いている行だけ
@@ -2724,14 +2744,11 @@ mod tests {
         assert!(!row.contains("Needs input"), "a dead row is asking for input: {row:?}");
         // アイコンは生死を表すので停止形（生きている行の `✻` ではない）
         assert!(row.starts_with(&format!("{CLOSED_MARK}{READ_MARK}∙")), "{row:?}");
-        // 集計もその 1 本を Completed 側で数える
-        let counts = texts
-            .iter()
-            .find(|t| t.contains("awaiting input"))
-            .expect("the summary row is missing");
-        assert!(
-            counts.starts_with("0 awaiting input · 0 working · 1"),
-            "a stopped row was counted as awaiting: {counts:?}"
+        // 集計もその 1 本を Stopped として数える（0 件の項目は出さない）
+        let counts = summary_row(&texts);
+        assert_eq!(
+            counts, "1 stopped",
+            "a stopped row was counted as something else"
         );
     }
 
@@ -2772,16 +2789,15 @@ mod tests {
     fn look_fixture() -> RowData {
         RowData {
             action: RowAction::Open(SessionId::new("a")),
-            group: Group::Completed,
+            group: Group::Stopped,
             cwd: "C:\\dev\\api".to_string(),
             glyph: "∙",
             color: MUTED_FG,
             label: "the-row".to_string(),
             is_active_window: false,
             unread: false,
-            status_label: "Stopped",
+            status_label: Group::Stopped.title(),
             age: "3m".to_string(),
-            bucket: Bucket::Completed,
             pinned: false,
         }
     }
@@ -3045,13 +3061,10 @@ mod tests {
             ..pinned_fixture(Grouping::State, true)
         };
         let texts = sidebar_texts(&mut app);
-        let counts = texts
-            .iter()
-            .find(|t| t.contains("awaiting input"))
-            .expect("the summary row is missing");
-        assert!(
-            counts.starts_with("0 awaiting input · 0 working · 3"),
-            "the pinned row was not counted: {counts:?}"
+        assert_eq!(
+            summary_row(&texts),
+            "3 stopped",
+            "the pinned row was not counted"
         );
     }
 
@@ -3086,15 +3099,10 @@ mod tests {
                 );
             }
             // 集計は一覧に出る行を全部数える（隠す行が無いので数と行数が一致する）
-            let counts = texts
-                .iter()
-                .find(|t| t.contains("awaiting input"))
-                .expect("the summary row is missing")
-                .clone();
-            // （末尾はサイドバー幅で切られるので、数の出るところまでを見る）
-            assert!(
-                counts.starts_with("0 awaiting input · 0 working · 2"),
-                "{grouping:?}: not every row is counted: {counts:?}"
+            let counts = summary_row(&texts);
+            assert_eq!(
+                counts, "2 stopped",
+                "{grouping:?}: not every row is counted"
             );
         }
     }

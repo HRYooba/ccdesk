@@ -37,27 +37,44 @@ use ccdesk::{lock_path_for, now_ms, write_json_atomically, Lock, LOCK_STALE};
 // hook のイベント名と入力 JSON は**公式**（文書化されている）が、pid を渡す
 // 環境変数は非公開なので綴りは [`crate::claude_format`] が持つ
 use crate::claude_format::CLAUDE_PID_ENV;
-use crate::poll::STOPPED;
+use crate::poll::{COMPLETED, STOPPED, WAITING, WORKING};
 use crate::sessions::{SessionId, SessionRow};
 
-/// 注入する hook イベントと、それが意味する state。
+/// 注入する hook イベントと、絞り込みの matcher と、それが意味する state。
 ///
 /// **`--settings` の生成（[`inject_settings`]）と受け口（[`run_hook`]）が同じ表を読む**
 /// ので、片方だけ増えた状態にならない。state 値は [`crate::poll::classify`] が読む語彙
-/// （`working` / `blocked` / `done` / `stopped`）で、**要約文は持たない**
-/// （行に出るのは状態だけ）。
+/// （`waiting` / `working` / `completed` / `stopped` ＝ 画面に出る語の小文字）で、
+/// **要約文は持たない**（行に出るのは状態だけ）。
 ///
 /// **turn 単位のイベントだけを載せる。** hook は毎回 ccdesk を 1 プロセス起こすので、
 /// `PreToolUse` / `PostToolUse` のような道具ごとに飛ぶイベントを足すと、Windows の
-/// プロセス起動コストがそのままセッションの遅さになる
-const HOOK_EVENTS: [(&str, &str); 5] = [
+/// プロセス起動コストがそのままセッションの遅さになる。
+///
+/// # `Notification` を絞る理由
+///
+/// `Notification` は通知の種類ごとに matcher を持つ（公式に文書化。値は完全一致で、
+/// `|` 区切りで複数指定できる）。**絞らずに全部拾うと `idle_prompt`（60 秒放置の催促）が
+/// 混ざり、ターンを終えた行が時間経過だけで入力待ちへ落ちる**。実害は 2 つあった:
+/// 「Needs input」が「claude が止まっている」意味を失い、既読にした行の未読印が復活した。
+///
+/// 拾うのは**ユーザーが動くまで進まない**通知だけ。`auth_success` /
+/// `elicitation_complete` / `elicitation_response` / `agent_completed` は完了・情報通知
+/// なので拾わない（完了は `Stop` が答える）。
+///
+/// 縮退: matcher が効かない版では `Notification` が一度も発火しない ＝ 入力待ちは
+/// `agents --json` の `status` 経由だけになる。**`done` が壊れるより取り逃すほうが軽い**
+const NOTIFICATION_MATCHER: &str = "permission_prompt|elicitation_dialog|agent_needs_input";
+
+/// 注入する hook（イベント名, matcher, state）。matcher が None のイベントは
+/// 全発火を拾う（そのイベント自体が 1 つの意味しか持たないもの）
+const HOOK_EVENTS: [(&str, Option<&str>, &str); 5] = [
     // 起動直後・再開直後はまだプロンプトを受けていない ＝ 入力待ち
-    ("SessionStart", "blocked"),
-    ("UserPromptSubmit", "working"),
-    // 入力待ち・許可待ちのどちらもユーザーの操作を待っている状態
-    ("Notification", "blocked"),
-    ("Stop", "done"),
-    ("SessionEnd", STOPPED),
+    ("SessionStart", None, WAITING),
+    ("UserPromptSubmit", None, WORKING),
+    ("Notification", Some(NOTIFICATION_MATCHER), WAITING),
+    ("Stop", None, COMPLETED),
+    ("SessionEnd", None, STOPPED),
 ];
 
 /// 保管ファイルのトップレベルキー（`{"states": { "<session-id>": { … } }}`）
@@ -123,6 +140,20 @@ impl HookStates {
     /// 窓の有無は見ない ＝ 動いていない行についても「最後に動いたのはいつか」を答える
     fn last_at(&self, id: &SessionId) -> Option<u64> {
         self.0.get(id).map(|entry| entry.at)
+    }
+
+    /// 前回の写しと比べて、**新しくターンを終えた行があるか**。
+    ///
+    /// 使用率はターンが終わった瞬間に動くので、これが取得の合図になる
+    /// （[`crate::usage`]。周期で叩き続けるより、変わった直後に 1 回叩くほうが
+    /// 正確で、何もしていない間は claude を 1 プロセスも起こさない）。
+    ///
+    /// **`at` まで比べる**のが要点: state だけを見ると、`completed` のまま残っている
+    /// 行が毎周「終わった」と言い続ける
+    pub(crate) fn any_turn_finished_since(&self, previous: &Self) -> bool {
+        self.0.iter().any(|(id, entry)| {
+            entry.state == COMPLETED && previous.0.get(id).map(|p| p.at) != Some(entry.at)
+        })
     }
 
     /// その行が**未読**か（行頭の `●`）。
@@ -201,8 +232,8 @@ impl HookStates {
 fn state_of(event: &str) -> Option<&'static str> {
     HOOK_EVENTS
         .iter()
-        .find(|(name, _)| *name == event)
-        .map(|(_, state)| *state)
+        .find(|(name, _, _)| *name == event)
+        .map(|(_, _, state)| *state)
 }
 
 /// `ccdesk hook <event>`。**注入した hook の受け口**（ユーザーは直接使わない）。
@@ -388,15 +419,24 @@ fn settings_document(exe_fwd: &str) -> Value {
         Value::Object(
             HOOK_EVENTS
                 .iter()
-                .map(|(event, _)| {
+                .map(|(event, matcher, _)| {
+                    // matcher を持つイベントだけ `matcher` を載せる。
+                    // **空文字を載せない**（`""` は「何にも一致しない」とも
+                    // 「全部に一致」とも読めるので、意図が伝わらない形にしない）
+                    let mut group = serde_json::Map::new();
+                    if let Some(matcher) = matcher {
+                        group.insert("matcher".to_string(), json!(matcher));
+                    }
+                    group.insert(
+                        "hooks".to_string(),
+                        json!([{
+                            "type": "command",
+                            "command": format!("\"{exe_fwd}\" hook {event}"),
+                        }]),
+                    );
                     (
                         (*event).to_string(),
-                        json!([{
-                            "hooks": [{
-                                "type": "command",
-                                "command": format!("\"{exe_fwd}\" hook {event}"),
-                            }],
-                        }]),
+                        json!([Value::Object(group)]),
                     )
                 })
                 .collect(),
@@ -455,16 +495,78 @@ mod tests {
         let document = settings_document("C:/bin/ccdesk.exe");
         let hooks = document.get("hooks").and_then(Value::as_object).unwrap();
         assert_eq!(hooks.len(), HOOK_EVENTS.len(), "number of injected hooks differs from the table");
-        for (event, state) in HOOK_EVENTS {
+        for (event, matcher, state) in HOOK_EVENTS {
             let command = hooks[event][0]["hooks"][0]["command"].as_str().unwrap();
             assert_eq!(
                 command,
                 format!("\"C:/bin/ccdesk.exe\" hook {event}"),
                 "{event} has a different invocation shape"
             );
+            // matcher は表のとおりに載る（持たないイベントにはキー自体を書かない）
+            assert_eq!(
+                hooks[event][0].get("matcher").and_then(Value::as_str),
+                matcher,
+                "{event} has a different matcher"
+            );
             assert_eq!(state_of(event), Some(state), "the receiver doesn't know {event}");
         }
         assert_eq!(state_of("PreToolUse"), None, "received an unregistered hook");
+    }
+
+    /// **ターン完了は「新しく `completed` になった」だけを合図にする。**
+    ///
+    /// `completed` のまま残っている行を state だけで見ると、毎周「終わった」と
+    /// 言い続けて使用率の取得が止まらない（`at` まで比べる理由）
+    #[test]
+    fn only_a_fresh_completion_counts_as_a_finished_turn() {
+        let none = HookStates::default();
+        let working = HookStates::from_entries([("s", WORKING, 1_000)]);
+        let finished = HookStates::from_entries([("s", COMPLETED, 2_000)]);
+
+        // 動いていた行が終わった ＝ 合図
+        assert!(finished.any_turn_finished_since(&working));
+        // 何も知らなかったところに完了が現れた ＝ 合図（起動直後）
+        assert!(finished.any_turn_finished_since(&none));
+        // 同じ完了が残っているだけ ＝ 合図にしない
+        assert!(!finished.any_turn_finished_since(&finished));
+        // 完了が無ければ合図にならない
+        assert!(!working.any_turn_finished_since(&none));
+
+        // **同じ行が次のターンを終えたら、また合図になる**（`at` が進むため）
+        let again = HookStates::from_entries([("s", COMPLETED, 3_000)]);
+        assert!(again.any_turn_finished_since(&finished));
+
+        // 別の行が終わっても合図（複数セッションを見ている）
+        let other = HookStates::from_entries([("s", COMPLETED, 2_000), ("t", COMPLETED, 2_500)]);
+        assert!(other.any_turn_finished_since(&finished));
+    }
+
+    /// **`Notification` は「ユーザーが動くまで進まない」通知だけを拾う。**
+    ///
+    /// 絞らずに全部拾うと `idle_prompt`（60 秒放置の催促）が混ざり、ターンを終えた行が
+    /// 時間経過だけで入力待ちへ落ちる ＝ 「Needs input」が「claude が止まっている」
+    /// 意味を失い、既読にした行の未読印が復活する。**この 2 つは実際に起きた**
+    #[test]
+    fn the_notification_hook_ignores_the_idle_reminder() {
+        let matcher = HOOK_EVENTS
+            .iter()
+            .find(|(event, _, _)| *event == "Notification")
+            .and_then(|(_, matcher, _)| *matcher)
+            .expect("Notification must be filtered by a matcher");
+        let kinds: Vec<&str> = matcher.split('|').collect();
+        for wanted in ["permission_prompt", "elicitation_dialog", "agent_needs_input"] {
+            assert!(kinds.contains(&wanted), "{wanted} is not picked up");
+        }
+        // 催促と完了・情報通知は拾わない（完了は Stop が答える）
+        for unwanted in [
+            "idle_prompt",
+            "auth_success",
+            "elicitation_complete",
+            "elicitation_response",
+            "agent_completed",
+        ] {
+            assert!(!kinds.contains(&unwanted), "{unwanted} must not be picked up");
+        }
     }
 
     /// **道具ごとに飛ぶイベントは登録しない**（hook は毎回 ccdesk を 1 プロセス
@@ -473,7 +575,7 @@ mod tests {
     fn only_turn_level_events_are_injected() {
         for event in ["PreToolUse", "PostToolUse", "PreCompact", "SubagentStop"] {
             assert!(
-                !HOOK_EVENTS.iter().any(|(name, _)| *name == event),
+                !HOOK_EVENTS.iter().any(|(name, _, _)| *name == event),
                 "{event} is not turn-level"
             );
         }
@@ -599,18 +701,18 @@ mod tests {
         // **記録に pid まで載る**（載らないと pid での引き当てが黙って効かなくなる）
         assert_eq!(
             padded,
-            Some((id("s-1"), "blocked", Some(4242))),
+            Some((id("s-1"), WAITING, Some(4242))),
             "the pid did not reach the record"
         );
         assert_eq!(bare, Some(4242), "the pid is not read from the environment");
         assert_eq!(
             broken,
-            Some((id("s-1"), "blocked", None)),
+            Some((id("s-1"), WAITING, None)),
             "built a pid out of something that is not a number"
         );
         assert_eq!(
             missing,
-            Some((id("s-1"), "blocked", None)),
+            Some((id("s-1"), WAITING, None)),
             "answered with a pid when the variable is not set"
         );
         // 知らないイベント / 読めない入力は何も書かない

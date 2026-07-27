@@ -14,7 +14,7 @@ use ccdesk::{claude_settings_channel, version_newer};
 use crate::claude_format::{
     AGENT_KIND, AGENT_KIND_INTERACTIVE, AGENT_PID, AGENT_SESSION_ID, AGENT_STATUS,
 };
-use crate::theme::{ui, C_ATTENTION, C_FAIL, C_OK, C_WORKING};
+use crate::theme::{ui, C_ATTENTION, C_OK, C_WORKING};
 
 /// `claude agents --json --all` の 1 エントリ（公式のスクリプト向けライブデータ）。
 ///
@@ -571,46 +571,69 @@ pub(crate) enum Grouping {
     Directory,
 }
 
-/// グループ順: Needs input → Working → Completed。
+/// 行の状態。**行のラベル・節の見出し・集計の項目がこの 1 つ**で、
+/// 並びは緊急度の順（上ほどユーザーの手が要る）。
 ///
-/// **Ready for review は持たない**: 判定材料（PR 番号）は bg の state.json
+/// **語彙を 1 つに保つのが要点。** 以前は同じ分類を 3 通りの言葉で持っていた
+/// （行ラベル `Needs input` / `Done`、節の見出し `Needs input` / `Completed`、
+/// 集計 `awaiting input` / `completed`）ので、画面の 3 箇所で別の語が出ていた。
+/// [`Self::title`] が唯一の綴りで、集計行はそれを小文字にして使う。
+///
+/// **`Ready for review` は持たない**: 判定材料（PR 番号）は bg の state.json
 /// （非公開の内部形式）にしか無く、前景セッションは書かない。正本を
 /// `sessions.json` 1 つにする代償として落とした
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Group {
-    NeedsInput,
+    /// claude がユーザーの操作を待って止まっている（許可・応答待ち・プロンプト待ち）
+    Waiting,
+    /// claude が動いている
     Working,
+    /// ターンが終わった
     Completed,
+    /// プロセスが終了した（行は残る）。**`Completed` と混ぜない**:
+    /// 止められたセッションを「完了」と呼ぶのは嘘になる
+    Stopped,
 }
 
 impl Group {
+    /// **この 4 語が画面に出る唯一の綴り**（行ラベル・節の見出し・集計）
     pub(crate) fn title(self) -> &'static str {
         match self {
-            Self::NeedsInput => "Needs input",
+            Self::Waiting => "Waiting",
             Self::Working => "Working",
             Self::Completed => "Completed",
+            Self::Stopped => "Stopped",
         }
     }
+
+    /// 表示順（節の並びと集計の並び）。**[`Ord`] と同じ順を 1 箇所で配る**ので、
+    /// 節を足したときに並びの書き漏らしが起きない
+    pub(crate) const ORDER: [Self; 4] = [
+        Self::Waiting,
+        Self::Working,
+        Self::Completed,
+        Self::Stopped,
+    ];
 }
 
-/// ヘッダー集計（N awaiting input · N working · N completed）の分類先
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum Bucket {
-    Awaiting,
-    Working,
-    Completed,
-}
-
-/// 状態 → 表示（グループ・ラベル・色・スピナー・集計先）の単一マッピング。
-/// draw 内に同じ分岐を複製しない（集計と行表示のずれを防ぐ）
+/// 状態 → 表示（節・色・スピナー）の単一マッピング。
+/// draw 内に同じ分岐を複製しない（集計と行表示のずれを防ぐ）。
+///
+/// **ラベルは持たない**（`group.title()` が答える）。持たせていた頃は
+/// 「ラベルは Done だが節は Completed」のような食い違いを作れた
 #[derive(Clone, Copy)]
 pub(crate) struct StateView {
     pub(crate) group: Group,
-    pub(crate) label: &'static str,
     pub(crate) color: Color,
     pub(crate) spinning: bool, // Working スピナーの対象
     pub(crate) alive: bool,    // プロセス生存（アイコン形状 ✻/∙）
-    pub(crate) bucket: Bucket,
+}
+
+impl StateView {
+    /// 行に出す文字列（＝ 節の見出しと同じ語）
+    pub(crate) fn label(&self) -> &'static str {
+        self.group.title()
+    }
 }
 
 /// **実行が終わった**ことを表す state 値。書く側（hook の `SessionEnd` ＝
@@ -626,66 +649,40 @@ pub(crate) const STOPPED: &str = "stopped";
 /// **これは従の経路**: 状態の主は
 /// hook（[`crate::hooks`]）で、ここへ落ちるのは hook が一度も来ていない行だけ
 /// （ccdesk が起こしていないセッション・注入が効かなかった場合）。
-/// hook のように Done を区別できないので、出るのは Working か Needs input の 2 つ。
-/// `busy` 以外を Needs input へ倒すのは、前景セッションが `busy` でないなら
-/// ユーザーの入力を待っているため（`idle` = プロンプト待ち、`waiting` = 確認待ち）
+/// hook のように「ターンが終わった」を区別できないので、出るのは Working か
+/// Waiting の 2 つ。`busy` 以外を Waiting へ倒すのは、前景セッションが `busy` で
+/// ないならユーザーの入力を待っているため（`idle` = プロンプト待ち、
+/// `waiting` = 確認待ち）
 pub(crate) fn foreground_state(status: &str) -> &'static str {
-    if status == "busy" { "working" } else { "blocked" }
+    if status == "busy" { WORKING } else { WAITING }
 }
 
-/// state 値（working|blocked|done|failed|stopped）+ 生死から表示を決める
+/// state 値。**書く側（hook）と読む側（[`classify`]）が同じ綴りを見る**ための 1 箇所。
+/// 語は [`Group`] の小文字（画面に出る語と内部の値を別にしない）
+pub(crate) const WAITING: &str = "waiting";
+pub(crate) const WORKING: &str = "working";
+pub(crate) const COMPLETED: &str = "completed";
+
+/// state 値（waiting|working|completed|stopped）+ 生死から表示を決める。
+///
+/// **未知の値は state として扱わない。** 生きているなら Working（まだ何も
+/// 報告していないセッションは動いている可能性が高い）、死んでいるなら Stopped。
+/// 以前は死んだ行に `Idle` という 5 番目の語を出していた
 pub(crate) fn classify(live_state: &str, alive: bool) -> StateView {
-    let needs_input = StateView {
-        group: Group::NeedsInput,
-        label: "Needs input",
-        color: C_ATTENTION,
-        spinning: false,
+    let view = |group: Group, color: Color, spinning: bool| StateView {
+        group,
+        color,
+        spinning,
         alive,
-        bucket: Bucket::Awaiting,
     };
     match live_state {
-        "done" => StateView {
-            group: Group::Completed,
-            label: "Done",
-            color: C_OK,
-            spinning: false,
-            alive,
-            bucket: Bucket::Completed,
-        },
-        "failed" => StateView {
-            group: Group::Completed,
-            label: "Failed",
-            color: C_FAIL,
-            spinning: false,
-            alive,
-            bucket: Bucket::Completed,
-        },
-        STOPPED => StateView {
-            group: Group::Completed,
-            label: "Stopped",
-            color: ui().dim,
-            spinning: false,
-            alive,
-            bucket: Bucket::Completed,
-        },
-        "blocked" => needs_input,
-        _ if alive => StateView {
-            group: Group::Working,
-            label: "Working",
-            color: C_WORKING,
-            spinning: true,
-            alive,
-            bucket: Bucket::Working,
-        },
-        // プロセスが居ない working / 不明値: グループと集計を Completed 側に揃える
-        _ => StateView {
-            group: Group::Completed,
-            label: "Idle",
-            color: ui().dim,
-            spinning: false,
-            alive,
-            bucket: Bucket::Completed,
-        },
+        COMPLETED => view(Group::Completed, C_OK, false),
+        STOPPED => view(Group::Stopped, ui().dim, false),
+        WAITING => view(Group::Waiting, C_ATTENTION, false),
+        // `working` と未知の値をまとめて扱う（どちらも「動いているらしい」）
+        _ if alive => view(Group::Working, C_WORKING, true),
+        // プロセスが居ない ＝ 動いていないので、report された state に関わらず Stopped
+        _ => view(Group::Stopped, ui().dim, false),
     }
 }
 

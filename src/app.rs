@@ -1326,7 +1326,13 @@ fn adopt_switched_session(app: &mut App, previous: &SessionId, next: &SessionId,
 /// hook の `at` になったことの裏返し: `UserPromptSubmit` はユーザー自身の打鍵でも
 /// 飛ぶので、見ている行の記録が進んだらその場で既読を合わせる
 fn adopt_hook_states(app: &mut App) {
-    app.hook_states = app.source.hook_states();
+    let previous = std::mem::replace(&mut app.hook_states, app.source.hook_states());
+    // **ターンが終わった行があれば使用率を取り直す。** 使用率が動くのはこの瞬間だけで、
+    // 周期で叩き続けるより正確なうえ、何もしていない間は claude を 1 プロセスも
+    // 起こさない（間引きは供給元の側。[`crate::usage`]）
+    if app.hook_states.any_turn_finished_since(&previous) {
+        app.source.note_turn_finished();
+    }
     let shown: Option<SessionId> = app.shown_session().cloned();
     if let Some(id) = shown {
         mark_read(app, &id);

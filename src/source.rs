@@ -22,7 +22,7 @@ use ccdesk::{
 use crate::hooks::HookStates;
 use crate::poll::{
     spawn_agents_poller, spawn_footer_poller, AccountStatus, AgentInfo, FooterInfo, Grouping,
-    VersionSinks,
+    VersionSinks, COMPLETED, WAITING, WORKING,
 };
 use crate::usage::{Usage, UsageInfo, UsageRefresh, UsageSlot, UsageWindow};
 use crate::sessions::{SessionId, SessionRow, SessionStore};
@@ -51,15 +51,16 @@ const DEFAULT_SIDEBAR_WIDTH: u16 = 34;
 /// （状態のグリフや区切りの記号は 1 文字が 1 桁とは限らない）:
 ///
 /// 1. セッション行 `= ␣ <グリフ> ␣ <名前>␣␣<状態>`。前置きが 4 桁で、
-///    [`demo_jobs`] の最長は "add dark mode toggle"(20) + "Needs input"(11)
-///    ＝ 4 + 20 + 2 + 11 = 37 桁
-/// 2. 集計ヘッダー行 `1 awaiting input · 0 working · 5 completed` ＝ 42 桁。
+///    [`demo_rows`] の最長は "add dark mode toggle"(20) + "Completed"(9)
+/// 2. 集計行 `1 waiting · 2 working · 2 completed · 1 stopped` ＝ 47 桁。
 ///    語の途中で切れると画像が壊れて見えるので、こちらが実際の下限になる
 ///
-/// List は枠の内側（幅 - 2）で切るので 42 + 2 = 44 桁。右ペインを削らないよう
+/// List は枠の内側（幅 - 2）で切るので 47 + 2 = 49 桁。右ペインを削らないよう
 /// これ以上は広げない。行末の要約・経過時間は元々溢れる前提（切っても意味が残る）。
+/// **実データではこの幅を要求しない**（集計行は 0 件の項目を出さないので、
+/// 4 種すべてが揃っている撮影データが最も長い）。
 /// 根拠は `demo_sidebar_width_fits_the_sidebar_rows` が固定する
-const DEMO_SIDEBAR_WIDTH: u16 = 44;
+const DEMO_SIDEBAR_WIDTH: u16 = 49;
 
 /// 撮影用の new session 画面の初期フォルダ（実フォルダを出さない）
 const DEMO_CWD: &str = "C:\\dev\\shop-app";
@@ -173,6 +174,10 @@ pub(crate) trait DataSource: Send + Sync {
     /// 使用率をその場で取り直す（フッターの使用率をクリックしたとき）。
     /// 取得しない供給元（撮影用）では何もしない
     fn refresh_usage(&self) {}
+
+    /// **どこかのセッションがターンを終えた。** 使用率が動いた瞬間なので取り直す
+    /// （実際に取るかは供給元が間引く。[`crate::usage::spawn_poller`]）
+    fn note_turn_finished(&self) {}
 
     /// 起動時に復元するウィンドウ状態
     fn window_state(&self) -> WindowState;
@@ -418,6 +423,12 @@ impl DataSource for LiveSource {
         }
     }
 
+    fn note_turn_finished(&self) {
+        if let Some((_, refresh)) = &self.usage {
+            refresh.note_turn_finished();
+        }
+    }
+
     fn window_state(&self) -> WindowState {
         // **存在しないディレクトリも落とさない**（dispatch_cwd の is_dir と対照的）:
         // リムーバブルドライブ・ネットワークドライブ・未マウントの作業領域は
@@ -627,11 +638,11 @@ fn demo_sessions() -> Vec<SessionRow> {
 /// 状態が None の行は**動かしている実行が無い** ＝ Stopped
 fn demo_rows() -> Vec<(SessionRow, String, Option<String>)> {
     let rows: [(&str, Option<&str>, &str); 6] = [
-        ("fix login form validation", Some("working"), "C:\\dev\\shop-app"),
-        ("add dark mode toggle", Some("blocked"), "C:\\dev\\shop-app"),
-        ("refactor api client", Some("working"), "C:\\dev\\api"),
-        ("write onboarding docs", Some("done"), "C:\\dev\\docs"),
-        ("optimize image pipeline", Some("done"), "C:\\dev\\api"),
+        ("fix login form validation", Some(WORKING), "C:\\dev\\shop-app"),
+        ("add dark mode toggle", Some(WAITING), "C:\\dev\\shop-app"),
+        ("refactor api client", Some(WORKING), "C:\\dev\\api"),
+        ("write onboarding docs", Some(COMPLETED), "C:\\dev\\docs"),
+        ("optimize image pipeline", Some(COMPLETED), "C:\\dev\\api"),
         ("migrate to vite", None, "C:\\dev\\shop-app"),
     ];
     let now = ccdesk::now_ms();
@@ -698,7 +709,7 @@ fn demo_usage() -> UsageInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::poll::{classify, Bucket};
+    use crate::poll::classify;
 
     /// 撮影データは固定。実セッション・実アカウント・実使用率が混ざらないことを、
     /// 中身そのもので固定する（描画側はこの値をそのまま出す）
@@ -1028,35 +1039,40 @@ mod tests {
         use unicode_width::UnicodeWidthStr;
 
         // 集計ヘッダー行（ui::draw が組む文面）。demo データではこの 1 通りに定まる
-        const DEMO_HEADER: &str = "1 awaiting input · 2 working · 3 completed";
+        const DEMO_HEADER: &str = "1 waiting · 2 working · 2 completed · 1 stopped";
 
         let inner = usize::from(DEMO_SIDEBAR_WIDTH - 2);
         // 名前より前の固定部分 `= ␣ <グリフ> ␣`。グリフ（✻ / ✽ / ∙）はどれも 1 桁
         let prefix = "= ∙ ".width();
         let mut widest = DEMO_HEADER.width();
-        let (mut awaiting, mut working, mut completed) = (0, 0, 0);
+        let mut counts = std::collections::BTreeMap::<&str, usize>::new();
         for (_, title, state) in demo_rows() {
             // 固定 state を持つ行は「動いている実行がある」扱い（[`crate::ui`] の導出と同じ）
             let view = match &state {
                 Some(state) => classify(state, true),
                 None => classify(crate::poll::STOPPED, false),
             };
-            match view.bucket {
-                Bucket::Awaiting => awaiting += 1,
-                Bucket::Working => working += 1,
-                Bucket::Completed => completed += 1,
-            }
-            let need = prefix + title.width() + 2 + view.label.width();
+            *counts.entry(view.label()).or_default() += 1;
+            let need = prefix + title.width() + 2 + view.label().width();
             assert!(
                 need <= inner,
                 "{:?} + {:?} needs {need} cols (inner is {inner} cols)",
                 title,
-                view.label
+                view.label()
             );
             widest = widest.max(need);
         }
-        // ヘッダー行の文面（= 上の DEMO_HEADER）が demo データと合っていること
-        assert_eq!((awaiting, working, completed), (1, 2, 3));
+        // ヘッダー行の文面（= 上の DEMO_HEADER）が demo データと合っていること。
+        // **語も件数もここで固定する**（撮影データと集計行がずれない）
+        assert_eq!(
+            counts,
+            std::collections::BTreeMap::from([
+                ("Waiting", 1),
+                ("Working", 2),
+                ("Completed", 2),
+                ("Stopped", 1),
+            ])
+        );
         assert!(
             DEMO_HEADER.width() <= inner,
             "summary header row gets truncated ({} cols / inner {inner} cols)",
