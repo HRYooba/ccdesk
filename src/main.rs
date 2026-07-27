@@ -29,7 +29,7 @@ mod update;
 mod usage;
 
 use app::{open_session, run, App, Focus, RightView, SelfUpdate};
-use cli::{print_usage, run_doctor, show_logs, update_self};
+use cli::{print_usage, print_usage_error, run_doctor, show_logs, update_self};
 use poll::FooterInfo;
 use source::{DataSource, DemoSource, LiveSource};
 use theme::HOST_COLORS;
@@ -64,9 +64,9 @@ fn main() -> anyhow::Result<()> {
         }
         // スクリーンショット撮影用: セッション・アカウント等を架空データで描画（非公開フラグ）
         Some("--demo") => demo = true,
+        // **stdout へ出さない**（理由は [`cli::print_usage_error`]）
         Some(other) => {
-            eprintln!("unknown argument: {other}\n");
-            print_usage();
+            print_usage_error(other);
             std::process::exit(2);
         }
         None => {}
