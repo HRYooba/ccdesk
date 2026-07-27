@@ -2,7 +2,7 @@
 //!
 //! **`~/.ccdesk/sessions.json` が一覧の正本。** 前景起動（`claude --session-id <uuid>`）は
 //! `~/.claude/jobs/*/state.json` に痕跡を残さないので、「どのセッションが存在するか」を
-//! ccdesk 自身が持つ必要がある。移行の全体像は `docs/foreground-migration.md`。
+//! ccdesk 自身が持つ必要がある。
 //!
 //! **[`crate::session`]（PTY のクライアント）とは別物**: あちらは「今開いている端末」、
 //! ここは「一覧に載る行」。プロセスが死んでも行は残る（動かすものが無い行 ＝ Stopped

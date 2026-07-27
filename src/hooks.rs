@@ -8,7 +8,7 @@
 //! 書き方（advisory lock と tmp → rename）は lib 側の 1 実装を使う
 //! （[`ccdesk::Lock`] / [`ccdesk::write_json_atomically`]）。
 //!
-//! **state の正本は 2 段構え**（`docs/foreground-migration.md` のフェーズ3）:
+//! **state の正本は 2 段構え**:
 //! hook が主で、hook が一度も来ていないセッションだけ `claude agents --json` の
 //! `status` から導く。**受けた state を行へ写さない**のが要点で、写していた頃は
 //! 保管（`sessions.json`）と hook が食い違い、しかもどちらが新しいかが行ごとに
@@ -41,7 +41,7 @@ use crate::sessions::{SessionId, SessionRow};
 /// **`--settings` の生成（[`inject_settings`]）と受け口（[`run_hook`]）が同じ表を読む**
 /// ので、片方だけ増えた状態にならない。state 値は [`crate::poll::classify`] が読む語彙
 /// （`working` / `blocked` / `done` / `stopped`）で、**要約文は持たない**
-/// （行に出るのは状態だけ ＝ `docs/foreground-migration.md` の確定仕様）。
+/// （行に出るのは状態だけ）。
 ///
 /// **turn 単位のイベントだけを載せる。** hook は毎回 ccdesk を 1 プロセス起こすので、
 /// `PreToolUse` / `PostToolUse` のような道具ごとに飛ぶイベントを足すと、Windows の

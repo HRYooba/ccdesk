@@ -294,7 +294,7 @@ fn remove_account_store(store: &Path) -> bool {
 
 /// セッション一覧の正本 ~/.ccdesk/sessions.json。
 /// 前景セッション（`claude --session-id <uuid>`）は `~/.claude/jobs` に痕跡を残さないので、
-/// 「どのセッションが存在するか」は ccdesk 自身が持つ（`docs/foreground-migration.md`）
+/// 「どのセッションが存在するか」は ccdesk 自身が持つ
 pub fn sessions_store_path() -> Option<std::path::PathBuf> {
     Some(ccdesk_dir()?.join("sessions.json"))
 }

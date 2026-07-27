@@ -19,7 +19,7 @@ use crate::theme::{ui, C_ATTENTION, C_FAIL, C_OK, C_WORKING};
 /// ccdesk の行（[`crate::sessions::SessionRow`]）と同じ鍵で、`status` が前景
 /// セッションの生きた状態（`~/.claude/sessions/<pid>.json` に書かれる
 /// busy|idle|waiting|shell）。bg 専用の `id`（short）・`state`・要約は読まない
-/// ＝ 非公開の内部形式に依存する経路をここで断つ（`docs/foreground-migration.md`）
+/// ＝ 非公開の内部形式に依存する経路をここで断つ
 #[derive(Clone, Default)]
 pub(crate) struct AgentInfo {
     /// transcript の `sessionId`（＝ `claude --session-id` へ渡した UUID）
@@ -128,8 +128,15 @@ pub(crate) fn read_usage() -> Option<UsageInfo> {
 ///
 /// **持つのは表示ラベルだけ。** アカウントの切り替えを撤去した今、ccdesk が
 /// アカウントについて答えるのは「今サインインしているのは誰か」の 1 行だけなので、
-/// email のような同一性の識別子を持ち回す先が無い（詳細は
-/// `docs/foreground-migration.md`）
+/// email のような同一性の識別子を持ち回す先が無い。
+///
+/// **切り替えを再び作らないこと。** `claude auth status --json` が返す email の出所は
+/// `~/.claude.json` の遅延取得キャッシュで、その更新契機は ccdesk から見えない
+/// （`auth status` は同ファイルを書かず、動いている claude が数秒おきに書き換え続けるので
+/// mtime も答えの新しさを語らない）。「今このトークンが誰のものか」を確実に知れないまま
+/// 保管へ書けば別アカウントのトークンを混ぜ、refreshToken は使い捨てなので
+/// **復旧不能な破壊**になる。待ち時間や自己修復は誤る確率を下げるだけで、
+/// 被害が復旧不能である以上は機能として成立しない
 #[derive(Clone, Default, Debug, PartialEq)]
 pub(crate) enum AccountStatus {
     /// まだ取得できていない（起動直後・CLI 実行失敗・JSON 不正）。行は出さない
@@ -578,7 +585,7 @@ pub(crate) enum Grouping {
 ///
 /// **Ready for review は持たない**: 判定材料（PR 番号）は bg の state.json
 /// （非公開の内部形式）にしか無く、前景セッションは書かない。正本を
-/// `sessions.json` 1 つにする代償として落とした（`docs/foreground-migration.md`）
+/// `sessions.json` 1 つにする代償として落とした
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Group {
     NeedsInput,
@@ -626,7 +633,7 @@ pub(crate) const STOPPED: &str = "stopped";
 /// [`classify`] が読む state 値へ写す。**呼ぶのは status が空でないときだけ**
 /// （空 ＝ まだ書かれていない・拾えていないので、判断の材料が無い）。
 ///
-/// **これは従の経路**（`docs/foreground-migration.md` のフェーズ3）: 状態の主は
+/// **これは従の経路**: 状態の主は
 /// hook（[`crate::hooks`]）で、ここへ落ちるのは hook が一度も来ていない行だけ
 /// （ccdesk が起こしていないセッション・注入が効かなかった場合）。
 /// hook のように Done を区別できないので、出るのは Working か Needs input の 2 つ。

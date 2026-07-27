@@ -125,7 +125,7 @@ pub(crate) enum SidebarPos {
     Row(usize),
     /// フッターのアカウント行。**今サインインしているアカウントを出すだけの行**で、
     /// 選択とホバーはできるが押しても何も起きない（[`SidebarRow::Inert`] と同じ扱い。
-    /// アカウントの切り替えを撤去した理由は `docs/foreground-migration.md`）。
+    /// 切り替えを持たない理由は [`crate::poll::AccountStatus`]）。
     ///
     /// **`SidebarRow::Inert` へは寄せられない**: あちらは `sidebar_rows` に積まれた
     /// 行の種類で、この行はフッター（一覧の外・下端に固定）に描かれるため index を
@@ -220,7 +220,7 @@ impl PopupKind {
     pub(crate) fn entries(&self, grouping: Grouping) -> Vec<(String, bool)> {
         match self {
             // 二次操作はここに集約する（ショートカットキーを併設しない ＝
-            // 入口を 2 つ持たない。`docs/foreground-migration.md`）。
+            // 入口を 2 つ持たない）。
             //
             // **先頭は `open`**: サイドバーのキーは `↑↓` と `Enter` だけになり、
             // セッション行の `Enter` もこのメニューを開くので、キーボードから
@@ -953,8 +953,8 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
 
 /// **ccdesk が横取りする打鍵。ここに無いキーは 1 つ残らず claude へ渡る。**
 ///
-/// 予約を 2 つだけに絞ったのは、二次操作をポップアップへ集めたから
-/// （`docs/foreground-migration.md`）。入口が「メニュー」と「ショートカット」の
+/// 予約を 2 つだけに絞ったのは、二次操作をポップアップへ集めたから。
+/// 入口が「メニュー」と「ショートカット」の
 /// 2 つあると、どちらが正なのか読む側にも実装側にも分岐が生まれるうえ、
 /// **予約キーの数だけ claude 本体のキーバインドが死ぬ**（`Ctrl+S` / `Ctrl+X` は
 /// 実際に claude 側の打鍵だった）。
