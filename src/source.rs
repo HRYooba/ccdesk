@@ -197,6 +197,16 @@ pub(crate) trait DataSource: Send + Sync {
     /// `claude agents --json` の `status` へ落ちる（[`crate::hooks`]）
     fn hook_states(&self) -> HookStates;
 
+    /// **窓を持たない行に与える固定の state**（`session_id` → state）。
+    ///
+    /// 行の状態は「その行を動かしている実行があるか」から導く（[`crate::ui`]）ので、
+    /// セッションを 1 本も起こさない撮影ではすべて Stopped になり、
+    /// state グルーピングが写らない。撮影用の供給元だけが、窓の代わりに
+    /// 「動いている実行」をこの表で名乗る。**実データ側は必ず空**
+    /// （実データの生死を答えるのは自分の子プロセスだけ）。
+    /// 名前を [`Titles::fixed`] で差し替えるのと同じ形
+    fn fixed_states(&self) -> std::collections::HashMap<SessionId, String>;
+
     /// hook の受け渡しファイルの見え方（長さ・更新時刻）。**中身を読まずに
     /// 「変わったか」だけを答える**口で、run ループが毎周見て、変わった周だけ
     /// 一覧を読み直す（ペイン内の `/resume` `/clear` に周期を待たずに気づく）。
@@ -442,6 +452,12 @@ impl DataSource for LiveSource {
         crate::hooks::read_states()
     }
 
+    fn fixed_states(&self) -> std::collections::HashMap<SessionId, String> {
+        // 実データの行が「動いている」と言えるのは自分の子プロセスが生きている
+        // ときだけ ＝ ここから状態を足す経路は持たない
+        std::collections::HashMap::new()
+    }
+
     fn hook_stamp(&self) -> Option<(u64, std::time::SystemTime)> {
         crate::hooks::states_stamp()
     }
@@ -590,9 +606,16 @@ impl DataSource for DemoSource {
     }
 
     fn hook_states(&self) -> HookStates {
-        // 撮影は実セッションの hook を読まない。空 ＝ 行の状態は
-        // [`demo_sessions`] が持つ `last_state` だけで決まる（固定の画面になる）
+        // 撮影は実セッションの hook を読まない（未読も経過時間も動かない）。
+        // 行の状態は [`Self::fixed_states`] だけで決まる ＝ 固定の画面になる
         HookStates::default()
+    }
+
+    fn fixed_states(&self) -> std::collections::HashMap<SessionId, String> {
+        demo_rows()
+            .into_iter()
+            .filter_map(|(row, _, state)| state.map(|state| (row.session_id, state)))
+            .collect()
     }
 
     fn hook_stamp(&self) -> Option<(u64, std::time::SystemTime)> {
@@ -641,7 +664,12 @@ impl DataSource for DemoSource {
 
     fn titles(&self) -> Titles {
         // 撮影は transcript も `~/.claude` も読まない（固定表だけを返す）
-        Titles::fixed(demo_rows().into_iter().map(|(row, name)| (row.session_id, name)).collect())
+        Titles::fixed(
+            demo_rows()
+                .into_iter()
+                .map(|(row, name, _)| (row.session_id, name))
+                .collect(),
+        )
     }
 
     fn accounts(&self) -> Vec<Account> {
@@ -660,28 +688,25 @@ impl DataSource for DemoSource {
 /// 撮影用の架空セッション行。実セッション名・実プロジェクトパス・実 ID を出さない。
 ///
 /// ID は架空の UUID。時刻は「今から N 分前」なので、いつ撮っても同じ見た目になる
-/// （[`demo_usage`] と同じ理由）。**未読は出さない**
-/// （`last_opened_at` = `updated_at`）: 撮影の見た目を撮った時刻で変えないため。
-///
-/// **どの行も生きた PTY を持たない**（撮影はセッションを起こさない）ので、
-/// 状態は `last_state` から決まる ＝ ここに書いた state がそのまま画面に出る
+/// （[`demo_usage`] と同じ理由）。**未読は出さない**（撮影は hook を読まないので、
+/// 未読の材料そのものが無い）
 fn demo_sessions() -> Vec<SessionRow> {
-    demo_rows()
-        .into_iter()
-        .map(|(row, _)| row)
-        .collect()
+    demo_rows().into_iter().map(|(row, _, _)| row).collect()
 }
 
-/// 撮影用の行と、その行に出す表示名。**名前は行が持たない**
-/// （正本は transcript）ので、撮影は [`Titles::fixed`] へ渡す表として持つ
-fn demo_rows() -> Vec<(SessionRow, String)> {
-    let rows: [(&str, &str, &str); 6] = [
-        ("fix login form validation", "working", "C:\\dev\\shop-app"),
-        ("add dark mode toggle", "blocked", "C:\\dev\\shop-app"),
-        ("refactor api client", "working", "C:\\dev\\api"),
-        ("write onboarding docs", "done", "C:\\dev\\docs"),
-        ("optimize image pipeline", "done", "C:\\dev\\api"),
-        ("migrate to vite", "stopped", "C:\\dev\\shop-app"),
+/// 撮影用の行と、その行に出す表示名・状態。
+///
+/// **名前も状態も行が持たない**（正本はそれぞれ transcript と「動いている実行」）
+/// ので、撮影は [`Titles::fixed`] と [`DataSource::fixed_states`] へ渡す表として持つ。
+/// 状態が None の行は**動かしている実行が無い** ＝ Stopped
+fn demo_rows() -> Vec<(SessionRow, String, Option<String>)> {
+    let rows: [(&str, Option<&str>, &str); 6] = [
+        ("fix login form validation", Some("working"), "C:\\dev\\shop-app"),
+        ("add dark mode toggle", Some("blocked"), "C:\\dev\\shop-app"),
+        ("refactor api client", Some("working"), "C:\\dev\\api"),
+        ("write onboarding docs", Some("done"), "C:\\dev\\docs"),
+        ("optimize image pipeline", Some("done"), "C:\\dev\\api"),
+        ("migrate to vite", None, "C:\\dev\\shop-app"),
     ];
     let now = ccdesk::now_ms();
     rows.iter()
@@ -693,11 +718,11 @@ fn demo_rows() -> Vec<(SessionRow, String)> {
             let id = SessionId::new(format!("demo0000-0000-4000-8000-{:012}", i + 1));
             (
                 SessionRow {
-                    last_state: (*state).to_string(),
                     updated_at: updated,
                     ..SessionRow::new(id, *cwd, updated)
                 },
                 (*title).to_string(),
+                state.map(str::to_string),
             )
         })
         .collect()
@@ -802,7 +827,10 @@ mod tests {
                 session.session_id
             );
             assert!(session.cwd.starts_with("C:\\dev\\"), "cwd: {:?}", session.cwd);
-            assert!(!session.unread(), "unread marker shows up in the demo");
+            assert!(
+                !DemoSource.hook_states().unread(session),
+                "unread marker shows up in the demo"
+            );
             assert!(!session.pinned);
         }
     }
@@ -1074,16 +1102,19 @@ mod tests {
         use unicode_width::UnicodeWidthStr;
 
         // 集計ヘッダー行（ui::draw が組む文面）。demo データではこの 1 通りに定まる
-        const DEMO_HEADER: &str = "1 awaiting input · 0 working · 5 completed";
+        const DEMO_HEADER: &str = "1 awaiting input · 2 working · 3 completed";
 
         let inner = usize::from(DEMO_SIDEBAR_WIDTH - 2);
-        // 名前より前の固定部分 `= ␣ <グリフ> ␣`。撮影はセッションを起こさないので
-        // 生きた PTY は無く、グリフは常に停止形（∙）
+        // 名前より前の固定部分 `= ␣ <グリフ> ␣`。グリフ（✻ / ✽ / ∙）はどれも 1 桁
         let prefix = "= ∙ ".width();
         let mut widest = DEMO_HEADER.width();
         let (mut awaiting, mut working, mut completed) = (0, 0, 0);
-        for (session, title) in demo_rows() {
-            let view = classify(&session.last_state, false);
+        for (_, title, state) in demo_rows() {
+            // 固定 state を持つ行は「動いている実行がある」扱い（[`crate::ui`] の導出と同じ）
+            let view = match &state {
+                Some(state) => classify(state, true),
+                None => classify(crate::poll::STOPPED, false),
+            };
             match view.bucket {
                 Bucket::Awaiting => awaiting += 1,
                 Bucket::Working => working += 1,
@@ -1099,7 +1130,7 @@ mod tests {
             widest = widest.max(need);
         }
         // ヘッダー行の文面（= 上の DEMO_HEADER）が demo データと合っていること
-        assert_eq!((awaiting, working, completed), (1, 0, 5));
+        assert_eq!((awaiting, working, completed), (1, 2, 3));
         assert!(
             DEMO_HEADER.width() <= inner,
             "summary header row gets truncated ({} cols / inner {inner} cols)",

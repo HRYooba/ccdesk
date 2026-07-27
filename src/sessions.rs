@@ -5,7 +5,8 @@
 //! ccdesk 自身が持つ必要がある。移行の全体像は `docs/foreground-migration.md`。
 //!
 //! **[`crate::session`]（PTY のクライアント）とは別物**: あちらは「今開いている端末」、
-//! ここは「一覧に載る行」。プロセスが死んでも行は残る（最後に観測した状態のまま）。
+//! ここは「一覧に載る行」。プロセスが死んでも行は残る（動かすものが無い行 ＝ Stopped
+//! として描かれるだけで、状態そのものは保存しない ＝ [`SessionRow`]）。
 //!
 //! パスは引数で受ける（[`SessionStore::new`]）。理由は [`crate::accounts`] と同じで、
 //! テストが実ユーザーの `~/.ccdesk` を絶対に触らないため。
@@ -28,7 +29,6 @@ const SESSIONS_KEY: &str = "sessions";
 const ID_KEY: &str = "session_id";
 const CWD_KEY: &str = "cwd";
 const TRANSCRIPT_KEY: &str = "transcript";
-const LAST_STATE_KEY: &str = "last_state";
 const PINNED_KEY: &str = "pinned";
 const LAST_OPENED_AT_KEY: &str = "last_opened_at";
 const CREATED_AT_KEY: &str = "created_at";
@@ -81,12 +81,34 @@ impl std::fmt::Display for SessionId {
 }
 
 /// 一覧に載る 1 行。**プロセスが死んでも残る**のがライブ状態（`claude agents --json`）
-/// との違いで、行の生死と表示する状態は別の知識になる。
+/// との違い。
 ///
-/// **表示名は持たない。** 名前の正本は transcript 1 つで、行に写しを置くと
-/// 「保存値」と「正本」の 2 本立てになり、ズレても気づけない（実害が出ていた:
-/// 保存値が `new session` のまま固定される・名前が変わるたびに `updated_at` が
-/// 動いて経過時間が 0s へ戻る）。表示名は描画のたびに導く（[`crate::title::Titles::of`]）
+/// # 行が持たないもの
+///
+/// **表示名も state も持たない。** どちらも正本が別にあり、行に写しを置くと
+/// 「保存値」と「正本」の 2 本立てになってズレても気づけない。実害はどちらでも
+/// 同じ形で出た:
+///
+/// - 表示名: 保存値が `new session` のまま固定される・名前が変わるたびに
+///   `updated_at` が動いて経過時間が 0s へ戻る（正本は transcript ＝
+///   [`crate::title::Titles::of`] が描画のたびに導く）
+/// - state: ccdesk が異常終了すると保存値が最後の観測のまま固まり、
+///   死んでいる行が `Needs input` を出し続ける。逆に窓を閉じた行へ保存値を
+///   書き戻すと、hook が持つ新しい記録より古い値が残る（実データでは
+///   「保管が `blocked`・hook が `stopped`」と「保管が `stopped`・hook が `blocked`」が
+///   同時に存在した）。state は描画のたびに導く（[`crate::ui`]）
+///
+/// # 2 つの時刻の役割
+///
+/// **`updated_at` と `last_opened_at` は別の問いに答える**（同じ材料を見ない）:
+///
+/// - `updated_at` ＝ **この保管の中身が最後に変わった時刻**。[`merge_sessions`] の
+///   後勝ち判定と、行の経過時間（`· 23s`）の下限に使う。ユーザーの操作
+///   （ピン留め等）で進む
+/// - `last_opened_at` ＝ **最後にその行を開いた時刻**。未読の判定に使うが、
+///   相手は `updated_at` ではなく **hook の `at`**（[`crate::hooks::HookStates::unread`]）＝
+///   「claude が何か言ったのが最後に開いた後か」。だから ccdesk を起動し直しても、
+///   ピン留めしても未読は生えない
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionRow {
     /// 行の identity（[`SessionId`]）
@@ -97,15 +119,12 @@ pub(crate) struct SessionRow {
     /// パスを動く値から導くのが誤りだったので、解決した結果をここに記録する。
     /// 消えていたら解決し直す（[`crate::title::Titles::refresh`]）
     pub(crate) transcript: Option<PathBuf>,
-    /// **最後に観測した** state。プロセスが死んでも消さない
-    /// （消すと「終わった」のか「見えなくなった」のか行から読めなくなる）
-    pub(crate) last_state: String,
     pub(crate) pinned: bool,
-    /// 未読判定用（ms）。`updated_at > last_opened_at` が未読
+    /// 最後にその行を開いた時刻（ms）。未読の判定材料
     pub(crate) last_opened_at: u64,
     pub(crate) created_at: u64,
-    /// **マージの後勝ち判定にも使う**（[`merge_sessions`]）ので、行の内容を
-    /// 変えたら必ず進める
+    /// 保管の中身が最後に変わった時刻（ms）。**マージの後勝ち判定に使う**
+    /// （[`merge_sessions`]）ので、行の内容を変えたら必ず進める
     pub(crate) updated_at: u64,
 }
 
@@ -117,22 +136,12 @@ impl SessionRow {
             session_id,
             cwd: cwd.into(),
             transcript: None,
-            last_state: String::new(),
             pinned: false,
             // 作った時点では未読にしない（作ったのはユーザー自身の操作）
             last_opened_at: now,
             created_at: now,
             updated_at: now,
         }
-    }
-
-    /// 未読か（行頭に `●` を出す判定）。
-    ///
-    /// **判定は行の意味論なのでここが持つ**: `updated_at` を進める側（[`crate::app`]
-    /// の `touch`）・既読にする側（同 `mark_opened`）・描画（[`crate::ui`]）が
-    /// どれもこの 1 つの式を見る
-    pub(crate) fn unread(&self) -> bool {
-        self.updated_at > self.last_opened_at
     }
 
     fn to_json(&self) -> Value {
@@ -142,7 +151,6 @@ impl SessionRow {
             // 解決できていない行はキーごと出さない（「まだ解決していない」と
             // 「解決したが空だった」を保存の形で作り分けない）
             TRANSCRIPT_KEY: self.transcript.as_ref().map(|p| p.to_string_lossy()),
-            LAST_STATE_KEY: self.last_state,
             PINNED_KEY: self.pinned,
             LAST_OPENED_AT_KEY: self.last_opened_at,
             CREATED_AT_KEY: self.created_at,
@@ -175,7 +183,6 @@ impl SessionRow {
                 .and_then(Value::as_str)
                 .filter(|p| !p.is_empty())
                 .map(PathBuf::from),
-            last_state: text(LAST_STATE_KEY),
             pinned: flag(PINNED_KEY),
             last_opened_at: ms(LAST_OPENED_AT_KEY),
             created_at: ms(CREATED_AT_KEY),
@@ -303,7 +310,7 @@ fn read_rows(path: &Path) -> Vec<SessionRow> {
 /// - 同一性は [`SessionId`]（行の identity。表示名や cwd では判定しない）
 /// - `baseline` は「ディスクはこうなっている」とこのインスタンスが最後に判断した一覧。
 ///   `next` との差が**このインスタンスの操作**なので、消した / 知らないを区別できる
-/// - **両方に居る行は `updated_at` が新しい方**を採る。行の中身（title・状態・
+/// - **両方に居る行は `updated_at` が新しい方**を採る。行の中身（cwd・transcript・
 ///   ピン留め・既読）は最後に触った側が正しく、こちらの写しが古いなら
 ///   他インスタンスの変更を踏み潰してはいけない
 /// - `baseline` に居て `next` に居ない行は**このインスタンスが削除した**ので、
@@ -395,12 +402,11 @@ mod tests {
     }
 
     /// テスト用の行。`updated_at` はマージの後勝ち判定に効くので明示で受ける。
-    /// 行の中身の違いは `last_state`（表示名は行が持たないので比較材料にできない）
-    fn row(id: &str, state: &str, updated_at: u64) -> SessionRow {
+    /// 行の中身の違いは `cwd`（表示名も state も行が持たないので比較材料にできない）
+    fn row(id: &str, cwd: &str, updated_at: u64) -> SessionRow {
         SessionRow {
             updated_at,
-            last_state: state.to_string(),
-            ..SessionRow::new(SessionId::new(id), "C:\\dev\\app", 1_000)
+            ..SessionRow::new(SessionId::new(id), cwd, 1_000)
         }
     }
 
@@ -412,14 +418,14 @@ mod tests {
     /// 逆に中身が違っても ID が同じなら同じ行（マージが同一視する単位）
     #[test]
     fn a_row_is_identified_by_its_session_id() {
-        let a = row("11111111-1111-4111-8111-111111111111", "same state", 1);
+        let a = row("11111111-1111-4111-8111-111111111111", "C:\\dev\\same", 1);
         let mut b = a.clone();
         b.session_id = SessionId::new("22222222-2222-4222-8222-222222222222");
         assert_ne!(a, b, "became the same row despite different IDs");
         assert_eq!(a.session_id.as_str(), a.session_id.to_string());
 
-        let disk = [row("a", "disk state", 2)];
-        let next = [row("a", "local state", 1)];
+        let disk = [row("a", "C:\\dev\\disk", 2)];
+        let next = [row("a", "C:\\dev\\local", 1)];
         assert_eq!(
             merge_sessions(&disk, &[], &next).len(),
             1,
@@ -427,25 +433,13 @@ mod tests {
         );
     }
 
-    /// 未読は `updated_at > last_opened_at`。新しく作った行は未読にしない
-    /// （作ったのはユーザー自身の操作）
-    #[test]
-    fn a_row_is_unread_when_it_changed_after_it_was_opened() {
-        let mut row = SessionRow::new(SessionId::new("s"), "C:\\dev\\app", 1_000);
-        assert!(!row.unread(), "freshly created row is marked unread");
-        row.updated_at = 1_001;
-        assert!(row.unread(), "changed row did not become unread");
-        row.last_opened_at = row.updated_at;
-        assert!(!row.unread(), "still unread after being opened");
-    }
-
     /// **他インスタンスが起こしたセッションを消さない**（マージが要る理由そのもの）。
     /// ディスクにしか居ない行は自分が基準を取った後に作られたので、末尾へ回して残す
     #[test]
     fn merging_keeps_sessions_started_by_another_instance() {
-        let baseline = [row("shared", "shared", 1)];
-        let disk = [row("shared", "shared", 1), row("from-b", "started by B", 2)];
-        let next = [row("shared", "shared", 1), row("from-a", "started by A", 3)];
+        let baseline = [row("shared", "C:\\dev\\shared", 1)];
+        let disk = [row("shared", "C:\\dev\\shared", 1), row("from-b", "C:\\dev\\b", 2)];
+        let next = [row("shared", "C:\\dev\\shared", 1), row("from-a", "C:\\dev\\a", 3)];
         assert_eq!(
             ids(&merge_sessions(&disk, &baseline, &next)),
             ["shared", "from-a", "from-b"],
@@ -457,7 +451,7 @@ mod tests {
     /// ディスクが読めなかった場合（空で渡る）も同じ
     #[test]
     fn merging_is_a_no_op_for_a_single_instance() {
-        let next = [row("a", "A", 1), row("b", "B", 2)];
+        let next = [row("a", "C:\\dev\\a", 1), row("b", "C:\\dev\\b", 2)];
         assert_eq!(merge_sessions(&next, &next, &next), next);
         assert_eq!(merge_sessions(&[], &next, &next), next);
     }
@@ -466,16 +460,16 @@ mod tests {
     /// 更新した行を、こちらの古い写しで踏み潰さない（逆にこちらが新しければ残す）
     #[test]
     fn merging_takes_the_more_recently_updated_row() {
-        let baseline = [row("s", "idle", 1)];
-        let disk = [row("s", "changed by B", 5)];
-        let next = [row("s", "idle", 1)];
+        let baseline = [row("s", "C:\\dev\\before", 1)];
+        let disk = [row("s", "C:\\dev\\changed-by-b", 5)];
+        let next = [row("s", "C:\\dev\\before", 1)];
         let merged = merge_sessions(&disk, &baseline, &next);
-        assert_eq!(merged[0].last_state, "changed by B", "clobbered another instance's update");
+        assert_eq!(merged[0].cwd, "C:\\dev\\changed-by-b", "clobbered another instance's update");
 
         // こちらの方が新しければこちらが残る（自分の操作が保存の往復で巻き戻らない）
-        let next = [row("s", "changed by A", 9)];
+        let next = [row("s", "C:\\dev\\changed-by-a", 9)];
         let merged = merge_sessions(&disk, &baseline, &next);
-        assert_eq!(merged[0].last_state, "changed by A", "own change got rolled back");
+        assert_eq!(merged[0].cwd, "C:\\dev\\changed-by-a", "own change got rolled back");
     }
 
     /// **削除した行は、このインスタンスの以降の書き込みでは復活しない。** baseline に
@@ -484,9 +478,9 @@ mod tests {
     /// マージの基準が要る理由）
     #[test]
     fn merging_keeps_a_deleted_row_out_of_this_instances_own_writes() {
-        let baseline = [row("keep", "kept", 1), row("dropped", "deleted", 1)];
-        let disk = [row("keep", "kept", 1), row("dropped", "deleted", 9)];
-        let next = [row("keep", "kept", 1)];
+        let baseline = [row("keep", "C:\\dev\\keep", 1), row("dropped", "C:\\dev\\drop", 1)];
+        let disk = [row("keep", "C:\\dev\\keep", 1), row("dropped", "C:\\dev\\drop", 9)];
+        let next = [row("keep", "C:\\dev\\keep", 1)];
         assert_eq!(
             ids(&merge_sessions(&disk, &baseline, &next)),
             ["keep"],
@@ -506,7 +500,6 @@ mod tests {
             1_700_000_000_000,
         );
         written.transcript = Some(PathBuf::from("C:\\Users\\me\\.claude\\projects\\p\\s.jsonl"));
-        written.last_state = "blocked".to_string();
         written.pinned = true;
         written.last_opened_at = 1_700_000_000_500;
         written.updated_at = 1_700_000_001_000;
@@ -527,15 +520,38 @@ mod tests {
         assert_eq!(temp.store().list()[0].transcript, None, "an empty path is not a resolution");
     }
 
-    /// **行は表示名を持たない。** 保存されるキーはここに並ぶものだけで、
-    /// `title` が戻ってきたらこのテストが落ちる（名前の正本が 2 つに割れない）
+    /// **行は表示名も state も持たない。** 保存されるキーはここに並ぶものだけで、
+    /// どちらかが戻ってきたらこのテストが落ちる（正本が 2 つに割れない）。
+    ///
+    /// state を持たせていた頃の実データでは、保管と hook が食い違ったうえ
+    /// **どちらが新しいかが行ごとに逆**だった（保管 `blocked` / hook `stopped` と、
+    /// 保管 `stopped` / hook `blocked` が同じファイルに並んだ）。
+    /// 保存する場所が無くなった今、その食い違いは表現できない
     #[test]
-    fn a_row_never_stores_a_display_name() {
-        let temp = TempStore::new("a_row_never_stores_a_display_name");
-        temp.store().store(&[row("s", "idle", 1)]);
+    fn a_row_never_stores_a_display_name_or_a_state() {
+        let temp = TempStore::new("a_row_never_stores_a_display_name_or_a_state");
+        temp.store().store(&[row("s", "C:\\dev\\app", 1)]);
         let text = std::fs::read_to_string(temp.path()).unwrap();
         assert!(!text.contains(r#""title""#), "the row stores a display name: {text}");
         assert!(!text.contains("title_source"), "the row stores a title source: {text}");
+        assert!(!text.contains("last_state"), "the row stores a state: {text}");
+
+        // 保管に残っていた state は読みでも拾わない（古い保管ファイルから復活しない）
+        std::fs::write(
+            temp.path(),
+            r#"{"sessions":[{"session_id":"s","last_state":"blocked"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            temp.store().list(),
+            [SessionRow {
+                created_at: 0,
+                updated_at: 0,
+                last_opened_at: 0,
+                ..SessionRow::new(SessionId::new("s"), "", 0)
+            }],
+            "a state stored by an older build came back"
+        );
     }
 
     /// 壊れた / 想定外の形でも読みは失敗しない（＝起動が止まらない）。
@@ -580,14 +596,14 @@ mod tests {
     fn writes_take_the_store_lock_and_give_up_in_bounded_time() {
         let temp = TempStore::new("writes_take_the_store_lock_and_give_up_in_bounded_time");
         let store = temp.store();
-        store.store(&[row("a", "A", 1)]);
+        store.store(&[row("a", "C:\\dev\\a", 1)]);
         let before = std::fs::read(temp.path()).unwrap();
 
         // 別インスタンス相当の保持者（mkdir されたばかりなので stale ではない）
         let held = Lock::acquire(&store.store_lock(), Duration::ZERO, LOCK_STALE).unwrap();
         let short = temp.store_with_short_wait();
         let started = Instant::now();
-        let returned = short.store(&[row("a", "A", 1), row("b", "B", 2)]);
+        let returned = short.store(&[row("a", "C:\\dev\\a", 1), row("b", "C:\\dev\\b", 2)]);
         let waited = started.elapsed();
         drop(held);
 
@@ -604,7 +620,7 @@ mod tests {
         );
 
         // 解放後は通常どおり書ける（＝ロックが理由で壊れているわけではない）
-        assert_eq!(ids(&short.store(&[row("a", "A", 1), row("b", "B", 2)])), ["a", "b"]);
+        assert_eq!(ids(&short.store(&[row("a", "C:\\dev\\a", 1), row("b", "C:\\dev\\b", 2)])), ["a", "b"]);
         assert!(!store.store_lock().exists(), "left the store file's lock behind");
     }
 
@@ -617,11 +633,11 @@ mod tests {
     fn a_failed_write_keeps_the_baseline_and_the_removal() {
         let temp = TempStore::new("a_failed_write_keeps_the_baseline_and_the_removal");
         let store = temp.store_with_short_wait();
-        store.store(&[row("p", "P", 1), row("q", "Q", 1)]);
+        store.store(&[row("p", "C:\\dev\\p", 1), row("q", "C:\\dev\\q", 1)]);
 
         // 書けない状態（別インスタンスが保管を書いている）で削除を保存する
         let held = Lock::acquire(&store.store_lock(), Duration::ZERO, LOCK_STALE).unwrap();
-        let next = [row("q", "Q", 1)]; // P を削除した
+        let next = [row("q", "C:\\dev\\q", 1)]; // P を削除した
         assert_eq!(ids(&store.store(&next)), ["q"], "the user's action got rolled back from the screen");
         drop(held);
 
@@ -638,9 +654,9 @@ mod tests {
         let temp = TempStore::new("a_second_save_of_the_same_state_leaves_the_disk_unchanged");
         let store = temp.store();
         // 他インスタンスが起こしたセッションが既にディスクに居る状態
-        temp.store().store(&[row("from-b", "started by B", 5)]);
+        temp.store().store(&[row("from-b", "C:\\dev\\from-b", 5)]);
 
-        let first = store.store(&[row("mine", "mine", 1)]);
+        let first = store.store(&[row("mine", "C:\\dev\\mine", 1)]);
         assert_eq!(ids(&first), ["mine", "from-b"]);
         let second = store.store(&first);
         assert_eq!(second, first, "list gets rewritten on every save");
@@ -652,7 +668,7 @@ mod tests {
     #[test]
     fn writes_land_atomically_without_leaving_a_tmp() {
         let temp = TempStore::new("writes_land_atomically_without_leaving_a_tmp");
-        temp.store().store(&[row("a", "A", 1)]);
+        temp.store().store(&[row("a", "C:\\dev\\a", 1)]);
 
         // tmp 名はインスタンスごとに一意なので、名前を組み立てずに走査で見る
         let leftovers: Vec<_> = std::fs::read_dir(&temp.0)

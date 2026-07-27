@@ -10,8 +10,13 @@
 //!
 //! **state の正本は 2 段構え**（`docs/foreground-migration.md` のフェーズ3）:
 //! hook が主で、hook が一度も来ていないセッションだけ `claude agents --json` の
-//! `status` から導く。行に残す `last_state`（[`crate::sessions::SessionRow`]）は
-//! ここで受けた state を写したもので、プロセスが死んだ後の表示に使う。
+//! `status` から導く。**受けた state を行へ写さない**のが要点で、写していた頃は
+//! 保管（`sessions.json`）と hook が食い違い、しかもどちらが新しいかが行ごとに
+//! 逆になっていた（[`crate::sessions::SessionRow`]）。
+//!
+//! ここが答えるのは 3 つ。どれも**行に保存せず、そのつど引く**:
+//! 状態（[`HookStates::get`]）・未読（[`HookStates::unread`]）・
+//! 行が今の姿になった時刻（[`HookStates::changed_at`]）。
 //!
 //! **注入する settings はここが 1 箇所で組む**（[`inject_settings`]）。使用率表示の
 //! statusLine も同じファイルに載るため（`--settings` は 1 つしか渡せない）で、
@@ -28,7 +33,8 @@ use ccdesk::{lock_path_for, now_ms, write_json_atomically, Lock, LOCK_STALE};
 // hook のイベント名と入力 JSON は**公式**（文書化されている）が、pid を渡す
 // 環境変数は非公開なので綴りは [`crate::claude_format`] が持つ
 use crate::claude_format::CLAUDE_PID_ENV;
-use crate::sessions::SessionId;
+use crate::poll::STOPPED;
+use crate::sessions::{SessionId, SessionRow};
 
 /// 注入する hook イベントと、それが意味する state。
 ///
@@ -47,7 +53,7 @@ const HOOK_EVENTS: [(&str, &str); 5] = [
     // 入力待ち・許可待ちのどちらもユーザーの操作を待っている状態
     ("Notification", "blocked"),
     ("Stop", "done"),
-    ("SessionEnd", "stopped"),
+    ("SessionEnd", STOPPED),
 ];
 
 /// 保管ファイルのトップレベルキー（`{"states": { "<session-id>": { … } }}`）
@@ -107,6 +113,37 @@ impl HookStates {
     pub(crate) fn get(&self, id: &SessionId, launched: Option<u64>) -> Option<&str> {
         let entry = self.0.get(id)?;
         (entry.at >= launched?).then_some(entry.state.as_str())
+    }
+
+    /// その行について **hook が最後に何か書いた時刻**（記録が無ければ None）。
+    /// 窓の有無は見ない ＝ 動いていない行についても「最後に動いたのはいつか」を答える
+    fn last_at(&self, id: &SessionId) -> Option<u64> {
+        self.0.get(id).map(|entry| entry.at)
+    }
+
+    /// その行が**未読**か（行頭の `●`）。
+    ///
+    /// **claude が何か言ったのが、最後にその行を開いた後か**で決まる。材料は
+    /// hook の `at` だけで、行の `updated_at` は見ない。だから:
+    ///
+    /// - ピン留め・メニュー操作など**ユーザー自身の操作では未読にならない**
+    ///   （行を書き換えても hook の記録は動かない）
+    /// - **ccdesk を起動し直しただけでも未読にならない**（`last_opened_at` は
+    ///   保管されるので、hook の記録がそれより古ければ既読のまま）
+    pub(crate) fn unread(&self, row: &SessionRow) -> bool {
+        self.last_at(&row.session_id)
+            .is_some_and(|at| at > row.last_opened_at)
+    }
+
+    /// その行が**今の姿になった時刻**（行に出る経過時間 `· 23s` の起点）。
+    ///
+    /// **未読とは別の材料を見る**: 姿は「claude が言った状態」と「保管の中身」の
+    /// 両方で変わるので、新しい方を採る。未読（[`Self::unread`]）が hook だけを
+    /// 見るのは、答える問いが「claude が何か言ったか」だから
+    pub(crate) fn changed_at(&self, row: &SessionRow) -> u64 {
+        self.last_at(&row.session_id)
+            .unwrap_or(0)
+            .max(row.updated_at)
     }
 
     /// **その claude プロセスが今動かしているセッション。** hook はどのイベントでも
@@ -506,6 +543,46 @@ mod tests {
         assert_eq!(states.get(&id("s"), None), None);
         // 記録の無い行はいつでも None（hook が一度も来ていない）
         assert_eq!(states.get(&id("other"), Some(0)), None);
+    }
+
+    /// **未読は「claude が何か言ったのが、最後に開いた後か」。**
+    ///
+    /// 材料が hook の `at` だけなので、次の 2 つは**書けなくなっている**:
+    /// ユーザー自身の操作で未読が付くこと（行を書き換えても記録は動かない）と、
+    /// ccdesk を起動し直しただけで未読になること（`last_opened_at` は保管される）
+    #[test]
+    fn a_row_is_unread_when_the_hook_is_newer_than_the_last_open() {
+        let row = |last_opened_at| SessionRow {
+            last_opened_at,
+            ..SessionRow::new(id("s"), "C:\\dev\\app", 0)
+        };
+        let states = HookStates::from_entries([("s", "done", 2_000)]);
+        assert!(states.unread(&row(1_999)), "claude spoke after the open but the row stayed read");
+        assert!(!states.unread(&row(2_000)), "a hook at the moment of the open marks it unread");
+        assert!(!states.unread(&row(2_001)));
+        // 記録の無い行は未読にならない（hook が一度も来ていない ＝ 何も言っていない）
+        assert!(!HookStates::default().unread(&row(0)));
+
+        // **行を書き換えても未読は動かない**（`updated_at` は材料ではない）
+        let mut pinned = row(2_001);
+        pinned.pinned = true;
+        pinned.updated_at = 9_999;
+        assert!(!states.unread(&pinned), "an edit to the row created an unread mark");
+    }
+
+    /// **経過時間の起点は未読とは別の材料。** 行の姿は「claude が言った状態」と
+    /// 「保管の中身」の両方で変わるので、新しい方を採る（未読は hook だけを見る）
+    #[test]
+    fn the_age_of_a_row_starts_at_whichever_moved_last() {
+        let row = |updated_at| SessionRow {
+            updated_at,
+            ..SessionRow::new(id("s"), "C:\\dev\\app", 0)
+        };
+        let states = HookStates::from_entries([("s", "done", 2_000)]);
+        assert_eq!(states.changed_at(&row(1_000)), 2_000, "the hook did not move the age");
+        assert_eq!(states.changed_at(&row(3_000)), 3_000, "an edit to the row did not move the age");
+        // hook を持たない行は保管の時刻だけ（起動しただけの行も 0 にならない）
+        assert_eq!(HookStates::default().changed_at(&row(1_000)), 1_000);
     }
 
     /// **pid は claude が hook の子へ渡す環境変数から読む**（実測: v2.1.220 の

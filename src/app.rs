@@ -375,9 +375,14 @@ pub(crate) struct App {
     /// サイドバーに並ぶ行。**正本は `~/.ccdesk/sessions.json`**（供給元が読み書きする）
     pub(crate) sessions: Vec<SessionRow>,
     /// hook（`--settings` で注入した公式 hook）が書いた state の写し。
-    /// **生きている行の state はこれが主**で、hook が一度も来ていない行だけ
-    /// `agents --json` の `status` へ落ちる（[`crate::hooks`]）
+    /// **行の state・未読・経過時間はどれもここから導く**（行に保存しない）。
+    /// hook が一度も来ていない行だけ `agents --json` の `status` へ落ちる
+    /// （[`crate::hooks`]）
     pub(crate) hook_states: HookStates,
+    /// 撮影用の固定 state（`session_id` → state）。**実データでは必ず空**で、
+    /// 窓を持たない行を「動いている」ものとして描くためだけにある
+    /// （[`crate::source::DataSource::fixed_states`]）
+    pub(crate) fixed_states: std::collections::HashMap<SessionId, String>,
     /// 最後に見た hook 受け渡しファイルの見え方（長さ・更新時刻）。
     /// **中身ではなく「変わったか」だけを持つ**ので、run ループが毎周見ても安い。
     /// 変わった周は周期を待たずに一覧を読み直す ＝ ペイン内の `/resume` `/clear` が
@@ -498,6 +503,7 @@ impl Default for App {
             agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Vec::new(),
             hook_states: HookStates::default(),
+            fixed_states: std::collections::HashMap::new(),
             hook_stamp: None,
             titles: Titles::default(),
             last_scan: std::time::Instant::now(),
@@ -733,11 +739,10 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
     loop {
         if app.last_live_scan.elapsed() > LIVE_SCAN_INTERVAL {
             // **前景では `child.try_wait()` が生死の唯一の真実。** 死んだ PTY の窓は
-            // 閉じるが、**行は消さない**（最後に観測した状態のまま一覧に残り、
-            // `claude -r` で再開できる ＝ 窓を閉じる ≠ 行を消す）
+            // 閉じるが、**行は消さない**（一覧に残り `claude -r` で再開できる ＝
+            // 窓を閉じる ≠ 行を消す）。**行へ書き戻すものは何も無い**: 窓が無い行は
+            // 動かしているものが無いので、そのまま Stopped として描かれる
             while let Some(pos) = app.windows.iter_mut().position(|w| !w.alive()) {
-                let id = app.windows[pos].session_id.clone();
-                mark_state(app, &id, "stopped");
                 remove_window(app, pos);
             }
             app.last_live_scan = std::time::Instant::now();
@@ -1336,90 +1341,25 @@ fn adopt_switched_session(app: &mut App, previous: &SessionId, next: &SessionId,
     if shown {
         app.source.save_window(WindowItem::LastView(next.as_str()));
     }
-    // 離れた行はもう誰も動かしていない（窓は新しいセッションへ移った）。
-    // **未読は作らない**: `/resume` を打ったのはユーザー自身で、
-    // 「見ていない間に起きたこと」ではない（[`edit_row`] の判断と同じ）
-    edit_row(app, previous, Unread::Keep, |row| {
-        row.last_state = "stopped".to_string();
-    });
+    // **離れた行へは何も書かない。** 窓が新しいセッションへ移った時点でその行を
+    // 動かしているものは無くなり、次の描画でそのまま Stopped になる
+    // （書き戻していた頃は、hook が持つ新しい記録より古い `stopped` が行に残った）。
     // 開いている窓の行は既読（今まさに見ている会話）
-    mark_opened(app, next);
+    mark_read(app, next);
 }
 
-/// 行の状態を書き換えて保存する（行が無ければ何もしない）。
-/// **プロセスが死んでも行は残す**ので、窓を閉じる側はここで状態だけを残す。
+/// hook が書いた state を読み直す。**行へは何も写さない**（写していた頃は
+/// 保管と hook が食い違い、しかもどちらが新しいかが行ごとに逆になった）。
 ///
-/// **未読になってよい**のがユーザー操作（[`edit_row`]）との違い: 状態が動いたのは
-/// セッションの側で起きたことなので、見ていない間に変わったなら未読が正しい
-fn mark_state(app: &mut App, id: &SessionId, state: &str) {
-    let showing = app.showing(id);
-    let Some(row) = app.sessions.iter_mut().find(|r| &r.session_id == id) else {
-        return;
-    };
-    if row.last_state == state {
-        return;
-    }
-    row.last_state = state.to_string();
-    touch(row, showing);
-    save_sessions(app);
-}
-
-/// 行の内容を変えたことを記録する。**`updated_at` を進める**のはマージの後勝ち判定
-/// （[`crate::sessions`] の `merge_sessions`）の材料であり、未読
-/// （[`SessionRow::unread`]）の材料でもあるため。
-///
-/// **ペインに出ている行は未読にしない**（`shown` が真なら既読も一緒に進める）:
-/// 未読が答えるのは「見ていない間に動いたか」で、目の前で動いている行に `●` が
-/// 点くのはその問いへの答えになっていない
-fn touch(row: &mut SessionRow, shown: bool) {
-    row.updated_at = now_ms();
-    if shown {
-        row.last_opened_at = row.updated_at;
-    }
-}
-
-/// hook が書いた state を読み直し、行へ載せる。
-///
-/// **保管（`last_state`）へ写すのが要点**: hook の受け渡しファイルは動いている
-/// セッションのための短命な写しなので、そこだけに置くと ccdesk を落とした時点で
-/// 「最後にどうなったか」が消える（次の起動で全部の行が Stopped に見える）。
-/// 生きている行の表示は写した値ではなく hook の写しから直接引く（[`crate::ui`]）
+/// 唯一の書き込みが「**ペインに出ている行を既読にする**」で、これは未読の材料が
+/// hook の `at` になったことの裏返し: `UserPromptSubmit` はユーザー自身の打鍵でも
+/// 飛ぶので、見ている行の記録が進んだらその場で既読を合わせる
 fn adopt_hook_states(app: &mut App) {
     app.hook_states = app.source.hook_states();
-    let updates = hook_updates(&app.sessions, &app.hook_states, |id| {
-        window_launched_at(app, id)
-    });
-    for (id, state) in updates {
-        mark_state(app, &id, &state);
+    let shown: Option<SessionId> = app.shown_session().cloned();
+    if let Some(id) = shown {
+        mark_read(app, &id);
     }
-}
-
-/// hook の写しから「行へ載せ替える state」を選ぶ（[`adopt_hook_states`] の判断。
-/// 副作用を持たないので単体で検査できる）。
-///
-/// **どの hook を採れるかは [`HookStates::get`] が答える**（窓の起動より新しい
-/// 記録だけが今の実行のもの）。載せ替えないのは 2 通り: 採れる hook が無い行と、
-/// 既に同じ state の行
-fn hook_updates(
-    rows: &[SessionRow],
-    hooks: &HookStates,
-    launched: impl Fn(&SessionId) -> Option<u64>,
-) -> Vec<(SessionId, String)> {
-    rows.iter()
-        .filter_map(|row| {
-            let state = hooks.get(&row.session_id, launched(&row.session_id))?;
-            (state != row.last_state).then(|| (row.session_id.clone(), state.to_string()))
-        })
-        .collect()
-}
-
-/// その行を**今動かしている窓**を起こした時刻（窓が無ければ None）。
-/// 正本は窓（[`crate::session::Session::started_at`]）で、ここは引くだけ
-fn window_launched_at(app: &App, id: &SessionId) -> Option<u64> {
-    app.windows
-        .iter()
-        .find(|w| &w.session_id == id)
-        .map(|w| w.started_at)
 }
 
 /// transcript を解決し直し、増えたぶんを走査する（読み方は [`crate::title`]）。
@@ -1445,58 +1385,51 @@ fn refresh_transcripts(app: &mut App) {
     }
 }
 
-/// その行を既読にする。**ペインを開いた時点**が既読の契機で、
-/// 開き方（切替・`claude -r` での再開・起動時の復元）は問わない
-fn mark_opened(app: &mut App, id: &SessionId) {
-    let Some(row) = app.sessions.iter_mut().find(|r| &r.session_id == id) else {
+/// その行を既読にする。**契機は 3 つで、どれも同じことをする**:
+/// ペインを開いた（開き方は問わない）・`mark as read`・ペインに出ている行へ
+/// hook が届いた（[`adopt_hook_states`]）。
+///
+/// 進めるのは `last_opened_at` だけで **`updated_at` は触らない**: 既読にしても
+/// 行の姿は変わらないので、経過時間（`· 23s`）が 0s へ戻ってはいけない。
+/// 既に読み終えている行なら書き込みもしない（周期処理が毎周保管を書かない）
+fn mark_read(app: &mut App, id: &SessionId) {
+    let now = now_ms();
+    let Some(index) = app.sessions.iter().position(|r| &r.session_id == id) else {
         return;
     };
-    if !row.unread() {
+    let row = &app.sessions[index];
+    // 時計が巻き戻っても既読を巻き戻さない。既読の行は書かない
+    if row.last_opened_at >= now || !app.hook_states.unread(row) {
         return;
     }
-    // 時計が巻き戻っていても既読にする（`updated_at` を下回らせない）
-    row.last_opened_at = now_ms().max(row.updated_at);
+    app.sessions[index].last_opened_at = now;
     save_sessions(app);
 }
 
-/// [`edit_row`] が未読（`updated_at > last_opened_at`）をどう扱うか
-#[derive(Clone, Copy, PartialEq)]
-enum Unread {
-    /// 変えない（ピン留め・名前の変更）
-    Keep,
-    /// 消す（`mark as read`）
-    Clear,
-}
-
-/// **メニューからの行操作を保存する唯一の口**（ピン留め・既読・名前）。
+/// **メニューからの行操作を保存する唯一の口**（今はピン留めだけ）。
 /// 行が無ければ何もしない（メニューを開いたまま他インスタンスが消した場合）。
 ///
 /// `updated_at` を進めるのはマージの後勝ち判定に要るから
-/// （[`crate::sessions`] の `merge_sessions`）。ただし進めるだけだと
-/// **ピン留めや改名で未読が生える**: 未読は「見ていない間に新しいことが起きた」の
-/// 意味なので、自分が今その行を触ったことで付くのは嘘になる。だから
-/// [`Unread::Keep`] は操作前の未読／既読をそのまま持ち越す
-/// （未読だった行は未読のまま ＝ 既読にする操作は [`Unread::Clear`] だけが行う）。
+/// （[`crate::sessions`] の `merge_sessions`）。**進めるのは行の中身が実際に
+/// 変わったときだけ**: `updated_at` は行に出る経過時間の材料でもあるので
+/// （[`crate::hooks::HookStates::changed_at`]）、何も変えない操作で進めると
+/// **行に何も起きていないのに経過時間が 0s へ戻る**。
 ///
-/// **進めるのは行の中身が実際に変わったときだけ。** `updated_at` は行に出る
-/// 経過時間の材料でもあるので（[`crate::ui`]）、何も変えない操作
-/// （既読の行への `mark as read`・同じ名前でのリネーム）でも進めると、
-/// **行に何も起きていないのに経過時間が 0s へ戻る**
-fn edit_row(app: &mut App, id: &SessionId, unread: Unread, edit: impl FnOnce(&mut SessionRow)) {
+/// **未読には触らない。** 未読の材料は hook の `at` だけなので、行を書き換えても
+/// `●` は点かないし消えない ＝ 「自分の操作で未読が生えない」は保証ではなく構造
+fn edit_row(app: &mut App, id: &SessionId, edit: impl FnOnce(&mut SessionRow)) {
     let changed = {
         let Some(row) = app.sessions.iter_mut().find(|r| &r.session_id == id) else {
             return;
         };
-        let was_read = !row.unread();
         let before = row.clone();
         edit(row);
         if *row != before {
             row.updated_at = now_ms();
+            true
+        } else {
+            false
         }
-        if unread == Unread::Clear || was_read {
-            row.last_opened_at = row.updated_at;
-        }
-        *row != before
     };
     if changed {
         save_sessions(app);
@@ -2028,10 +1961,8 @@ fn run_popup_action(app: &mut App, action: PopupAction, anchor_y: u16) {
             open_session(app, &id);
             app.set_focus(Focus::Terminal);
         }
-        PopupAction::TogglePin(id) => {
-            edit_row(app, &id, Unread::Keep, |row| row.pinned = !row.pinned)
-        }
-        PopupAction::MarkRead(id) => edit_row(app, &id, Unread::Clear, |_| {}),
+        PopupAction::TogglePin(id) => edit_row(app, &id, |row| row.pinned = !row.pinned),
+        PopupAction::MarkRead(id) => mark_read(app, &id),
         PopupAction::Stop(id) => menu_stop(app, &id),
         PopupAction::Close(id) => menu_close(app, &id),
         PopupAction::SetGrouping(next) => {
@@ -2325,30 +2256,27 @@ fn toggle_grouping(app: &mut App) {
 
 /// メニュー: stop（セッションのプロセスを終わらせる）。
 ///
-/// **行は残す。** 前景セッションは ccdesk の子なので、止める ＝ プロセスが
-/// 終わること。行は最後に観測した状態（`stopped`）のまま一覧に残り、`open` で
-/// 再開できる（プロセスを止める ≠ 一覧から外す）
+/// **行は残す**うえ、**行へは何も書かない。** 前景セッションは ccdesk の子なので、
+/// 止める ＝ プロセスが終わること ＝ その行を動かしているものが無くなること。
+/// 表示が Stopped になるのはその結果で、記録によるものではない（だから
+/// `stop` でも `/clear` でも `/resume` でも同じ表示になる）
 fn menu_stop(app: &mut App, id: &SessionId) {
     if id.is_empty() {
         return;
     }
-    mark_state(app, id, "stopped");
     close_window_of(app, id);
 }
 
-/// 終了時: 開いている窓の行を `stopped` として記録してから子プロセスを終わらせる。
+/// 終了時に子プロセスを残さない。**行へは何も書かない**（`sessions.json` は
+/// そのまま ＝ 次の起動で一覧に出て `claude -r` で再開できる）。
 ///
-/// **記録が要る**のは、`last_state` が「最後に観測した state」だから: 記録せずに
-/// 殺すと、次の起動で行が「動いていた頃の state」（`blocked` ＝ Needs input 等）を
-/// 出し続ける ＝ 死んでいるのに入力待ちに見える。
-///
-/// **[`menu_stop`] を回さない**のは、あちらが窓を外して new session 画面へ切り替え、
-/// `last_view` を上書きしてしまうため（次の起動で開く画面が変わる）
-pub(crate) fn stop_sessions_on_exit(app: &mut App) {
-    let open: Vec<SessionId> = app.windows.iter().map(|w| w.session_id.clone()).collect();
-    for id in &open {
-        mark_state(app, id, "stopped");
-    }
+/// 以前はここで開いていた行を `stopped` として**記録**していた。状態を行に
+/// 保存していたので、記録せずに殺すと次の起動で「動いていた頃の state」を
+/// 出し続けたためだが、**ccdesk が異常終了すればその記録は残らない**（実データで
+/// 保管が `blocked`・hook が `stopped` のまま固まっていた）。状態を導くように
+/// なった今は、窓が 1 つも無い起動直後は必ず全部 Stopped になるので、
+/// 終了時に書き残すものは無い
+pub(crate) fn kill_sessions_on_exit(app: &mut App) {
     for window in &mut app.windows {
         let _ = window.child.kill();
     }
@@ -2636,7 +2564,7 @@ fn relaunch<'a>(
 /// 失敗（cwd 消失等）は握りつぶさず下部バーへ通知する
 pub(crate) fn open_session(app: &mut App, id: &SessionId) {
     // **ペインを開いた時点が既読の契機**（切替も再開も同じ ＝ ここ 1 箇所で済む）
-    mark_opened(app, id);
+    mark_read(app, id);
     if let Some(i) = app.windows.iter().position(|w| &w.session_id == id) {
         app.show_session(i);
         return;
@@ -3779,6 +3707,11 @@ mod tests {
             self.hooks.clone()
         }
 
+        // 窓を持たない行を動いていることにする経路は撮影用だけ（[`DemoSource`]）
+        fn fixed_states(&self) -> std::collections::HashMap<SessionId, String> {
+            std::collections::HashMap::new()
+        }
+
         fn hook_stamp(&self) -> Option<(u64, std::time::SystemTime)> {
             // テストの供給元はファイルを持たない（周期の前倒しは起きない）
             None
@@ -4845,7 +4778,7 @@ mod tests {
         assert_eq!(app.titles.of(only_row(&app)), "a generated name");
         assert_eq!(only_row(&app).updated_at, 1_234, "the name moved updated_at");
         assert_eq!(only_row(&app).last_opened_at, 1_234, "the name marked the row unread");
-        assert!(!only_row(&app).unread());
+        assert!(!app.hook_states.unread(only_row(&app)));
     }
 
     /// **hook が何か書いたら周期を待たずに一覧を読み直す。**
@@ -4934,20 +4867,27 @@ mod tests {
             .find(|row| row.session_id == after)
             .expect("the row for the new session was not created");
         assert_eq!(added.cwd, "C:\\dev\\api", "the folder of the pane was not carried over");
-        assert!(!added.unread(), "the session showing in the pane became unread");
+        assert!(
+            !app.hook_states.unread(added),
+            "the session showing in the pane became unread"
+        );
         assert_eq!(
             views.lock().unwrap().as_slice(),
             ["after"],
             "the next start would open the session from before the /resume"
         );
-        // 離れた行はもう動いていない（`Working` のまま残らない）が、未読にはしない
+        // **離れた行へは何も書かない。** 窓が移った時点でその行を動かすものは無く、
+        // 表示は描画側が Stopped にする（記録を残さないので古い値も残らない）
         let left = app
             .sessions
             .iter()
             .find(|row| row.session_id == before)
             .expect("the row that was left behind is gone");
-        assert_eq!(left.last_state, "stopped", "the row left behind still looks alive");
-        assert!(!left.unread(), "leaving a row put an unread mark on it");
+        assert_eq!(left, &session_row("before", "C:\\dev\\api", 1), "the row left behind was written to");
+        assert!(
+            !app.hook_states.unread(left),
+            "leaving a row put an unread mark on it"
+        );
 
         // 既にある行へ戻ったときは行を増やさない（`last_view` だけが動く）
         adopt_switched_session(&mut app, &after, &before, true);
@@ -5613,10 +5553,12 @@ mod tests {
         assert!(rows_dropped_while_open(&mine, &mine, &open).is_empty());
     }
 
-    /// hook が書いた state を持つ App（行は 1 本、窓は開いていない）
+    /// hook が書いた state を持つ App（窓は開いていない）。**供給元と写しの両方に
+    /// 同じものを入れる**ので、読み直し（[`adopt_hook_states`]）を通さずに引ける
     fn app_with_hooks(rows: &[SessionRow], hooks: HookStates) -> App {
         App {
             sessions: rows.to_vec(),
+            hook_states: hooks.clone(),
             source: Arc::new(TestSource::for_hooks(hooks)),
             ..Default::default()
         }
@@ -5629,107 +5571,77 @@ mod tests {
             .expect("the row is gone")
     }
 
-    /// **hook が書いた state は行へ載り、行は未読になる。**
+    /// **hook を読み直しても行には何も書かない。**
     ///
-    /// 保管（`last_state`）へ写すのが要点で、写さないと ccdesk を落とした時点で
-    /// 「最後にどうなったか」が消える。載せ替えるのは [`mark_state`] 1 箇所で、
-    /// **同じ state をもう一度受けても行は動かない**（未読が延々と点き直さない）
+    /// 写していた頃の実データでは、保管と hook が食い違ったうえ**どちらが新しいかが
+    /// 行ごとに逆**だった（保管 `blocked` / hook `stopped` 11:14:06 と、
+    /// 保管 `stopped` / hook `blocked` 11:13:43）。前者は ccdesk が異常終了して
+    /// 記録が止まった行、後者は窓を閉じるときに書き戻した行で、**どちらも
+    /// 「保存する場所がある」ことが原因**。書かなくなった今は残骸の hook が
+    /// 何を言っていても行は動かない
     #[test]
-    fn a_hook_state_lands_on_the_row_and_marks_it_unread() {
+    fn refreshing_hook_states_writes_nothing_to_the_rows() {
         let rows = [session_row("s", "C:\\dev\\api", 1)];
-        let mut app = app_with_hooks(&rows, HookStates::default());
-        let id = SessionId::new("s");
-        assert!(!row_of(&app, "s").unread(), "a freshly created row is already unread");
-
-        mark_state(&mut app, &id, "done");
-        assert_eq!(row_of(&app, "s").last_state, "done");
-        assert!(row_of(&app, "s").unread(), "a row whose state changed is not unread");
-
-        let before = row_of(&app, "s").clone();
-        mark_state(&mut app, &id, "done");
-        assert_eq!(row_of(&app, "s"), &before, "the row changed for the very same state");
-    }
-
-    /// **どの hook を行へ載せるかは「その窓の起動より新しい記録か」で決まる。**
-    ///
-    /// 実機で起きた食い違いがここ: `stop` した行は `stopped` を記録しているのに、
-    /// 保管に残っていた**停止前の `blocked`** が次の周期で載り直し、死んでいる行が
-    /// `Needs input` に戻っていた（一瞬 Stopped → Needs input に見える症状）。
-    /// 窓が無い行の hook はすべて過去の実行のものなので載せない
-    #[test]
-    fn only_hooks_newer_than_the_windows_launch_land_on_a_row() {
-        let mut stopped = session_row("s", "C:\\dev\\api", 1);
-        stopped.last_state = "stopped".to_string();
-        let mut working = session_row("t", "C:\\dev\\web", 1);
-        working.last_state = "working".to_string();
-        let rows = [stopped, working];
-        let hooks = HookStates::from_entries([("s", "blocked", 500), ("t", "blocked", 1_500)]);
-
-        // 窓が無い行（`stop` 済み）へは載せない ＝ `stopped` のままでいられる
-        assert!(hook_updates(&rows, &hooks, |_| None).is_empty());
-        // 起動より新しい記録だけが載る（`s` の 500 は起動前の残骸、`t` の 1_500 は今の実行）
-        assert_eq!(
-            hook_updates(&rows, &hooks, |_| Some(1_000)),
-            [(SessionId::new("t"), "blocked".to_string())]
-        );
-        // 既に同じ state の行は載せ替えない
-        let same = HookStates::from_entries([("t", "working", 1_500)]);
-        assert!(hook_updates(&rows, &same, |_| Some(1_000)).is_empty());
-        // hook が一度も来ていない行は触らない（`agents --json` の従経路で表示される）
-        assert!(hook_updates(&rows, &HookStates::default(), |_| Some(0)).is_empty());
-    }
-
-    /// 周期処理は hook の写しを取り直す（生きている行の表示はそちらから引く）。
-    /// **窓が無い行の state は動かさない**（判断は [`hook_updates`]）
-    #[test]
-    fn refreshing_hook_states_keeps_a_stopped_row_stopped() {
-        let mut stopped = session_row("s", "C:\\dev\\api", 1);
-        stopped.last_state = "stopped".to_string();
-        let mut app = app_with_hooks(
-            std::slice::from_ref(&stopped),
-            HookStates::from_entries([("s", "blocked", 9_999)]),
-        );
+        // 写しは空のまま（供給元だけが記録を持つ ＝ 読み直しで初めて届く）
+        let mut app = App {
+            sessions: rows.to_vec(),
+            source: Arc::new(TestSource::for_hooks(HookStates::from_entries([(
+                "s", "blocked", 9_999,
+            )]))),
+            ..Default::default()
+        };
         adopt_hook_states(&mut app);
-        assert_eq!(
-            row_of(&app, "s").last_state,
-            "stopped",
-            "a leftover hook resurrected the state of a row with no process"
-        );
-        assert_eq!(row_of(&app, "s"), &stopped, "the row moved at all");
-        // 写しそのものは取り直されている
+        assert_eq!(app.sessions, rows, "a leftover hook wrote to the row");
+        // 写しそのものは取り直されている（表示はここから導く）
         assert_eq!(app.hook_states.get(&SessionId::new("s"), Some(0)), Some("blocked"));
     }
 
-    /// **ペインを開いた時点で既読になる**（開き方は問わない ＝ [`open_session`] の
-    /// 入口 1 箇所で済ませてある）。消えた行を指しても何も起きない
+    /// **未読は「claude が何か言ったのが、最後に開いた後か」。**
+    ///
+    /// 材料は hook の `at` だけなので、次の 2 つは**構造的に**起きない:
+    /// ユーザー自身の操作で未読が生えること（行を書き換えても hook は動かない）と、
+    /// ccdesk を起動し直しただけで未読になること（`last_opened_at` は保管される）
+    #[test]
+    fn a_row_is_unread_only_when_claude_spoke_after_it_was_opened() {
+        let mut row = session_row("s", "C:\\dev\\api", 1_000);
+        row.last_opened_at = 1_000;
+        let unread = |at| HookStates::from_entries([("s", "done", at)]).unread(&row);
+        assert!(!HookStates::default().unread(&row), "a row with no hook record is unread");
+        assert!(!unread(1_000), "a hook from before the row was opened marks it unread");
+        assert!(unread(1_001), "claude spoke after the row was opened but it stayed read");
+
+        // 自分の操作（ピン留め）は行を書き換えるが未読の材料を動かさない
+        let hooks = HookStates::from_entries([("s", "done", 999)]);
+        let mut app = App {
+            sessions: vec![row.clone()],
+            hook_states: hooks,
+            ..Default::default()
+        };
+        edit_row(&mut app, &SessionId::new("s"), |row| row.pinned = true);
+        assert!(only_row(&app).pinned, "the premise (an edited row) broke");
+        assert!(
+            !app.hook_states.unread(only_row(&app)),
+            "our own edit created an unread mark"
+        );
+    }
+
+    /// **ペインを開いた時点で既読になる**（開き方は問わない ＝ [`mark_read`] の
+    /// 1 箇所で済ませてある。`mark as read` と、ペインに出ている行へ hook が届いた
+    /// ときも同じ関数）。消えた行を指しても何も起きない
     #[test]
     fn opening_a_pane_marks_the_row_read() {
         let rows = [session_row("s", "C:\\dev\\api", 1)];
-        let mut app = app_with_hooks(&rows, HookStates::default());
-        mark_state(&mut app, &SessionId::new("s"), "done");
-        assert!(row_of(&app, "s").unread());
+        let mut app = app_with_hooks(&rows, HookStates::from_entries([("s", "done", 2)]));
+        assert!(app.hook_states.unread(row_of(&app, "s")), "the premise (an unread row) broke");
 
-        mark_opened(&mut app, &SessionId::new("s"));
+        mark_read(&mut app, &SessionId::new("s"));
         let row = row_of(&app, "s");
-        assert!(!row.unread(), "still unread after being opened");
-        assert!(row.last_opened_at >= row.updated_at, "the read timestamp is older than the update");
+        assert!(!app.hook_states.unread(row), "still unread after being opened");
+        // 既読にしても行の姿は変わらない ＝ 経過時間が 0s へ戻らない
+        assert_eq!(row.updated_at, 1, "marking as read reset the age");
 
-        mark_opened(&mut app, &SessionId::new("gone-row"));
+        mark_read(&mut app, &SessionId::new("gone-row"));
         assert_eq!(app.sessions.len(), 1, "an unknown row changed the list");
-    }
-
-    /// **ペインに出ている行は未読にしない。** 未読が答えるのは「見ていない間に
-    /// 動いたか」なので、目の前で動いている行に `●` が点くのは答えになっていない
-    #[test]
-    fn a_change_on_the_shown_row_does_not_make_it_unread() {
-        let mut row = session_row("s", "C:\\dev\\api", 1);
-        touch(&mut row, false);
-        assert!(row.unread(), "a row nobody is looking at is not unread");
-
-        let mut row = session_row("s", "C:\\dev\\api", 1);
-        touch(&mut row, true);
-        assert!(!row.unread(), "the row on screen was marked unread");
-        assert_eq!(row.last_opened_at, row.updated_at);
     }
 
     /// Enter でメニューを開く行の画面 y。固定ヘッダーはスクロールに動かされず、
@@ -5784,28 +5696,30 @@ mod tests {
         assert!(!only_row(&app).pinned, "the second pick does not clear the flag");
     }
 
-    /// **自分の操作で未読を作らない・消さない。** 未読は「見ていない間に新しいことが
-    /// 起きた」の意味なので、ピン留めや改名で `●` が生えるのは嘘になる。
-    /// 消せるのは `mark as read` だけ
+    /// **メニューの操作は未読を作らない・消さない**（消せるのは `mark as read` だけ）。
+    /// 未読の材料が hook しか無いので、行を書き換えるメニュー操作は `●` に触れない
     #[test]
     fn row_edits_leave_unread_alone_and_only_mark_as_read_clears_it() {
         let mut app = app_with_row("s");
         let id = SessionId::new("s");
-        // 未読の行（応答が届いたのにまだ開いていない）
+        // 未読の行（claude が何か言ったのに、まだ開いていない）
         app.sessions[0].last_opened_at = 1_000;
-        app.sessions[0].updated_at = 2_000;
-        assert!(only_row(&app).unread(), "the premise (an unread row) broke");
+        app.hook_states = HookStates::from_entries([("s", "done", 2_000)]);
+        assert!(app.hook_states.unread(only_row(&app)), "the premise (an unread row) broke");
 
         run_popup_action(&mut app, PopupAction::TogglePin(id.clone()), 0);
-        assert!(only_row(&app).unread(), "pinning cleared unread");
+        assert!(app.hook_states.unread(only_row(&app)), "pinning cleared unread");
 
         run_popup_action(&mut app, PopupAction::MarkRead(id.clone()), 0);
-        assert!(!only_row(&app).unread(), "still unread after mark as read");
+        assert!(!app.hook_states.unread(only_row(&app)), "still unread after mark as read");
 
         // 既読の行を触っても未読は生えない（`updated_at` はマージのために進む）
         let before = only_row(&app).updated_at;
         run_popup_action(&mut app, PopupAction::TogglePin(id), 0);
-        assert!(!only_row(&app).unread(), "our own edit created an unread mark");
+        assert!(
+            !app.hook_states.unread(only_row(&app)),
+            "our own edit created an unread mark"
+        );
         assert!(
             only_row(&app).updated_at >= before,
             "the last-write-wins input for merging did not advance"
@@ -5814,20 +5728,25 @@ mod tests {
 
     /// **何も変えない操作は `updated_at` を動かさない。**
     ///
-    /// `updated_at` は行に出る経過時間の材料（[`crate::ui`]）でもあるので、
-    /// 中身が変わっていないのに進めると**行に何も起きていないのに `· 0s` へ戻る**。
-    /// 変わったときだけ進むことと、既読にする副作用は残ることを対で固定する
+    /// `updated_at` は行に出る経過時間の材料でもあるので
+    /// （[`crate::hooks::HookStates::changed_at`]）、中身が変わっていないのに進めると
+    /// **行に何も起きていないのに `· 0s` へ戻る**。`mark as read` は姿を変えないので
+    /// 進めず、ピン留めは変えるので進む
     #[test]
     fn an_edit_that_changes_nothing_leaves_the_age_alone() {
         let mut app = app_with_row("s");
         let id = SessionId::new("s");
         app.sessions[0].last_opened_at = 1_000;
         app.sessions[0].updated_at = 2_000;
+        app.hook_states = HookStates::from_entries([("s", "done", 2_000)]);
 
-        // 未読の行への `mark as read`: 既読にはなるが行の中身は変わっていない
+        // 未読の行への `mark as read`: 既読にはなるが行の姿は変わっていない
         run_popup_action(&mut app, PopupAction::MarkRead(id.clone()), 0);
         assert_eq!(only_row(&app).updated_at, 2_000, "mark as read reset the age");
-        assert!(!only_row(&app).unread(), "mark as read did not clear unread");
+        assert!(
+            !app.hook_states.unread(only_row(&app)),
+            "mark as read did not clear unread"
+        );
 
         // もう一度押しても何も動かない
         run_popup_action(&mut app, PopupAction::MarkRead(id.clone()), 0);
@@ -5838,15 +5757,16 @@ mod tests {
         assert!(only_row(&app).updated_at > 2_000, "a real change did not advance the age");
     }
 
-    /// **`stop` は行の state を `stopped` にして残す**（行は消えず `open` で再開できる）。
-    /// 死んでいる行が `Needs input` のまま残らないことの入口側の固定
+    /// **`stop` は窓を閉じるだけで、行へは何も書かない**（行は消えず `open` で
+    /// 再開できる）。表示が Stopped になるのは「動かしているものが無い」の結果なので、
+    /// `stop` でも `/clear` でも `/resume` でも同じ表示になる（描画側は
+    /// `a_row_with_no_run_is_stopped_whatever_the_hooks_say` が固定する）
     #[test]
-    fn stopping_a_row_records_the_stopped_state_and_keeps_the_row() {
+    fn stopping_a_row_keeps_the_row_and_writes_nothing_to_it() {
         let mut app = app_with_row("s");
-        app.sessions[0].last_state = "blocked".to_string();
+        let before = app.sessions.clone();
         run_popup_action(&mut app, PopupAction::Stop(SessionId::new("s")), 0);
-        assert_eq!(app.sessions.len(), 1, "stop removed the row from the list");
-        assert_eq!(only_row(&app).last_state, "stopped");
+        assert_eq!(app.sessions, before, "stop wrote to the row (or removed it)");
     }
 
     /// **`close` は ccdesk の一覧からだけ外す。** transcript
@@ -5913,14 +5833,16 @@ mod tests {
     #[test]
     fn the_session_menu_open_entry_opens_the_session() {
         let mut app = test_app(34, TERM);
-        app.sessions = vec![SessionRow {
-            updated_at: 2, // last_opened_at より後 ＝ 未読
-            ..session_row("s", "C:\\ccdesk-test-no-such-folder", 1)
-        }];
+        app.sessions = vec![session_row("s", "C:\\ccdesk-test-no-such-folder", 1)];
+        // claude が行を開いた後に何か言った ＝ 未読
+        app.hook_states = HookStates::from_entries([("s", "done", 2)]);
         app.sidebar_rows = vec![SidebarRow::Action(RowAction::Open(SessionId::new("s")))];
         app.sidebar_header_rows = 1;
         app.selection = SidebarPos::Row(0);
-        assert!(only_row(&app).unread(), "the row must start unread for this test's premise");
+        assert!(
+            app.hook_states.unread(only_row(&app)),
+            "the row must start unread for this test's premise"
+        );
 
         press(&mut app, KeyCode::Enter); // 行のメニュー
         let index = app
@@ -5936,9 +5858,12 @@ mod tests {
 
         activate_popup(&mut app, index);
         assert!(app.popup.is_none(), "the menu stayed open after open ran");
-        // 開いた行は既読になり（[`mark_opened`] ＝ open_session の唯一の入口）、
+        // 開いた行は既読になり（[`mark_read`] ＝ open_session の唯一の入口）、
         // 打鍵の宛先はそのセッションになる
-        assert!(!only_row(&app).unread(), "open did not mark the row as read");
+        assert!(
+            !app.hook_states.unread(only_row(&app)),
+            "open did not mark the row as read"
+        );
         assert_eq!(app.focus, Focus::Terminal, "open did not move the keys to the pane");
     }
 

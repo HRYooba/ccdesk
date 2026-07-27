@@ -691,6 +691,12 @@ pub(crate) struct StateView {
     pub(crate) bucket: Bucket,
 }
 
+/// **実行が終わった**ことを表す state 値。書く側（hook の `SessionEnd` ＝
+/// [`crate::hooks`]）と、読む側（[`classify`] と行の状態の導出 ＝ [`crate::ui`]）が
+/// 同じ綴りを見るための 1 箇所。綴りを 2 通り持つと「hook が言った `stopped`」と
+/// 「表示の Stopped」が黙って別物になる
+pub(crate) const STOPPED: &str = "stopped";
+
 /// 生きている前景セッションのライブ状態（`agents --json` の `status`）を、
 /// [`classify`] が読む state 値へ写す。**呼ぶのは status が空でないときだけ**
 /// （空 ＝ まだ書かれていない・拾えていないので、判断の材料が無い）。
@@ -732,7 +738,7 @@ pub(crate) fn classify(live_state: &str, alive: bool) -> StateView {
             alive,
             bucket: Bucket::Completed,
         },
-        "stopped" => StateView {
+        STOPPED => StateView {
             group: Group::Completed,
             label: "Stopped",
             color: ui().dim,

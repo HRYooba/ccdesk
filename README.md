@@ -59,20 +59,28 @@ reopen one and it resumes from its transcript.
   Until the first turn creates a transcript there is nothing to read, so the row reads
   `new session`
 - **A row's age** — the `· 12s` at the right of a row is how long the row has looked the way
-  it does, i.e. the time since its state last actually changed. Clicking around the
+  it does: the time since claude last reported something for it, or since the row's own
+  stored fields last changed, whichever is more recent. Clicking around the
   list, focusing a pane, claude renaming the conversation or redrawing itself does not
   reset it
-- **Unread rows** — a `●` in the second column marks a row that changed while you were not
-  looking at it (`mark as read` clears it, and so does opening the row). The column is
-  reserved either way, so names never shift sideways
+- **Unread rows** — a `●` in the second column marks a row **claude said something on while
+  you were not looking at it** (`mark as read` clears it, and so does opening the row). It is
+  read from the hooks, never from the row's own fields, so **your own actions never raise it**
+  — pinning a row, stopping it, or restarting ccdesk leaves it exactly as it was. The column
+  is reserved either way, so names never shift sideways
 - **The row you are looking at** — a `❯` in the first column, plus a bold name, marks the
   session the pane is showing, and opening a session moves the keyboard selection onto that
   row. Three states therefore stay apart: the highlight band means selected or hovered, the
   brighter text inside the band means selected, and the `❯` means shown in the pane —
   a mark rather than one more colour, so they still read on top of each other. Moving the
   selection with `↑↓` never changes the pane; only opening a session moves the selection
-- **Live status** — state changes land as claude's hooks fire (turn by turn), with
-  `claude agents --json` as the fallback for sessions ccdesk did not start (~2 s)
+- **Live status, never stored** — a row's state is worked out every time the sidebar is
+  drawn: a row ccdesk is running shows what claude's hooks last reported for it (turn by
+  turn, with `claude agents --json` as the ~2 s fallback for sessions ccdesk did not start),
+  and a row nothing is running shows `Stopped`. Nothing is written down, so **a freshly
+  launched ccdesk always shows every row as `Stopped`** — no window is open yet — and a row
+  can never claim to be waiting for input after its process is gone, however ccdesk last
+  exited. `stop`, `/clear` and `/resume` all end up at the same display for the same reason
 - **Account line** in the sidebar footer, showing the signed-in Claude account, the same value
   `ccdesk doctor` prints. A login or logout that rewrites `~/.claude/.credentials.json` shows
   up in ~1 s; where credentials live outside that file, only the ~60 s refresh applies

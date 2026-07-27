@@ -17,7 +17,7 @@ use crate::app::{
     SelfUpdate, SidebarPos, SidebarRow,
 };
 use crate::poll::{
-    classify, foreground_state, AccountStatus, Bucket, Group, Grouping, StateView,
+    classify, foreground_state, AccountStatus, Bucket, Group, Grouping, StateView, STOPPED,
 };
 use crate::session::SessionStatus;
 use crate::sessions::SessionId;
@@ -70,32 +70,47 @@ fn mark(on: bool, yes: &'static str, no: &'static str) -> &'static str {
     if on { yes } else { no }
 }
 
-/// 1 行に出す状態を決める。**hook が主、`agents --json` が従**
-/// （`docs/foreground-migration.md` のフェーズ3）。
-///
-/// - 死んでいる行 ＝ 最後に観測した state のまま（空 ＝ 一度も観測していない行は
-///   動いていない）。生きている行の判断材料は使わない
-/// - 生きている行は hook（[`crate::hooks`]）が答える。turn 単位で届くので
-///   Working / Needs input / Done を取り違えない
-/// - **どの hook を採るかはここでは決めない**: 前回の実行の残骸を捨てる判断は
-///   [`crate::hooks::HookStates::get`] が窓の起動時刻で行うので、ここへ来る
-///   `hook` は「今の実行が書いたもの」だけ（`stopped` も含めてそのまま採る ＝
-///   `stop` 直後に生死の観測を待たずに Stopped が出る）
-/// - hook が一度も来ていない行だけ `agents --json` の `status` へ落ちる
-///   （ccdesk が起こしていないセッション・注入が効かなかった場合）
-/// - `status` も無い（ポーラーが拾う前）間は出力の変化から推す
-fn row_state(
-    alive: bool,
-    last_state: &str,
-    hook: Option<&str>,
-    status: &str,
+/// その行を**今動かしている実行**の観測。窓 1 つが実行 1 つで、
+/// 撮影用の供給元だけは窓を持たずにこれを名乗る（[`crate::source`] の固定表）
+struct Run<'a> {
+    /// その実行が hook で報告した最新の state（一度も来ていなければ None）。
+    /// 前回の実行の残骸を捨てる判断は [`crate::hooks::HookStates::get`] が
+    /// 窓の起動時刻で済ませてあるので、ここへ来るのは今の実行が書いたものだけ
+    hook: Option<&'a str>,
+    /// `agents --json` の `status`（hook が一度も来ていない行の従経路。
+    /// 空 ＝ ポーラーがまだ拾っていない）
+    status: &'a str,
+    /// PTY の出力から推した状態（`status` も無い間の最後の手段）
     heuristic: Option<SessionStatus>,
-) -> StateView {
-    if !alive {
-        let state = if last_state.is_empty() { "stopped" } else { last_state };
-        return classify(state, false);
-    }
-    match (hook, status, heuristic) {
+}
+
+/// 1 行に出す状態を決める。**行に保存せず、そのつど導く。**
+///
+/// ```text
+/// state(row) = 動かしている実行がある ? その実行が報告した最新 : Stopped
+/// ```
+///
+/// この形から出る性質が 3 つあり、どれも**構造的に**成り立つ:
+///
+/// - **ccdesk の起動直後は窓が 1 つも無いので必ず全部 Stopped**（保存値が
+///   「動いていた頃の state」を出し続けることが起こり得ない ＝ ccdesk が
+///   異常終了しても次の起動で正しくなる）
+/// - `stop` / `/clear` / `/resume` の**どれで止まっても同じ表示**（止まる ＝
+///   その行を動かす実行が無くなる、の 1 通りしかない）
+/// - **`Stopped` なのに `✻`（生存形）という矛盾が作れない**: `stopped` は
+///   「実行が終わった」の言い換えなので、hook がそう言った実行は実行として扱わない
+///   ＝ Stopped は必ず生死フラグが降りた状態でしか作られない
+///
+/// 実行があるときの中身は **hook が主、`agents --json` が従**
+/// （`docs/foreground-migration.md` のフェーズ3）: hook は turn 単位で届くので
+/// Working / Needs input / Done を取り違えない。hook が一度も来ていない行
+/// （ccdesk が起こしていないセッション・注入が効かなかった場合）だけ `status` へ落ち、
+/// `status` も無い間は出力の変化から推す
+fn row_state(run: Option<Run<'_>>) -> StateView {
+    let Some(run) = run.filter(|run| run.hook != Some(STOPPED)) else {
+        return classify(STOPPED, false);
+    };
+    match (run.hook, run.status, run.heuristic) {
         (Some(state), _, _) => classify(state, true),
         (None, "", Some(SessionStatus::Working)) => classify("working", true),
         (None, "", _) => classify("blocked", true),
@@ -936,7 +951,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             .iter()
             .enumerate()
             .find(|(_, w)| w.session_id == row.session_id);
-        let alive = window.is_some_and(|(_, w)| w.alive);
         // 生きている行のライブ状態は `agents --json` の interactive エントリが答える
         let status = app
             .agents
@@ -944,22 +958,31 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             .find(|a| a.is_interactive() && a.session_id == row.session_id.as_str())
             .map(|a| a.status.as_str())
             .unwrap_or_default();
-        let view = row_state(
-            alive,
-            &row.last_state,
-            app.hook_states
-                .get(&row.session_id, window.map(|(_, w)| w.launched_at)),
-            status,
-            window.map(|(_, w)| w.heuristic),
-        );
-        // **経過時間は「その行が今の姿になってからの時間」**（＝ 行の内容が最後に
-        // 実際に変わってからの経過）で、材料は `updated_at` 1 つだけ。
+        // **その行を動かしている実行**。窓（＝ ccdesk の子プロセス）が生きている行だけが
+        // 持ち、窓を持たない行は撮影用の固定表だけが名乗れる（実データでは常に空）
+        let run = window
+            .filter(|(_, w)| w.alive)
+            .map(|(_, w)| Run {
+                hook: app.hook_states.get(&row.session_id, Some(w.launched_at)),
+                status,
+                heuristic: Some(w.heuristic),
+            })
+            .or_else(|| {
+                app.fixed_states.get(&row.session_id).map(|state| Run {
+                    hook: Some(state.as_str()),
+                    status: "",
+                    heuristic: None,
+                })
+            });
+        let view = row_state(run);
+        // **経過時間は「その行が今の姿になってからの時間」。** 姿を決めているのは
+        // 「claude が言った状態」と「保管の中身」の 2 つなので、材料も
+        // その両方の新しい方（[`crate::hooks::HookStates::changed_at`]）。
         //
         // **PTY の最後の出力からの経過は使わない**: そちらは行の中身と関係なく動く
         // （フォーカスの出入り・カーソルの点滅・スピナーの描き直しでも新しくなる）ので、
-        // 他の行をクリックしただけで 0s に戻る。行に出す数が答えるべきなのは
-        // 「この行は最後にいつ変わったか」なので、材料も行の側に置く
-        let age_secs = now_ms.saturating_sub(row.updated_at) / 1000;
+        // 他の行をクリックしただけで 0s に戻る
+        let age_secs = now_ms.saturating_sub(app.hook_states.changed_at(row)) / 1000;
         data.push(RowData {
             action: RowAction::Open(row.session_id.clone()),
             group: view.group,
@@ -969,7 +992,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             label: app.titles.of(row),
             is_active_window: window.is_some_and(|(i, _)| i == active)
                 && matches!(app.right_view, RightView::Sessions),
-            unread: row.unread(),
+            unread: app.hook_states.unread(row),
             status_label: view.label,
             age: fmt_age(age_secs),
             bucket: view.bucket,
@@ -1557,13 +1580,19 @@ mod tests {
             sidebar_width: 34,
             sessions: vec![
                 crate::sessions::SessionRow {
-                    // 見ていない間に動いた行（`updated_at > last_opened_at`）
+                    // 見ていない間に claude が何か言った行（hook の `at` > `last_opened_at`）
                     last_opened_at: 1_000,
-                    updated_at: 2_000,
                     ..named_session("a", "C:\\dev\\api", "fresh-row")
                 },
-                named_session("b", "C:\\dev\\api", "seen-row"),
+                crate::sessions::SessionRow {
+                    last_opened_at: 3_000,
+                    ..named_session("b", "C:\\dev\\api", "seen-row")
+                },
             ],
+            hook_states: crate::hooks::HookStates::from_entries([
+                ("a", "done", 2_000),
+                ("b", "done", 2_000),
+            ]),
             titles: fixed_titles(),
             ..Default::default()
         };
@@ -1585,12 +1614,17 @@ mod tests {
         assert_eq!(name_col(&read, "seen-row"), HEAD_COLS);
     }
 
-    /// **生きている行の状態は hook が主、`agents --json` が従。**
+    /// **動いている行の状態は hook が主、`agents --json` が従。**
     /// hook は turn 単位で届くので Done を区別できるが、`status` からは出せない
     #[test]
     fn a_live_row_prefers_the_hook_state_over_the_live_status() {
         let label = |hook, status, heuristic| {
-            row_state(true, "stopped", hook, status, heuristic).label
+            row_state(Some(Run {
+                hook,
+                status,
+                heuristic,
+            }))
+            .label
         };
         // hook が居れば status も出力ヒューリスティックも見ない
         assert_eq!(label(Some("done"), "busy", Some(SessionStatus::Working)), "Done");
@@ -1605,46 +1639,66 @@ mod tests {
         assert_eq!(label(None, "", None), "Needs input");
     }
 
-    /// **今の実行が書いた hook は `stopped` でもそのまま採る。**
+    /// **動かしているものが無い行は、hook が何を言っていても Stopped。**
     ///
-    /// 以前は「生きている行の `stopped` は捨てる」ガードを持っていたが、生死の観測
-    /// （`try_wait`）は 2 秒周期で遅れて届くので、`stop` した直後の**正当な
-    /// `stopped` まで捨てて**前の state（`blocked` ＝ Needs input）へ戻していた
-    /// （実機で「一瞬 Stopped になってすぐ Needs input へ戻る」として出た）。
-    /// 前回の実行の残骸を捨てる判断は [`crate::hooks::HookStates::get`]
-    /// （窓の起動との時刻比較）が持つので、ここへ来るのは今の実行が書いた hook だけ
+    /// 実データで起きていた食い違いがこれで消える。行ごとに新旧が逆の 3 本
+    /// （保管 `blocked` / hook `stopped` 11:14:06・保管 `stopped` / hook `blocked`
+    /// 11:13:43・保管も hook も `stopped`）が、**ccdesk を起動し直せば必ず全部
+    /// Stopped**になる ＝ 窓が 1 つも無い ＝ 実行がどれにも無いため。
+    /// `stop` / `/clear` / `/resume` のどれで止まっても同じ表示になるのも同じ理由
     #[test]
-    fn a_stopped_hook_is_shown_before_the_process_death_is_observed() {
-        // pid の消失がまだ届いていない周期（窓は生きて見えている）
-        let view = row_state(
-            true,
-            "blocked",
-            Some("stopped"),
-            "idle",
-            Some(SessionStatus::NeedsInput),
-        );
-        assert_eq!(view.label, "Stopped", "a fresh stopped was thrown away");
+    fn a_row_with_no_run_is_stopped_whatever_the_hooks_say() {
+        let view = row_state(None);
+        assert_eq!(view.label, "Stopped");
         assert!(view.group == Group::Completed, "a stopped row is not in the last group");
         assert!(!view.spinning);
-        // **アイコンの形は状態ではなくプロセスの生死**を表す（観測どおりに出す）
-        assert!(view.alive, "the shape stopped following the process");
-        // 観測が届いた後も Stopped のまま（行に残る state が `stopped` になっている）
-        let dead = row_state(false, "stopped", None, "", None);
-        assert_eq!(dead.label, "Stopped");
-        assert!(!dead.alive);
+        // **`Stopped` なのに生存形（✻）という矛盾が作れない**
+        assert!(!view.alive, "a stopped row claims its process is alive");
+
+        // 実データの 3 本（保管と hook が食い違い、しかも新旧が行ごとに逆だった）を、
+        // 窓が 1 つも無い状態 ＝ ccdesk の起動直後として描く
+        let mut app = App {
+            term_size: (140, 40),
+            sidebar_width: 60,
+            sessions: vec![
+                named_session("8d162272", "C:\\dev\\api", "hook-newer"),
+                named_session("25bf4b8f", "C:\\dev\\api", "both-agree"),
+                named_session("a632c052", "C:\\dev\\api", "store-newer"),
+            ],
+            hook_states: crate::hooks::HookStates::from_entries([
+                ("8d162272", STOPPED, 1_785_118_446_410),
+                ("25bf4b8f", STOPPED, 1_785_118_379_396),
+                ("a632c052", "blocked", 1_785_118_423_198),
+            ]),
+            titles: fixed_titles(),
+            ..Default::default()
+        };
+        for line in session_lines(&mut app) {
+            assert!(line.contains("Stopped"), "a row with no window is not stopped: {line:?}");
+            // 形はプロセスの生死（窓が無いので停止形）
+            assert!(line.contains('∙'), "a stopped row is drawn with a live glyph: {line:?}");
+            assert!(!line.contains('✻'), "{line:?}");
+        }
     }
 
-    /// **死んでいる行は最後に観測した state のまま**（生きている行の材料は使わない）。
-    /// 一度も観測していない行 ＝ 動いていない
+    /// **`stopped` と言った実行は実行として扱わない。**
+    ///
+    /// pid の消失は 2 秒周期でしか届かないので、`SessionEnd` が飛んだ直後は
+    /// 「窓は生きて見えているが実行は終わっている」周期がある。ここで hook の
+    /// `stopped` をそのまま `classify(_, alive = true)` へ通すと **Stopped なのに
+    /// アイコンが生存形（✻）**になる。実行の終わりは実行が無いことと同じに畳む
     #[test]
-    fn a_dead_row_shows_the_last_state_it_was_seen_in() {
-        let label = |last_state| row_state(false, last_state, Some("working"), "busy", None).label;
-        assert_eq!(label("done"), "Done");
-        assert_eq!(label("stopped"), "Stopped");
-        assert_eq!(label(""), "Stopped", "a never-observed row looks like it is running");
-        // 死んでいる行はアイコンの形も生死を表す（✻ ではなく ∙）
-        assert!(!row_state(false, "done", None, "", None).alive);
-        assert!(row_state(true, "", Some("done"), "", None).alive);
+    fn a_stopped_hook_ends_the_run_instead_of_labelling_a_live_one() {
+        let view = row_state(Some(Run {
+            hook: Some(STOPPED),
+            status: "idle",
+            heuristic: Some(SessionStatus::NeedsInput),
+        }));
+        assert_eq!(view.label, "Stopped", "a fresh stopped was thrown away");
+        assert!(!view.alive, "the shape says the process is alive on a stopped row");
+        assert!(!view.spinning);
+        // 他の state はそのまま生きている実行として出る（形は生存形）
+        assert!(row_state(Some(Run { hook: Some("done"), status: "", heuristic: None })).alive);
     }
 
     /// 更新の有無で行構成が変わらない（固定ヘッダー行数もマーカー桁の位置も動かない）。
@@ -2274,22 +2328,30 @@ mod tests {
         render_sidebar(app).into_iter().map(|(_, t)| t).collect()
     }
 
-    /// **行に出る経過時間は `updated_at` からの経過**（＝ その行が今の姿になってからの
-    /// 時間）。材料が行の側にあるので、**行に関係のない出来事では動かない**
-    /// （以前は動いている行だけ PTY の最後の出力から数えていたので、フォーカスの
-    /// 出入りや claude の描き直しで 0s へ戻っていた）
+    /// **行に出る経過時間は「その行が今の姿になってから」の時間**
+    /// （[`crate::hooks::HookStates::changed_at`]）。材料は行の側と hook の側の
+    /// 新しい方で、**行に関係のない出来事では動かない**（以前は動いている行だけ
+    /// PTY の最後の出力から数えていたので、フォーカスの出入りや claude の
+    /// 描き直しで 0s へ戻っていた）
     #[test]
     fn the_age_on_a_row_counts_from_the_last_change_to_that_row() {
         let now = ccdesk::now_ms();
+        let ago = |secs: u64| now.saturating_sub(secs * 1_000);
         let aged = |secs: u64, id: &str, title: &str| crate::sessions::SessionRow {
-            updated_at: now.saturating_sub(secs * 1_000),
+            updated_at: ago(secs),
             last_opened_at: now,
             ..named_session(id, "C:\\dev\\api", title)
         };
         let mut app = App {
-            term_size: (120, 40),
-            sidebar_width: 34,
-            sessions: vec![aged(12, "a", "fresh"), aged(3 * 60, "b", "older")],
+            term_size: (140, 40),
+            sidebar_width: 44,
+            sessions: vec![
+                aged(12, "a", "fresh"),
+                aged(3 * 60, "b", "older"),
+                // 保管はずっと動いていないが、hook はさっき何か言った行
+                aged(9 * 60 * 60, "c", "spoke-recently"),
+            ],
+            hook_states: crate::hooks::HookStates::from_entries([("c", "done", ago(45))]),
             titles: fixed_titles(),
             ..Default::default()
         };
@@ -2304,22 +2366,29 @@ mod tests {
         // 行末はメニュー記号なので、経過はその手前に出る
         assert!(line("fresh").ends_with(&format!("12s {MENU_MARK}")), "{:?}", line("fresh"));
         assert!(line("older").ends_with(&format!("3m {MENU_MARK}")), "{:?}", line("older"));
+        assert!(
+            line("spoke-recently").ends_with(&format!("45s {MENU_MARK}")),
+            "the age ignored what the hook said: {:?}",
+            line("spoke-recently")
+        );
     }
 
     /// **止めた行は `Stopped`（Completed グループ・dim・停止形のアイコン）。**
     ///
     /// 実機では `stop` の直後に一瞬 `Stopped` になってから `Needs input` へ戻っていた
-    /// （保管に残った停止前の hook が載り直していた）。行の `last_state` が
-    /// `stopped` なら画面もそうなることを描画で固定する
+    /// （保管に残った停止前の hook が載り直していた）。**残骸の hook を持っていても**
+    /// 窓が無い行は Stopped として描かれることを固定する
     #[test]
     fn a_stopped_row_is_drawn_as_stopped_and_not_as_needs_input() {
         let mut app = App {
             term_size: (120, 40),
             sidebar_width: 34,
             sessions: vec![crate::sessions::SessionRow {
-                last_state: "stopped".to_string(),
+                // 既読の行にしておく（見たいのは状態の描かれ方で、未読の印ではない）
+                last_opened_at: 10_000,
                 ..named_session("s", "C:\\dev\\api", "stopped-row")
             }],
+            hook_states: crate::hooks::HookStates::from_entries([("s", "blocked", 9_999)]),
             titles: fixed_titles(),
             ..Default::default()
         };

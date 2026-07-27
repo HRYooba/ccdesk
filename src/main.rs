@@ -91,6 +91,9 @@ fn main() -> anyhow::Result<()> {
     // hook（子の claude が書く state）の写しも起動時に 1 度読む。
     // 以降は一覧の読み直しと同じ周期で取り直す（app::adopt_hook_states）
     let hook_states = source.hook_states();
+    // 撮影用の固定 state（実データでは空）。窓を持たない行を「動いている」ものとして
+    // 描くための表で、起動時に 1 度受け取れば足りる（撮影データは動かない）
+    let fixed_states = source.fixed_states();
     let footer = source.footer();
     let window = source.window_state();
     // 保管済みアカウントは起動時に 1 度読む（以降はアカウント行を開いた時と
@@ -142,6 +145,7 @@ fn main() -> anyhow::Result<()> {
         agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         sessions,
         hook_states,
+        fixed_states,
         // 起動時の見え方を先に控える（run ループの 1 周目が「変わった」と誤解しない）
         hook_stamp: source.hook_stamp(),
         titles: source.titles(),
@@ -209,7 +213,7 @@ fn main() -> anyhow::Result<()> {
 
     // 終了時に子プロセスを残さない。**行は残す**（`sessions.json` はそのまま ＝
     // 次の起動で一覧に出て `claude -r` で再開できる）
-    app::stop_sessions_on_exit(&mut app);
+    app::kill_sessions_on_exit(&mut app);
     let _ = crossterm::execute!(
         std::io::stdout(),
         DisableFocusChange,
