@@ -82,25 +82,12 @@ reopen one and it resumes from its transcript.
   can never claim to be waiting for input after its process is gone, however ccdesk last
   exited. `stop`, `/clear` and `/resume` all end up at the same display for the same reason
 - **Account line** in the sidebar footer, showing the signed-in Claude account, the same value
-  `ccdesk doctor` prints. A login or logout that rewrites `~/.claude/.credentials.json` shows
-  up in ~1 s; where credentials live outside that file, only the ~60 s refresh applies
-- **Account switching** — **clicking anywhere on the account line** (or selecting it with `↑↓`
-  past the bottom of the list and pressing `Enter`) opens a menu of the accounts
-  ccdesk has stored (`●` marks the one you are signed in as) plus `register current`, and picking
-  a stored account offers `switch` / `unregister`. Registering copies the current
-  `claudeAiOauth` credentials into `~/.ccdesk/accounts.json` under your account's email;
-  switching writes them back, leaving `mcpOAuth` and every other key in
-  `~/.claude/.credentials.json` untouched. Both take the same lock file claude Code uses for
-  token refresh, and the outgoing account's tokens are folded into the store under that lock,
-  so a rotated refresh token is never lost. Since Windows claude re-reads the credentials file,
-  **live sessions move to the new account from their next message**.
-  Until the signed-in account is stored the line is prefixed with
-  `⚠`: that is the reminder to register before your next `/login`, because
-  `.credentials.json` only ever holds one account and the previous one is overwritten. Stored
-  refresh tokens are single-use, so an account you have used elsewhere in the meantime can go
-  stale; ccdesk does not probe for that ahead of time and the account line simply reports
-  `not logged in · run /login` once the switch lands. Export/import and automatic rotation are
-  deliberately out of scope
+  `ccdesk doctor` prints, or `not logged in · run /login` when there is no session. A login or
+  logout that rewrites `~/.claude/.credentials.json` shows up in ~1 s; where credentials live
+  outside that file, only the ~60 s refresh applies. **The line only reports** — you can select
+  and hover it, but pressing it does nothing, and ccdesk neither stores nor switches accounts
+  (why that was dropped: `docs/foreground-migration.md`). Switch accounts with `/login`
+  inside a claude session
 - **Version rows** at the top of the sidebar — `ccdesk vX.Y.Z` and `claude vX.Y.Z` — each with a
   `⟳` marker column and a verb at the right edge. When a newer version exists the row reads
   `⟳ ccdesk vX.Y.Z          update` and **clicking anywhere on it runs the update**, showing
@@ -113,7 +100,7 @@ reopen one and it resumes from its transcript.
   (the same install path as `ccdesk update`). A native `claude` install also auto-updates in
   the background by default, so the claude row may clear itself without you doing anything
 - **Mouse-first**: click to switch/focus, the `=` at the right end of a row for what you can
-  do to it, `⊞ group` row to switch grouping, account line for account switching, drag the
+  do to it, `⊞ group` row to switch grouping, drag the
   border to resize. **Dragging is the only thing that changes the sidebar width**: a terminal
   too narrow to hold it draws a narrower sidebar without forgetting the width you picked, so
   the sidebar comes back when there is room again
@@ -122,9 +109,10 @@ reopen one and it resumes from its transcript.
   and a bare `←`/`→`. With the sidebar focused there are only two keys: `↑↓` select — past
   the bottom of the list they reach the account line in the footer, and one more step wraps
   around to the top of the list (so `↑` on the first row reaches the account line) — and `Enter` does
-  whatever the selected row does. That is a menu for session rows, project headings,
-  `⊞ group` and the account line; the new-session screen for `+ new session`; the update
-  for a version row that has one; and nothing at all for a version row that is up to date.
+  whatever the selected row does. That is a menu for session rows, project headings and
+  `⊞ group`; the new-session screen for `+ new session`; the update
+  for a version row that has one; and nothing at all for a version row that is up to date
+  or for the account line.
   The bottom bar spells out which of those it is. In an open menu, `↑↓` select, `Enter` runs
   and `Esc` closes. On the new-session screen, `Tab` cycles fields, `Enter` runs the selected
   folder-list row, and `Esc` cancels the path edit while the path field has focus and
@@ -178,9 +166,9 @@ ccdesk --help     # show usage
 Settings (grouping, opt-ins) live in `~/.ccdesk/config.json`; window state
 (sidebar width, last screen, last folder, registered projects) in `~/.ccdesk/state.json`.
 Errors and panics are appended to `~/.ccdesk/error.log`.
-Accounts you register from the account line are stored in
-`~/.ccdesk/accounts.json` — it holds their OAuth tokens, so treat it exactly
-like `~/.claude/.credentials.json` and never share or copy it elsewhere.
+An earlier build stored account credentials in `~/.ccdesk/accounts.json`; that
+feature is gone, and ccdesk deletes the file (and its lock) once at startup,
+noting it in the error log.
 
 ccdesk passes the official `--settings` flag to the `claude` sessions it starts
 to install turn-level hooks that report each session's state (working / waiting
