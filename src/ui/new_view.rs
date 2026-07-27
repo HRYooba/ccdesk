@@ -1,5 +1,5 @@
 //! 新規セッション画面（フォルダブラウザ + 初回プロンプト入力）。
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -8,123 +8,11 @@ use ratatui::Frame;
 
 use crate::app::{start_new_session, App, RightView};
 use crate::theme::{ui, C_OK, C_WORKING, FOCUS_BORDER, MUTED_FG};
+use crate::ui::text_field::TextField;
 use crate::ui::{pane_fallback_pos, FrameCursor};
 
-/// カーソル付きテキストフィールド（挿入・削除・←→・Home/End・クリック位置反映、全角幅対応）
-#[derive(Default)]
-pub(crate) struct TextField {
-    pub(crate) text: String,
-    pub(crate) cursor: usize, // 文字（char）単位のカーソル位置
-}
-
-impl TextField {
-    pub(crate) fn set_text(&mut self, s: &str) {
-        self.text = s.to_string();
-        self.cursor = self.text.chars().count();
-    }
-
-    fn char_count(&self) -> usize {
-        self.text.chars().count()
-    }
-
-    /// char index → バイト位置
-    fn byte_at(&self, idx: usize) -> usize {
-        self.text
-            .char_indices()
-            .nth(idx)
-            .map(|(b, _)| b)
-            .unwrap_or(self.text.len())
-    }
-
-    fn insert(&mut self, c: char) {
-        let b = self.byte_at(self.cursor);
-        self.text.insert(b, c);
-        self.cursor += 1;
-    }
-
-    pub(crate) fn insert_str(&mut self, s: &str) {
-        let b = self.byte_at(self.cursor);
-        self.text.insert_str(b, s);
-        self.cursor += s.chars().count();
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor > 0 {
-            let b = self.byte_at(self.cursor - 1);
-            self.text.remove(b);
-            self.cursor -= 1;
-        }
-    }
-
-    fn delete(&mut self) {
-        if self.cursor < self.char_count() {
-            let b = self.byte_at(self.cursor);
-            self.text.remove(b);
-        }
-    }
-
-    fn left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    fn right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.char_count());
-    }
-
-    fn home(&mut self) {
-        self.cursor = 0;
-    }
-
-    fn end(&mut self) {
-        self.cursor = self.char_count();
-    }
-
-    /// カーソルの表示列（全角 = 2 幅）
-    fn cursor_x(&self) -> u16 {
-        use unicode_width::UnicodeWidthChar;
-        self.text
-            .chars()
-            .take(self.cursor)
-            .map(|c| c.width().unwrap_or(0) as u16)
-            .sum()
-    }
-
-    /// クリックされた表示列 → カーソル位置
-    pub(crate) fn click(&mut self, x: u16) {
-        use unicode_width::UnicodeWidthChar;
-        let mut acc = 0u16;
-        let mut idx = 0;
-        for c in self.text.chars() {
-            let w = c.width().unwrap_or(0) as u16;
-            if acc + w > x {
-                break;
-            }
-            acc += w;
-            idx += 1;
-        }
-        self.cursor = idx;
-    }
-
-    /// フィールド共通のキー処理。処理したら true
-    fn handle_key(&mut self, key: &KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.insert(c);
-            }
-            KeyCode::Backspace => self.backspace(),
-            KeyCode::Delete => self.delete(),
-            KeyCode::Left => self.left(),
-            KeyCode::Right => self.right(),
-            KeyCode::Home => self.home(),
-            KeyCode::End => self.end(),
-            _ => return false,
-        }
-        true
-    }
-}
-
 /// New 画面のフォーカス対象フィールド
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum NewFocus {
     Prompt,  // 下部のプロンプト入力（初期フォーカス。Enter で起動）
     Browser, // フォルダ一覧（↑↓ で行移動・→← で潜る/上がる。Enter は選択行の実行）
@@ -171,7 +59,7 @@ pub(crate) struct NewState {
     /// `dir_idx` は 0 = 起動ボタン行に戻るが `focus` は Browser のまま残るので、これが
     /// 無いと「フォルダ行を再クリックして潜った直後の起動ボタン 1 クリック」が
     /// 再クリック扱いになり、書きかけのプロンプトでセッションが起動してしまう
-    /// （supervisor 管理なので取り消せない）。作り直しで立て、明示的な選択移動
+    /// （送ったメッセージは取り消せない）。作り直しで立て、明示的な選択移動
     /// （↑↓・ホイール・選択を動かすクリック）で倒す
     pub(crate) selection_from_rebuild: bool,
 }
@@ -448,7 +336,7 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
                     state.cancel_path_edit();
                     state.focus = NewFocus::Prompt;
                 }
-                _ if !app.sessions.is_empty() => {
+                _ if !app.windows.is_empty() => {
                     app.right_view = RightView::Sessions;
                 }
                 _ => {}
@@ -657,14 +545,37 @@ fn list_rows_for_message(no_folder_rows: bool, list_height: u16) -> usize {
     }
 }
 
+/// ペイン内ヒント 1 行。**フォーカス中の欄で意味が変わるキーを出し分ける**
+/// （[`handle_new_view_key`] が正本）:
+///
+/// - `Enter`: Prompt = 起動 / Path = パスの適用 / Browser = 選択行の実行
+/// - `Esc`: Path = 編集の取り消し / それ以外 = セッション一覧へ戻る
+///
+/// `can_leave` ＝ 戻れる窓があるか。窓が 1 つも無いときは Esc が何もしないので
+/// **出さない**（効かないキーを案内しない）
+fn new_view_hint(focus: NewFocus, can_leave: bool) -> &'static str {
+    match focus {
+        NewFocus::Prompt if can_leave => "Tab: next field · Enter: start · Esc: back to sessions",
+        NewFocus::Prompt => "Tab: next field · Enter: start",
+        // Path の Esc は戻る先に関係なく編集の取り消し（一覧へは戻らない）
+        NewFocus::Path => "Tab: next field · Enter: apply path · Esc: cancel edit",
+        NewFocus::Browser if can_leave => {
+            "Tab: next field · ↑↓ select · Enter: run row · ←→ move · Esc: back to sessions"
+        }
+        NewFocus::Browser => "Tab: next field · ↑↓ select · Enter: run row · ←→ move",
+    }
+}
+
 /// 新規セッション画面の描画（フォルダブラウザ + 初回チャット入力）。
-/// starting = `claude --bg` 実行中（別スレッド）: プロンプト欄に進行中表示を出す
+/// starting = 起こした子がまだ端末を掴んでいない: プロンプト欄に進行中表示を出す。
+/// can_leave = Esc で戻れるセッションの窓があるか（[`new_view_hint`]）
 pub(crate) fn draw_new_view(
     frame: &mut Frame,
     area: Rect,
     state: &mut NewState,
     focused: bool,
     starting: bool,
+    can_leave: bool,
 ) -> FrameCursor {
     let border = if focused {
         Style::default().fg(FOCUS_BORDER)
@@ -859,13 +770,8 @@ pub(crate) fn draw_new_view(
         Rect::new(prompt_inner.x, layout.input_y, prompt_inner.width, 1),
     );
 
-    // ペイン内ヒント（下部バーの "new session:" セグメントはここへ移設して重複を避ける）。
-    // Enter の意味はフォーカスで変わる（Browser では選択行の実行）ので出し分ける
-    let hint = match state.focus {
-        NewFocus::Prompt => "Tab: next field · Enter: start",
-        NewFocus::Path => "Tab: next field · Enter: apply path",
-        NewFocus::Browser => "Tab: next field · ↑↓ select · Enter: run row · ←→ move",
-    };
+    // ペイン内ヒント（下部バーの "new session:" セグメントはここへ移設して重複を避ける）
+    let hint = new_view_hint(state.focus, can_leave);
     frame.render_widget(
         ratatui::widgets::Paragraph::new(
             Line::from(format!("{pad}{hint}")).style(Style::default().fg(ui().dim)),
@@ -895,7 +801,7 @@ mod tests {
             let cursor = new_view_cursor(pane, focus, 0, 0, true);
             assert!(
                 contains(pane, cursor.pos),
-                "focus 切替で pos {:?} がペイン外",
+                "pos {:?} is outside the pane after a focus switch",
                 cursor.pos
             );
         }
@@ -912,7 +818,7 @@ mod tests {
                     let cursor = new_view_cursor(pane, focus, cursor_x, cursor_x, true);
                     assert!(
                         contains(pane, cursor.pos),
-                        "幅 {width} / cursor_x {cursor_x} で pos {:?} がペイン外",
+                        "width {width} / cursor_x {cursor_x}: pos {:?} is outside the pane",
                         cursor.pos
                     );
                 }
@@ -946,12 +852,12 @@ mod tests {
                         assert_eq!(
                             cursor.pos,
                             Position::new(pane.x, pane.y),
-                            "{w}x{h} でペイン原点に落ちていない"
+                            "{w}x{h} did not fall back to the pane origin"
                         );
                     } else {
                         assert!(
                             contains(pane, cursor.pos),
-                            "{w}x{h} で pos {:?} がペイン外",
+                            "{w}x{h}: pos {:?} is outside the pane",
                             cursor.pos
                         );
                     }
@@ -973,7 +879,7 @@ mod tests {
         for focus in FOCUSES {
             let cursor = new_view_cursor(pane, focus, 0, 0, false);
             assert!(!cursor.visible);
-            assert!(contains(pane, cursor.pos), "非表示でも位置は確定させる");
+            assert!(contains(pane, cursor.pos), "the position must be set even while hidden");
         }
     }
 
@@ -1132,7 +1038,7 @@ mod tests {
         assert!(state.selected_is_launch());
         assert!(
             !state.click_activates(0),
-            "作り直し直後の起動ボタンが 1 クリックで起動する"
+            "the launch button right after a rebuild fires on a single click"
         );
 
         // 起動ボタン行を明示的にクリック（1 回目）した後は次のクリックで起動する
@@ -1153,14 +1059,14 @@ mod tests {
         assert!(!state.selection_from_rebuild);
         state.path.set_text(&root.join("sub").to_string_lossy());
         state.refresh_from_input();
-        assert!(state.selection_from_rebuild, "フィルタでの作り直し");
+        assert!(state.selection_from_rebuild, "rebuild triggered by the filter");
         assert!(!state.click_activates(state.dir_idx));
 
         // 実在パス全体を入れた作り直し
         state.select(1);
         state.path.set_text(&root.join("sub_b").to_string_lossy());
         state.refresh_from_input();
-        assert!(state.selection_from_rebuild, "パス確定での作り直し");
+        assert!(state.selection_from_rebuild, "rebuild triggered by committing the path");
 
         // set_dir（→ / Enter での移動もここを通る）
         state.select(0);
@@ -1169,9 +1075,9 @@ mod tests {
 
         // 明示操作で倒れる
         state.select_next();
-        assert!(!state.selection_from_rebuild, "↓ / ホイール下");
+        assert!(!state.selection_from_rebuild, "down arrow / wheel down");
         state.select_prev();
-        assert!(!state.selection_from_rebuild, "↑ / ホイール上");
+        assert!(!state.selection_from_rebuild, "up arrow / wheel up");
     }
 
     /// 0 件メッセージ用の 1 行を確保する。list_height == 1（layout.ok の下限）では
@@ -1183,7 +1089,7 @@ mod tests {
         assert_eq!(
             list_rows_for_message(true, 1),
             0,
-            "1 行しか無いならメッセージを優先する"
+            "with only 1 row available, the message wins"
         );
         assert_eq!(list_rows_for_message(true, 5), 4);
         assert_eq!(list_rows_for_message(true, 0), 0);
@@ -1209,7 +1115,7 @@ mod tests {
                 .unwrap();
         terminal
             .draw(|frame| {
-                draw_new_view(frame, pane, &mut state, true, false);
+                draw_new_view(frame, pane, &mut state, true, false, false);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -1219,7 +1125,7 @@ mod tests {
             .collect();
         assert!(
             text.contains("no matching folders"),
-            "0 件の理由が描画されていない: {text:?}"
+            "the reason for zero results is not rendered: {text:?}"
         );
     }
 
@@ -1250,7 +1156,7 @@ mod tests {
                 BrowseRow::Dir("sub_a".into()),
                 BrowseRow::Dir("sub_b".into()),
             ],
-            "cur_dir と一致しているのに一覧が絞り込み後のまま"
+            "the listing is still filtered even though the text matches cur_dir"
         );
         assert!(!state.no_folder_rows());
     }
@@ -1316,8 +1222,32 @@ mod tests {
             }
             assert_eq!(
                 state.entries, expected,
-                "text {text:?} で一覧が (cur_dir {:?}, filter {:?}) と不整合",
+                "text {text:?}: entries do not match (cur_dir {:?}, filter {:?})",
                 state.cur_dir, state.filter
+            );
+        }
+    }
+
+    /// ペイン内ヒントは**フォーカス中の欄で意味が変わる `Esc` を出し分ける**
+    /// （[`handle_new_view_key`] の分岐が正本）。戻る窓が無いときは Esc が
+    /// 何もしないので出さない
+    #[test]
+    fn the_pane_hint_spells_out_what_esc_means_in_the_focused_field() {
+        for focus in [NewFocus::Prompt, NewFocus::Browser] {
+            assert!(
+                new_view_hint(focus, true).ends_with("Esc: back to sessions"),
+                "{focus:?}: cannot tell that Esc returns to the session list"
+            );
+            assert!(
+                !new_view_hint(focus, false).contains("Esc"),
+                "{focus:?}: hints an Esc that does nothing"
+            );
+        }
+        // Folder 欄の Esc は編集の取り消し（戻る窓の有無に関係なく効く）
+        for can_leave in [true, false] {
+            assert!(
+                new_view_hint(NewFocus::Path, can_leave).ends_with("Esc: cancel edit"),
+                "can_leave={can_leave}: Esc means something different in the Folder field"
             );
         }
     }
@@ -1337,7 +1267,7 @@ mod tests {
         state.cancel_path_edit();
         assert_eq!(state.path.text, root);
         assert_eq!(state.cur_dir, root);
-        assert!(!state.no_folder_rows(), "Esc 後も一覧が絞り込み後のまま");
+        assert!(!state.no_folder_rows(), "the listing is still filtered even after Esc");
     }
 
     /// 一覧の入力 `(cur_dir, filter)` が変わらない打鍵（Folder 欄での ←→ 等）では

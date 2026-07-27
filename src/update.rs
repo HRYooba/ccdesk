@@ -376,7 +376,7 @@ mod tests {
             .map(|c| String::from_utf8_lossy(c).to_string())
             .collect();
         let out = format!(
-            "SHA256 ハッシュ (対象 C:\\x\\ccdesk.exe):\r\n{}\r\nCertUtil: 完了しました。\r\n",
+            "SHA256 digest for target C:\\x\\ccdesk.exe:\r\n{}\r\nCertUtil: finished successfully.\r\n",
             spaced.join(" ")
         );
         assert_eq!(parse_certutil_hash(&out).as_deref(), Some(HASH));
@@ -471,13 +471,13 @@ mod tests {
         let yml = include_str!("../.github/workflows/release.yml");
         assert!(
             yml.contains(&format!("asset={ASSET_NAME}")),
-            "release.yml がアップロードする資産名が ASSET_NAME ({ASSET_NAME}) とずれている"
+            "release.yml uploads an asset name that doesn't match ASSET_NAME ({ASSET_NAME})"
         );
         // `.sha256` の URL は実行ファイル URL への接尾で組み立てる（asset_urls）ので、
         // 生産側も同じ名前 + ".sha256" で上げていること
         assert!(
             yml.contains("\"$asset.sha256\""),
-            "release.yml が <資産名>.sha256 以外の名前でチェックサムを上げている"
+            "release.yml uploads the checksum under a name other than <asset-name>.sha256"
         );
     }
 
@@ -558,18 +558,18 @@ mod tests {
         );
 
         let installed = install_at(&exe, &ws.url(ASSET_NAME), &ws.url(&format!("{ASSET_NAME}.sha256")))
-            .expect("検証済みの更新が適用されていない");
+            .expect("verified update was not applied");
 
         assert_eq!(std::fs::read_to_string(&installed.exe).unwrap(), "NEW BINARY");
         assert_eq!(
             std::fs::read_to_string(&installed.old).unwrap(),
             "OLD BINARY",
-            "現行 exe が <exe>.old へ退避されていない"
+            "current exe was not parked to <exe>.old"
         );
         assert_eq!(installed.old, old_exe_path(&exe));
         assert!(
             !staged_exe_path(&exe).exists(),
-            "ステージ用の <exe>.new が残っている"
+            "staged <exe>.new remains"
         );
     }
 
@@ -584,13 +584,13 @@ mod tests {
         ws.write(&format!("{ASSET_NAME}.sha256"), &format!("{HASH}  {ASSET_NAME}\n"));
 
         let err = install_at(&exe, &ws.url(ASSET_NAME), &ws.url(&format!("{ASSET_NAME}.sha256")))
-            .expect_err("ハッシュ不一致で差し替えてしまっている");
+            .expect_err("replaced despite a hash mismatch");
         assert!(err.to_string().contains("mismatch"), "{err}");
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "OLD BINARY");
-        assert!(!old_exe_path(&exe).exists(), "退避ファイルが残っている");
+        assert!(!old_exe_path(&exe).exists(), "parked file remains");
         assert!(
             !staged_exe_path(&exe).exists(),
-            "検証前にステージしている（検証を通るまで exe の隣に何も置かない）"
+            "staged before verification (nothing should be placed next to the exe until verification passes)"
         );
     }
 
@@ -602,7 +602,7 @@ mod tests {
         let exe = ws.write("ccdesk.exe", "OLD BINARY");
 
         let err = install_at(&exe, &ws.url("missing.exe"), &ws.url("missing.exe.sha256"))
-            .expect_err("取得に失敗したのに差し替えている");
+            .expect_err("replaced despite the download failing");
         assert!(err.to_string().contains("download failed"), "{err}");
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "OLD BINARY");
         assert!(!old_exe_path(&exe).exists());
@@ -629,10 +629,10 @@ mod tests {
             &ws.url(ASSET_NAME),
             &ws.url(&format!("{ASSET_NAME}.sha256")),
         )
-        .expect_err("ステージに失敗したのに成功を返している");
+        .expect_err("returned success despite staging failing");
         assert!(err.to_string().contains("could not stage"), "{err}");
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "OLD BINARY");
-        assert!(!old_exe_path(&exe).exists(), "退避まで進んでしまっている");
+        assert!(!old_exe_path(&exe).exists(), "proceeded to parking anyway");
     }
 
     /// 退避（`<exe>.old` への改名）に失敗しても実行ファイルは残り、ステージ済みの
@@ -655,7 +655,7 @@ mod tests {
             &ws.url(ASSET_NAME),
             &ws.url(&format!("{ASSET_NAME}.sha256")),
         )
-        .expect_err("退避に失敗したのに成功を返している");
+        .expect_err("returned success despite parking failing");
         assert!(
             err.to_string().contains("could not move the current exe aside"),
             "{err}"
@@ -663,11 +663,11 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&exe).unwrap(),
             "OLD BINARY",
-            "退避に失敗したのに実行ファイルが失われている"
+            "exe was lost even though parking failed"
         );
         assert!(
             !staged_exe_path(&exe).exists(),
-            "ステージした <exe>.new が残っている"
+            "staged <exe>.new remains"
         );
     }
 
@@ -675,7 +675,7 @@ mod tests {
     #[test]
     fn only_reports_tags_newer_than_this_build() {
         let current = env!("CARGO_PKG_VERSION");
-        assert!(!tag_is_newer(&format!("v{current}")), "同版で更新を勧めている");
+        assert!(!tag_is_newer(&format!("v{current}")), "recommended an update for the same version");
         assert!(!tag_is_newer("v0.0.1"));
         assert!(tag_is_newer("v999.0.0"));
     }

@@ -1,5 +1,5 @@
 // ccdesk: Claude Desktop の TUI 版。portable-pty で claude を起動 → vt100 でパース → tui-term で描画
-// マウス主体の操作: クリックでセッション切替・フォーカス / ☰ = stop・delete メニュー /
+// マウス主体の操作: クリックでセッション切替・フォーカス / 行頭の = で二次操作のメニュー /
 // 境界線ドラッグで幅変更。ターミナルフォーカス中のキーは PTY へ素通し。
 // 予約は Ctrl+Q（終了）と Alt+←→（ペインフォーカス移動）のみ
 
@@ -12,24 +12,36 @@ use crossterm::event::{
 };
 use ccdesk::{load_setting, log_error};
 
-mod accounts;
 mod app;
+mod claude_format;
 mod cli;
+mod git;
+mod hooks;
 mod keys;
 mod poll;
 mod session;
+mod sessions;
 mod source;
 mod theme;
+mod title;
 mod ui;
 mod update;
 
-use app::{clamp_sidebar, instant_ago, open_short, run, App, Focus, RightView, SelfUpdate};
+use app::{instant_ago, open_session, run, App, Focus, RightView, SelfUpdate};
 use cli::{print_usage, run_doctor, show_logs, statusline_hook, update_self};
 use poll::FooterInfo;
 use source::{DataSource, DemoSource, LiveSource};
 use theme::HOST_COLORS;
 
 fn main() -> anyhow::Result<()> {
+    // **エラーログの出力先を決めるのはここだけ。** 決めていないプロセス（＝ テスト）
+    // では `log_error` は何も書かない ＝ `cargo test` がユーザーの
+    // `~/.ccdesk/error.log` を汚さない（[`ccdesk::enable_error_log`]）
+    ccdesk::enable_error_log();
+    // アカウント切り替えを撤去したので、残っている保管ファイル（**トークンを含む**）を
+    // 消す。**エラーログを有効にした直後**に置くのは、消したことを 1 行残すため
+    // （[`ccdesk::purge_account_store`]）
+    ccdesk::purge_account_store();
     let mut demo = false;
     // フラグ/サブコマンドは TUI 起動前に処理
     match std::env::args().nth(1).as_deref() {
@@ -39,8 +51,13 @@ fn main() -> anyhow::Result<()> {
         }
         Some("doctor") => return run_doctor(),
         Some("logs") => return show_logs(),
-        // 使用率表示（opt-in）が attach セッションへ注入する内部フック
+        // 使用率表示（opt-in）が起こしたセッションへ注入する内部フック
         Some("statusline-hook") => return statusline_hook(),
+        // セッションの状態を受け取る内部フック（`--settings` で注入し、
+        // 子の claude が turn ごとに `ccdesk hook <event>` として起こす）
+        Some("hook") => {
+            return hooks::run_hook(std::env::args().nth(2).unwrap_or_default().as_str())
+        }
         Some("update") => return update_self(),
         Some("--help" | "-h" | "help") => {
             print_usage();
@@ -73,12 +90,15 @@ fn main() -> anyhow::Result<()> {
         Arc::new(LiveSource::new(usage_display))
     };
     // セッション一覧・フッター・ウィンドウ状態はすべて供給元から受け取る
-    let jobs = source.jobs();
+    let sessions = source.sessions();
+    // hook（子の claude が書く state）の写しも起動時に 1 度読む。
+    // 以降は一覧の読み直しと同じ周期で取り直す（app::adopt_hook_states）
+    let hook_states = source.hook_states();
+    // 撮影用の固定 state（実データでは空）。窓を持たない行を「動いている」ものとして
+    // 描くための表で、起動時に 1 度受け取れば足りる（撮影データは動かない）
+    let fixed_states = source.fixed_states();
     let footer = source.footer();
     let window = source.window_state();
-    // 保管済みアカウントは起動時に 1 度読む（以降はアカウント行を開いた時と
-    // 保管を変更した後に取り直す。変えるのはこの UI だけなのでポーリングしない）
-    let accounts = source.accounts();
 
     // ホスト端末の実 fg/bg を OSC 10/11 で照会。
     // raw mode / alt screen に入る前に行う。非対応端末はヒューリスティックで
@@ -118,15 +138,21 @@ fn main() -> anyhow::Result<()> {
 
     let area = terminal.get_frame().area();
     let mut app = App {
-        sessions: Vec::new(),
+        windows: Vec::new(),
         active: 0,
         agents: Vec::new(),
         agents_shared: Arc::new(Mutex::new(Vec::new())),
         agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        jobs,
+        sessions,
+        hook_states,
+        fixed_states,
+        // 起動時の見え方を先に控える（run ループの 1 周目が「変わった」と誤解しない）
+        hook_stamp: source.hook_stamp(),
+        titles: source.titles(),
         last_scan: std::time::Instant::now(),
         last_live_scan: std::time::Instant::now(),
-        rescan_hot_until: None,
+        // 保存値はそのまま持つ（画面に出す桁数は端末幅から導くので丸めない ＝
+        // 狭い端末で一度起動しただけでユーザーの選んだ幅が失われない）
         sidebar_width: window.sidebar_width,
         dragging: false,
         last_drag_resize: std::time::Instant::now(),
@@ -136,15 +162,16 @@ fn main() -> anyhow::Result<()> {
         sidebar_header_rows: 0,
         sidebar_scroll: 0,
         sidebar_follow_sel: false,
-        hovered_row: None,
-        selected_row: 0,
+        hovered: None,
+        selection: app::SidebarPos::Row(0),
+        // 起動時の復元でペインが指す行へは最初の描画で揃う（None ＝ まだ揃えていない）
+        pane_shown: None,
         dispatch_cwd: window.dispatch_cwd,
         right_view: RightView::Sessions,
         footer,
         footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
         footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        accounts,
         claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
         ccdesk_latest: None,
@@ -153,9 +180,6 @@ fn main() -> anyhow::Result<()> {
         usage_display,
         usage: None,
         last_usage_read: instant_ago(Duration::from_secs(60)),
-        pending_delete: None,
-        spawn_rx: None,
-        account_job: None,
         input_gate: None,
         notice: None,
         grouping: window.grouping,
@@ -164,20 +188,24 @@ fn main() -> anyhow::Result<()> {
         focus: Focus::Terminal,
         source,
     };
-    clamp_sidebar(&mut app); // 保存値が現在の端末幅を超えていたら丸める
     // 既にあるセッションのフォルダを登録へ埋め戻す（以前から使っているフォルダの
-    // 見出しが、最後のセッションを消した時点で消えないように）。jobs を読んだ後・
+    // 見出しが、最後のセッションを消した時点で消えないように）。一覧を読んだ後・
     // 画面を組む前のこの位置に置く: 埋め戻しは初回の一覧に効く必要がある
     app::backfill_projects(&mut app);
+    // **最初の描画より前に transcript を解決して名前を読む。** 走査の結果を持つのは
+    // Titles のキャッシュだけなので、ここで 1 度走らせないと最初の周期（2 秒）まで
+    // 全部の行が `new session` に見える。未記録の行の解決し直しも同じ 1 回で済む
+    app::refresh_transcripts(&mut app);
     // バックグラウンド取得の起動。撮影用の供給元は 1 本も起こさないので、
     // ここに `if !demo` は要らない
     app.source.spawn_pollers(app.poll_sinks());
-    // 前回開いていた画面を復元: セッションを見ていたなら再 attach、それ以外は new session 画面
-    match window.last_view {
-        Some(short) if app.jobs.iter().any(|j| j.short == short) => {
-            open_short(&mut app, &short);
-            if app.sessions.is_empty() {
-                app.open_new_view(); // attach 失敗時のフォールバック
+    // 前回開いていた画面を復元: セッションを見ていたなら `claude -r` で再開、
+    // それ以外は new session 画面
+    match window.last_view.map(sessions::SessionId::new) {
+        Some(id) if app.sessions.iter().any(|row| row.session_id == id) => {
+            open_session(&mut app, &id);
+            if app.windows.is_empty() {
+                app.open_new_view(); // 再開に失敗したときのフォールバック
             }
         }
         _ => app.open_new_view(),
@@ -185,10 +213,9 @@ fn main() -> anyhow::Result<()> {
 
     let result = run(&mut terminal, &mut app);
 
-    // 終了時に子プロセスを残さない
-    for session in &mut app.sessions {
-        let _ = session.child.kill();
-    }
+    // 終了時に子プロセスを残さない。**行は残す**（`sessions.json` はそのまま ＝
+    // 次の起動で一覧に出て `claude -r` で再開できる）
+    app::kill_sessions_on_exit(&mut app);
     let _ = crossterm::execute!(
         std::io::stdout(),
         DisableFocusChange,

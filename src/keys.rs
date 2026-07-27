@@ -12,9 +12,12 @@ use crate::app::App;
 pub(crate) fn forward_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<()> {
     use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
-    let session = &mut app.sessions[app.active];
+    // 右ペイン内側（枠線 1px）基準の x 原点。**当たり判定は描画と同じ導出幅**
+    // （[`crate::app::sidebar_cols`]）で、窓を借りる前に取る
+    let ox = crate::app::sidebar_cols(app) + 1;
+    let window = &mut app.windows[app.active];
     let (mode, encoding, size) = {
-        let parser = session.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let parser = window.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let screen = parser.screen();
         (
             screen.mouse_protocol_mode(),
@@ -26,8 +29,6 @@ pub(crate) fn forward_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result
         return Ok(()); // claude は SGR(1006) を有効化する。他エンコーディングは対象外
     }
 
-    // 右ペイン内側（枠線 1px）基準の 1 始まり座標へ変換
-    let ox = app.sidebar_width + 1;
     let oy = 1;
     if mouse.column < ox || mouse.row < oy {
         return Ok(());
@@ -69,7 +70,7 @@ pub(crate) fn forward_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result
 
     let suffix = if release { 'm' } else { 'M' };
     let seq = format!("\x1b[<{code};{x};{y}{suffix}");
-    let mut writer = session.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut writer = window.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     writer.write_all(seq.as_bytes())?;
     writer.flush()?;
     Ok(())
