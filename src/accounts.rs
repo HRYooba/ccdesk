@@ -81,21 +81,36 @@ pub(crate) fn credentials_fingerprint(path: &Path) -> CredentialsFp {
     Some((md.modified().ok()?, md.len()))
 }
 
-/// 観測した認証情報の変化が落ち着いたか（[`FOLLOW_UP_SETTLE`]）。
+/// 観測した認証情報の変化からの経過を、**その持ち主の判定を信じてよいか**という
+/// 1 つの問いに畳んだ答え（[`CREDENTIALS_SETTLE`]）。
 ///
-/// **待ちの起点は指紋が既に持っている mtime。** 「いつ変わったか」を別に覚えると
+/// **追従更新とユーザー操作が同じ判断を共有するための型。** 両者が必要とする答えは
+/// 向きが逆（追従更新は「信じてよいときだけ書く」、ユーザー操作は「信じられない
+/// ときだけ断る」）なので bool で渡すと、否定の取り方と「材料が無い」の扱いを
+/// 呼び出し口ごとに決め直すことになる ＝ 同じ知識が 2 箇所に増える
+enum Settle {
+    /// 変化から [`CREDENTIALS_SETTLE`] 以上経った ＝ 判定を信じてよい
+    Settled,
+    /// 変化したばかり ＝ どの材料も嘘を検出できない窓の中
+    Changing,
+    /// 経過を出せない（指紋が無い ＝ ファイルが無い・読めない / 時計が巻き戻った）
+    Unknown,
+}
+
+/// 観測した認証情報の変化がどの段階か（[`Settle`]）。
+///
+/// **起点は指紋が既に持っている mtime。** 「いつ変わったか」を別に覚えると
 /// 同じ知識が 2 箇所に増え、複数インスタンスで食い違う（覚えているのは自分の
-/// プロセスが見た分だけ）。ファイル自身の時刻なら誰が読んでも同じ答えになる。
-///
-/// **指紋が無い（ファイルが無い・読めない）ときと、時計が巻き戻っていて経過を
-/// 出せないときは「落ち着いていない」**（判定材料が無い側 ＝ 書かない側へ倒す）
-fn settled(seen: CredentialsFp) -> bool {
+/// プロセスが見た分だけ）。ファイル自身の時刻なら誰が読んでも同じ答えになる
+fn settle(seen: CredentialsFp) -> Settle {
     let Some((modified, _)) = seen else {
-        return false;
+        return Settle::Unknown;
     };
-    std::time::SystemTime::now()
-        .duration_since(modified)
-        .is_ok_and(|age| age >= FOLLOW_UP_SETTLE)
+    match std::time::SystemTime::now().duration_since(modified) {
+        Ok(age) if age >= CREDENTIALS_SETTLE => Settle::Settled,
+        Ok(_) => Settle::Changing,
+        Err(_) => Settle::Unknown,
+    }
 }
 
 /// 「今 `.credentials.json` の持ち主はこのアカウント」という **いつの観測か付きの**
@@ -246,8 +261,7 @@ const STORE_LOCK_WAIT: Duration = Duration::from_secs(2);
 /// 回数を増やしても通らない ＝ 早く諦めて打つ手を返す方が速い
 const OWNER_CHECK_ATTEMPTS: u32 = 3;
 
-/// 認証情報の変化を、持ち主の判定に使ってよいと見なすまでの猶予
-/// （[`AccountStore::sync_active`]）。
+/// 認証情報の変化を、持ち主の判定に使ってよいと見なすまでの猶予。
 ///
 /// **`claude auth status` の答えは遅れる。** email の出所は `~/.claude.json` の
 /// `oauthAccount` ＝ 遅延取得のキャッシュなので、`/login` で別アカウントへ入った
@@ -259,12 +273,17 @@ const OWNER_CHECK_ATTEMPTS: u32 = 3;
 /// 動いたかしか言わず、持ち主の再判定（[`OwnerCheck`]）も同じキャッシュを読むので
 /// 同じ古い答えを返す。判定材料が全て古い以上、**窓が閉じるまで待つ以外に手が無い**。
 ///
+/// **保管へトークンを書く経路は全てこの猶予を通る**（[`Settle`]）。窓の中で
+/// できることだけが経路で違う: 追従更新（[`AccountStore::sync_active`]）は次の
+/// 周期があるので黙って見送り、ユーザー操作（[`AccountStore::require_attributable`]）
+/// は押した本人が待てないので理由を返して断る。
+///
 /// 起点はファイル自身の mtime なので、待つために覚えておく状態は要らない。
 /// 実測の遅れは数秒なのでここは十分に長く、claude のトークン更新の間隔（数時間）
 /// よりはるかに短いので、待っている間に次の更新へ追い越されることは無い。
 /// 次の機会はポーラーの周期フォールバック（60 秒）で来るため、この猶予が
 /// 追従を遅らせるのは高々その 1 周期
-const FOLLOW_UP_SETTLE: Duration = Duration::from_secs(30);
+const CREDENTIALS_SETTLE: Duration = Duration::from_secs(30);
 
 /// 保管への 1 件書き込み（[`AccountStore::upsert`]）の要求元。
 ///
@@ -403,14 +422,14 @@ impl AccountStore {
     ///
     /// 呼び手（ポーラー）の観測だけでは足りない。実機で起きた壊れ方はこうだった:
     /// `/login` で別アカウントへ入る → 1 秒後の追従更新が走る → そのとき
-    /// `claude auth status` はまだ前のアカウントを答える（[`FOLLOW_UP_SETTLE`]）→
+    /// `claude auth status` はまだ前のアカウントを答える（[`CREDENTIALS_SETTLE`]）→
     /// **新しいアカウントのトークンが前のアカウントの保管へ入った**。指紋は
     /// `/login` の書き込みで既に落ち着いているので、[`Self::still_current`] では
     /// 止まらない。
     ///
     /// そこで書き込みの手前に 2 つ置く:
     ///
-    /// 1. **変化が落ち着くまで待つ**（[`FOLLOW_UP_SETTLE`]）。答えが遅れている窓では
+    /// 1. **変化が落ち着くまで待つ**（[`CREDENTIALS_SETTLE`]）。答えが遅れている窓では
     ///    どの材料も嘘を検出できないので、窓が閉じるまで書かない
     /// 2. **持ち主を判定し直す**（[`Self::reconfirm_owner`]）。判定できなければ書かない
     ///
@@ -446,7 +465,7 @@ impl AccountStore {
             // ラベルはトークンを動かさないので持ち主の判定は要らない
             FollowUp::Label => self.upsert(account, &oauth, Upsert::FollowUp),
             FollowUp::Credentials => {
-                if !settled(active.seen) {
+                if !matches!(settle(active.seen), Settle::Settled) {
                     return Ok(false); // 判定材料が揃うまで次の機会へ回す
                 }
                 let Ok(confirmed) = self.reconfirm_owner(active) else {
@@ -468,7 +487,7 @@ impl AccountStore {
         let Some(entry) = accounts.get(&account.email) else {
             return FollowUp::UpToDate; // 登録が外れた ＝ 書く相手が居ない
         };
-        if entry.get(CREDENTIALS_KEY) != Some(oauth) {
+        if !holds_credentials(entry, oauth) {
             FollowUp::Credentials
         } else if entry_label(entry, &account.email) != account.label {
             FollowUp::Label
@@ -486,6 +505,49 @@ impl AccountStore {
     /// 巻き取りの直前に照合させる（[`ActiveAccount`]）
     pub(crate) fn credentials_fingerprint(&self) -> CredentialsFp {
         credentials_fingerprint(&self.paths.credentials)
+    }
+
+    /// ユーザー操作が **「このトークンは誰のものか」を保管に書き込む前**の関門
+    /// （[`AccountStore::register`] / [`AccountStore::switch_to`] の巻き取り）。
+    ///
+    /// **ロックを取る前に呼ぶ。** `~/.claude.lock` は claude と共有しているので、
+    /// その下で断ると claude のトークン更新を無駄に待たせる。判断材料は呼び手が
+    /// 既に持っている観測（[`ActiveAccount::seen`]）と保管ファイルだけで、
+    /// 子プロセスもネットワークも要らない ＝ ロックの外で答えが出る。
+    ///
+    /// # なぜ追従更新のように「待つ」ではなく「断る」か
+    ///
+    /// 窓の中では持ち主を言える材料が無い（[`CREDENTIALS_SETTLE`]）ところまでは
+    /// 追従更新と同じで、違うのは打つ手。ポーラーには次の周期があるが、
+    /// **ユーザーは押した瞬間に反応がほしい**。窓が閉じるまで黙って止めると、
+    /// 押したのに何も起きない時間が最大 [`CREDENTIALS_SETTLE`] 続き、しかも
+    /// 待つ場所はロックの外に用意し直す必要がある。断れば理由と打つ手が
+    /// その場で出て、保管も現行の認証情報も 1 バイトも動かない。
+    ///
+    /// # 窓の中でも通す場合
+    ///
+    /// **保管がその値を既に持っているなら通す**（[`Self::stores_something_new`]）。
+    /// 書いても「誰のトークンか」の割り当ては増えないので、窓は関係が無い。
+    /// ccdesk 自身の切替直後がここに当たり（現行ファイルへ書いたのは保管の写し
+    /// そのもの）、連続した切替や切替直後の `register current` は窓に掛からない
+    fn require_attributable(&self, active: &ActiveAccount) -> anyhow::Result<()> {
+        let email = &active.account.email;
+        if !matches!(settle(active.seen), Settle::Changing) || !self.stores_something_new(email) {
+            return Ok(());
+        }
+        Err(Unconfirmed::Unsettled.into_error(&self.paths.credentials, email))
+    }
+
+    /// 現行の認証情報を保管へ書くと、この email の持ち分が**変わる**か。
+    /// 変わらない（同じ値を既に持っている・そもそも保管できる認証情報が無い）なら、
+    /// 書いても持ち主の割り当ては動かない
+    fn stores_something_new(&self, email: &str) -> bool {
+        let Some(oauth) = read_oauth(&self.paths.credentials) else {
+            return false;
+        };
+        !read_accounts(&self.paths.store)
+            .get(email)
+            .is_some_and(|entry| holds_credentials(entry, &oauth))
     }
 
     /// 呼び出し側の観測が **今もそのまま** か。**ロックを保持している間に呼ぶ**
@@ -516,9 +578,11 @@ impl AccountStore {
     ///
     /// ユーザー操作の経路はメニューを開いてから押すまでの数秒が関心事で、その間に
     /// ファイルが動いていないなら観測はそのまま使える ＝ 子プロセスを起こす理由が無い。
-    /// **追従更新はこの入口を通らない**（[`Self::sync_active`]）: あちらが守りたい
-    /// 壊れ方（`/login` 直後の遅れた答え）では指紋が動いていないので、
-    /// ここで打ち切ると判定そのものが省かれてしまう
+    ///
+    /// **指紋が動いていない嘘（`/login` 直後の遅れた答え）はここでは止まらない。**
+    /// それは判定材料が全て古い窓の中の話で、聞き直しても同じ答えが返る ＝
+    /// 判定ではなく窓が閉じるのを待つしかない。ユーザー操作はロックを取る前に
+    /// [`Self::require_attributable`] が、追従更新は [`Self::sync_active`] が受け持つ
     fn confirm(&self, active: &ActiveAccount) -> anyhow::Result<ActiveAccount> {
         if self.still_current(active) {
             return Ok(active.clone());
@@ -578,6 +642,9 @@ impl AccountStore {
     /// 使い捨ての refreshToken を古い値で保管すると、そのアカウントは切替時に
     /// 復元できない
     fn capture_current(&self, active: &ActiveAccount) -> anyhow::Result<()> {
+        // 認証情報が変わったばかりなら、どの材料も持ち主を言えない
+        // （[`Self::require_attributable`]）。**ロックを取る前に断る**
+        self.require_attributable(active)?;
         let _lock = Lock::acquire(&self.paths.lock, self.lock_wait, self.lock_stale)?;
         // 観測が古いなら **別アカウントの現行トークンをこの email として保管しうる**
         // （切替直後の `register current` で実際に起きていた）。動いていても
@@ -645,7 +712,8 @@ impl AccountStore {
     }
 }
 
-/// 観測が古く、持ち主を確かめ直せなかった理由（[`AccountStore::confirm`]）。
+/// 持ち主を確かめられないまま保管へ書くのを拒んだ理由
+/// （[`AccountStore::confirm`] / [`AccountStore::require_attributable`]）。
 ///
 /// **経路ごとに違う文言を出すためだけに在る型。** 拒む理由はここに並ぶだけあるのに
 /// 全部が同じ 1 文（「変わったのでメニューを開き直せ」）を返していたので、実機で
@@ -667,6 +735,10 @@ enum Unconfirmed {
     KeptChanging,
     /// 判定し直した持ち主が観測と食い違う（別 email・未ログイン・判定不能）
     Owner(Owner),
+    /// 認証情報が変わったばかりで、**確かめ直しても嘘を検出できない**窓の中
+    /// （[`CREDENTIALS_SETTLE`]）。他の理由と違い、再判定は「同じ古い答え」を
+    /// 返すので試すだけ無駄 ＝ 聞きにも行かずに断る
+    Unsettled,
 }
 
 impl Unconfirmed {
@@ -701,6 +773,13 @@ impl Unconfirmed {
             Self::Owner(Owner::Unknown) => anyhow!(
                 "{path} changed and ccdesk could not run claude to see who owns it now; \
                  make sure claude runs from this shell and try again"
+            ),
+            // 秒数は定数から出す（文言と実際の待ちがずれない）
+            Self::Unsettled => anyhow!(
+                "{path} changed less than {}s ago, so ccdesk cannot yet tell whether it still \
+                 belongs to {expected}: claude reports the logged-in account from a cache that \
+                 lags behind this file; wait a few seconds and try again",
+                CREDENTIALS_SETTLE.as_secs()
             ),
         }
     }
@@ -758,7 +837,9 @@ impl AccountStore {
     /// **観測が古ければ書かずに失敗する。** 巻き取り先を決める材料が古いと
     /// 「A の保管に B のトークンを書く」＝ A も B も復旧不能、という壊し方をする
     /// （[`ActiveAccount`]）。切替自体を諦めるのは、諦めれば次の操作で必ず正しく
-    /// やり直せるのに対し、書いてしまうと取り返しがつかないため
+    /// やり直せるのに対し、書いてしまうと取り返しがつかないため。
+    /// **古いと言えない古さ**（`/login` 直後の遅れた答え）も同じ理由で断る
+    /// （[`Self::require_attributable`]）
     pub(crate) fn switch_to(
         &self,
         email: &str,
@@ -771,33 +852,43 @@ impl AccountStore {
         // `unregister` する窓がある。書き込みは tmp + rename で原子的なので、
         // 最悪でも「登録解除したはずのアカウントに切り替わる」だけでファイルは壊れない
         let (label, stored) = self.stored_entry(email)?;
-        let _lock = Lock::acquire(&self.paths.lock, self.lock_wait, self.lock_stale)?;
-        // 判断材料が動いていたら持ち主を判定し直す（[`Self::confirm`]）。
-        // 別人へ変わっていれば巻き取りも上書きもしない
         let outgoing = match outgoing {
-            Outgoing::Known(active) => Some(self.confirm(active)?),
+            // 同じアカウントへの「切替」は何もしない。書き戻すと、保管より新しい
+            // 可能性のある現行トークンを古い写しで上書きしてしまい、使い捨ての
+            // refreshToken が無効な値に戻って **今のログインを壊す**。
+            // **何も書かない操作なので、ここから先（共有ロック・持ち主の再判定・
+            // 変化の窓の関門）は 1 つも要らない** ＝ ロックを取る前に返す
+            Outgoing::Known(active)
+                if !active.account.email.is_empty() && active.account.email == email =>
+            {
+                return Ok(AccountChange::AlreadyActive)
+            }
+            Outgoing::Known(active) => Some(active),
             // 誰もログインしていないと観測できている ＝ 巻き取る対象が無い
             Outgoing::NobodyLoggedIn => None,
         };
-        let capture = match &outgoing {
-            // 同じアカウントへの「切替」は何もしない。書き戻すと、保管より新しい
-            // 可能性のある現行トークンを古い写しで上書きしてしまい、使い捨ての
-            // refreshToken が無効な値に戻って **今のログインを壊す**
-            Some(active) if !active.account.email.is_empty() && active.account.email == email => {
-                return Ok(AccountChange::AlreadyActive)
-            }
-            // email を持たないアカウント（email を返さない認証方式）は保管の
-            // キーが無いので巻き取れない。切替自体は通す
-            Some(active) => Some(&active.account).filter(|a| !a.email.is_empty()),
-            None => None,
-        };
+        // 巻き取る相手（email を持たないアカウント ＝ email を返さない認証方式は
+        // 保管のキーが無いので巻き取れない。切替自体は通す）
+        let capture = outgoing.filter(|active| !active.account.email.is_empty());
+        // 認証情報が変わったばかりなら、その巻き取り先は当てにできない
+        // （[`Self::require_attributable`]）。**ロックを取る前に断る**
+        if let Some(active) = capture {
+            self.require_attributable(active)?;
+        }
+        let _lock = Lock::acquire(&self.paths.lock, self.lock_wait, self.lock_stale)?;
+        // 判断材料が動いていたら持ち主を判定し直す（[`Self::confirm`]）。
+        // 別人へ変わっていれば巻き取りも上書きもしない。**確かめるのは同一性だけ**で
+        // 返る観測は使わない（巻き取り先の email は判定の前後で変わらない）
+        if let Some(active) = outgoing {
+            self.confirm(active)?;
+        }
         let mut current = self.current_document()?;
         if let Some(capture) = capture
             && let Some(oauth) = current.get(OAUTH_KEY).filter(|o| usable_oauth(o)).cloned()
         {
             // 未登録のアカウントには何もしない（[`Upsert::only_if_present`]）。
             // 明示登録するまで認証情報をコピーしない規則は切替でも同じ
-            self.upsert(capture, &oauth, Upsert::Capture)?;
+            self.upsert(&capture.account, &oauth, Upsert::Capture)?;
         }
         current[OAUTH_KEY] = stored;
         write_json_atomically(&self.paths.credentials, &current)?;
@@ -887,6 +978,15 @@ fn read_oauth(path: &Path) -> Option<Value> {
 /// 現行のログインを壊すだけになる
 fn usable_oauth(value: &Value) -> bool {
     value.is_object() && refresh_token(value).is_some()
+}
+
+/// 保管 1 件がこの `claudeAiOauth` をそのまま持っているか。
+///
+/// **「保管と現行が同じか」を見る 2 者が同じ突き合わせを使う**ための関数:
+/// 追従更新が何をするか（[`FollowUp`]）と、ユーザー操作が変化の窓に掛かるか
+/// （[`AccountStore::stores_something_new`]）は、どちらもこの一致で決まる
+fn holds_credentials(entry: &Value, oauth: &Value) -> bool {
+    entry.get(CREDENTIALS_KEY) == Some(oauth)
 }
 
 /// 保管 1 件の表示ラベル。**ラベルが失われていても空にはしない**
@@ -1043,7 +1143,22 @@ pub(crate) mod tests {
             )
         }
 
+        /// **もう落ち着いた**認証情報を書く（＝ 変化から時間が経った、実運用で
+        /// ほとんどの時間そうである状態）。
+        ///
+        /// 既定をこちらにしてあるのは、**変化の窓は例外だから**
+        /// （[`CREDENTIALS_SETTLE`]）。窓の中では追従更新も手動操作も書かないので、
+        /// 何気なく書いた前提が黙って「窓の中の話」になると、テストの主題と関係の
+        /// ない理由で通ったり落ちたりする。窓そのものを試すテストは
+        /// [`Self::write_fresh_credentials`] で明示する
         pub(crate) fn write_credentials(&self, value: &Value) {
+            self.write_fresh_credentials(value);
+            settle_credentials(&self.paths().credentials);
+        }
+
+        /// **たった今書き換わった**認証情報（`/login` の直後・claude のトークン更新の
+        /// 直後）。持ち主の答えがまだ遅れている窓（[`CREDENTIALS_SETTLE`]）の中
+        pub(crate) fn write_fresh_credentials(&self, value: &Value) {
             write_credentials_at(&self.paths().credentials, value);
         }
 
@@ -1065,19 +1180,26 @@ pub(crate) mod tests {
         std::fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
     }
 
-    /// 認証情報ファイルの変化を **[`FOLLOW_UP_SETTLE`] の外へ動かす**
+    /// 認証情報ファイルの変化を **[`CREDENTIALS_SETTLE`] の外へ動かす**
     /// （＝「もう落ち着いた変化」を経過を待たずに作る）。
     ///
     /// 待ちの起点はファイル自身の mtime なので、時刻を動かせば実運用と同じ
     /// 判断がその場で得られる ＝ テストが定数の値に引きずられない
-    /// （[`settled`] を短く差し替える口を作らないのはこのため。
-    ///  差し替えると「実際にどれだけ待つか」がテストから見えなくなる）
+    /// （[`settle`] を短く差し替える口を作らないのはこのため。
+    ///  差し替えると「実際にどれだけ待つか」がテストから見えなくなる）。
+    ///
+    /// **ずらすのは `now` からではなくファイル自身の mtime から。** `now` から
+    /// 作ると、同じ時刻刻みに収まった 2 回の書き込みが同じ時刻へ潰れて
+    /// 「変化していない」に見える（[`wait_for_a_new_mtime`] が避けている形を
+    /// こちらで作ってしまう）。ずらし幅が一定なら前後関係も間隔も保たれる
     fn settle_credentials(path: &Path) {
         let handle = std::fs::File::options().write(true).open(path).unwrap();
+        let modified = handle.metadata().unwrap().modified().unwrap();
         handle
-            .set_times(std::fs::FileTimes::new().set_modified(
-                std::time::SystemTime::now() - FOLLOW_UP_SETTLE - Duration::from_secs(60),
-            ))
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(modified - CREDENTIALS_SETTLE - Duration::from_secs(60)),
+            )
             .unwrap();
     }
 
@@ -1471,7 +1593,6 @@ pub(crate) mod tests {
 
         // claude がトークンを更新した（refreshToken が新しい値に置き換わる）
         home.write_credentials(&credentials_doc("access-a2", "refresh-a2"));
-        settle_credentials(&home.paths().credentials);
         let syncing = home.store_that_sees(Owner::LoggedIn(EMAIL_A.to_string()));
         assert!(
             syncing.sync_active(&home.active(EMAIL_A, "taro")).unwrap(),
@@ -1546,7 +1667,6 @@ pub(crate) mod tests {
         store.register(&home.active(EMAIL_A, "taro")).unwrap();
 
         home.write_credentials(&credentials_doc("access-a2", "refresh-a2"));
-        settle_credentials(&home.paths().credentials);
 
         assert!(
             !store.sync_active(&home.active(EMAIL_A, "taro")).unwrap(),
@@ -1579,7 +1699,7 @@ pub(crate) mod tests {
             Owner::LoggedIn(EMAIL_A.to_string())
         });
         // 書き換えられたばかりの認証情報（実運用ではポーラーの次のティック）
-        home.write_credentials(&credentials_doc("access-a2", "refresh-a2"));
+        home.write_fresh_credentials(&credentials_doc("access-a2", "refresh-a2"));
 
         assert!(
             !syncing.sync_active(&home.active(EMAIL_A, "taro")).unwrap(),
@@ -1627,7 +1747,7 @@ pub(crate) mod tests {
 
         // /login で B へ入った（ccdesk はまだ何も知らない）
         wait_for_a_new_mtime();
-        home.write_credentials(&credentials_doc("access-b", "refresh-b"));
+        home.write_fresh_credentials(&credentials_doc("access-b", "refresh-b"));
 
         // 1 秒後の追従更新。ポーラーは取得の前に指紋を読むので観測は今のファイルの
         // もの（＝ 指紋ガードは通る）だが、答えた email は 1 つ前のアカウント
@@ -1643,7 +1763,9 @@ pub(crate) mod tests {
             "A's stored entry now holds B's token"
         );
 
-        // 遅れが解けた後の `register current` が通る（実機ではここが拒まれた）
+        // 遅れが解けた後の `register current` が通る（実機ではここが拒まれた）。
+        // 「解けた」＝ 変化が窓の外へ出たこと（手動操作もそれまでは断る）
+        settle_credentials(&home.paths().credentials);
         let now_correct = home.active(EMAIL_B, "hanako");
         home.store_that_sees(Owner::LoggedIn(EMAIL_B.to_string()))
             .register(&now_correct)
@@ -2024,6 +2146,7 @@ pub(crate) mod tests {
             Unconfirmed::Owner(Owner::LoggedIn(EMAIL_B.to_string())),
             Unconfirmed::Owner(Owner::LoggedOut),
             Unconfirmed::Owner(Owner::Unknown),
+            Unconfirmed::Unsettled,
         ];
         let messages: Vec<String> = reasons
             .into_iter()
@@ -2147,7 +2270,6 @@ pub(crate) mod tests {
 
         // 同じ email への上書き（トークン更新の追従）は当然通る
         home.write_credentials(&credentials_doc("access-b2", "refresh-b2"));
-        settle_credentials(&home.paths().credentials);
         assert!(home
             .store_that_sees(Owner::LoggedIn(EMAIL_B.to_string()))
             .sync_active(&home.active(EMAIL_B, "hanako"))
@@ -2223,6 +2345,185 @@ pub(crate) mod tests {
             stored_oauth(&store, EMAIL_A),
             Some(oauth("access-a", "refresh-a")),
             "A's stored entry was clobbered by B's token"
+        );
+    }
+
+    /// **`/login` の直後に押した切替を断る**（手動経路に残っていた穴）。
+    ///
+    /// 追従更新は変化が落ち着くまで見送るようになったが、ユーザー操作は
+    /// 「指紋が動いていなければ判定しない」ままだった。`/login` の書き込みで指紋は
+    /// 落ち着いており、`claude auth status` は遅延キャッシュからまだ前のアカウントを
+    /// 答えるので、[`AccountStore::confirm`] も [`AccountStore::reconfirm_owner`] も
+    /// 素通りする ＝ **前のアカウントの保管へ新しいアカウントのトークンを巻き取る**。
+    ///
+    /// 窓の中に判定材料が無いのは追従更新と同じなので、**押した瞬間に断って
+    /// 打つ手を返す**（待たせない: 押した本人が最大 [`CREDENTIALS_SETTLE`] 待つ）
+    #[test]
+    fn a_switch_inside_the_change_window_is_refused_instead_of_capturing() {
+        let home =
+            TempHome::new("a_switch_inside_the_change_window_is_refused_instead_of_capturing");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-b", "refresh-b"));
+        store.register(&home.active(EMAIL_B, "hanako")).unwrap();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+
+        // 認証情報がたった今書き換わった。これが A のトークン更新なのか
+        // 別アカウントの `/login` なのかは、**窓の中では誰にも言えない**
+        wait_for_a_new_mtime();
+        home.write_fresh_credentials(&credentials_doc("access-a2", "refresh-a2"));
+
+        let switching = home.store_that_sees(Owner::LoggedIn(EMAIL_A.to_string()));
+        let err = switching
+            .switch_to(EMAIL_B, &Outgoing::Known(home.active(EMAIL_A, "taro")))
+            .expect_err("captured a token whose owner cannot be told apart from a fresh /login");
+        assert!(
+            err.to_string().contains("wait a few seconds"),
+            "does not say that waiting is the way forward: {err}"
+        );
+        assert_eq!(
+            stored_oauth(&store, EMAIL_A),
+            Some(oauth("access-a", "refresh-a")),
+            "wrote the store from inside the window"
+        );
+        assert_eq!(
+            home.read_credentials()[OAUTH_KEY],
+            oauth("access-a2", "refresh-a2"),
+            "overwrote the current credentials without knowing whose they are"
+        );
+
+        // **窓が閉じれば同じ操作が通る**（断りであって行き止まりではない）
+        settle_credentials(&home.paths().credentials);
+        assert_eq!(
+            home.store_that_sees(Owner::LoggedIn(EMAIL_A.to_string()))
+                .switch_to(EMAIL_B, &Outgoing::Known(home.active(EMAIL_A, "taro")))
+                .expect("a settled change is refused too = the operation is unusable"),
+            AccountChange::Switched(home.active(EMAIL_B, "hanako"))
+        );
+        assert_eq!(
+            stored_oauth(&store, EMAIL_A),
+            Some(oauth("access-a2", "refresh-a2")),
+            "did not capture the outgoing token once the owner could be confirmed"
+        );
+    }
+
+    /// **`register current` も同じ関門を通る**（実機で汚染を起こした操作そのもの）。
+    ///
+    /// `/login` で B へ入った直後は `claude auth status` がまだ A を答えるので、
+    /// そのまま押すと **B のトークンが A の保管へ入る**（保管の中で 2 つの email が
+    /// 同じ refreshToken を指し、どちらを使っても他方が死ぬ）。窓の中では断り、
+    /// 遅れが解けてから押せば B として正しく保管される
+    #[test]
+    fn register_current_inside_the_change_window_is_refused() {
+        let home = TempHome::new("register_current_inside_the_change_window_is_refused");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+
+        // /login で B へ入った直後（ポーラーの答えはまだ A）
+        wait_for_a_new_mtime();
+        home.write_fresh_credentials(&credentials_doc("access-b", "refresh-b"));
+        let lagging = home.active(EMAIL_A, "taro");
+
+        let err = home
+            .store_that_sees(Owner::LoggedIn(EMAIL_A.to_string()))
+            .register(&lagging)
+            .expect_err("stored B's token under A (both accounts become unusable)");
+        assert!(
+            err.to_string().contains("wait a few seconds"),
+            "does not say that waiting is the way forward: {err}"
+        );
+        assert_eq!(
+            stored_oauth(&store, EMAIL_A),
+            Some(oauth("access-a", "refresh-a")),
+            "A's stored entry now holds B's token"
+        );
+
+        // 遅れが解けた後は B として保管される
+        settle_credentials(&home.paths().credentials);
+        home.store_that_sees(Owner::LoggedIn(EMAIL_B.to_string()))
+            .register(&home.active(EMAIL_B, "hanako"))
+            .expect("register current never becomes possible");
+        assert_eq!(
+            stored_oauth(&store, EMAIL_B),
+            Some(oauth("access-b", "refresh-b"))
+        );
+    }
+
+    /// **関門は claude と共有するロックを取る前に通る。**
+    ///
+    /// ロックの下で断ると、その手前の取得（最大 [`LOCK_WAIT`]）で claude の
+    /// トークン更新を待たされてから断ることになる ＝ **断ると決められる材料は
+    /// 全部手元にあるのに、claude を待たせた上でユーザーも待たせる**。
+    /// 材料は観測の指紋と保管ファイルだけなので、ロックの外で答えが出る
+    #[test]
+    fn the_change_window_is_judged_before_taking_the_shared_lock() {
+        let home = TempHome::new("the_change_window_is_judged_before_taking_the_shared_lock");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-b", "refresh-b"));
+        store.register(&home.active(EMAIL_B, "hanako")).unwrap();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+        home.write_fresh_credentials(&credentials_doc("access-a2", "refresh-a2"));
+
+        // claude がトークン更新中（＝ 共有ロックを保持している）
+        let held = Lock::acquire(&home.paths().lock, Duration::ZERO, LOCK_STALE).unwrap();
+        let started = Instant::now();
+        let err = store
+            .switch_to(EMAIL_B, &Outgoing::Known(home.active(EMAIL_A, "taro")))
+            .expect_err("switched from inside the window");
+        let waited = started.elapsed();
+        drop(held);
+
+        assert!(
+            err.to_string().contains("wait a few seconds"),
+            "refused for another reason, so this does not measure the window: {err}"
+        );
+        assert!(
+            waited < LOCK_WAIT / 2,
+            "waited for the shared lock before refusing ({waited:?}) = claude was made to wait too"
+        );
+    }
+
+    /// **保管が既に持っている値なら窓は関係が無い。**
+    ///
+    /// 窓が守っているのは「このトークンは誰のものか」を保管に**新しく**書く操作で、
+    /// 同じ値を書き直しても割り当ては増えない。ccdesk 自身の切替直後がこれに当たる
+    /// （現行ファイルへ書いたのは保管の写しそのもの）ので、この例外が無いと
+    /// **連続した切替と切替直後の `register current` が 30 秒使えなくなる**
+    #[test]
+    fn a_switch_right_after_another_switch_is_not_held_by_the_window() {
+        let home = TempHome::new("a_switch_right_after_another_switch_is_not_held_by_the_window");
+        let store = home.store();
+        for (email, label, token) in [(EMAIL_B, "hanako", "b"), (EMAIL_A, "taro", "a")] {
+            home.write_credentials(&credentials_doc(
+                &format!("access-{token}"),
+                &format!("refresh-{token}"),
+            ));
+            store.register(&home.active(email, label)).unwrap();
+        }
+
+        // 1 回目の切替（現行ファイルは ccdesk がたった今書いた ＝ 窓の中）
+        let AccountChange::Switched(now_b) = store
+            .switch_to(EMAIL_B, &Outgoing::Known(home.active(EMAIL_A, "taro")))
+            .unwrap()
+        else {
+            panic!("the first switch did not report a new owner");
+        };
+
+        // 続けて A へ戻す。書いた値は B の保管の写しそのものなので巻き取りは
+        // 何も変えない ＝ 窓に掛からない
+        store
+            .switch_to(EMAIL_A, &Outgoing::Known(now_b))
+            .expect("a switch was blocked by the window right after ccdesk wrote the file itself");
+        assert_eq!(
+            home.read_credentials()[OAUTH_KEY],
+            oauth("access-a", "refresh-a")
+        );
+        assert_eq!(
+            stored_oauth(&store, EMAIL_B),
+            Some(oauth("access-b", "refresh-b")),
+            "B's stored entry changed"
         );
     }
 
