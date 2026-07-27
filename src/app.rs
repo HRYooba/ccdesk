@@ -10,13 +10,12 @@ use ratatui::layout::{Position, Rect};
 
 use ccdesk::{log_error, now_ms, same_dir};
 
-use crate::accounts::{Account, AccountChange, ActiveAccount, Outgoing};
 use crate::hooks::HookStates;
 use crate::keys::{encode_key, forward_mouse};
-use crate::poll::{AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo};
+use crate::poll::{AgentInfo, FooterInfo, Grouping, UsageInfo};
 use crate::session::{Launch, Session};
 use crate::sessions::{SessionId, SessionRow};
-use crate::source::{AccountAction, DataSource, PollSinks, WindowItem, PROJECTS_LIMIT};
+use crate::source::{DataSource, PollSinks, WindowItem, PROJECTS_LIMIT};
 use crate::title::Titles;
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
 use crate::ui::{draw, menu_zone, popup_rect, row_at, row_y, sidebar_layout};
@@ -124,7 +123,14 @@ impl SidebarRow {
 pub(crate) enum SidebarPos {
     /// 一覧の行（[`App::sidebar_rows`] の index）
     Row(usize),
-    /// フッターのアカウント行
+    /// フッターのアカウント行。**今サインインしているアカウントを出すだけの行**で、
+    /// 選択とホバーはできるが押しても何も起きない（[`SidebarRow::Inert`] と同じ扱い。
+    /// アカウントの切り替えを撤去した理由は `docs/foreground-migration.md`）。
+    ///
+    /// **`SidebarRow::Inert` へは寄せられない**: あちらは `sidebar_rows` に積まれた
+    /// 行の種類で、この行はフッター（一覧の外・下端に固定）に描かれるため index を
+    /// 持たない。「押しても何も起きない」という**答え**は
+    /// [`selected_enter`] が `None` を返す 1 箇所に揃えてある
     Account,
 }
 
@@ -160,22 +166,6 @@ const POPUP_CHROME: u16 = 3;
 /// （項目が長ければ [`PopupKind::width`] がそちらを採る）
 const POPUP_MIN_WIDTH: u16 = 14;
 
-/// ポップアップに並べるアカウント 1 件。表示名と識別子を分けて持つ:
-/// 表示名（`ooba · 1→10, Inc.` 等）は組織違い・別 email で重複し得るので、
-/// 対象の特定はラベル一致ではなく「選択 index → id」で行う。
-///
-/// **[`crate::accounts::Account`] と統合せず、[`account_items`] の写像 1 行で繋ぐ。**
-/// 形は似ているが持っている値の意味が違う: `label` はアクティブ印（`● `）を
-/// 前置した**メニューに出す文字列そのもの**で、`Account::label` は
-/// `accounts.json` に保管され追従更新で書き戻される**ドメインの値**。統合すると
-/// 印を付けた文字列が保管へ流れ込む経路ができる（保管したラベルに `● ` が付き、
-/// 次に開いたときは印が二重になる）。層が違うものを 1 つの型にしない
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct AccountItem {
-    pub(crate) label: String,
-    pub(crate) id: String,
-}
-
 /// モーダルの種類。**メニューの中身（項目・幅・項目の意味）はこの型が答える**。
 /// [`Popup`] は「どこに開いたか・どれを選んでいるか」だけを持つので、
 /// 種類を足すときの変更は [`PopupKind::entries`] と [`PopupKind::action`] の
@@ -196,12 +186,6 @@ pub(crate) enum PopupKind {
         open: bool,
     },
     Group,
-    /// アカウント一覧。開いた時点の写しを持つ（一覧の供給はデータ層の責務で、
-    /// メニューは受け取った並びをそのまま出す）。保管 0 件でも
-    /// `register current` だけのメニューとして成立する
-    Account { accounts: Vec<AccountItem> },
-    /// アカウント 1 件への操作（Account から遷移する 2 階層目）
-    AccountActions { account: AccountItem },
     /// プロジェクト単位の操作。`has_sessions` は開いた時点の写し（[`PopupKind::Session`] の
     /// `open` と同じ作り）で、`remove project` を出せるかの判断に使う
     Project { cwd: String, has_sessions: bool },
@@ -224,14 +208,6 @@ enum PopupAction {
     /// 一覧から行を外す（transcript は消さない ＝ 会話ログは残る）
     Close(SessionId),
     SetGrouping(Grouping),
-    /// 2 階層目のメニューへ遷移する
-    Open(PopupKind),
-    /// 現在ログイン中のアカウントを保管に加える
-    RegisterCurrent,
-    /// 保管アカウントへ切り替える（[`AccountItem::id`]）
-    SwitchAccount(String),
-    /// 保管アカウントを一覧から外す（[`AccountItem::id`]）
-    UnregisterAccount(String),
     /// 指定フォルダで新規セッション
     NewSessionIn(String),
     /// プロジェクトを一覧から外す
@@ -280,17 +256,6 @@ impl PopupKind {
                     (format!("{}directory", mark(Grouping::Directory)), true),
                 ]
             }
-            // 保管一覧が先、`register current` が末尾（0 件でもこの 1 項目は残る）。
-            // **情報行は持たない**（項目はすべて選んで動くもの）
-            PopupKind::Account { accounts } => accounts
-                .iter()
-                .map(|a| (a.label.clone(), true))
-                .chain(std::iter::once(("register current".to_string(), true)))
-                .collect(),
-            PopupKind::AccountActions { .. } => vec![
-                ("switch".to_string(), true),
-                ("unregister".to_string(), true),
-            ],
             // **セッションが残っているフォルダは登録解除させない。** 見出しの一覧は
             // 「登録リスト ∪ セッションの cwd」なので、登録を外してもセッション由来で
             // 見出しは出続ける。押せるのに表示が変わらないのは嘘なので、
@@ -333,20 +298,6 @@ impl PopupKind {
                 1 => Some(PopupAction::SetGrouping(Grouping::Directory)),
                 _ => None,
             },
-            PopupKind::Account { accounts } => match accounts.get(index) {
-                // 一覧の行 → そのアカウントの 2 階層目
-                Some(account) => Some(PopupAction::Open(PopupKind::AccountActions {
-                    account: account.clone(),
-                })),
-                // 一覧の 1 つ後ろが末尾項目
-                None if index == accounts.len() => Some(PopupAction::RegisterCurrent),
-                None => None,
-            },
-            PopupKind::AccountActions { account } => match index {
-                0 => Some(PopupAction::SwitchAccount(account.id.clone())),
-                1 => Some(PopupAction::UnregisterAccount(account.id.clone())),
-                _ => None,
-            },
             PopupKind::Project { cwd, .. } => match index {
                 0 => Some(PopupAction::NewSessionIn(cwd.clone())),
                 1 => Some(PopupAction::RemoveProject(cwd.clone())),
@@ -357,7 +308,7 @@ impl PopupKind {
 }
 
 /// 行頭の `=` / group 行クリックで開くコンテキストメニューの開き状態。
-/// 2 階層目は**階層を積まずに開き直す**（Esc・外クリックは常に全閉。戻り先を持たない）
+/// **階層は持たない**（Esc・外クリックは常に全閉。戻り先を持たない）
 pub(crate) struct Popup {
     pub(crate) kind: PopupKind,
     pub(crate) anchor_y: u16, // 開いた元の画面行（矩形はこの 1 つ下に出る）
@@ -433,13 +384,6 @@ pub(crate) struct App {
     pub(crate) footer_shared: Arc<Mutex<FooterInfo>>,
     pub(crate) footer_dirty: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) footer_refresh: Arc<std::sync::atomic::AtomicBool>,
-    // 保管済みアカウントの写し。**アカウント行の ⚠（[`active_unstored`]）と
-    // アカウントメニューの一覧が、どちらもこの 1 つの写しを見る**。
-    //
-    // ポーラーで追わずに写しで持つのは、保管の「メンバーシップ」が変わるのが
-    // この UI の登録・登録解除だけだから（追従更新はトークンを書き換えるが
-    // 一覧の顔ぶれは変えない）。取り直す契機は [`refresh_accounts`] に集める
-    pub(crate) accounts: Vec<Account>,
     // claude update 実行中（行の連打防止と "updating…" 表示）
     pub(crate) claude_updating: Arc<std::sync::atomic::AtomicBool>,
     // ccdesk 自身の更新の進行状態（版行の表示と多重起動防止の正本）
@@ -455,15 +399,8 @@ pub(crate) struct App {
     pub(crate) usage_display: bool,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) last_usage_read: std::time::Instant,
-    // 進行中のアカウント操作（登録・切替・登録解除）。**Some の間は次の要求を
-    // 受けない**（多重実行の防止）うえ、アカウント行が進行中の語を出す。
-    // 別スレッドへ逃がしてあるのは、ロック待ちが最大 11 秒あり（claude と共有する
-    // 認証情報ロック 9 秒 + 保管ロック 2 秒）、前景で取ると再描画も Ctrl+Q も
-    // 効かない時間ができるため（[`apply_account`]）
-    pub(crate) account_job: Option<AccountJob>,
     // 画面に出す値の供給元（実データ / 撮影用の固定データ）。起動時に 1 度だけ選ばれ、
-    // 以降ここを通る限り「今 demo か」を問う必要が無い。
-    // **`Arc` なのはアカウント操作を別スレッドへ渡すため**（[`AccountJob`]）
+    // 以降ここを通る限り「今 demo か」を問う必要が無い
     pub(crate) source: Arc<dyn DataSource>,
     // 起動した子がまだ端末を掴んでいない間だけ Some（起こした時刻）。
     // 降ろす契機は「子が最初の出力を出した」（run ループ）と期限切れ
@@ -533,8 +470,6 @@ impl Default for App {
             footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
             footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            // 保管 0 件 = どのアカウントもまだ保管していない中立な状態
-            accounts: Vec::new(),
             claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
             ccdesk_latest: None,
@@ -545,7 +480,6 @@ impl Default for App {
             last_usage_read: std::time::Instant::now(),
             // 撮影用の供給元は state.json / config.json を書かないので、
             // テストが開発者の設定を踏まない
-            account_job: None,
             source: Arc::new(crate::source::DemoSource),
             input_gate: None,
             notice: None,
@@ -805,11 +739,6 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         // 通知が出る**ように run ループ側で見る（門番の中で期限を見ると、
         // ハングに気づけるのが「打った人」だけになる）
         if expire_input_gate(app) {
-            force_draw = true;
-        }
-        // 別スレッドのアカウント操作（登録・切替・登録解除）の完了を取り込む。
-        // UI はロック待ちの間もブロックしない（[`apply_account`]）
-        if take_account_result(app) {
             force_draw = true;
         }
         // 使用率を 5 秒毎に取り込む（実データなら statusline フックが書いた
@@ -1105,12 +1034,13 @@ impl Enter {
 
 /// いま選択している位置で `Enter` が起こすこと（何も起きない位置は `None`）。
 ///
-/// **キーボードの実行と下部バーの案内が読む唯一の写像。** 版行は更新が無いと
-/// [`SidebarRow::Inert`] ＝ 選択はできるが `Enter` は何もしないので `None` になる
+/// **キーボードの実行と下部バーの案内が読む唯一の写像。** 押しても何も起きない行は
+/// ここが `None` を返すことで表す ＝ 更新の無い版行（[`SidebarRow::Inert`]）と
+/// アカウント行（[`SidebarPos::Account`]）が同じ 1 つの答えを共有する
 pub(crate) fn selected_enter(app: &App) -> Option<Enter> {
     let SidebarPos::Row(row) = app.selection else {
-        // アカウント行が持つのはメニューだけ
-        return Some(Enter::Menu);
+        // アカウント行は今サインインしているアカウントを出すだけ
+        return None;
     };
     match app.sidebar_rows.get(row)?.action()? {
         RowAction::New => Some(Enter::NewSession),
@@ -1144,8 +1074,7 @@ fn run_enter(app: &mut App) {
 fn open_row_menu(app: &mut App) {
     let anchor_y = selected_row_y(app);
     let SidebarPos::Row(row) = app.selection else {
-        open_account_popup(app, anchor_y);
-        return;
+        return; // メニューを持たない位置（アカウント行）
     };
     match app.sidebar_rows.get(row).and_then(SidebarRow::action).cloned() {
         Some(RowAction::Open(id)) => open_session_popup(app, &id, anchor_y),
@@ -1742,16 +1671,17 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         }
         // アカウント行（フッター下段）はサイドバー一覧の行ではないので、
         // 一覧のヒットテスト（`row_at` はフッター帯を不感帯にする）ではなくここで受ける。
-        // **列は見ない = 行のどこを押しても当たる**（一覧の行と同じ規則）
+        // **列は見ない = 行のどこを押しても当たる**（一覧の行と同じ規則）。
+        // **押しても何も起きない行**（今サインインしているアカウントを出すだけ）
+        // なので、受けるのは選択とホバーだけ ＝ 更新の無い版行と同じ扱い
         if sl.footer_visible && mouse.row == sl.account_y {
             // ホバーもここで決める ＝ **当たり判定はクリックと同じこの 1 分岐**
             // （フッターを描いていない狭い端末はこの分岐に入らないのでホバーもしない）
             app.hovered = Some(SidebarPos::Account);
             if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
                 app.set_focus(Focus::Sidebar);
-                // 選択もここへ移す（キーボードで開いたときと同じ位置に居る）
+                // 選択もここへ移す（キーボードで降りたときと同じ位置に居る）
                 app.selection = SidebarPos::Account;
-                open_account_popup(app, mouse.row);
             }
             return Ok(false);
         }
@@ -1986,16 +1916,13 @@ fn activate_popup(app: &mut App, index: usize) {
     let Some(action) = popup.kind.action(index) else {
         return;
     };
-    // 2 階層目は 1 階層目の選択行から生えて見えるようにする。矩形は anchor_y の
-    // 1 つ下に出るので、渡すのは「選択行 - 1」= 枠の上端 + index
-    let anchor_y = popup_rect(app, popup).y + index as u16;
     app.popup = None;
-    run_popup_action(app, action, anchor_y);
+    run_popup_action(app, action);
 }
 
 /// メニュー項目の実行。**副作用はここだけ**に集め、「どの項目が何を意味するか」の
 /// 判定は [`PopupKind::action`]（純関数）に置く
-fn run_popup_action(app: &mut App, action: PopupAction, anchor_y: u16) {
+fn run_popup_action(app: &mut App, action: PopupAction) {
     match action {
         // 開いたら打ち先はそのセッションなので、行クリックと同じくフォーカスを端末へ移す
         PopupAction::OpenSession(id) => {
@@ -2011,277 +1938,9 @@ fn run_popup_action(app: &mut App, action: PopupAction, anchor_y: u16) {
                 toggle_grouping(app);
             }
         }
-        // 開き直し（積まない）。anchor は親の選択行なので親から生えて見える
-        PopupAction::Open(kind) => {
-            app.popup = Some(Popup {
-                kind,
-                anchor_y,
-                selected: 0,
-            });
-        }
         // 空プロンプトで起動する（登録は dispatch_session が行う）
         PopupAction::NewSessionIn(cwd) => dispatch_session(app, cwd, String::new()),
-        // アカウント操作は 3 つとも供給元へ流す（実処理は [`crate::accounts`]、
-        // demo は実ファイルを触らない）。**実行後にメニューを開き直さない**:
-        // activate_popup が実行前に閉じており、一覧は開くたびに
-        // [`account_items`] が作り直すので、開いたまま更新する経路
-        // （＝一覧の組み立てを 2 箇所に持つ）を作らずに再取得が成立する
-        PopupAction::RegisterCurrent => register_current(app),
-        PopupAction::SwitchAccount(email) => switch_account(app, &email),
-        PopupAction::UnregisterAccount(email) => {
-            apply_account(app, AccountAction::Unregister(email))
-        }
         PopupAction::RemoveProject(cwd) => remove_project(app, &cwd),
-    }
-}
-
-/// 一覧でアクティブなアカウントに前置する印。`PopupKind::Group` が現在の grouping に
-/// 付けているものと同じ語彙（印なしの行は同じ桁数の空白で埋めて桁を揃える）
-const ACTIVE_MARK: &str = "● ";
-/// [`ACTIVE_MARK`] と同じ桁を確保する空白（印の有無で名前の桁が動かない）
-const NO_MARK: &str = "  ";
-
-/// 今ログイン中のアカウントの観測（未取得・未ログインなら None）。
-/// **アカウント操作が `footer.account` を読む唯一の場所**にしてある。
-///
-/// 返すのが [`ActiveAccount`]（同一性 + いつの認証情報を見た判断か）なのは、
-/// 保管への書き込みがこの値を材料にするため。**「誰が今のアカウントか」の正本は
-/// この 1 箇所**で、書き手はポーラーの取り込みと [`publish_active_account`] の 2 つ
-fn active_account(app: &App) -> Option<&ActiveAccount> {
-    match &app.footer.account {
-        AccountStatus::LoggedIn(active) => Some(active),
-        AccountStatus::LoggedOut | AccountStatus::Unknown => None,
-    }
-}
-
-/// 切替に渡す「出ていく側」の観測（[`Outgoing`]）。**未取得（`Unknown`）は None**。
-///
-/// [`active_account`] が 3 状態を 2 状態へ畳んでいるのが指摘の穴だった:
-/// あちらの None は「未ログイン」と「まだ取得できていない」の両方で、後者を
-/// 「巻き取る対象が無い」として切替へ渡すと、**登録済みアカウントの
-/// ローテート済み refreshToken を巻き取れないまま `.credentials.json` を上書きする**
-/// （そのアカウントは復旧不能。[`Outgoing`] のドキュメント参照）。
-///
-/// 表示（[`active_account`]）と書き込み（この関数）で読み方を分けたのは、
-/// 未取得のときに求められる振る舞いが逆だから: 表示は「印を付けない」で足りるが、
-/// 書き込みは**止めなければならない**
-fn outgoing_account(app: &App) -> Option<Outgoing> {
-    match &app.footer.account {
-        AccountStatus::LoggedIn(active) => Some(Outgoing::Known(active.clone())),
-        AccountStatus::LoggedOut => Some(Outgoing::NobodyLoggedIn),
-        AccountStatus::Unknown => None,
-    }
-}
-
-/// 「今の持ち主」の表示を確定値へ置き換える。
-///
-/// **ポーラーの共有側にも書く。** run ループは `footer_dirty` を見て
-/// `footer_shared` を**丸ごと**取り込むので、手元（`app.footer`）だけ更新すると
-/// 次の更新（バージョン取得など）で古い値へ巻き戻る。
-/// ポーラー自身の持ち越し（`shown`）は触らない: 認証ファイルが変わったことは
-/// ポーラーも指紋で気づいて取り直すので、放っておけば同じ値に収束する
-fn publish_active_account(app: &mut App, status: AccountStatus) {
-    app.footer.account = status.clone();
-    app.footer_shared
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .account = status;
-}
-
-/// アクティブなアカウントが保管されていないか（アカウント行の ⚠ の判定）。
-///
-/// **未取得・未ログインでは出さない**: ⚠ は「今のログインを失いかけている」
-/// 警告なので、失う対象が分からない状態で出すと何を直せばいいのか分からない。
-/// email を持たないアカウント（email を返さない認証方式）も出さない
-/// ＝ そもそも保管できないので、警告しても打つ手が無い
-pub(crate) fn active_unstored(app: &App) -> bool {
-    active_account(app).is_some_and(|active| {
-        let email = &active.account.email;
-        !email.is_empty() && !app.accounts.iter().any(|a| &a.email == email)
-    })
-}
-
-/// 保管一覧の写しを取り直す。⚠ とメニューの一覧が同じ写しを見るので、
-/// 取り直す契機（起動時・アカウント行を開いた時・保管を変更した後）はここに集める
-fn refresh_accounts(app: &mut App) {
-    app.accounts = app.source.accounts();
-}
-
-/// 保管一覧 → メニューの行。アクティブな 1 件にだけ [`ACTIVE_MARK`] を前置する。
-/// id は email（表示ラベルは組織名の抑制で変わるので同一性判定に使えない）
-fn account_items(app: &App) -> Vec<AccountItem> {
-    let active = active_account(app)
-        .map(|a| a.account.email.as_str())
-        .unwrap_or("");
-    app.accounts
-        .iter()
-        .map(|account| AccountItem {
-            label: format!(
-                "{}{}",
-                if !account.email.is_empty() && account.email == active {
-                    ACTIVE_MARK
-                } else {
-                    NO_MARK
-                },
-                account.label
-            ),
-            id: account.email.clone(),
-        })
-        .collect()
-}
-
-/// アカウント行クリックで開く一覧。開く直前に写しを取り直すので、
-/// 別インスタンスや前回の操作で変わった保管もその場で反映される。
-///
-/// 矩形は他のメニューと同じ [`popup_rect`] が決める。アカウント行は画面の下端
-/// なので必ず上へ丸められ、**行自体に被って開く**。被りを許容するのは、行に出る
-/// 情報（アクティブなアカウントのラベル）がメニュー側のアクティブ印で代弁される
-/// ため（幅と同じ判断: 内容を切って読めなくするより被せる）
-fn open_account_popup(app: &mut App, anchor_y: u16) {
-    refresh_accounts(app);
-    app.popup = Some(Popup {
-        kind: PopupKind::Account {
-            accounts: account_items(app),
-        },
-        anchor_y,
-        selected: 0,
-    });
-}
-
-/// 「今の持ち主」が分からないときの通知。**register も switch も同じ理由で止まる**
-/// （保管すべきトークンがあるかどうかが分からない）ので、文面も 1 つに保つ。
-/// 打つ手は「少し待ってからもう一度」＝ ポーラーが取得すれば通る
-const UNKNOWN_ACTIVE_NOTICE: &str = "active account unknown · try again shortly";
-
-/// `register current`: 今ログイン中のアカウントを保管へ加える
-fn register_current(app: &mut App) {
-    let Some(active) = active_account(app).cloned() else {
-        // 未取得・未ログインでは保管する対象が無い（押しても無反応に見せない）
-        set_notice(app, UNKNOWN_ACTIVE_NOTICE.to_string());
-        return;
-    };
-    apply_account(app, AccountAction::Register(active));
-}
-
-/// `switch`: 保管アカウントへ切り替える。
-/// **出ていく側の観測（[`outgoing_account`]）をそのまま渡す**
-/// （出ていくアカウントのトークンを同じロック下で保管へ巻き取るために必須。
-/// 渡さないと、切替の直前に更新された使い捨ての refreshToken を落として
-/// そのアカウントへ戻れなくなる）。
-///
-/// **観測できていなければ切り替えない**（[`register_current`] と同じ扱い）:
-/// 起動直後の ~350ms とアカウント取得が失敗し続ける間は誰が持ち主か言えず、
-/// そのまま上書きすると巻き取るべきトークンがあったかどうかも分からない。
-/// 諦めれば次の操作でやり直せるが、書いてしまうと取り返しがつかない
-fn switch_account(app: &mut App, email: &str) {
-    let Some(outgoing) = outgoing_account(app) else {
-        set_notice(app, UNKNOWN_ACTIVE_NOTICE.to_string());
-        return;
-    };
-    apply_account(
-        app,
-        AccountAction::Switch {
-            email: email.to_string(),
-            outgoing,
-        },
-    );
-}
-
-/// 「既にそのアカウント」で切替が何もしなかったときの通知。
-/// **成功と同じ無反応にはしない**（メニューの `●` と同じ事実を言葉でも出す）
-const ALREADY_ACTIVE_NOTICE: &str = "already using this account";
-
-/// 進行中のアカウント操作（[`apply_account`] が別スレッドへ逃がした要求）。
-///
-/// **語を一緒に持つ**のが要点: 結果が届いた時点で要求はもう手元に無いので、
-/// 失敗文と行の進行表示をここで抱えておく（[`AccountAction::what`] /
-/// [`AccountAction::progress`] から受け取る ＝ 語彙の正本は要求の側 1 箇所）
-pub(crate) struct AccountJob {
-    rx: std::sync::mpsc::Receiver<anyhow::Result<AccountChange>>,
-    /// 失敗通知の語（「アカウントの{what}に失敗」）
-    what: &'static str,
-    /// アカウント行に出す進行中の語
-    pub(crate) progress: &'static str,
-}
-
-/// 進行中にもう 1 つアカウント操作を押したときの通知。
-/// **黙って捨てない**（進行中の行表示と併せて、押したのに何も起きないメニューに
-/// 見せない）。待ち行列にしないのは、前の操作が「今の持ち主」を変えるので、
-/// 並んだ要求は古い観測を材料に走ることになるため（[`ActiveAccount`]）。
-/// 取り直した観測で押し直す方が安全
-const ACCOUNT_BUSY_NOTICE: &str = "account action running — try again once it finishes";
-
-/// 保管への変更を供給元へ流す。**別スレッドで走らせ、結果は run ループが
-/// 受けて反映する**（[`take_account_result`]）。
-///
-/// **前景で取ってはいけない理由**: 登録と切替は claude と共有する認証情報ロック
-/// （最大 9 秒）の下で保管ロック（最大 2 秒）も取るので、claude がトークン更新中に
-/// `register current` を押すと **UI スレッドが最大約 11 秒止まる**（再描画も Ctrl+Q も
-/// 効かない ＝ ハングに見える）。他の重い操作（`claude update` / 自己更新）は
-/// すべて別スレッドで、ここだけが前景だった。
-///
-/// **観測時点（[`ActiveAccount`]）は逃がしても守られる**: 要求が運ぶのは
-/// 「押した時点の観測」で、それが今も有効かはドメイン側がロックの下で照合し、
-/// 古ければ書かずに失敗する（`still_current`）。前景でもロック待ちの間に同じことが
-/// 起きるので、逃がしたことで隔たりが伸びるわけではない（送るのは即座）
-fn apply_account(app: &mut App, action: AccountAction) {
-    if app.account_job.is_some() {
-        set_notice(app, ACCOUNT_BUSY_NOTICE.to_string());
-        return;
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    app.account_job = Some(AccountJob {
-        rx,
-        what: action.what(),
-        progress: action.progress(),
-    });
-    let source = app.source.clone();
-    std::thread::spawn(move || {
-        // 受け手が消えていても（run ループの終了）送信の失敗は無視する
-        let _ = tx.send(source.apply_account(action));
-    });
-}
-
-/// 別スレッドのアカウント操作の結果を取り込む（run ループが毎周見る）。
-/// 取り込んだら `true`（＝即描画する）
-fn take_account_result(app: &mut App) -> bool {
-    let Some(job) = app.account_job.take() else {
-        return false;
-    };
-    let result = match job.rx.try_recv() {
-        Ok(result) => result,
-        Err(std::sync::mpsc::TryRecvError::Empty) => {
-            app.account_job = Some(job); // まだ走っている
-            return false;
-        }
-        // 結果は永久に来ない。**進行中の印は降ろす**（降ろさないと行が永久に
-        // `switching…` のままで、以降のアカウント操作も全て拒まれる）
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-            Err(anyhow::anyhow!("worker thread ended without a result"))
-        }
-    };
-    apply_account_result(app, result, job.what);
-    true
-}
-
-/// アカウント操作の結果を状態へ反映する。成功したら写しを取り直し
-/// （⚠ と一覧が即座に追従する）、失敗は下部バーへ出す。
-/// **エラー文はそのまま載せてよい**: ドメイン側の失敗はパスとロックの事情だけを
-/// 述べ、トークンを含まない
-fn apply_account_result(app: &mut App, result: anyhow::Result<AccountChange>, what: &str) {
-    match result {
-        // **切替が成功した時点で「今の持ち主」は確定している**（ccdesk 自身が
-        // 書いた値）。ポーラーの追いつき（認証ファイルの変化検出 → 子プロセス起動で
-        // 1〜2 秒）を待つと、その間の操作が切替前の持ち主を材料に走り、
-        // 出ていったはずのアカウントの保管を別アカウントのトークンで潰す
-        Ok(AccountChange::Switched(active)) => {
-            publish_active_account(app, AccountStatus::LoggedIn(active));
-            refresh_accounts(app);
-        }
-        // 何もしなかったことを伝える（無反応と成功を見分けられるようにする）
-        Ok(AccountChange::AlreadyActive) => set_notice(app, ALREADY_ACTIVE_NOTICE.to_string()),
-        Ok(AccountChange::StoreOnly) => refresh_accounts(app),
-        Err(e) => set_notice(app, format!("failed to {what} account: {e}")),
     }
 }
 
@@ -2632,10 +2291,6 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unicode_width::UnicodeWidthStr;
-
-    // アカウント操作を逃がした先を見るためのロック（claude が保持している状態を作る）
-    use ccdesk::{Lock, LOCK_STALE};
 
     use crate::source::{persist_projects, WindowState};
 
@@ -2686,34 +2341,16 @@ mod tests {
         }
     }
 
-    /// 別スレッドで走るアカウント操作（[`apply_account`]）の完了を待って反映する。
-    ///
-    /// **反映は本番と同じ [`take_account_result`] を通す**（待つ点だけが違う）ので、
-    /// 「操作 → 結果が状態へ入る」の順序はテストと実運用で同じ。走っていなければ
-    /// 何もしない ＝ 要求を出さない経路（未取得で止めた場合）でもそのまま呼べる
-    fn settle_account(app: &mut App) {
-        let started = std::time::Instant::now();
-        while app.account_job.is_some() {
-            assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "account action did not finish in time"
-            );
-            if !take_account_result(app) {
-                std::thread::yield_now();
-            }
-        }
-    }
+    /// プロジェクトメニューが指すフォルダ
+    const PROJECT_CWD: &str = "C:\\dev\\shop-app";
 
-    fn account(label: &str, id: &str) -> AccountItem {
-        AccountItem {
-            label: label.to_string(),
-            id: id.to_string(),
+    /// **項目が最も長いメニュー**（`remove project` ＝ 14 桁）。矩形まわりの検査は
+    /// 「サイドバーより広いメニュー」を要るので、幅の下限を越えるこれを使う
+    fn project_menu() -> PopupKind {
+        PopupKind::Project {
+            cwd: PROJECT_CWD.to_string(),
+            has_sessions: false,
         }
-    }
-
-    /// アカウント一覧のメニュー
-    fn account_menu(accounts: Vec<AccountItem>) -> PopupKind {
-        PopupKind::Account { accounts }
     }
 
     /// 窓が開いているセッションのメニュー（ピン留めされていない行）。
@@ -2875,68 +2512,6 @@ mod tests {
         assert!(app.popup.is_none());
     }
 
-    /// 保管 0 件でも register current だけのメニューとして成立し、
-    /// 保管があれば一覧が先・register current が末尾に並ぶ
-    #[test]
-    fn account_menu_lists_stored_accounts_before_register_current() {
-        let empty = account_menu(Vec::new());
-        assert_eq!(labels(&empty, Grouping::State), ["register current"]);
-        let two = account_menu(vec![
-            account("ooba · 1→10, Inc.", "id-a"),
-            account("you@example.com", "id-b"),
-        ]);
-        assert_eq!(
-            labels(&two, Grouping::State),
-            ["ooba · 1→10, Inc.", "you@example.com", "register current"]
-        );
-    }
-
-    /// 表示名が同じ項目が並んでも、選んだ行の対象（id）が選ばれる。
-    /// ラベル文字列から対象を復元する実装では区別できない組み合わせ
-    #[test]
-    fn account_menu_picks_the_row_target_even_when_labels_are_identical() {
-        let kind = account_menu(vec![
-            account("ooba", "id-personal"),
-            account("ooba", "id-work"),
-        ]);
-        assert_eq!(
-            labels(&kind, Grouping::State),
-            ["ooba", "ooba", "register current"]
-        );
-        assert_eq!(
-            kind.action(0),
-            Some(PopupAction::Open(PopupKind::AccountActions {
-                account: account("ooba", "id-personal"),
-            }))
-        );
-        assert_eq!(
-            kind.action(1),
-            Some(PopupAction::Open(PopupKind::AccountActions {
-                account: account("ooba", "id-work"),
-            }))
-        );
-        assert_eq!(kind.action(2), Some(PopupAction::RegisterCurrent));
-        assert_eq!(kind.action(3), None);
-    }
-
-    /// 2 階層目は対象アカウントの id を各動作へ持ち込む
-    #[test]
-    fn account_actions_menu_carries_the_account_id_into_each_action() {
-        let kind = PopupKind::AccountActions {
-            account: account("ooba", "id-work"),
-        };
-        assert_eq!(labels(&kind, Grouping::State), ["switch", "unregister"]);
-        assert_eq!(
-            kind.action(0),
-            Some(PopupAction::SwitchAccount("id-work".to_string()))
-        );
-        assert_eq!(
-            kind.action(1),
-            Some(PopupAction::UnregisterAccount("id-work".to_string()))
-        );
-        assert_eq!(kind.action(2), None);
-    }
-
     /// プロジェクトメニューは対象フォルダを各動作へ持ち込む
     #[test]
     fn project_menu_carries_its_folder_into_each_action() {
@@ -2959,67 +2534,31 @@ mod tests {
         assert_eq!(kind.action(2), None);
     }
 
-    /// 一覧の項目を Enter で選ぶと 2 階層目が開き、矩形は 1 階層目の選択行に来る
+    /// Esc は開いているメニューを閉じる（階層を持たないので戻り先も無い）。
+    /// 外クリックも同じ
     #[test]
-    fn selecting_an_account_opens_the_second_level_at_the_selected_row() {
+    fn esc_and_outside_click_close_the_popup() {
         let mut app = test_app(34, TERM);
-        open(
-            &mut app,
-            account_menu(vec![account("ooba", "id-a"), account("you@example.com", "id-b")]),
-            5,
-        );
-        handle_popup_key(&mut app, KeyCode::Down); // 2 行目（id-b）を選ぶ
-        let parent = popup_rect(&app, app.popup.as_ref().unwrap());
-        let selected_row = parent.y + 1 + 1; // 上枠 + 選択 index
-        handle_popup_key(&mut app, KeyCode::Enter);
-        let popup = app.popup.as_ref().expect("second level menu must be open");
-        assert_eq!(
-            popup.kind,
-            PopupKind::AccountActions {
-                account: account("you@example.com", "id-b"),
-            }
-        );
-        assert_eq!(popup.selected, 0, "second level selection must start at the top");
-        assert_eq!(
-            popup_rect(&app, popup).y,
-            selected_row,
-            "second level must anchor to the parent's selected row"
-        );
-    }
-
-    /// Esc は階層を戻らず全部閉じる（戻り先を持たない）。外クリックも同じ
-    #[test]
-    fn esc_and_outside_click_close_every_popup_level() {
-        let mut app = test_app(34, TERM);
-        let accounts = || account_menu(vec![account("ooba", "id-a")]);
-        open(&mut app, accounts(), 5);
-        handle_popup_key(&mut app, KeyCode::Enter); // 1 階層目 → 2 階層目
-        assert!(
-            matches!(
-                app.popup.as_ref().map(|p| &p.kind),
-                Some(PopupKind::AccountActions { .. })
-            ),
-            "second level menu must be open"
-        );
+        let menu = || PopupKind::Group;
+        open(&mut app, menu(), 5);
         handle_popup_key(&mut app, KeyCode::Esc);
-        assert!(app.popup.is_none(), "esc must return to the list");
+        assert!(app.popup.is_none(), "esc must close the menu");
 
-        open(&mut app, accounts(), 5);
-        handle_popup_key(&mut app, KeyCode::Enter);
+        open(&mut app, menu(), 5);
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
         handle_mouse(&mut app, &click(rect.right() + 2, rect.bottom() + 2)).unwrap();
-        assert!(app.popup.is_none(), "an outside click must return to the list");
+        assert!(app.popup.is_none(), "an outside click must close the menu");
     }
 
     /// ↑↓ は項目数の範囲で止まる（端で溢れない）
     #[test]
     fn arrow_keys_clamp_the_selection_to_the_entry_range() {
         let mut app = test_app(34, TERM);
-        open(&mut app, account_menu(vec![account("ooba", "id-a")]), 3);
+        // 2 項目のメニュー（state / directory）
+        open(&mut app, PopupKind::Group, 3);
         for _ in 0..5 {
             handle_popup_key(&mut app, KeyCode::Down);
         }
-        // 一覧 1 件 + register current の 2 項目
         assert_eq!(app.popup.as_ref().unwrap().selected, 1);
         for _ in 0..5 {
             handle_popup_key(&mut app, KeyCode::Up);
@@ -3096,43 +2635,12 @@ mod tests {
         );
     }
 
-    /// 幅は最長項目の表示幅から決まる（email やアカウント表示名が切れない）。
-    /// 桁数は文字数ではなく表示幅で数える（全角は 2 桁）
-    #[test]
-    fn menu_width_adapts_to_the_longest_entry() {
-        let long = "very.long.address@example.co.jp";
-        let kind = account_menu(vec![account("ooba", "id-a"), account(long, "id-b")]);
-        assert_eq!(
-            kind.width(Grouping::State),
-            long.width() as u16 + POPUP_CHROME
-        );
-        assert!(kind.width(Grouping::State) > PopupKind::Group.width(Grouping::State));
-
-        // 全角（表示幅 2）を含む入力である必要がある。日本語そのものは使えない
-        // （`tests/no_japanese_in_code.rs` の検査対象になるため）ので、
-        // 全角ラテン文字（U+FF21-U+FF5A）で幅 2 の性質だけを借りる
-        let wide_label = "ＯＢＡ · 1→10, Inc.";
-        let wide = account_menu(vec![account(wide_label, "id-c")]);
-        assert_eq!(
-            wide.width(Grouping::State),
-            wide_label.width() as u16 + POPUP_CHROME
-        );
-        assert!(
-            wide_label.width() > wide_label.chars().count(),
-            "the fullwidth premise no longer holds"
-        );
-    }
-
     /// 内容から幅を決めるので、狭いサイドバーでは右ペインに被る。
     /// 被ることは許容するが、端末の外へは出さない
     #[test]
     fn wide_menu_overlaps_the_right_pane_but_keeps_its_left_edge() {
         let mut app = test_app(12, TERM);
-        open(
-            &mut app,
-            account_menu(vec![account("very.long.address@example.co.jp", "id-a")]),
-            3,
-        );
+        open(&mut app, project_menu(), 3);
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
         assert_eq!(rect.x, 1, "left edge must stay at sidebar x=1 while it fits");
         assert!(
@@ -3146,22 +2654,7 @@ mod tests {
     /// 幅は内容で決まるため「サイドバーより広い」「端末より広い」が起こり得る
     #[test]
     fn popup_rect_stays_inside_the_terminal_for_any_sidebar_width() {
-        let kinds = || {
-            vec![
-                session("s1", false),
-                PopupKind::Group,
-                account_menu(
-                    (0..30)
-                        .map(|i| {
-                            account(
-                                &format!("very.long.address.number.{i}@example.co.jp"),
-                                &format!("id-{i}"),
-                            )
-                        })
-                        .collect(),
-                ),
-            ]
-        };
+        let kinds = || vec![session("s1", false), PopupKind::Group, project_menu()];
         for (term_w, term_h) in [(120u16, 40u16), (80, 24), (52, 8), (14, 5), (1, 1)] {
             for sidebar_width in [12u16, 26, 34, term_w] {
                 for anchor_y in [0u16, 1, 5, u16::MAX] {
@@ -3244,25 +2737,20 @@ mod tests {
     #[test]
     fn clicking_a_menu_row_over_the_resize_border_does_not_start_a_drag() {
         let mut app = test_app(12, TERM);
-        open(
-            &mut app,
-            account_menu(vec![account("very.long.address@example.co.jp", "id-a")]),
-            3,
-        );
+        app.projects = vec![PROJECT_CWD.to_string()];
+        open(&mut app, project_menu(), 3);
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
         assert!(
             rect.right() > app.sidebar_width,
             "must overlap the resize border by the test's premise"
         );
         let border_col = app.sidebar_width;
-        handle_mouse(&mut app, &click(border_col, rect.y + 1)).unwrap();
+        // 2 行目 = `remove project`（実行されると登録から外れる ＝ 結果が見える）
+        handle_mouse(&mut app, &click(border_col, rect.y + 2)).unwrap();
         assert!(!app.dragging, "must not start a resize drag");
         assert_eq!(app.sidebar_width, 12, "sidebar width must not change");
         assert!(
-            matches!(
-                app.popup.as_ref().map(|p| &p.kind),
-                Some(PopupKind::AccountActions { .. })
-            ),
+            app.projects.is_empty(),
             "the overlapped column's entry must run"
         );
     }
@@ -3592,41 +3080,22 @@ mod tests {
         }
     }
 
-    /// 供給元へ渡ったアカウント操作の記録。**UI が組んだ引数そのもの**を見るので、
-    /// 実ユーザーの `~/.claude` / `~/.ccdesk` を触らずに配線を固定できる
-    /// （特に switch の `outgoing`。落とすと出ていくアカウントへ戻れなくなる）
-    #[derive(Debug, PartialEq)]
-    enum Recorded {
-        Register(ActiveAccount),
-        Switch { email: String, outgoing: Outgoing },
-        Unregister(String),
-    }
-
-    /// テスト用の供給元は **これ 1 つだけ**。差し替えたいのは「アカウント」と
-    /// 「プロジェクト永続化」の 2 軸なので、軸ごとの enum を差し込む形にして
-    /// `impl DataSource` を 1 つに保つ。
+    /// テスト用の供給元は **これ 1 つだけ**。差し替えたいのは「プロジェクト永続化」
+    /// なので、軸ごとの enum を差し込む形にして `impl DataSource` を 1 つに保つ。
     ///
     /// **なぜ軸ごとに別の struct を並べないか（判断の記録）**: 以前は
     /// `RecordingSource` / `StoreSource` / `MemoryDiskSource` の 3 つがそれぞれ
     /// `impl DataSource` を持っていた。[`DataSource`] にメソッドが 1 つ増えるだけで
     /// 直す場所が 3 箇所になり、しかも「メソッドを足す変更」と「戻り値を変える変更」が
     /// 別ブランチで並ぶと**テキスト衝突なしにテストビルドだけが壊れたマージ**が
-    /// 生まれる（`store_projects` の追加と `apply_account` の戻り値変更が実際に
-    /// 衝突なくマージされ、E0046 / E0053 になった）。[`App`] の [`Default`] を
+    /// 生まれる（実際に E0046 / E0053 になった）。[`App`] の [`Default`] を
     /// 構造体定義の隣に置いてあるのと同じ判断で、
     /// **1 つの変更が 1 箇所に閉じる（局所性）**方を取る。
     ///
-    /// **軸を enum にしたのは「実物を通す」性質を落とさないため**: 記録用の供給元では
-    /// 見えなかった破壊（切替の後もまだ前の持ち主を材料に次の操作を走らせ、
-    /// 使い捨ての refreshToken で別アカウントの保管を潰す）を捕まえたのは、実物の
-    /// [`crate::accounts::AccountStore`] を通すテストだった。統合後も
-    /// [`AccountBackend::Store`] は実物のストアを保持し、
-    /// [`ProjectsBackend::MemoryDisk`] は live と同じ
-    /// [`persist_projects`] を通る ＝ ドメインを偽物へ置き換えていない。
-    /// 各テストがどちらの軸を実物で見ているかは、下の 3 つの組み立てヘルパ
-    /// （[`recording_app`] / [`app_with_real_store`] / [`app_with_disk`]）が表す
+    /// **軸を enum にしたのは「実物を通す」性質を落とさないため**:
+    /// [`ProjectsBackend::MemoryDisk`] は live と同じ [`persist_projects`] を通る
+    /// ＝ ドメインを偽物へ置き換えていない
     struct TestSource {
-        accounts: AccountBackend,
         projects: ProjectsBackend,
         /// hook が書いた state の写し（[`DataSource::hook_states`] が返す値）。
         /// 実ファイルを読まないので、テストが開発者の
@@ -3635,31 +3104,6 @@ mod tests {
         /// [`WindowItem::LastView`] として保存された値の記録（**保存された回数まで
         /// 見たい**ので Vec）。実ファイル（`~/.ccdesk/state.json`）は書かない
         views: Arc<Mutex<Vec<String>>>,
-    }
-
-    /// アカウント側の振る舞い
-    enum AccountBackend {
-        /// アカウントを扱わないテスト（プロジェクト側の検査）。
-        /// **変更要求が来たら panic させる**: [`DataSource::apply_account`] の戻り値は
-        /// そのままアカウント行の確定値に化けるので、「中立な成功」を返すと嘘の
-        /// ドメイン結果をテストに信じさせる。`store_projects` と違って
-        /// **何もしないことが正解になる戻り値が無い**ため、黙って通さない
-        Absent,
-        /// 保管一覧を固定値で返し、変更要求を記録するだけ。
-        /// `fails` を立てると変更が失敗する（下部バーへの通知経路を見るため）。
-        ///
-        /// **切替の結果は「実際に切り替わった」で返す**。ドメイン側は成功時に
-        /// 新しい持ち主を返す契約なので、記録用でも同じ形にしないと
-        /// 「成功後にアカウント行が確定値へ更新される」経路を見られない
-        Recording {
-            stored: Vec<Account>,
-            recorded: Arc<Mutex<Vec<Recorded>>>,
-            fails: bool,
-        },
-        /// 実物の [`crate::accounts::AccountStore`]（一時ディレクトリ上）。
-        /// 対応表も本番と同じ [`crate::source::apply_account_action`] を通す
-        /// （テスト用の写しを作らない）
-        Store(crate::accounts::AccountStore),
     }
 
     /// プロジェクト永続化側の振る舞い
@@ -3685,22 +3129,13 @@ mod tests {
         /// （軸を足したときに直すのがこの 1 箇所で済む）
         fn plain() -> Self {
             Self {
-                accounts: AccountBackend::Absent,
                 projects: ProjectsBackend::Absent,
                 hooks: HookStates::default(),
                 views: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        /// アカウント側だけを見る供給元（プロジェクトは永続化層を持たない）
-        fn for_accounts(accounts: AccountBackend) -> Self {
-            Self {
-                accounts,
-                ..Self::plain()
-            }
-        }
-
-        /// プロジェクト側だけを見る供給元（アカウントは扱わない）
+        /// プロジェクト側だけを見る供給元
         fn for_projects(projects: ProjectsBackend) -> Self {
             Self {
                 projects,
@@ -3819,135 +3254,66 @@ mod tests {
             false
         }
 
-        fn accounts(&self) -> Vec<Account> {
-            match &self.accounts {
-                AccountBackend::Absent => Vec::new(),
-                AccountBackend::Recording { stored, .. } => stored.clone(),
-                AccountBackend::Store(store) => store.list(),
-            }
-        }
-
-        fn apply_account(&self, action: AccountAction) -> anyhow::Result<AccountChange> {
-            match &self.accounts {
-                AccountBackend::Absent => panic!(
-                    "a change request reached a source that does not handle accounts \
-                     (use AccountBackend::Recording or ::Store instead)"
-                ),
-                AccountBackend::Recording {
-                    stored,
-                    recorded,
-                    fails,
-                } => {
-                    let change = match &action {
-                        // 切替先のラベルは保管一覧から引く（実物と同じく、確定値は
-                        // 保管の側から来る）。ここでは指紋を持たない観測で足りる:
-                        // 記録用の供給元はファイルを読まないので照合の相手が無い
-                        AccountAction::Switch { email, .. } => AccountChange::Switched(
-                            ActiveAccount::unseen(Account::new(
-                                email,
-                                stored
-                                    .iter()
-                                    .find(|a| &a.email == email)
-                                    .map(|a| a.label.as_str())
-                                    .unwrap_or(email),
-                            )),
-                        ),
-                        AccountAction::Register(_) | AccountAction::Unregister(_) => {
-                            AccountChange::StoreOnly
-                        }
-                    };
-                    recorded
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(match action {
-                            AccountAction::Register(active) => Recorded::Register(active),
-                            AccountAction::Switch { email, outgoing } => {
-                                Recorded::Switch { email, outgoing }
-                            }
-                            AccountAction::Unregister(email) => Recorded::Unregister(email),
-                        });
-                    if *fails {
-                        // 実際に返り得る失敗（ロック競合）と同じ形。トークンは含まない
-                        return Err(anyhow::anyhow!("lock is held by another process"));
-                    }
-                    Ok(change)
-                }
-                AccountBackend::Store(store) => crate::source::apply_account_action(store, action),
-            }
-        }
     }
 
-    /// 記録用の供給元を挿した App。`active` が `footer.account`（アクティブな
-    /// アカウント）、`stored` が保管一覧で、写しは起動時と同じく供給元と揃えておく
-    fn recording_app(
-        active: Option<Account>,
-        stored: Vec<Account>,
-        fails: bool,
-    ) -> (App, Arc<Mutex<Vec<Recorded>>>) {
-        let recorded = Arc::new(Mutex::new(Vec::new()));
-        let app = App {
+    /// ログイン済みのアカウント行を持つ `App`
+    fn app_with_account_footer() -> App {
+        use crate::poll::AccountStatus;
+        App {
             footer: FooterInfo {
-                account: match active {
-                    Some(account) => AccountStatus::LoggedIn(ActiveAccount::unseen(account)),
-                    None => AccountStatus::Unknown,
-                },
+                account: AccountStatus::LoggedIn("taro".to_string()),
                 ..FooterInfo::default()
             },
-            accounts: stored.clone(),
-            source: Arc::new(TestSource::for_accounts(AccountBackend::Recording {
-                stored,
-                recorded: recorded.clone(),
-                fails,
-            })),
             ..test_app(34, TERM)
-        };
-        (app, recorded)
-    }
-
-    /// アカウントメニューの中身（開いていなければ panic）
-    fn open_account_items(app: &App) -> &[AccountItem] {
-        match app.popup.as_ref().map(|p| &p.kind) {
-            Some(PopupKind::Account { accounts, .. }) => accounts,
-            other => panic!("account menu must be open: {other:?}"),
         }
     }
 
-    /// アカウント行は**行全体が当たる**。列 0（一覧行なら `=` の桁）から内容の
-    /// 最右列まで、どこを押してもアカウントメニューが開く。
+    /// **アカウント行は押しても何も起きない。** 出しているのは「今サインインして
+    /// いるのは誰か」だけなので、行全体が当たっても起きるのは選択とホバーだけ
+    /// （メニューは開かず、幅変更ドラッグにもならない）。
     /// 当たり判定は描画と同じ [`sidebar_layout`] の `account_y`
     #[test]
-    fn clicking_anywhere_on_the_account_row_opens_the_account_menu() {
-        let active = Account::new("a@example.com", "taro");
-        let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
+    fn clicking_the_account_row_only_moves_the_selection() {
+        let mut app = app_with_account_footer();
         let sl = sidebar_layout(&app);
         assert!(sl.footer_visible, "the footer must be visible for this test's premise");
         // 内容の桁は x=1..=sidebar_width-2（枠の内側）。列 0 も行に当たる
         let rightmost = app.sidebar_width - 2;
         for col in [0, 1, 2, 5, rightmost - 1, rightmost] {
-            app.popup = None;
+            app.selection = SidebarPos::Row(0);
             handle_mouse(&mut app, &click(col, sl.account_y)).unwrap();
-            let popup = app
-                .popup
-                .as_ref()
-                .unwrap_or_else(|| panic!("menu must be open at col={col}"));
-            assert!(
-                matches!(popup.kind, PopupKind::Account { .. }),
-                "a different menu must not open at col={col}"
-            );
-            assert_eq!(popup.anchor_y, sl.account_y, "col={col}");
+            assert!(app.popup.is_none(), "a menu opened at col={col}");
             assert!(!app.dragging, "col={col} must not start a resize drag");
+            // 選択はアカウント行へ移る（キーボードで降りたときと同じ位置に居る）
+            assert_eq!(app.selection, SidebarPos::Account, "col={col}");
+            // ホバーもアカウント行を指す（一覧の行 index には化けない）
+            assert_eq!(app.hovered, Some(SidebarPos::Account), "col={col}");
         }
         assert_eq!(app.sidebar_width, 34, "sidebar width must not change");
-        // 選択はアカウント行へ移る（キーボードで開いたときと同じ位置に居る）
-        assert_eq!(app.selection, SidebarPos::Account);
-        // ホバーもアカウント行を指す（一覧の行 index には化けない）
-        assert_eq!(app.hovered, Some(SidebarPos::Account));
+    }
+
+    /// **アカウント行を選んだ `Enter` は何も起こさない。**
+    /// 更新の無い版行（[`SidebarRow::Inert`]）と同じ答えを
+    /// [`selected_enter`] 1 箇所から得ることの固定
+    #[test]
+    fn pressing_enter_on_the_account_row_does_nothing() {
+        let mut app = app_with_account_footer();
+        app.sidebar_rows = vec![SidebarRow::Action(RowAction::New)];
+        app.sidebar_header_rows = 1;
+        app.selection = SidebarPos::Account;
+        assert_eq!(selected_enter(&app), None, "the account row claims an Enter action");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.popup.is_none(), "Enter opened a menu on the account row");
+        assert!(
+            matches!(app.right_view, RightView::Sessions),
+            "Enter changed the right pane from the account row"
+        );
+        assert_eq!(app.selection, SidebarPos::Account, "Enter moved the selection");
     }
 
     /// ホバーの行き先が両方ある `App`: フッターのアカウント行と、一覧の押せる行 1 本
     fn app_with_hoverable_rows() -> App {
-        let active = Account::new("a@example.com", "taro");
-        let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
+        let mut app = app_with_account_footer();
         app.sidebar_rows = vec![SidebarRow::Action(RowAction::New)];
         app.sidebar_header_rows = 1;
         app
@@ -3964,8 +3330,6 @@ mod tests {
 
         handle_mouse(&mut app, &moved(3, sl.account_y)).unwrap();
         assert_eq!(app.hovered, Some(SidebarPos::Account));
-        // メニューは開かない（乗せただけ）
-        assert!(app.popup.is_none(), "moving the mouse must not open a menu");
 
         // 一覧の行へ移ればそちらのホバーへ移る（アカウント行のハイライトは消える）
         handle_mouse(&mut app, &moved(3, 1)).unwrap();
@@ -3978,7 +3342,7 @@ mod tests {
 
     /// **ホバーとクリックはまったく同じ行に当たる。** 当たり判定を別に計算していない
     /// ことの担保なので、片方の y だけを見るのではなく、サイドバー内の全 y について
-    /// 「ホバーがアカウント行になる y」と「クリックでアカウントメニューが開く y」の
+    /// 「ホバーがアカウント行になる y」と「クリックで選択がアカウント行へ移る y」の
     /// 集合が一致することを見る
     #[test]
     fn the_hover_and_the_click_hit_the_account_row_at_the_same_rows() {
@@ -4001,10 +3365,7 @@ mod tests {
             .filter(|y| {
                 let mut app = app_with_hoverable_rows();
                 handle_mouse(&mut app, &click(COL, *y)).unwrap();
-                matches!(
-                    app.popup.as_ref().map(|p| &p.kind),
-                    Some(PopupKind::Account { .. })
-                )
+                app.selection == SidebarPos::Account
             })
             .collect();
         assert_eq!(hovered_rows, clicked_rows, "the hover and the click hit different rows");
@@ -4095,8 +3456,7 @@ mod tests {
     /// 一覧全体を遡らずに済む）
     #[test]
     fn the_arrow_keys_loop_through_the_list_and_the_account_row() {
-        let active = Account::new("a@example.com", "taro");
-        let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
+        let mut app = app_with_account_footer();
         app.sidebar_rows = vec![
             SidebarRow::Action(RowAction::New),
             SidebarRow::Decoration,
@@ -4119,31 +3479,12 @@ mod tests {
         assert_eq!(app.selection, SidebarPos::Row(2), "must return to the list");
     }
 
-    /// **アカウント行はマウスとキーボードで同じ場所に同じメニューが開く。**
-    /// キーボードの入口は `Enter` だけ（`←` `→` はサイドバーから撤去した）
-    #[test]
-    fn the_account_menu_opens_the_same_way_from_the_mouse_and_the_keyboard() {
-        let active = Account::new("a@example.com", "taro");
-        let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
-        let sl = sidebar_layout(&app);
-        handle_mouse(&mut app, &click(3, sl.account_y)).unwrap();
-        let by_mouse = app.popup.take().expect("menu must be open from the mouse click");
-
-        app.popup = None;
-        app.selection = SidebarPos::Account;
-        press(&mut app, KeyCode::Enter);
-        let popup = app.popup.as_ref().expect("menu must be open for Enter");
-        assert_eq!(popup.kind, by_mouse.kind, "a different menu must not open from the keyboard");
-        assert_eq!(popup.anchor_y, sl.account_y, "Enter must open at the same position");
-    }
-
     /// フッターが無い（狭い）端末ではアカウント行は描かれないので選択対象にもしない。
     /// **押せない位置に選択を残さない**という一覧の行と同じ規則で、
     /// 巡回は一覧の中だけで閉じる
     #[test]
     fn a_hidden_footer_keeps_the_account_row_out_of_the_selection() {
-        let active = Account::new("a@example.com", "taro");
-        let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
+        let mut app = app_with_account_footer();
         app.term_size = (60, 8); // 下部バー 1 行を引くと footer_visible が落ちる高さ
         assert!(
             !sidebar_layout(&app).footer_visible,
@@ -4164,567 +3505,6 @@ mod tests {
         app.sidebar_rows.push(SidebarRow::Action(RowAction::ToggleGroup));
         press(&mut app, KeyCode::Up);
         assert_eq!(app.selection, SidebarPos::Row(1), "the list must loop on its own");
-    }
-
-    /// 一覧は供給元の保管一覧（[`crate::accounts::AccountStore::list`]）から作られ、
-    /// **id は email**。表示ラベルは組織名の抑制で変わるので同一性に使えない
-    #[test]
-    fn the_account_menu_comes_from_the_stored_list_keyed_by_email() {
-        let active = Account::new("b@example.com", "hanako · Acme, Inc.");
-        let stored = vec![Account::new("a@example.com", "taro"), active.clone()];
-        let (mut app, _) = recording_app(Some(active), stored, false);
-        let sl = sidebar_layout(&app);
-        handle_mouse(&mut app, &click(3, sl.account_y)).unwrap();
-
-        let items = open_account_items(&app);
-        assert_eq!(
-            items.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
-            ["a@example.com", "b@example.com"],
-            "id must be the email"
-        );
-        // **アクティブな 1 件だけに ● が付き**、他は同じ桁数の空白で桁を揃える
-        assert_eq!(
-            items.iter().map(|a| a.label.as_str()).collect::<Vec<_>>(),
-            ["  taro", "● hanako · Acme, Inc."]
-        );
-        // 末尾は register current（保管 0 件でも残る項目）
-        assert_eq!(
-            labels(&app.popup.as_ref().unwrap().kind, app.grouping).last(),
-            Some(&"register current".to_string())
-        );
-    }
-
-    /// 保管された 2 件の表示ラベルが同じでも、クリックした行の email が対象になる。
-    /// ラベル文字列から対象を復元する実装では区別できない組み合わせ
-    #[test]
-    fn identical_labels_still_target_the_clicked_account() {
-        // アクティブはどちらでもない ＝ ● が付かず 2 行が完全に同じ文字列になる
-        let stored = vec![
-            Account::new("work@example.com", "ooba"),
-            Account::new("x-personal@example.com", "ooba"),
-        ];
-        let (mut app, recorded) =
-            recording_app(Some(Account::new("other@example.com", "other")), stored, false);
-        let sl = sidebar_layout(&app);
-        handle_mouse(&mut app, &click(3, sl.account_y)).unwrap();
-        assert_eq!(
-            open_account_items(&app)
-                .iter()
-                .map(|a| a.label.as_str())
-                .collect::<Vec<_>>(),
-            ["  ooba", "  ooba"],
-            "the labels must be identical for this test's premise"
-        );
-
-        // 2 行目（x-personal）を選んで 2 階層目 → switch
-        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
-        handle_mouse(&mut app, &click(rect.x + 1, rect.y + 2)).unwrap();
-        assert_eq!(
-            app.popup.as_ref().map(|p| &p.kind),
-            Some(&PopupKind::AccountActions {
-                account: account("  ooba", "x-personal@example.com"),
-            })
-        );
-        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
-        handle_mouse(&mut app, &click(rect.x + 1, rect.y + 1)).unwrap();
-        settle_account(&mut app);
-        assert_eq!(
-            *recorded
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            [Recorded::Switch {
-                email: "x-personal@example.com".to_string(),
-                outgoing: Outgoing::Known(ActiveAccount::unseen(Account::new(
-                    "other@example.com",
-                    "other"
-                ))),
-            }],
-            "the target must be the clicked row's account, not another"
-        );
-    }
-
-    /// 3 つの動作がそれぞれ正しい引数でドメインへ届く。**switch の第 2 引数
-    /// `active` は `footer.account` のアクティブアカウント**で、これが無いと
-    /// 出ていくアカウントの使い捨て refreshToken を落として戻れなくなる
-    #[test]
-    fn account_actions_reach_the_store_with_the_arguments_from_the_footer() {
-        let active = Account::new("a@example.com", "taro");
-        let stored = vec![active.clone(), Account::new("b@example.com", "hanako")];
-        let (mut app, recorded) = recording_app(Some(active.clone()), stored, false);
-
-        // **1 つずつ完了させる**: 要求は別スレッドで走り、進行中は次の要求を
-        // 受けないので（[`ACCOUNT_BUSY_NOTICE`]）、実運用の「押す → 終わる → 押す」と
-        // 同じ順序で流す
-        run_popup_action(&mut app, PopupAction::RegisterCurrent, 0);
-        settle_account(&mut app);
-        run_popup_action(
-            &mut app,
-            PopupAction::SwitchAccount("b@example.com".to_string()),
-            0,
-        );
-        settle_account(&mut app);
-        run_popup_action(
-            &mut app,
-            PopupAction::UnregisterAccount("b@example.com".to_string()),
-            0,
-        );
-        settle_account(&mut app);
-
-        assert_eq!(
-            *recorded
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            [
-                Recorded::Register(ActiveAccount::unseen(active.clone())),
-                Recorded::Switch {
-                    email: "b@example.com".to_string(),
-                    outgoing: Outgoing::Known(ActiveAccount::unseen(active)),
-                },
-                Recorded::Unregister("b@example.com".to_string()),
-            ]
-        );
-        assert!(app.notice.is_none(), "a successful action must not produce a notice");
-    }
-
-    /// 同じアカウントへの switch は「切替先 = アクティブ」の組で渡る。これが
-    /// ドメイン側の no-op 条件そのもの（[`crate::accounts::AccountStore::switch_to`]
-    /// は現行トークンを古い写しで上書きしない）で、実物での確認は
-    /// `source::tests::switching_to_the_active_account_changes_nothing` が持つ
-    #[test]
-    fn switching_to_the_active_account_passes_it_as_both_target_and_active() {
-        let active = Account::new("a@example.com", "taro");
-        let (mut app, recorded) = recording_app(Some(active.clone()), vec![active.clone()], false);
-        run_popup_action(
-            &mut app,
-            PopupAction::SwitchAccount("a@example.com".to_string()),
-            0,
-        );
-        settle_account(&mut app);
-        assert_eq!(
-            *recorded
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            [Recorded::Switch {
-                email: "a@example.com".to_string(),
-                outgoing: Outgoing::Known(ActiveAccount::unseen(active)),
-            }]
-        );
-        assert!(app.notice.is_none(), "a no-op must not be treated as a failure");
-    }
-
-    /// 保管する対象が無い（未取得・未ログイン）ときの `register current` は、
-    /// 何も送らずに理由を出す（押しても無反応に見せない）。
-    /// ここで書かれるのは診断ログ（`~/.ccdesk/error.log`）だけで、
-    /// 認証情報・保管ファイルには触らない
-    #[test]
-    fn register_current_without_a_known_account_says_why() {
-        let (mut app, recorded) = recording_app(None, Vec::new(), false);
-        run_popup_action(&mut app, PopupAction::RegisterCurrent, 0);
-        settle_account(&mut app); // 要求を出していなければ何もしない
-        assert!(
-            recorded
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "must not send a request when there is nothing to store"
-        );
-        assert!(app.notice.is_some(), "must not appear unresponsive");
-    }
-
-    /// 切替が失敗したら下部バーへ出す（**ドメインのエラー文をそのまま載せる**:
-    /// パスとロックの事情だけでトークンを含まないため）。
-    /// 通知は診断ログ（`~/.ccdesk/error.log`）にも 1 行残る＝ここで触る実ファイルは
-    /// それだけで、認証情報・保管ファイルには触らない
-    #[test]
-    fn a_failed_account_action_is_reported_in_the_bottom_bar() {
-        let active = Account::new("a@example.com", "taro");
-        let (mut app, _) = recording_app(Some(active.clone()), vec![active], true);
-        run_popup_action(
-            &mut app,
-            PopupAction::SwitchAccount("b@example.com".to_string()),
-            0,
-        );
-        settle_account(&mut app);
-        let (msg, _) = app.notice.as_ref().expect("the failure must be reported");
-        assert!(msg.contains("switch"), "which action failed is unclear: {msg:?}");
-        assert!(
-            msg.contains("lock is held by another process"),
-            "the domain's error text is missing: {msg:?}"
-        );
-    }
-
-    // ── アカウント操作の「操作列」テスト ────────────────────────────────
-    //
-    // ここから下は **実物の保管ストア（一時ディレクトリ）へ繋いで UI の操作列を
-    // そのまま流す**（[`AccountBackend::Store`]）。記録用の背板
-    // （[`AccountBackend::Recording`]）は引数を見るだけなので、
-    // 「切替の後に、まだ切替前の持ち主を材料に次の操作を走らせる」形のバグ
-    // ＝ 別アカウントの保管を使い捨ての refreshToken で潰す破壊は、そこでは
-    // 再現できない（実際にこの形で見落とされていた）
-
-    // フィクスチャは [`crate::accounts::tests`] のものを借りる（「実ホームを
-    // 触らない」境界の知識を複製しない）
-    use crate::accounts::tests::{credentials_doc, oauth, stored_oauth, TempHome};
-
-    const STORE_A: &str = "a@example.com";
-    const STORE_B: &str = "b@example.com";
-    const STORE_C: &str = "c@example.com";
-
-    /// A・B・C を保管済みで、**A でログイン中かつ A のトークンが更新済み**
-    /// （保管は `access-a`、現行は `access-a2`）の App。
-    ///
-    /// 「保管より現行が新しい」状態にしてあるのは、切替の巻き取りが効いているかが
-    /// この差でしか見えないため（使い捨ての refreshToken を落とすと戻れなくなる）
-    fn app_with_real_store(test: &str) -> (App, TempHome, crate::accounts::AccountStore) {
-        let home = TempHome::new(test);
-        let store = home.store();
-        for (email, label, token) in [
-            (STORE_C, "carol", "c"),
-            (STORE_B, "bob", "b"),
-            (STORE_A, "alice", "a"),
-        ] {
-            home.write_credentials(&credentials_doc(
-                &format!("access-{token}"),
-                &format!("refresh-{token}"),
-            ));
-            store.register(&home.active(email, label)).unwrap();
-        }
-        // A で作業してトークンが更新された（追従更新はまだ走っていない）
-        home.write_credentials(&credentials_doc("access-a2", "refresh-a2"));
-        let app = App {
-            footer: FooterInfo {
-                // ポーラーが「今は A」と判定した時点の観測
-                account: AccountStatus::LoggedIn(home.active(STORE_A, "alice")),
-                ..FooterInfo::default()
-            },
-            accounts: store.list(),
-            // **実物のストアを通す**（記録用では見えなかった破壊を捕まえる要）。
-            // 検査用に返す `store` とは別インスタンスにしてあるのは、
-            // ロックの取り合いを含めて本番と同じ経路を通すため
-            source: Arc::new(TestSource::for_accounts(AccountBackend::Store(
-                crate::accounts::AccountStore::new(home.paths()),
-            ))),
-            ..test_app(34, TERM)
-        };
-        (app, home, store)
-    }
-
-    /// メニューから switch を選ぶ 1 操作（完了まで見る）
-    fn switch(app: &mut App, email: &str) {
-        press_switch(app, email);
-        settle_account(app);
-    }
-
-    /// switch を**押すだけ**（完了を待たない）。進行中の状態を見るテスト用
-    fn press_switch(app: &mut App, email: &str) {
-        run_popup_action(app, PopupAction::SwitchAccount(email.to_string()), 0);
-    }
-
-    /// アカウント行が「今の持ち主」として持っている email
-    fn active_email(app: &App) -> &str {
-        active_account(app)
-            .map(|a| a.account.email.as_str())
-            .unwrap_or("")
-    }
-
-    /// 保管された `claudeAiOauth`（トークンが潰れていないかを見る）
-    fn stored(store: &crate::accounts::AccountStore, email: &str) -> Option<serde_json::Value> {
-        stored_oauth(store, email)
-    }
-
-    /// **切替が成功したら、次の操作はもう新しい持ち主を材料にする。**
-    /// A→B の後に B→C を押すと、以前は `switch_to(C, active=A)` が渡り、現行ファイル
-    /// （もう B）の `claudeAiOauth` を **A の保管へ** 書き込んでいた。refreshToken は
-    /// 使い捨てなので A は復旧不能になり、A と B の保管が同じ refreshToken を指すため
-    /// どちらか一方を使った瞬間に他方も死ぬ
-    #[test]
-    fn switching_again_does_not_overwrite_the_previous_account() {
-        let (mut app, home, store) =
-            app_with_real_store("switching_again_does_not_overwrite_the_previous_account");
-
-        switch(&mut app, STORE_B);
-        assert_eq!(
-            active_email(&app),
-            STORE_B,
-            "the account row must not keep the previous owner after a successful switch \
-             (the next action would use stale material)"
-        );
-
-        switch(&mut app, STORE_C);
-
-        assert_eq!(app.notice, None, "failed: {:?}", app.notice);
-        assert_eq!(
-            stored(&store, STORE_A),
-            Some(oauth("access-a2", "refresh-a2")),
-            "A's stored tokens must not be overwritten by B's (A would be unrecoverable)"
-        );
-        assert_eq!(
-            stored(&store, STORE_B),
-            Some(oauth("access-b", "refresh-b")),
-            "B's tokens must be captured on the way out"
-        );
-        assert_eq!(
-            home.read_credentials()["claudeAiOauth"],
-            oauth("access-c", "refresh-c"),
-            "must have switched to C"
-        );
-    }
-
-    /// 同じアカウントへの switch をもう一度押しても壊れない。
-    /// 以前は `●` が前の持ち主に付いたままだったので「効いていない」と見えて
-    /// もう一度押され、`switch_to(B, active=A)` で A の保管が潰れていた
-    #[test]
-    fn pressing_switch_twice_on_the_same_account_changes_nothing() {
-        let (mut app, home, store) =
-            app_with_real_store("pressing_switch_twice_on_the_same_account_changes_nothing");
-
-        switch(&mut app, STORE_B);
-        switch(&mut app, STORE_B);
-
-        assert_eq!(
-            stored(&store, STORE_A),
-            Some(oauth("access-a2", "refresh-a2")),
-            "A's stored tokens must not be overwritten by B's"
-        );
-        assert_eq!(
-            home.read_credentials()["claudeAiOauth"],
-            oauth("access-b", "refresh-b"),
-            "must not overwrite the current token with a stale copy"
-        );
-        // 何もしなかったことは伝える（無反応と成功を見分けられるようにする）
-        let (msg, _) = app.notice.as_ref().expect("a no-op must not appear unresponsive");
-        assert_eq!(msg, ALREADY_ACTIVE_NOTICE);
-    }
-
-    /// 切替直後の `register current` も同じ根。以前は `capture_current(A)` が
-    /// **現行 = B のトークンを A として保管**していた
-    #[test]
-    fn register_current_after_a_switch_stores_the_new_account() {
-        let (mut app, _home, store) =
-            app_with_real_store("register_current_after_a_switch_stores_the_new_account");
-
-        switch(&mut app, STORE_B);
-        run_popup_action(&mut app, PopupAction::RegisterCurrent, 0);
-        settle_account(&mut app);
-
-        assert_eq!(app.notice, None, "failed: {:?}", app.notice);
-        assert_eq!(
-            stored(&store, STORE_A),
-            Some(oauth("access-a2", "refresh-a2")),
-            "A's stored tokens must not be overwritten by B's"
-        );
-        assert_eq!(
-            stored(&store, STORE_B),
-            Some(oauth("access-b", "refresh-b")),
-            "must be able to store the currently logged in account"
-        );
-    }
-
-    /// **「間違えた、戻す」が効く。** 以前はアカウント行がまだ A だったので
-    /// `switch_to(A, active=A)` が渡り、同一アカウントの no-op ガードで黙って
-    /// 何もせず成功を返していた（現行は B のまま。稼働中セッションは次の
-    /// メッセージから B で喋り続ける）
-    #[test]
-    fn switching_back_to_the_previous_account_restores_it() {
-        let (mut app, home, _store) =
-            app_with_real_store("switching_back_to_the_previous_account_restores_it");
-
-        switch(&mut app, STORE_B);
-        switch(&mut app, STORE_A);
-
-        assert_eq!(app.notice, None, "failed: {:?}", app.notice);
-        assert_eq!(
-            home.read_credentials()["claudeAiOauth"],
-            oauth("access-a2", "refresh-a2"),
-            "must switch back to A (silently became a no-op instead)"
-        );
-        assert_eq!(active_email(&app), STORE_A);
-    }
-
-    /// **今の持ち主が分からないうちは切り替えない（起動直後の窓）。**
-    ///
-    /// 起動直後の ~350ms（`claude auth status` が返るまで）と、取得が失敗し続ける間は
-    /// [`AccountStatus::Unknown`]。アカウント行は空白に見えるが `app.accounts` は
-    /// 保管から読み込み済みなのでメニューは操作でき、**起動してすぐ切り替えると踏む**。
-    /// このとき「巻き取る対象が無い」と扱って上書きすると、登録済みアカウントが
-    /// 登録後にローテートした refreshToken（使い捨て）が保管へ入らないまま消えて
-    /// **復旧不能**になる。`register current` と同じく理由を出して拒否する
-    #[test]
-    fn switching_before_the_active_account_is_known_leaves_the_credentials_alone() {
-        let (mut app, home, store) = app_with_real_store(
-            "switching_before_the_active_account_is_known_leaves_the_credentials_alone",
-        );
-        // 起動直後（ポーラーがまだ誰がログインしているか答えていない）
-        app.footer.account = AccountStatus::Unknown;
-
-        switch(&mut app, STORE_B);
-
-        assert_eq!(
-            home.read_credentials()["claudeAiOauth"],
-            oauth("access-a2", "refresh-a2"),
-            "must not overwrite the current credentials while the owner is unknown \
-             (A's rotated refresh token would be lost)"
-        );
-        assert_eq!(
-            stored(&store, STORE_A),
-            Some(oauth("access-a", "refresh-a")),
-            "the stored account must not change (switch must not proceed without capture)"
-        );
-        assert!(app.notice.is_some(), "the reason for the refusal must be reported");
-    }
-
-    /// **「まだ観測できていない」と「主張が無い」は別物。** 巻き取る対象が無いと
-    /// **観測できている**ケース（email を返さない認証方式・未ログイン）は従来どおり通す
-    /// ＝ 上の拒否は `Unknown` だけを止める（保管できないアカウントで
-    /// 切替そのものが使えなくならない）
-    #[test]
-    fn switching_with_nothing_to_capture_still_works() {
-        let (mut app, home, _store) =
-            app_with_real_store("switching_with_nothing_to_capture_still_works");
-        // email を返さない認証方式（保管のキーが無い ＝ 巻き取れないが持ち主は言えている）
-        app.footer.account = AccountStatus::LoggedIn(home.active("", "claude.ai"));
-
-        switch(&mut app, STORE_B);
-
-        assert_eq!(app.notice, None, "failed: {:?}", app.notice);
-        assert_eq!(
-            home.read_credentials()["claudeAiOauth"],
-            oauth("access-b", "refresh-b"),
-            "must not block a switch when there is nothing to capture"
-        );
-
-        // 未ログイン（誰も持ち主でないと観測できている）も同じ
-        app.footer.account = AccountStatus::LoggedOut;
-        switch(&mut app, STORE_C);
-        assert_eq!(app.notice, None, "failed: {:?}", app.notice);
-        assert_eq!(
-            home.read_credentials()["claudeAiOauth"],
-            oauth("access-c", "refresh-c"),
-            "must not block a switch from being logged out"
-        );
-    }
-
-    /// **アカウント操作は UI スレッドをブロックしない。**
-    ///
-    /// 登録と切替は claude と共有する認証情報ロック（最大 9 秒）の下で保管ロック
-    /// （最大 2 秒）も取るので、前景で取ると **claude のトークン更新中に押した瞬間から
-    /// 最大約 11 秒、再描画も Ctrl+Q も効かない**（ハングに見える）。
-    ///
-    /// 併せて逃がした先の作法も固定する: 進行中はアカウント行が進行中の語を出し
-    /// （[`AccountAction::progress`]）、2 つ目の要求は受けず、完了したら結果が
-    /// アカウント行と保管一覧へ入る
-    #[test]
-    fn an_account_action_does_not_block_the_ui() {
-        let (mut app, home, store) = app_with_real_store("an_account_action_does_not_block_the_ui");
-        // claude がトークン更新中（認証情報ロックを保持）＝ ドメイン側は待たされる
-        let held = Lock::acquire(&home.paths().lock, Duration::ZERO, LOCK_STALE).unwrap();
-
-        let started = std::time::Instant::now();
-        press_switch(&mut app, STORE_B);
-        let blocked = started.elapsed();
-        assert!(
-            blocked < Duration::from_millis(500),
-            "the UI thread must not wait on the lock ({blocked:?})"
-        );
-
-        // 進行中であることが行に出る（進行表示が無いと固まったように見える）
-        assert_eq!(
-            app.account_job.as_ref().map(|job| job.progress),
-            Some("switching…"),
-            "the account row must show that it is in progress"
-        );
-        // 2 つ目の要求は受けない（多重実行の防止）。**黙って捨てない**
-        press_switch(&mut app, STORE_C);
-        let (msg, _) = app.notice.as_ref().expect("dropping the request must be reported");
-        assert!(msg.contains("account action running"), "what happened is unclear: {msg:?}");
-        assert!(!take_account_result(&mut app), "must not adopt a result before it finishes");
-
-        // claude がロックを離せば完了し、結果がアカウント行と保管一覧へ入る
-        drop(held);
-        settle_account(&mut app);
-        assert_eq!(active_email(&app), STORE_B, "the account row must reflect the result");
-        assert_eq!(
-            home.read_credentials()["claudeAiOauth"],
-            oauth("access-b", "refresh-b"),
-            "the switch must have happened"
-        );
-        assert_eq!(
-            stored(&store, STORE_A),
-            Some(oauth("access-a2", "refresh-a2")),
-            "A's outgoing tokens must be captured"
-        );
-        assert_eq!(app.accounts.len(), 3, "must refetch the stored account list");
-    }
-
-    /// **逃がしても「いつの観測か」は守られる。**
-    ///
-    /// 要求が運ぶのは押した時点の観測（[`ActiveAccount`]）で、それが今も有効かは
-    /// ドメイン側がロックの下で照合する。待っている間に別端末の `/login` や
-    /// トークン更新が入ったら**書かずに失敗する**（古い判断で切替を通すと、
-    /// 出ていく側の保管に別アカウントのトークンを書いて両方を復旧不能にする）。
-    /// これは前景で取っていた頃と同じ保証で、逃がしたことで崩れていないことを見る
-    #[test]
-    fn a_switch_running_off_thread_still_refuses_a_stale_observation() {
-        let (mut app, home, store) =
-            app_with_real_store("a_switch_running_off_thread_still_refuses_a_stale_observation");
-        let held = Lock::acquire(&home.paths().lock, Duration::ZERO, LOCK_STALE).unwrap();
-
-        press_switch(&mut app, STORE_B);
-        // 待っている間に別端末で /login された（指紋はサイズが変わるので必ず動く）
-        home.write_credentials(&credentials_doc("access-elsewhere", "refresh-elsewhere"));
-        drop(held);
-        settle_account(&mut app);
-
-        let (msg, _) = app.notice.as_ref().expect("a switch must not proceed on a stale observation");
-        assert!(
-            msg.contains("changed since ccdesk last checked"),
-            "the staleness reason is missing: {msg:?}"
-        );
-        assert_eq!(
-            home.read_credentials()["claudeAiOauth"],
-            oauth("access-elsewhere", "refresh-elsewhere"),
-            "must not overwrite credentials without knowing whose they are"
-        );
-        // 巻き取りも起きていない ＝ 登録したときの写しのまま（`access-a2` は
-        // 保管へ入っていない。切替が成功したときだけ巻き取られる値）
-        assert_eq!(
-            stored(&store, STORE_A),
-            Some(oauth("access-a", "refresh-a")),
-            "A's stored tokens must not change after giving up"
-        );
-    }
-
-    /// **アカウントのメニューは選べる項目だけ**（情報行を持たない）。
-    ///
-    /// 以前は末尾に「N sessions will switch」という選べない行を出していた。
-    /// 撤去したのは、切替の影響は押した後にアカウント行が示すもので、
-    /// メニューに数を並べても打つ手が増えないため
-    #[test]
-    fn the_account_menu_has_no_unselectable_note_row() {
-        let active = Account::new("a@example.com", "taro");
-        let (mut app, _) = recording_app(Some(active.clone()), vec![active], false);
-        // 稼働中のセッションがあっても項目は増えない
-        app.agents = vec![AgentInfo {
-            pid: Some(4242),
-            ..AgentInfo::default()
-        }];
-        let sl = sidebar_layout(&app);
-        handle_mouse(&mut app, &click(3, sl.account_y)).unwrap();
-        let kind = &app.popup.as_ref().expect("the account menu must open").kind;
-        let entries = kind.entries(app.grouping);
-        assert_eq!(
-            entries,
-            [("● taro".to_string(), true), ("register current".to_string(), true)],
-            "the account menu is not just the stored accounts plus register current"
-        );
-        assert!(
-            entries.iter().all(|(_, enabled)| *enabled),
-            "an unselectable row is back in the menu: {entries:?}"
-        );
-        assert!(
-            !entries.iter().any(|(label, _)| label.contains("will switch")),
-            "the switch note is back: {entries:?}"
-        );
     }
 
     /// 更新の入口のガード。**副作用（ダウンロード）が起きない経路だけを通す**:
@@ -5795,10 +4575,10 @@ mod tests {
         let id = SessionId::new("s");
         assert!(!only_row(&app).pinned, "the flag is already set to begin with");
 
-        run_popup_action(&mut app, PopupAction::TogglePin(id.clone()), 0);
+        run_popup_action(&mut app, PopupAction::TogglePin(id.clone()));
         assert!(only_row(&app).pinned, "the first pick does not set the flag");
 
-        run_popup_action(&mut app, PopupAction::TogglePin(id), 0);
+        run_popup_action(&mut app, PopupAction::TogglePin(id));
         assert!(!only_row(&app).pinned, "the second pick does not clear the flag");
     }
 
@@ -5813,15 +4593,15 @@ mod tests {
         app.hook_states = HookStates::from_entries([("s", "done", 2_000)]);
         assert!(app.hook_states.unread(only_row(&app)), "the premise (an unread row) broke");
 
-        run_popup_action(&mut app, PopupAction::TogglePin(id.clone()), 0);
+        run_popup_action(&mut app, PopupAction::TogglePin(id.clone()));
         assert!(app.hook_states.unread(only_row(&app)), "pinning cleared unread");
 
-        run_popup_action(&mut app, PopupAction::MarkRead(id.clone()), 0);
+        run_popup_action(&mut app, PopupAction::MarkRead(id.clone()));
         assert!(!app.hook_states.unread(only_row(&app)), "still unread after mark as read");
 
         // 既読の行を触っても未読は生えない（`updated_at` はマージのために進む）
         let before = only_row(&app).updated_at;
-        run_popup_action(&mut app, PopupAction::TogglePin(id), 0);
+        run_popup_action(&mut app, PopupAction::TogglePin(id));
         assert!(
             !app.hook_states.unread(only_row(&app)),
             "our own edit created an unread mark"
@@ -5847,7 +4627,7 @@ mod tests {
         app.hook_states = HookStates::from_entries([("s", "done", 2_000)]);
 
         // 未読の行への `mark as read`: 既読にはなるが行の姿は変わっていない
-        run_popup_action(&mut app, PopupAction::MarkRead(id.clone()), 0);
+        run_popup_action(&mut app, PopupAction::MarkRead(id.clone()));
         assert_eq!(only_row(&app).updated_at, 2_000, "mark as read reset the age");
         assert!(
             !app.hook_states.unread(only_row(&app)),
@@ -5855,11 +4635,11 @@ mod tests {
         );
 
         // もう一度押しても何も動かない
-        run_popup_action(&mut app, PopupAction::MarkRead(id.clone()), 0);
+        run_popup_action(&mut app, PopupAction::MarkRead(id.clone()));
         assert_eq!(only_row(&app).updated_at, 2_000, "a second mark as read reset the age");
 
         // 中身が変わる操作は進める（マージの後勝ち判定の材料なので必ず進む）
-        run_popup_action(&mut app, PopupAction::TogglePin(id), 0);
+        run_popup_action(&mut app, PopupAction::TogglePin(id));
         assert!(only_row(&app).updated_at > 2_000, "a real change did not advance the age");
     }
 
@@ -5871,7 +4651,7 @@ mod tests {
     fn stopping_a_row_keeps_the_row_and_writes_nothing_to_it() {
         let mut app = app_with_row("s");
         let before = app.sessions.clone();
-        run_popup_action(&mut app, PopupAction::Stop(SessionId::new("s")), 0);
+        run_popup_action(&mut app, PopupAction::Stop(SessionId::new("s")));
         assert_eq!(app.sessions, before, "stop wrote to the row (or removed it)");
     }
 
@@ -5892,7 +4672,7 @@ mod tests {
         std::fs::write(&transcript, "{}").unwrap();
 
         let mut app = app_with_row(id);
-        run_popup_action(&mut app, PopupAction::Close(SessionId::new(id)), 0);
+        run_popup_action(&mut app, PopupAction::Close(SessionId::new(id)));
 
         assert!(app.sessions.is_empty(), "the row is still in the list");
         assert!(transcript.exists(), "closing the row removed its transcript too");

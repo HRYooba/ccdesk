@@ -244,10 +244,52 @@ pub fn usage_cache_path() -> Option<std::path::PathBuf> {
     Some(ccdesk_dir()?.join("usage.json"))
 }
 
-/// 複数アカウントの保管先 ~/.ccdesk/accounts.json。
-/// **トークンを含む**ので、ログやエラーメッセージに中身を出さないこと
-pub fn accounts_store_path() -> Option<std::path::PathBuf> {
-    Some(ccdesk_dir()?.join("accounts.json"))
+/// 撤去したアカウント切り替えが使っていた保管ファイルの名前。
+/// **トークンを含む**ので、残っていれば起動時に消す（[`purge_account_store`]）
+const ACCOUNT_STORE: &str = "accounts.json";
+
+/// 撤去したアカウント切り替えの名残（`~/.ccdesk/accounts.json` とその付随物）を
+/// 消す。**呼ぶのは `main` の起動列だけ**（[`enable_error_log`] と同じ扱いで、
+/// `main` を通らないプロセス ＝ テストの実行ファイルは構造上ここへ到達しない）。
+///
+/// **無ければ何もしない**（ログも出さない）。失敗しても起動は止めない:
+/// 消せなかったところで ccdesk はもうこのファイルを読まないので、
+/// 起動を止める理由にならない
+pub fn purge_account_store() {
+    let Some(store) = ccdesk_dir().map(|dir| dir.join(ACCOUNT_STORE)) else {
+        return;
+    };
+    if remove_account_store(&store) {
+        // **1 行だけ残す。** 消えた理由が分からないと、保管を頼りにしていた人が
+        // 「壊れた」と読む（`ccdesk logs` に出る）
+        log_error("removed the account store (account switching was dropped)");
+    }
+}
+
+/// 保管ファイル本体・そのロック・書きかけの `.tmp` を消す。
+/// 戻り値は**本体を消したか**（付随物だけが残っていた場合はログを出さない）。
+///
+/// **パスを引数で受ける**のはテストが実ユーザーの `~/.ccdesk` を触らないため。
+/// tmp は古さ（[`TMP_KEEP`]）を見ずに消す: このファイルを書く者はもう居ないので、
+/// 「今まさに書いている別インスタンスの tmp」は存在しない
+fn remove_account_store(store: &Path) -> bool {
+    let removed = std::fs::remove_file(store).is_ok();
+    // ロックの実体はディレクトリ（[`Lock`]）
+    let _ = std::fs::remove_dir_all(lock_path_for(store));
+    if let (Some(dir), Some(name)) = (store.parent(), store.file_name().and_then(|n| n.to_str()))
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|file| is_leftover_tmp(file, name))
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    removed
 }
 
 /// セッション一覧の正本 ~/.ccdesk/sessions.json。
@@ -336,17 +378,17 @@ fn now_iso() -> String {
 // ---------------------------------------------------------------------------
 // 複数プロセスで共有するファイルへの書き込み（advisory lock + tmp → rename）。
 //
-// **ここに置いてある理由**: 守る対象が 2 系統ある（`~/.claude/.credentials.json` と
-// `~/.ccdesk/accounts.json` = ドメイン層の accounts モジュール、`~/.ccdesk/state.json` と
-// `config.json` = このファイルの kv 群）。「どう安全に書くか」の知識を系統ごとに
-// 持つと、片方だけ直した状態が生まれる（実際に起きた: 保管ファイル側は pid + 連番の
-// tmp 名で同時書き込みを避けているのに、state.json 側は全インスタンス共通の
-// `state.json.tmp` を使っていた）。**仕組みは 1 つ、守る対象ごとに違うのは
+// **ここに置いてある理由**: 守る対象が複数ある（`~/.ccdesk/sessions.json` =
+// ドメイン層の sessions モジュール、`~/.ccdesk/hook-states.json` = hooks モジュール、
+// `~/.ccdesk/state.json` と `config.json` = このファイルの kv 群）。
+// 「どう安全に書くか」の知識を対象ごとに持つと、片方だけ直した状態が生まれる
+// （実際に起きた: 一方は pid + 連番の tmp 名で同時書き込みを避けているのに、
+// state.json 側は全インスタンス共通の `state.json.tmp` を使っていた）。**仕組みは 1 つ、守る対象ごとに違うのは
 // 「どのロックを使うか」と「どれだけ待つか」だけ**にしてある。
 // ---------------------------------------------------------------------------
 
 /// proper-lockfile のロック名は `<target>.lock`（拡張子の置換ではなく **付加**）。
-/// 設定ホーム `~/.claude` に対しては `~/.claude.lock` になる
+/// ディレクトリを対象にしても同じ規則で、`<dir>.lock` が隣に並ぶ
 pub fn lock_path_for(target: &Path) -> PathBuf {
     let mut name = target.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
@@ -363,50 +405,38 @@ const LOCK_MAX_STEALS: u32 = 3;
 
 /// ファイル 1 本を守る advisory lock（RAII）。
 ///
-/// 用途は 2 つあり、**プロトコルは claude 側に合わせた 1 つだけ**を持つ:
-/// - `~/.claude/.credentials.json`（claude と**共有する**ロック `~/.claude.lock`）
-/// - ccdesk 自身のファイル（`accounts.json` / `state.json` / `config.json`。
-///   claude は触らないが、ccdesk を複数起動すると読み書きが交差する）
+/// 守るのは **ccdesk 自身のファイル**（`sessions.json` / `hook-states.json` /
+/// `state.json` / `config.json`）。claude は触らないが、ccdesk を複数起動すると
+/// 読み書きが交差する。仕組みを 1 つに保つのは、「どう排他するか」の知識を
+/// 2 通り持つと片方だけ直した状態が生まれるため。違いは**どのファイルを守り、
+/// どれだけ待つか**だけで、それは呼び手（守る対象を知っている側）が決める。
 ///
-/// 後者に別の仕組みを作らないのは、「どう排他するか」の知識を 2 通り持つと
-/// 片方だけ直した状態が生まれるため。違いは**どのファイルを守り、どれだけ待つか**
-/// だけで、それは呼び手（守る対象を知っている側）が決める。
-///
-/// claude Code は OAuth トークン更新を npm `proper-lockfile` で保護している。
-/// 合わせる必要があるプロトコル:
+/// **プロトコルは npm `proper-lockfile`**（claude Code が OAuth トークン更新を
+/// 保護しているのと同じもの）に合わせてある。自作せずに借りたのは、
+/// 実装が枯れていて分解能や stale の扱いを実測で確かめられるため:
 /// - ロックの実体は **ディレクトリ** `<target>.lock`。`mkdir` の原子性が mutex
 /// - mtime が 10 秒より古いロックは stale とみなして奪ってよい
 /// - 保持者は 5 秒ごとに mtime を touch して生存を示す
-/// - claude は取れないとき 1〜2 秒のジッタ付きで 5 回リトライしてから諦める
-///   （＝短時間の保持は協調的で、待たせても壊れない）
-///
-/// ロックを取らずに書くと、claude のトークン更新（読む → ネットワーク更新 → 保存を
-/// `~/.claude.lock` の下で行う）と衝突し、**差し替えた認証情報が旧アカウントの
-/// 更新済みトークンで上書きされる**。
 ///
 /// # 解放は所有権を確認してから行う
 ///
 /// 取得した瞬間の mtime を所有権の印として持ち、[`Drop`] では **それが今も
 /// 一致するときだけ** `rmdir` する。無条件に消すと、自分のロックが stale 判定で
-/// 奪われた後（奪取は rmdir → mkdir なので mtime が変わる）に **奪った側＝claude の
-/// ロックを消してしまい**、トークン更新の最中に第三者が入れる状態を作る。
-/// それはこのロックがまさに防ごうとしている上書きそのもので、使い捨ての
-/// refreshToken が壊れるとログインは復旧不能になりうる。
+/// 奪われた後（奪取は rmdir → mkdir なので mtime が変わる）に **奪った側の
+/// ロックを消してしまい**、守っていたはずの区間に第三者が入れる状態を作る
+/// ＝ このロックがまさに防ごうとしている上書きそのものになる。
 ///
 /// 印に mtime を選んだ理由:
-/// - **claude 側（proper-lockfile）も同じ基準で所有権を見ている。** 取得時の mtime と
-///   現在の mtime が違えば "compromised" と判定する実装で、claude のバイナリにも
-///   その痕跡（`mtimePrecision` / `ECOMPROMISED` / `onCompromised` /
-///   `Unable to update lock within the stale threshold` の文字列）がある
+/// - **proper-lockfile も同じ基準で所有権を見ている。** 取得時の mtime と
+///   現在の mtime が違えば "compromised" と判定する実装
 /// - **ロックディレクトリの中に印のファイルは置けない。** 奪う側は `rmdir` で
-///   消すが、非空ディレクトリの `rmdir` は `ENOTEMPTY` で失敗する（この定数も
-///   claude のバイナリにある）。中身を置くと claude が stale ロックを回収できず、
-///   トークン更新が永久に失敗しうる
+///   消すが、非空ディレクトリの `rmdir` は `ENOTEMPTY` で失敗する ＝
+///   中身を置くと stale ロックを誰も回収できなくなる
 ///
 /// mtime の分解能（NTFS は 100ns 刻み）より短い間隔で奪われると判別できないが、
 /// 奪取は「mtime が 10 秒より古い」ことが前提なので実運用では起きない。
 ///
-/// **mtime を更新するスレッドは持たない。** ここでの保持は小さなファイル 2 本の
+/// **mtime を更新するスレッドは持たない。** ここでの保持は小さなファイル 1 本の
 /// 読み書き（ミリ秒）で、stale 閾値 10 秒に対して十分短い。仮に環境要因
 /// （ウイルス対策のスキャン・スリープ復帰）で 10 秒を超えて奪われても、
 /// 上の所有権確認があるので他者のロックを消すことはなく、こちらの書き込みが
@@ -424,8 +454,8 @@ pub struct Lock {
 impl Lock {
     /// `wait` まで待って取る。`stale` より古いロックは奪う
     pub fn acquire(path: &Path, wait: Duration, stale: Duration) -> anyhow::Result<Self> {
-        // ロックの置き場所が無いと mkdir は必ず失敗する。保管ファイル用のロックは
-        // 初回起動（`~/.ccdesk` がまだ無い）で実際にこの状況になる
+        // ロックの置き場所が無いと mkdir は必ず失敗する。`~/.ccdesk` 配下の
+        // ロックは初回起動（そのディレクトリがまだ無い）で実際にこの状況になる
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -519,8 +549,7 @@ pub fn is_leftover_tmp(name: &str, target: &str) -> bool {
 /// tmp → rename で置く（読み手が書きかけの JSON を見ないため）。
 /// tmp は同じディレクトリに作る（別ボリュームだと rename が失敗する）。
 /// 名前は pid + 連番で一意にする（同じパスへの同時書き込みで tmp を共有しない）。
-/// **rename 前に取り残された tmp は起動時に回収する**
-/// （[`reap_leftover_tmp`]。保管ファイルの tmp は中身がトークンなので放置しない）
+/// **rename 前に取り残された tmp は起動時に回収する**（[`reap_leftover_tmp`]）
 pub fn write_json_atomically(path: &Path, value: &serde_json::Value) -> anyhow::Result<()> {
     static SEQ: AtomicUsize = AtomicUsize::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -534,8 +563,7 @@ pub fn write_json_atomically(path: &Path, value: &serde_json::Value) -> anyhow::
     let text = serde_json::to_string_pretty(value)?;
     // **rename の前に中身をディスクへ確定させる。** rename 自体は NTFS の
     // メタデータジャーナルで守られるが、tmp の中身は守られない。電源断で
-    // 0 バイトの `.credentials.json` が残ると、claude 本体から見て全アカウントの
-    // ログインが飛ぶ（保管ファイル側なら全アカウントの保管が飛ぶ）。
+    // 0 バイトの `sessions.json` が残ると、一覧が丸ごと飛ぶ。
     // 小さなファイル 1 本なので代償は小さい
     if let Err(e) = write_and_sync(&tmp, text.as_bytes()) {
         let _ = std::fs::remove_file(&tmp); // 中間ファイルを残さない
@@ -560,8 +588,8 @@ fn write_and_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub const TMP_KEEP: Duration = Duration::from_secs(3600);
 
 /// `target` の書きかけ `.tmp` を回収する。**[`write_json_atomically`] が
-/// rename する前にプロセスが死ぬと、その tmp は誰にも消されずに残る**
-/// （保管ファイルなら中身はトークン）。`update::cleanup_old_exe` と同じ
+/// rename する前にプロセスが死ぬと、その tmp は誰にも消されずに残る**。
+/// `update::cleanup_old_exe` と同じ
 /// 「次にプロセスを起こしたときに片付ける」方式。
 ///
 /// **tmp の名前を決めるのと同じ場所に置いてある**のが要点で、名前の形
@@ -598,7 +626,7 @@ pub fn reap_leftover_tmp(target: &Path) {
 }
 
 /// 起動時の掃除: ウィンドウ状態・設定の書きかけ `.tmp` を回収する。
-/// **保管ファイル側（`AccountStore::cleanup_leftover_tmp`）と同じ理由**で、
+/// **他の書き手（`SessionStore` / `hooks`）と同じ理由**で、
 /// tmp 名が一意になった以上、rename 前に死んだ分は積もる
 pub fn reap_leftover_kv_tmp() {
     for target in [state_path(), settings_path()].into_iter().flatten() {
@@ -669,7 +697,7 @@ const KV_LOCK_WAIT: Duration = Duration::from_millis(500);
 /// ロックは 2 段で、プロセス内（[`KV_LOCK`]）と**インスタンス間**
 /// （[`KV_LOCK_WAIT`]）の両方を閉じる: 前者だけでは多重起動で読み書きが交差する。
 ///
-/// 置き換えは [`write_json_atomically`]（保管ファイルと同じ 1 実装）。
+/// 置き換えは [`write_json_atomically`]（他の書き手と同じ 1 実装）。
 /// **自前で tmp を書かない**のが要点で、以前ここは全インスタンス共通の
 /// `state.json.tmp` を使っており、同時保存で他インスタンスの tmp を rename して
 /// 「成功したのに自分の内容が乗っていない」状態を作れた。
@@ -877,6 +905,44 @@ mod tests {
         path
     }
 
+    /// **撤去したアカウント切り替えの名残を、起動時に一式まとめて消す。**
+    ///
+    /// 消すのは保管ファイル本体だけでは足りない: 書きかけの `.tmp` にも
+    /// **同じトークンが入っている**ので、本体だけ消しても隣に残り続ける。
+    /// ロック（ディレクトリ）も、誰も取らなくなった以上ただのごみになる。
+    ///
+    /// **実ユーザーの `~/.ccdesk` は触らない**（パスを引数で受ける形にしてある理由）
+    #[test]
+    fn purging_the_account_store_takes_its_lock_and_tmp_files_with_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "ccdesk-test-{}-account-store-purge",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join(ACCOUNT_STORE);
+
+        // 何も無ければ何もしない（＝ ログを出す理由が無い）
+        assert!(!remove_account_store(&store), "reported a removal that did not happen");
+
+        std::fs::write(&store, "{\"accounts\": {}}").unwrap();
+        std::fs::create_dir_all(lock_path_for(&store)).unwrap();
+        // tmp 名は書き手が付ける形をそのまま使う（名前の規則を書き写さない）
+        let tmp = dir.join(format!("{ACCOUNT_STORE}.{}-0.tmp", std::process::id()));
+        std::fs::write(&tmp, "{}").unwrap();
+        // 無関係なファイルは巻き込まない
+        let other = dir.join("sessions.json");
+        std::fs::write(&other, "{}").unwrap();
+
+        assert!(remove_account_store(&store), "did not report removing the store");
+        assert!(!store.exists(), "the account store is still there");
+        assert!(!lock_path_for(&store).exists(), "the lock directory is still there");
+        assert!(!tmp.exists(), "a tmp file with tokens in it is still there");
+        assert!(other.exists(), "removed a file that is not the account store");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 壊れた / 古い形式の state.json でも読みは失敗しない（＝起動が止まらない）。
     /// 保存形式を足したときに一番壊れやすいのがここなので、想定外の形を並べて固定する
     #[test]
@@ -1016,7 +1082,7 @@ mod tests {
     /// tmp が全インスタンス共通（`state.json.tmp`）だと、同時保存で
     /// 「A が tmp を書く → B が同じ tmp を上書き → A が rename して成功を返す」
     /// が成立し、**成功を返した A の内容ではなく B の内容がディスクに乗る**。
-    /// 保管ファイル側（`accounts.json`）は pid + 連番の tmp 名でこれを塞いでいたのに、
+    /// 他の書き手は pid + 連番の tmp 名でこれを塞いでいたのに、
     /// こちらは塞いでいなかった ＝ 同じ危険に対策が 2 通りあった。
     ///
     /// 状況は **共有を許さないハンドル**で作る: 別インスタンスが tmp を掴んでいる間、
@@ -1130,8 +1196,7 @@ mod tests {
     }
 
     /// **奪われた後の Drop で他者のロックを消してはいけない。**
-    /// 消すと、claude がトークン更新の最中（`~/.claude.lock` の下で
-    /// 読む → ネットワーク更新 → 保存を行う）に第三者が入れる状態になり、
+    /// 消すと、奪った側が守っている区間へ第三者が入れる状態になり、
     /// このロック機構が防ごうとしている上書きそのものが起きる
     #[test]
     fn drop_keeps_a_lock_that_another_holder_took_over() {

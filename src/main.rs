@@ -12,7 +12,6 @@ use crossterm::event::{
 };
 use ccdesk::{load_setting, log_error};
 
-mod accounts;
 mod app;
 mod claude_format;
 mod cli;
@@ -39,6 +38,10 @@ fn main() -> anyhow::Result<()> {
     // では `log_error` は何も書かない ＝ `cargo test` がユーザーの
     // `~/.ccdesk/error.log` を汚さない（[`ccdesk::enable_error_log`]）
     ccdesk::enable_error_log();
+    // アカウント切り替えを撤去したので、残っている保管ファイル（**トークンを含む**）を
+    // 消す。**エラーログを有効にした直後**に置くのは、消したことを 1 行残すため
+    // （[`ccdesk::purge_account_store`]）
+    ccdesk::purge_account_store();
     let mut demo = false;
     // フラグ/サブコマンドは TUI 起動前に処理
     match std::env::args().nth(1).as_deref() {
@@ -96,9 +99,6 @@ fn main() -> anyhow::Result<()> {
     let fixed_states = source.fixed_states();
     let footer = source.footer();
     let window = source.window_state();
-    // 保管済みアカウントは起動時に 1 度読む（以降はアカウント行を開いた時と
-    // 保管を変更した後に取り直す。変えるのはこの UI だけなのでポーリングしない）
-    let accounts = source.accounts();
 
     // ホスト端末の実 fg/bg を OSC 10/11 で照会。
     // raw mode / alt screen に入る前に行う。非対応端末はヒューリスティックで
@@ -172,7 +172,6 @@ fn main() -> anyhow::Result<()> {
         footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
         footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        accounts,
         claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
         ccdesk_latest: None,
@@ -181,7 +180,6 @@ fn main() -> anyhow::Result<()> {
         usage_display,
         usage: None,
         last_usage_read: instant_ago(Duration::from_secs(60)),
-        account_job: None,
         input_gate: None,
         notice: None,
         grouping: window.grouping,

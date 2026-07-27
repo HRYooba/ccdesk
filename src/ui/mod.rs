@@ -13,7 +13,7 @@ use tui_term::widget::PseudoTerminal;
 use ccdesk::dir_key;
 
 use crate::app::{
-    active_unstored, selected_enter, sidebar_cols, App, Focus, Popup, RightView, RowAction,
+    selected_enter, sidebar_cols, App, Focus, Popup, RightView, RowAction,
     SelfUpdate, SidebarPos, SidebarRow,
 };
 use crate::poll::{
@@ -645,45 +645,21 @@ fn row_body(label: &str, status: &str, age: &str, inner_width: u16) -> (String, 
     (name, " ".repeat(gap), tail)
 }
 
-/// 未保管警告のマーカー。**表示幅は実測 1 桁**（U+26A0 / unicode-width 0.2.2 で `1`。
-/// 異体字セレクタを付けた `⚠️` は 2 桁になるので、素の 1 文字で持つ）。
-/// 既定のサイドバー幅（内側 32 桁）にアカウント行を収める前提がこの実測値に乗っている
-const WARN_MARK: &str = "⚠";
-
-/// 未ログインのときのアカウント行。**再ログインの手順まで出す。**
-///
-/// 保管したアカウントのリフレッシュトークンは使い捨てで、ccdesk が動いていない間に
-/// 別の場所でそのアカウントを使うと保管が無効になる。切替直後にこの状態へ落ちるのが
-/// その現れで、**事前検知はしない**（検知には ccdesk 自身がトークン更新
-/// エンドポイントを叩く必要があり、それは claude Code の client_id を借用する
-/// 行為なので意図的に避けている）。事後にこの行で気づけることが唯一の出口なので、
-/// 状態だけでなく打つ手も書く。文面は `ccdesk doctor` の案内と同じ語彙にそろえる
+/// 未ログインのときのアカウント行。**再ログインの手順まで出す**
+/// （状態だけ出しても打つ手が分からない）。
+/// 文面は `ccdesk doctor` の案内と同じ語彙にそろえる
 const LOGGED_OUT_ROW: &str = "not logged in · run /login";
 
-/// アカウント行の文面とスタイル。Frame に触らない純関数なので、`⚠` の有無と
-/// 桁数をテストで固定できる。`unstored` は [`active_unstored`] の判定。
+/// アカウント行の文面とスタイル。Frame に触らない純関数なので、文面と桁数を
+/// テストで固定できる。
 ///
-/// `pending` は進行中のアカウント操作の語（[`crate::app::AccountJob`]）。
-/// **進行中は他の何よりこれを出す**: 操作は別スレッドで走り最大 11 秒かかりうるので、
-/// 何も出さないと「押したのに変わらない行」に見える（版行が `updating…` を出すのと
-/// 同じ方針で、語彙は要求の側が持つ）。進行中の値は「今の持ち主」ではないので、
-/// `⚠` も dim も付けない（判断材料が確定していない間の見た目を作り分けない）
-fn account_row(status: &AccountStatus, unstored: bool, pending: Option<&str>) -> (String, Style) {
-    if let Some(progress) = pending {
-        return (progress.to_string(), Style::default().fg(ui().dim));
-    }
+/// **出すだけの行**（押しても何も起きない）。ccdesk がアカウントについて答えるのは
+/// 「今サインインしているのは誰か」だけなので、警告も進行中の語も持たない
+/// （アカウントの切り替えを撤去した理由は `docs/foreground-migration.md`）
+fn account_row(status: &AccountStatus) -> (String, Style) {
     match status {
-        // 未保管のときは `⚠` を前置し、色も dim から注意色へ上げる。dim のままだと
-        // 登録し忘れに気づけず、次の /login で前のアカウントの認証情報が
-        // 上書きされて失われる（`.credentials.json` は常に 1 アカウント分だけ）
-        AccountStatus::LoggedIn(active) if unstored => (
-            format!("{WARN_MARK} {}", active.account.label),
-            Style::default().fg(C_ATTENTION),
-        ),
-        // 出すのはラベルだけ（email は同一性の保持用で、行には出さない）
-        AccountStatus::LoggedIn(active) => {
-            (active.account.label.clone(), Style::default().fg(ui().dim))
-        }
+        // 出すのはラベル（`alice` または `alice · Acme, Inc.`）
+        AccountStatus::LoggedIn(label) => (label.clone(), Style::default().fg(ui().dim)),
         AccountStatus::LoggedOut => {
             (LOGGED_OUT_ROW.to_string(), Style::default().fg(C_ATTENTION))
         }
@@ -1233,14 +1209,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             Rect::new(fx, account_y - 1, fw, 1),
         );
         // アカウント行（表示名 · 組織名）。文面の判断は account_row に閉じる。
-        // **この行はクリックでもキーボードでも押せる**（アカウントメニューの入口。
-        // 当たり判定は handle_mouse 側が同じ `sidebar_layout` の account_y で持ち、
+        // **選択とホバーはできるが押しても何も起きない行**（当たり判定は
+        // handle_mouse 側が同じ `sidebar_layout` の account_y で持ち、
         // キーボードの選択は [`SidebarPos::Account`]）
-        let (account, mut account_style) = account_row(
-            &app.footer.account,
-            active_unstored(app),
-            app.account_job.as_ref().map(|job| job.progress),
-        );
+        let (account, mut account_style) = account_row(&app.footer.account);
         // 選択中・ホバー中は一覧の行とまったく同じ見え方にする
         // （キーボードで降りてもマウスを乗せても「今ここ」が同じ帯で分かる）
         account_style = Look::at(app, SidebarPos::Account, false).band(account_style);
@@ -1847,26 +1819,20 @@ mod tests {
         assert_eq!(clip_to_width(wide, 0), "");
     }
 
-    /// アカウント行に出るのは [`crate::accounts::Account`] の **ラベルだけ**。
-    /// email は保管のキー（同一性）として持ち回すだけで、行には出さない。
+    /// **今サインインしているアカウントがフッターに出る。**
     ///
     /// ジオメトリだけを見る他のフッターテストと違い、ここは実際に 1 フレーム
     /// 描いて中身を見る: 版行が上部へ移って 2 行固定になったフッターと、
-    /// アカウントが `String` から `Account` になった変更が噛み合っていることは、
-    /// 「その行に何が出たか」でしか固定できない。
+    /// アカウント行が噛み合っていることは「その行に何が出たか」でしか固定できない。
     /// 供給元は [`DemoSource`] 既定の `App`（ファイルもネットワークも触らない）
     #[test]
-    fn account_row_renders_the_label_without_the_email() {
-        use crate::accounts::{Account, ActiveAccount};
+    fn the_account_row_shows_the_signed_in_account() {
         use crate::poll::FooterInfo;
 
         let mut app = App {
             term_size: (120, 30),
             footer: FooterInfo {
-                account: AccountStatus::LoggedIn(ActiveAccount::unseen(Account::new(
-                    "you@example.com",
-                    "you · Acme, Inc.",
-                ))),
+                account: AccountStatus::LoggedIn("you · Acme, Inc.".to_string()),
                 current: "2.1.220".to_string(),
                 latest: None,
             },
@@ -1889,11 +1855,6 @@ mod tests {
         assert!(
             row(sl.account_y).contains("you · Acme, Inc."),
             "the account row has no label: {:?}",
-            row(sl.account_y)
-        );
-        assert!(
-            !row(sl.account_y).contains('@'),
-            "the row shows the email: {:?}",
             row(sl.account_y)
         );
         assert!(
@@ -2873,69 +2834,27 @@ mod tests {
         }
     }
 
-    /// 未保管警告 `⚠` の表示幅は **1 桁**。既定幅（内側 32 桁）にアカウント行を
-    /// 収める前提がこの実測値に乗っているので固定する（幅の判定は文字ごとに違い、
-    /// 中には端末によって変わる曖昧なものもある ＝ 実測しないと分からない）
-    #[test]
-    fn the_warning_mark_is_one_column_wide() {
-        use unicode_width::UnicodeWidthStr;
-        assert_eq!(WARN_MARK.width(), 1, "WARN_MARK is not 1 column wide");
-        assert_eq!(
-            WARN_MARK.chars().count(),
-            1,
-            "a variation selector slipped in — emoji presentation makes it 2 columns wide"
-        );
-    }
-
     /// テスト内でアカウント行の文面だけを見るための短縮
-    fn row_text(status: &AccountStatus, unstored: bool) -> String {
-        account_row(status, unstored, None).0
+    fn row_text(status: &AccountStatus) -> String {
+        account_row(status).0
     }
 
-    /// **アクティブなアカウントが未保管のときだけ `⚠` を前置する。**
-    /// 保管済みなら付けない（常時出ていると警告の意味が無くなる）
+    /// **行に出るのは今サインインしているアカウントのラベルだけ。**
+    /// 未取得は空行のまま（誤情報を出さない）
     #[test]
-    fn account_row_marks_only_an_unstored_active_account() {
-        use crate::accounts::{Account, ActiveAccount};
-        let logged_in = AccountStatus::LoggedIn(ActiveAccount::unseen(Account::new(
-            "you@example.com",
-            "you · Acme, Inc.",
-        )));
-
-        assert_eq!(row_text(&logged_in, true), "⚠ you · Acme, Inc.");
+    fn account_row_shows_the_label_as_is() {
         assert_eq!(
-            row_text(&logged_in, false),
-            "you · Acme, Inc.",
-            "a stored account still shows the warning"
+            row_text(&AccountStatus::LoggedIn("you · Acme, Inc.".to_string())),
+            "you · Acme, Inc."
         );
-        // 未取得は空行のまま（誤情報を出さない）。未ログインは行そのものが警告なので
-        // ⚠ は前置しない ＝ ⚠ は「未保管」だけを意味する
-        assert_eq!(row_text(&AccountStatus::Unknown, true), "");
-        assert_eq!(row_text(&AccountStatus::LoggedOut, true), LOGGED_OUT_ROW);
-        assert!(!LOGGED_OUT_ROW.contains(WARN_MARK));
+        assert_eq!(row_text(&AccountStatus::Unknown), "");
+        assert_eq!(row_text(&AccountStatus::LoggedOut), LOGGED_OUT_ROW);
     }
 
-    /// **進行中のアカウント操作は行に出る**（版行の `updating…` と同じ方針）。
-    /// 操作は別スレッドで走り最大 11 秒かかりうるので、出さないと「押したのに
-    /// 変わらない行」に見える。⚠ より優先するのは、進行中の値がまだ
-    /// 「今の持ち主」ではないため（確定していない間の見た目を作り分けない）
-    #[test]
-    fn the_account_row_shows_a_running_account_action() {
-        use crate::accounts::{Account, ActiveAccount};
-        let active = AccountStatus::LoggedIn(ActiveAccount::unseen(Account::new(
-            "a@example.com",
-            "you",
-        )));
-        let (text, _) = account_row(&active, true, Some("switching…"));
-        assert_eq!(text, "switching…", "the running action is not shown on the row");
-        assert!(!text.contains(WARN_MARK), "a value that is not settled yet is marked with ⚠");
-    }
-
-    /// 未ログインの行は **再ログインの手順まで出す**。保管トークンの期限切れも
-    /// この状態で現れる（事前検知はしない方針なので、ここが唯一の気づきどころ）
+    /// 未ログインの行は **再ログインの手順まで出す**（状態だけでは打つ手が分からない）
     #[test]
     fn account_row_prompts_a_login_when_logged_out() {
-        let (text, style) = account_row(&AccountStatus::LoggedOut, false, None);
+        let (text, style) = account_row(&AccountStatus::LoggedOut);
         assert!(text.contains("not logged in"), "{text:?}");
         assert!(text.contains("/login"), "the row does not say how to log back in: {text:?}");
         assert_eq!(
@@ -2945,28 +2864,21 @@ mod tests {
         );
     }
 
-    /// 既定のサイドバー幅（34 桁 = 内側 32 桁）でアカウント行が切られない。
-    /// `⚠ ` の 2 桁ぶんが増えても、現実的なラベルなら収まることの固定
+    /// 既定のサイドバー幅（34 桁 = 内側 32 桁）でアカウント行が切られない
     #[test]
     fn account_row_fits_the_default_sidebar_width() {
-        use crate::accounts::{Account, ActiveAccount};
         use unicode_width::UnicodeWidthStr;
         // README・撮影データに出る実寸のラベルと、表示幅 2 の文字（全角）を含む
-        // ラベル。`⚠ ` の 2 桁が乗っても切れないことを見たいので幅 2 の文字が要る。
-        // 源を ASCII に保つため \u エスケープで書く（表示幅 4 桁の 2 文字）
+        // ラベル。源を ASCII に保つため \u エスケープで書く（表示幅 4 桁の 2 文字）
         let wide = format!("{} · 1→10, Inc.", "\u{5927}\u{5834}");
         for label in ["ooba · 1→10, Inc.", "you · Acme, Inc.", wide.as_str()] {
-            let status =
-                AccountStatus::LoggedIn(ActiveAccount::unseen(Account::new("you@example.com", label)));
-            for unstored in [false, true] {
-                let text = row_text(&status, unstored);
-                assert_eq!(
-                    clip_to_width(&text, DEFAULT_INNER),
-                    text,
-                    "clipped at the default width: {text:?} ({} cols / inner {DEFAULT_INNER} cols)",
-                    text.width()
-                );
-            }
+            let text = row_text(&AccountStatus::LoggedIn(label.to_string()));
+            assert_eq!(
+                clip_to_width(&text, DEFAULT_INNER),
+                text,
+                "clipped at the default width: {text:?} ({} cols / inner {DEFAULT_INNER} cols)",
+                text.width()
+            );
         }
         // 未ログインの案内も切ってはいけない（打つ手が読めなくなる）
         assert_eq!(
@@ -2977,63 +2889,17 @@ mod tests {
         );
     }
 
-    /// 実際に 1 フレーム描いた結果でも `⚠` の出方が変わる。判定は
-    /// [`active_unstored`]（アクティブな email が保管の写しに居るか）なので、
-    /// 保管に加えた瞬間に消えることまで含めて固定する
-    #[test]
-    fn the_drawn_account_row_warns_until_the_active_account_is_stored() {
-        use crate::accounts::Account;
-
-        let active = active_account();
-        let drawn = |accounts: Vec<Account>| -> String {
-            let mut app = app_with_account_row(accounts);
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
-            terminal
-                .draw(|frame| {
-                    draw(frame, &mut app);
-                })
-                .unwrap();
-            let buffer = terminal.backend().buffer();
-            let y = sidebar_layout_of(29, 34).account_y;
-            (0..120).map(|x| buffer[(x, y)].symbol()).collect()
-        };
-
-        let unstored = drawn(Vec::new());
-        assert!(
-            unstored.contains(WARN_MARK) && unstored.contains("you · Acme, Inc."),
-            "an unstored active account is not warned about: {unstored:?}"
-        );
-        // 別アカウントだけが保管されていても、アクティブな 1 件が未保管なら警告する
-        let other = drawn(vec![Account::new("other@example.com", "other")]);
-        assert!(other.contains(WARN_MARK), "storing a different email cleared the warning: {other:?}");
-        // アクティブなアカウントを保管したら消える
-        let stored = drawn(vec![active.clone()]);
-        assert!(
-            !stored.contains(WARN_MARK) && stored.contains("you · Acme, Inc."),
-            "the warning is still there after the active account was stored: {stored:?}"
-        );
-    }
-
-    /// アカウント行に出るアクティブなアカウント
-    fn active_account() -> crate::accounts::Account {
-        crate::accounts::Account::new("you@example.com", "you · Acme, Inc.")
-    }
-
-    /// [`active_account`] でログイン済みの `App`。保管の写し（⚠ の出方を決める）は
-    /// テストごとに変わるので引数で受ける
-    fn app_with_account_row(accounts: Vec<crate::accounts::Account>) -> App {
-        use crate::accounts::ActiveAccount;
+    /// ログイン済みのアカウント行を持つ `App`
+    fn app_with_account_row() -> App {
         use crate::poll::FooterInfo;
 
         App {
             term_size: (120, 30),
             footer: FooterInfo {
-                account: AccountStatus::LoggedIn(ActiveAccount::unseen(active_account())),
+                account: AccountStatus::LoggedIn("you · Acme, Inc.".to_string()),
                 current: "2.1.220".to_string(),
                 latest: None,
             },
-            accounts,
             ..Default::default()
         }
     }
@@ -3071,7 +2937,7 @@ mod tests {
         let bg_of = |row: &[(String, Color, Color)]| {
             row.iter().map(|(_, _, bg)| *bg).collect::<Vec<_>>()
         };
-        let mut app = app_with_account_row(vec![active_account()]);
+        let mut app = app_with_account_row();
         let plain = drawn_account_row(&mut app);
 
         app.selection = SidebarPos::Account;
@@ -3125,7 +2991,7 @@ mod tests {
     /// 「同じ幅」は桁数を書き写さず、**同じ App の一覧の行と突き合わせて**見る
     #[test]
     fn the_account_row_band_is_as_wide_as_a_list_row() {
-        let mut app = app_with_account_row(vec![active_account()]);
+        let mut app = app_with_account_row();
         // 突き合わせる相手は `+ new session`（文字が短いので帯を埋めているかが出る）。
         // 行 index は描画結果から引く
         highlighted_columns(&mut app, 0);

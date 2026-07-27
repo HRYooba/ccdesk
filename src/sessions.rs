@@ -8,8 +8,9 @@
 //! ここは「一覧に載る行」。プロセスが死んでも行は残る（動かすものが無い行 ＝ Stopped
 //! として描かれるだけで、状態そのものは保存しない ＝ [`SessionRow`]）。
 //!
-//! パスは引数で受ける（[`SessionStore::new`]）。理由は [`crate::accounts`] と同じで、
-//! テストが実ユーザーの `~/.ccdesk` を絶対に触らないため。
+//! パスは引数で受ける（[`SessionStore::new`]）。テストが実ユーザーの `~/.ccdesk` を
+//! 絶対に触らないためと、「ファイルがどこにあるか」の知識を
+//! [`SessionStore::detect`] 1 箇所に閉じるため。
 //!
 //! **共有ファイルへの安全な書き込みは lib 側の 1 実装を使う**（advisory lock と
 //! tmp → rename）。ここが持つのは「どのファイルをどのロックで守り、どれだけ待つか」と
@@ -41,9 +42,9 @@ const UPDATED_AT_KEY: &str = "updated_at";
 /// 重なると後着が前着を無かったことにする（[`merge_sessions`] が守る不変条件は、
 /// 読みと書きの間に他インスタンスの書き込みが挟まらないことが前提）。
 ///
-/// 長さの判断は [`crate::accounts`] の保管ロックと同じ: 守る区間は小さなファイル
-/// 1 本の読み書きだけ（ネットワークも子プロセスも無い）なので短くてよく、
-/// **無限には待たない**（取れなければ書かずに諦め、次の保存でもう一度載せに行く）
+/// 守る区間は小さなファイル 1 本の読み書きだけ（ネットワークも子プロセスも無い）
+/// なので短くてよく、**無限には待たない**
+/// （取れなければ書かずに諦め、次の保存でもう一度載せに行く）
 const STORE_LOCK_WAIT: Duration = Duration::from_secs(2);
 
 /// セッションの identity（claude の `sessionId` = UUID）。
@@ -228,8 +229,8 @@ impl SessionStore {
         lock_path_for(&self.store)
     }
 
-    /// 一覧を読む。**ロックを取らない**のは [`crate::accounts::AccountStore::list`] と
-    /// 同じ判断で、書き込みが tmp → rename で原子的なので中途の JSON は読めないため
+    /// 一覧を読む。**ロックを取らない**のは、書き込みが tmp → rename で原子的なので
+    /// 中途の JSON を読むことがないため
     /// （読みのたびに待つと、周期的に呼ぶ側が他インスタンスの書き込みで止まる）。
     ///
     /// **読んだ内容が以降の書き込みでマージする基準になる**（[`merge_sessions`]）
@@ -359,12 +360,9 @@ mod tests {
     use ccdesk::{is_leftover_tmp, TMP_KEEP};
 
     /// テスト専用の保管先。**実ユーザーの `~/.ccdesk` を絶対に触らない**ための境界。
-    /// Drop で丸ごと消すので、アサート失敗でパニックしても残らない。
-    ///
-    /// [`crate::accounts::tests::TempHome`] と同じ規律（テスト名 + pid + 連番で一意）だが、
-    /// あちらは認証情報ファイルと保管ファイルの**対**を作る道具で、こちらが要るのは
-    /// 1 本だけ。あちらの [`crate::accounts::Paths`] にセッションの保管先を足すのは
-    /// 「アカウント保管が依存するファイル」という意味を壊すので、ここは分けて持つ
+    /// 名前はテスト名 + pid + 連番で一意にする（並列実行・別チェックアウトの
+    /// 同時実行と衝突させない）。Drop で丸ごと消すので、アサート失敗で
+    /// パニックしても残らない
     struct TempStore(PathBuf);
 
     impl TempStore {
@@ -689,7 +687,7 @@ mod tests {
     fn leftover_tmp_files_are_reclaimed_at_startup() {
         assert!(is_leftover_tmp("sessions.json.1234-0.tmp", "sessions.json"));
         assert!(!is_leftover_tmp("sessions.json.tmp", "sessions.json"));
-        assert!(!is_leftover_tmp("sessions.json.1234-0.tmp", "accounts.json"));
+        assert!(!is_leftover_tmp("sessions.json.1234-0.tmp", "state.json"));
 
         let temp = TempStore::new("leftover_tmp_files_are_reclaimed_at_startup");
         let old = temp.path().with_file_name("sessions.json.4242-7.tmp");
