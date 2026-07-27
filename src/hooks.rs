@@ -37,15 +37,15 @@ use ccdesk::{lock_path_for, now_ms, write_json_atomically, Lock, LOCK_STALE};
 // hook のイベント名と入力 JSON は**公式**（文書化されている）が、pid を渡す
 // 環境変数は非公開なので綴りは [`crate::claude_format`] が持つ
 use crate::claude_format::CLAUDE_PID_ENV;
-use crate::poll::STOPPED;
+use crate::poll::{COMPLETED, STOPPED, WAITING, WORKING};
 use crate::sessions::{SessionId, SessionRow};
 
 /// 注入する hook イベントと、絞り込みの matcher と、それが意味する state。
 ///
 /// **`--settings` の生成（[`inject_settings`]）と受け口（[`run_hook`]）が同じ表を読む**
 /// ので、片方だけ増えた状態にならない。state 値は [`crate::poll::classify`] が読む語彙
-/// （`working` / `blocked` / `done` / `stopped`）で、**要約文は持たない**
-/// （行に出るのは状態だけ）。
+/// （`waiting` / `working` / `completed` / `stopped` ＝ 画面に出る語の小文字）で、
+/// **要約文は持たない**（行に出るのは状態だけ）。
 ///
 /// **turn 単位のイベントだけを載せる。** hook は毎回 ccdesk を 1 プロセス起こすので、
 /// `PreToolUse` / `PostToolUse` のような道具ごとに飛ぶイベントを足すと、Windows の
@@ -70,10 +70,10 @@ const NOTIFICATION_MATCHER: &str = "permission_prompt|elicitation_dialog|agent_n
 /// 全発火を拾う（そのイベント自体が 1 つの意味しか持たないもの）
 const HOOK_EVENTS: [(&str, Option<&str>, &str); 5] = [
     // 起動直後・再開直後はまだプロンプトを受けていない ＝ 入力待ち
-    ("SessionStart", None, "blocked"),
-    ("UserPromptSubmit", None, "working"),
-    ("Notification", Some(NOTIFICATION_MATCHER), "blocked"),
-    ("Stop", None, "done"),
+    ("SessionStart", None, WAITING),
+    ("UserPromptSubmit", None, WORKING),
+    ("Notification", Some(NOTIFICATION_MATCHER), WAITING),
+    ("Stop", None, COMPLETED),
     ("SessionEnd", None, STOPPED),
 ];
 
@@ -659,18 +659,18 @@ mod tests {
         // **記録に pid まで載る**（載らないと pid での引き当てが黙って効かなくなる）
         assert_eq!(
             padded,
-            Some((id("s-1"), "blocked", Some(4242))),
+            Some((id("s-1"), WAITING, Some(4242))),
             "the pid did not reach the record"
         );
         assert_eq!(bare, Some(4242), "the pid is not read from the environment");
         assert_eq!(
             broken,
-            Some((id("s-1"), "blocked", None)),
+            Some((id("s-1"), WAITING, None)),
             "built a pid out of something that is not a number"
         );
         assert_eq!(
             missing,
-            Some((id("s-1"), "blocked", None)),
+            Some((id("s-1"), WAITING, None)),
             "answered with a pid when the variable is not set"
         );
         // 知らないイベント / 読めない入力は何も書かない

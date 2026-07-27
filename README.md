@@ -13,7 +13,7 @@ processes while the rows stay — reopen one and it resumes from its transcript.
 ## Features
 
 - **Persistent sidebar** — every session ccdesk knows about, across all projects,
-  grouped by state (Needs input / Working / Completed) or by directory
+  grouped by state (Waiting / Working / Completed / Stopped) or by directory
 - **Foreground sessions ccdesk owns** — a row starts or resumes a real `claude`
   process in the pane; `stop` ends the process and keeps the row, `close` drops the
   row. Your transcripts in `~/.claude/projects/` are never removed
