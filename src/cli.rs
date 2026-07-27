@@ -3,8 +3,9 @@
 use crate::poll::{fetch_account, AccountStatus};
 use crate::update;
 
-pub(crate) fn print_usage() {
-    println!(
+/// 使い方の本文。**出力先は呼び手が決める**（[`print_usage`] / [`print_usage_error`]）
+fn usage_text() -> String {
+    format!(
         "ccdesk {} — Claude Code session manager TUI\n\n\
          Usage:\n\
          \x20 ccdesk            launch the TUI\n\
@@ -13,7 +14,25 @@ pub(crate) fn print_usage() {
          \x20 ccdesk update     download and install the latest release\n\
          \x20 ccdesk --version  print version",
         env!("CARGO_PKG_VERSION")
-    );
+    )
+}
+
+/// `--help` で明示的に求められた使い方。**求められた出力なので stdout**
+pub(crate) fn print_usage() {
+    println!("{}", usage_text());
+}
+
+/// 知らない引数を渡されたときの案内。**stdout には 1 バイトも出さない。**
+///
+/// エラーの案内を stdout へ出すと、ccdesk を「出力を読み取る道具」として
+/// 呼んでいる相手にヘルプ本文を食わせることになる。実際に踏みうる経路がある:
+/// 旧版が `--settings` へ注入した `statusLine`（`ccdesk statusline-hook`）が
+/// 残っている claude セッションは、ccdesk を更新した後もそれを呼び続けるので、
+/// **ユーザーの statusline 行にヘルプが並ぶ**。stderr へ出せば stdout は空になり、
+/// 行が空欄になるだけで済む（セッションを開き直せば注入ファイルごと消える）
+pub(crate) fn print_usage_error(argument: &str) {
+    eprintln!("unknown argument: {argument}\n");
+    eprintln!("{}", usage_text());
 }
 
 /// 自己更新。最新リリースの実行ファイルを取得し、SHA-256 を検証してから
