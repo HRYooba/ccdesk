@@ -25,6 +25,7 @@ use crate::theme::{
     ui, usage_color, C_ATTENTION, C_FAIL, C_WORKING, FOCUS_BORDER, MUTED_FG,
 };
 use crate::ui::new_view::draw_new_view;
+use crate::usage::{Usage, UsageInfo, UsageWindow};
 
 /// **セッション行の行頭に縦に並ぶ 2 つの印。** どちらも「点いているか」を答えるだけの
 /// 1 桁で、消えている側も同じ幅の空白を取る ＝ 印が付いたり消えたりしても
@@ -130,6 +131,153 @@ fn fmt_reset_at(resets_at: u64) -> String {
     } else {
         format!("{}/{} {:02}:{:02}", t.month(), t.day(), t.hour(), t.minute())
     }
+}
+
+/// 使用率の詳しさ。**幅が足りないときに何から落とすか**の順序そのもの
+/// （左が最も詳しい）。使用率は補助情報なので、キーヒントを押し出してまで
+/// 詳しく出さない
+#[derive(Clone, Copy)]
+enum UsageDetail {
+    /// 5h / 7d / モデル別 + それぞれのリセット時刻
+    Full,
+    /// リセット時刻を落とす
+    NoResets,
+    /// モデル別も落とす（5h / 7d の数字だけ）
+    WindowsOnly,
+}
+
+/// 右下の使用率行。**何も出さない状態と、出せない状態を区別する**:
+///
+/// | [`Usage`] | 見え方 | 理由 |
+/// |:--|:--|:--|
+/// | `Unknown` | 何も出さない | opt-in していない、または起動直後で判断が付いていない |
+/// | `Unavailable` | 何も出さない | 枠の概念が無いアカウント ＝ **恒久的に取れない**ので警告し続けない（理由は `ccdesk doctor` が言う） |
+/// | `Failed` | `usage —` | opt-in したのに取れていないことを出す（黙って消さない） |
+/// | `Ready` | 枠の一覧 | 最後の取得が古ければ全体を dim |
+///
+/// `max_width` に収まる最も詳しい形を選ぶ（[`UsageDetail`]）。
+/// `fetching` が真の間は色を落とす（取得は 3 秒前後かかるので、
+/// **クリックしたことが画面に出ないと壊れているように見える**）。
+/// 幅は変えない ＝ 取得中にクリック位置がずれない
+fn usage_line(usage: &Usage, max_width: u16, fetching: bool) -> Vec<Span<'static>> {
+    let info = match usage {
+        Usage::Unknown | Usage::Unavailable => return Vec::new(),
+        Usage::Failed => {
+            return vec![
+                Span::styled(" usage ", Style::default().fg(ui().dim)),
+                Span::styled("—", Style::default().fg(C_FAIL)),
+                Span::raw(" "),
+            ]
+        }
+        Usage::Ready(info) => info,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stale = info.is_stale(now) || fetching;
+    for detail in [
+        UsageDetail::Full,
+        UsageDetail::NoResets,
+        UsageDetail::WindowsOnly,
+    ] {
+        let spans = usage_spans(info, stale, detail);
+        if span_width(&spans) <= max_width {
+            return spans;
+        }
+    }
+    // どれも収まらない幅（極端に狭い端末）では出さない
+    Vec::new()
+}
+
+/// [`usage_line`] の 1 形。判断（何を落とすか）は呼び手が持ち、ここは組むだけ
+fn usage_spans(info: &UsageInfo, stale: bool, detail: UsageDetail) -> Vec<Span<'static>> {
+    let with_resets = matches!(detail, UsageDetail::Full);
+    let with_models = !matches!(detail, UsageDetail::WindowsOnly);
+    let ring = |pct: f64| ["○", "◔", "◑", "◕", "●"][(pct / 25.0).min(4.0) as usize];
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut push = |label: &str, w: &UsageWindow| {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", Style::default().fg(ui().dim)));
+        }
+        spans.push(Span::styled(
+            format!("{label} "),
+            Style::default().fg(ui().dim),
+        ));
+        // 古い値は色を消して dim へ落とす（古さを黙って隠さない）
+        let value_color = if stale { ui().dim } else { usage_color(w.pct) };
+        spans.push(Span::styled(
+            format!("{} {}%", ring(w.pct), w.pct.round() as u32),
+            Style::default().fg(value_color),
+        ));
+        if with_resets && let Some(resets_at) = w.resets_at {
+            spans.push(Span::styled(
+                format!(" →{}", fmt_reset_at(resets_at)),
+                Style::default().fg(ui().dim),
+            ));
+        }
+    };
+    if let Some(w) = &info.five {
+        push("5h", w);
+    }
+    if let Some(w) = &info.seven {
+        push("7d", w);
+    }
+    if with_models {
+        for (name, w) in &info.models {
+            push(name, w);
+        }
+    }
+    if !spans.is_empty() {
+        spans.push(Span::raw(" "));
+    }
+    spans
+}
+
+/// 下部バーに出す使用率。**描画とクリック判定がこの 1 つの導出を共有する**
+/// （位置の答えが 2 つあると、クリックできる場所と見えている場所がずれる）。
+/// notice を出している間は下部バーが notice に置き換わるので、使用率は出ない
+fn usage_footer(app: &App) -> Vec<Span<'static>> {
+    if app.notice.is_some() {
+        return Vec::new();
+    }
+    usage_line(
+        &app.usage,
+        // キーヒントを押し出さないよう、使用率に渡すのは幅の半分まで
+        app.term_size.0 / 2,
+        app.usage_fetching.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// 使用率のクリック当たり判定（右下の使用率を押すとその場で取り直す）
+pub(crate) struct UsageHit {
+    pub(crate) row: u16,
+    pub(crate) columns: std::ops::Range<u16>,
+}
+
+/// 使用率が今どこに描かれているか。出していないときは None ＝ 当たらない
+pub(crate) fn usage_hit(app: &App) -> Option<UsageHit> {
+    let (width, height) = app.term_size;
+    if height == 0 {
+        return None;
+    }
+    let drawn = span_width(&usage_footer(app));
+    (drawn > 0).then(|| UsageHit {
+        // 下部バーは最下行（[`draw`] の縦分割と同じ）
+        row: height - 1,
+        // 右端に寄せて描くので、占めるのは末尾 `drawn` 列
+        columns: width.saturating_sub(drawn)..width,
+    })
+}
+
+/// 表示幅（`Span` の表示幅の合計）。**文字数ではなく表示幅**で測る:
+/// モデル名は claude が返す表示名なので、全角を含みうる
+fn span_width(spans: &[Span<'_>]) -> u16 {
+    use unicode_width::UnicodeWidthStr as _;
+    spans
+        .iter()
+        .map(|s| s.content.width() as u16)
+        .sum()
 }
 
 /// サイドバーのジオメトリ（描画とクリック判定で同じ計算を共有する）
@@ -812,42 +960,15 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(C_WORKING),
             ));
         }
-        // 右端: 5h/7d 使用率とリセット時刻（opt-in。statusline フック由来の公式データ）。
-        // 古いデータ（10 分超更新なし）は消さず、全体を dim に落として区別する
-        let mut usage_spans: Vec<Span> = Vec::new();
-        if let Some(usage) = &app.usage {
-            let stale = usage.stale;
-            let ring = |pct: f64| ["○", "◔", "◑", "◕", "●"][(pct / 25.0).min(4.0) as usize];
-            let mut push_window = |label: &str, w: Option<(f64, u64)>| {
-                if let Some((pct, resets)) = w {
-                    if !usage_spans.is_empty() {
-                        usage_spans.push(Span::styled(" · ", Style::default().fg(ui().dim)));
-                    }
-                    usage_spans.push(Span::styled(
-                        format!("{label} "),
-                        Style::default().fg(ui().dim),
-                    ));
-                    let value_color = if stale { ui().dim } else { usage_color(pct) };
-                    usage_spans.push(Span::styled(
-                        format!("{} {}%", ring(pct), pct.round() as u32),
-                        Style::default().fg(value_color),
-                    ));
-                    if resets > 0 {
-                        usage_spans.push(Span::styled(
-                            format!(" →{}", fmt_reset_at(resets)),
-                            Style::default().fg(ui().dim),
-                        ));
-                    }
-                }
-            };
-            push_window("5h", usage.five);
-            push_window("7d", usage.seven);
-            usage_spans.push(Span::raw(" "));
-        }
-        let usage_w = usage_spans
-            .iter()
-            .map(|s| s.content.chars().count() as u16)
-            .sum::<u16>();
+        // 右端: 使用率（opt-in）。中身は [`crate::usage`] が取ったもので、
+        // **statusline には一切関与しない**。
+        //
+        // **無言の空白を作らない**のが要点。以前は「opt-in していない」
+        // 「取得が効いていない」「枠が無いアカウント」「壊れた」が全部同じ
+        // 見え方（何も出ない）で、opt-in したのに出ない人へ渡せる情報が無かった
+        // **当たり判定（[`usage_hit`]）と同じ導出**を通す
+        let usage_spans = usage_footer(app);
+        let usage_w = span_width(&usage_spans);
         let bar = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(1), Constraint::Length(usage_w)])
@@ -1409,6 +1530,141 @@ fn terminal_cursor_pos(pane: Rect, inner: Rect, crow: u16, ccol: u16) -> Positio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 使用率行を 1 本の文字列にして中身を見る（描画の検査用）
+    fn usage_text(usage: &Usage, max_width: u16) -> String {
+        usage_line(usage, max_width, false)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
+    fn ready(models: Vec<(String, UsageWindow)>) -> Usage {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Usage::Ready(UsageInfo {
+            five: Some(UsageWindow {
+                pct: 18.0,
+                resets_at: Some(now + 3600),
+            }),
+            seven: Some(UsageWindow {
+                pct: 55.0,
+                resets_at: Some(now + 4 * 86400),
+            }),
+            models,
+            fetched_at: now,
+        })
+    }
+
+    /// **4 つの状態が画面上で区別できる。** 以前はどれも「無言の空白」に潰れていて、
+    /// opt-in したのに出ない人へ渡せる情報が無かった
+    #[test]
+    fn the_usage_line_distinguishes_why_it_has_nothing_to_show() {
+        // opt-in していない / 起動直後 — 判断が付く前に何も言わない
+        assert_eq!(usage_text(&Usage::Unknown, 80), "");
+        // 枠の概念が無いアカウント — 恒久的に取れないので警告し続けない
+        assert_eq!(usage_text(&Usage::Unavailable, 80), "");
+        // 取れていない — 黙って消さず、取れていないことを出す
+        assert!(
+            usage_text(&Usage::Failed, 80).contains("usage"),
+            "a failed fetch must be visible"
+        );
+    }
+
+    /// 3 つの枠（5h / 7d / モデル別）が並び、リセット時刻まで出る
+    #[test]
+    fn all_three_windows_appear_when_there_is_room() {
+        let text = usage_text(
+            &ready(vec![(
+                "Fable".to_string(),
+                UsageWindow {
+                    pct: 12.0,
+                    resets_at: None,
+                },
+            )]),
+            120,
+        );
+        assert!(text.contains("5h"), "{text}");
+        assert!(text.contains("18%"), "{text}");
+        assert!(text.contains("7d"), "{text}");
+        assert!(text.contains("55%"), "{text}");
+        assert!(text.contains("Fable"), "{text}");
+        assert!(text.contains("12%"), "{text}");
+        assert!(text.contains('\u{2192}'), "reset time is missing: {text}");
+    }
+
+    /// **狭い端末では詳しさから落とす。** 落とす順はリセット時刻 → モデル別 →
+    /// （それでも入らなければ）表示しない。使用率は補助情報なので、
+    /// キーヒントを押し出してまで出さない
+    #[test]
+    fn a_narrow_footer_drops_detail_before_it_overflows() {
+        let usage = ready(vec![(
+            "Fable".to_string(),
+            UsageWindow {
+                pct: 12.0,
+                resets_at: None,
+            },
+        )]);
+        for max_width in [0_u16, 4, 8, 12, 16, 20, 24, 32, 48, 64, 120] {
+            let spans = usage_line(&usage, max_width, false);
+            assert!(
+                span_width(&spans) <= max_width,
+                "overflowed {max_width}: {:?}",
+                spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+            );
+        }
+        // 幅を削ると、まずリセット時刻が消え、次にモデル別が消える。
+        // **境界の幅は数え上げず、その形の実寸から引く**（書式を変えたときに
+        // テストが嘘にならないように）
+        let Usage::Ready(info) = &usage else {
+            panic!("built a Ready value");
+        };
+        let width_of = |detail| span_width(&usage_spans(info, false, detail));
+        // 取得中は色だけ落ちて**幅は変わらない**（押した瞬間にクリック位置が動かない）
+        for detail in [
+            UsageDetail::Full,
+            UsageDetail::NoResets,
+            UsageDetail::WindowsOnly,
+        ] {
+            assert_eq!(
+                span_width(&usage_spans(info, true, detail)),
+                span_width(&usage_spans(info, false, detail)),
+                "the width changed while fetching"
+            );
+        }
+
+        let full = usage_text(&usage, width_of(UsageDetail::Full));
+        assert!(full.contains('\u{2192}'), "{full}");
+        assert!(full.contains("Fable"), "{full}");
+
+        // Full には 1 桁足りない幅 = リセット時刻が落ちる
+        let no_resets = usage_text(&usage, width_of(UsageDetail::Full) - 1);
+        assert!(!no_resets.contains('\u{2192}'), "{no_resets}");
+        assert!(no_resets.contains("Fable"), "{no_resets}");
+
+        // NoResets にも 1 桁足りない幅 = モデル別が落ちる
+        let windows_only = usage_text(&usage, width_of(UsageDetail::NoResets) - 1);
+        assert!(!windows_only.contains("Fable"), "{windows_only}");
+        assert!(
+            windows_only.contains("5h") && windows_only.contains("7d"),
+            "{windows_only}"
+        );
+
+        // 一番簡素な形にも足りない幅 = 何も出さない（はみ出させない）
+        assert_eq!(
+            usage_text(&usage, width_of(UsageDetail::WindowsOnly) - 1),
+            ""
+        );
+    }
+
+    /// モデル別枠が無いアカウントでも 5h / 7d は出る
+    #[test]
+    fn the_line_works_without_model_windows() {
+        let text = usage_text(&ready(Vec::new()), 120);
+        assert!(text.contains("5h") && text.contains("7d"), "{text}");
+    }
 
     /// pos が矩形の内側にあるか（幅・高さ 0 の矩形は「内側なし」なので常に false）
     fn contains(rect: Rect, pos: Position) -> bool {

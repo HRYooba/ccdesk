@@ -1,13 +1,12 @@
 # ccdesk
 
-A Claude Code session manager TUI, modeled after **Claude Desktop** and the built-in
-**Agent View** — see, switch, and drive all your sessions in one terminal.
+A session manager TUI for Claude Code — see, switch, and drive all your sessions in
+one terminal.
 
-ccdesk embeds the official `claude` CLI in a PTY pane and keeps an Agent View–style
-session list in a persistent sidebar (like Claude Desktop's session list). Each pane **is**
-a foreground `claude` session that ccdesk owns, and the list itself lives in
-`~/.ccdesk/sessions.json`, so closing ccdesk ends the processes while the rows stay —
-reopen one and it resumes from its transcript.
+ccdesk embeds the official `claude` CLI in a PTY pane and keeps a session list in a
+persistent sidebar. Each pane **is** a foreground `claude` session that ccdesk owns,
+and the list itself lives in `~/.ccdesk/sessions.json`, so closing ccdesk ends the
+processes while the rows stay — reopen one and it resumes from its transcript.
 
 ![ccdesk](assets/screenshot.png)
 
@@ -90,20 +89,40 @@ ccdesk passes the official `--settings` flag to the `claude` sessions it starts
 to install turn-level hooks that report each session's state (working / waiting
 for input / done) back to ccdesk — that is what the sidebar shows. The hooks
 run `ccdesk hook <event>`, so no external scripts are installed, and they write
-only to `~/.ccdesk/hook-states.json`. Sessions opened outside ccdesk are
-unaffected.
+only to `~/.ccdesk/hook-states.json`. **`hooks` is the only key ccdesk injects**:
+Claude Code merges hooks across settings sources, so yours keep running, and no
+other setting of yours is replaced for that session. Sessions opened outside
+ccdesk are unaffected.
 
 ## Usage display (opt-in)
 
 Add `"usage_display": "on"` to `~/.ccdesk/config.json` to show your Claude
-rate-limit usage (5h / 7d windows, with time until reset) at the bottom right.
+rate-limit usage at the bottom right: the 5-hour window, the 7-day window, and
+each per-model weekly window, with time until reset. Narrow terminals drop the
+reset times first, then the per-model windows.
 
-When enabled, ccdesk adds a status-line hook to the same injected settings
-file it already passes with `--settings`. The hook saves the
-official rate-limit JSON that Claude Code provides to status lines, and then
-chains to your own status line if you have one configured — your display keeps
-working unchanged. No files outside `~/.ccdesk/` are modified, and sessions
-opened outside ccdesk are unaffected.
+**Click it to refresh right away** instead of waiting for the next poll — the
+numbers dim while the fetch is in flight. Otherwise ccdesk refreshes every two
+minutes, and stops polling entirely on accounts that have no rate-limit windows
+(a click still re-checks, in case you signed in elsewhere).
+
+ccdesk gets the numbers by running the official `claude` CLI headless for a
+moment and sending one `get_usage` request over the Agent SDK control channel.
+No model runs, so no tokens and no rate-limit quota are consumed.
+
+It is opt-in because this is the one thing ccdesk does that reaches Anthropic's
+servers while you are not there — everything else it polls is local. Consumer
+Terms §3 permits automated access to the Services via an API key "or where we
+otherwise explicitly permit it", and running a documented feature of the
+official CLI against your own subscription, for yourself, reads as permitted,
+but that is a reading and not a ruling. Leave the setting out and the fetch
+thread never starts.
+
+`ccdesk doctor` reports what the probe returns on your machine, and runs even
+with the setting off so you can look before turning it on. A failed fetch shows
+as `usage —` rather than a silent blank; a reading older than 10 minutes is
+dimmed; an account with no rate-limit windows at all (API key, Bedrock, Vertex)
+hides the gauge instead of warning forever.
 
 ## License
 

@@ -21,9 +21,10 @@ use ccdesk::{
 
 use crate::hooks::HookStates;
 use crate::poll::{
-    read_usage, spawn_agents_poller, spawn_ccdesk_version_check, spawn_footer_poller,
-    AccountStatus, AgentInfo, FooterInfo, Grouping, UsageInfo,
+    spawn_agents_poller, spawn_footer_poller, AccountStatus, AgentInfo, FooterInfo, Grouping,
+    VersionSinks,
 };
+use crate::usage::{Usage, UsageInfo, UsageRefresh, UsageSlot, UsageWindow};
 use crate::sessions::{SessionId, SessionRow, SessionStore};
 use crate::title::Titles;
 
@@ -165,8 +166,13 @@ pub(crate) trait DataSource: Send + Sync {
     /// live はポーラーが後から埋めるので既定値でよい
     fn footer(&self) -> FooterInfo;
 
-    /// 使用率（5h/7d 枠）。表示しないなら None
-    fn usage(&self) -> Option<UsageInfo>;
+    /// 使用率（5h 枠 / 7d 枠 / モデル別週次）。**まだ答えが無いなら
+    /// [`Usage::Unknown`]**（「まだ分からない」と「取れなかった」を混ぜない）
+    fn usage(&self) -> Usage;
+
+    /// 使用率をその場で取り直す（フッターの使用率をクリックしたとき）。
+    /// 取得しない供給元（撮影用）では何もしない
+    fn refresh_usage(&self) {}
 
     /// 起動時に復元するウィンドウ状態
     fn window_state(&self) -> WindowState;
@@ -306,8 +312,14 @@ pub(crate) fn persist_projects(
 /// 実データ。~/.claude と ~/.ccdesk を読み、ポーラーで claude CLI と
 /// 公式配布エンドポイントを叩く
 pub(crate) struct LiveSource {
-    /// 使用率表示の opt-in（config.json の usage_display = "on"）
-    usage_display: bool,
+    /// 使用率の共有スロットと手動取得の口。**opt-in していないなら None** ＝
+    /// 取得スレッドを起こさず、[`DataSource::usage`] は常に [`Usage::Unknown`]
+    /// （＝ 何も描かない）を返す。
+    ///
+    /// opt-in を要求する理由は資源ではなく、これが ccdesk で唯一「無人で Anthropic の
+    /// サーバーへ出る」経路だから（判断とその根拠は [`crate::main`] にある）。
+    /// **切っている人の環境では claude プロセスが 1 つも増えない**
+    usage: Option<(UsageSlot, UsageRefresh)>,
     /// 「ディスク上の登録プロジェクトはこうなっている」とこのインスタンスが最後に
     /// 判断した一覧。**書き込みのマージの基準**（[`merge_projects`]）で、
     /// 起動時の読み込みと、**実際にディスクへ書いた内容**で更新する
@@ -319,7 +331,13 @@ pub(crate) struct LiveSource {
 }
 
 impl LiveSource {
-    pub(crate) fn new(usage_display: bool) -> Self {
+    /// `usage_dirty` は使用率が更新されたことを run ループへ伝える合図で、
+    /// `usage_fetching` は取得中かどうか（押したことを画面に出すため）
+    pub(crate) fn new(
+        usage_display: bool,
+        usage_dirty: Arc<std::sync::atomic::AtomicBool>,
+        usage_fetching: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         // 前回の異常終了が残した書きかけの `.tmp` を回収する。実データ側だけで
         // 行う ＝ 撮影（[`DemoSource`]）は実ファイルに触らない、という約束を
         // 「今 demo か」の分岐を足さずに守れる置き場所
@@ -333,8 +351,15 @@ impl LiveSource {
         // hook の受け渡しファイルも同じ理由（書き手は短命な hook プロセスなので、
         // rename の前に殺されると tmp が残る）
         crate::hooks::cleanup_leftover_tmp();
+        // **opt-in の分岐はここ 1 箇所。** off なら取得スレッドを起こさない
+        let usage = usage_display.then(|| {
+            let slot: UsageSlot = Arc::new(Mutex::new(Usage::default()));
+            let refresh =
+                crate::usage::spawn_poller(Arc::clone(&slot), usage_dirty, usage_fetching);
+            (slot, refresh)
+        });
         Self {
-            usage_display,
+            usage,
             projects_baseline: Mutex::new(Vec::new()),
             sessions,
         }
@@ -378,9 +403,19 @@ impl DataSource for LiveSource {
         FooterInfo::default() // 実値は spawn_footer_poller が書く
     }
 
-    fn usage(&self) -> Option<UsageInfo> {
-        // opt-in が off なら usage.json も読まない
-        self.usage_display.then(read_usage).flatten()
+    fn usage(&self) -> Usage {
+        // opt-in していなければスロットが無い ＝ 取得もしないし何も描かない
+        self.usage.as_ref().map_or(Usage::Unknown, |(slot, _)| {
+            slot.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+    }
+
+    fn refresh_usage(&self) {
+        if let Some((_, refresh)) = &self.usage {
+            refresh.request();
+        }
     }
 
     fn window_state(&self) -> WindowState {
@@ -469,9 +504,17 @@ impl DataSource for LiveSource {
 
     fn spawn_pollers(&self, sinks: PollSinks) {
         spawn_agents_poller(sinks.agents, sinks.agents_dirty);
-        spawn_footer_poller(sinks.footer, sinks.footer_dirty, sinks.footer_refresh);
-        // ccdesk 自身の版チェックは起動時 1 回だけ（周期ポーリングしない）
-        spawn_ccdesk_version_check(sinks.ccdesk_latest, sinks.ccdesk_latest_dirty);
+        // 版行 2 本（claude / ccdesk）の更新チェックは**同じポーラーの同じゲート**で
+        // 回す（周期を分けると片方だけ別の規則へ流れる。[`VersionSinks`]）
+        spawn_footer_poller(
+            VersionSinks {
+                claude: sinks.footer,
+                claude_dirty: sinks.footer_dirty,
+                ccdesk: sinks.ccdesk_latest,
+                ccdesk_dirty: sinks.ccdesk_latest_dirty,
+            },
+            sinks.footer_refresh,
+        );
     }
 
     fn titles(&self) -> Titles {
@@ -521,8 +564,8 @@ impl DataSource for DemoSource {
         demo_footer()
     }
 
-    fn usage(&self) -> Option<UsageInfo> {
-        Some(demo_usage())
+    fn usage(&self) -> Usage {
+        Usage::Ready(demo_usage())
     }
 
     fn window_state(&self) -> WindowState {
@@ -626,16 +669,29 @@ fn demo_footer() -> FooterInfo {
 }
 
 /// 撮影用の架空使用率。リセット時刻は「今から N 時間後」なので、
-/// いつ撮っても同じ見た目（残り時間の相対値）になる
+/// いつ撮っても同じ見た目（残り時間の相対値）になる。
+/// `fetched_at` も今にしておく ＝ 撮影で dim（古い表示）にならない
 fn demo_usage() -> UsageInfo {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let window = |pct: f64, resets_at: u64| UsageWindow {
+        pct,
+        resets_at: Some(resets_at),
+    };
     UsageInfo {
-        five: Some((34.0, now + 2 * 3600 + 40 * 60)),
-        seven: Some((58.0, now + 3 * 86400 + 5 * 3600)),
-        stale: false,
+        five: Some(window(34.0, now + 2 * 3600 + 40 * 60)),
+        seven: Some(window(58.0, now + 3 * 86400 + 5 * 3600)),
+        // モデル別枠はリセット時刻を持たない形（実測）で撮る
+        models: vec![(
+            "Fable".to_string(),
+            UsageWindow {
+                pct: 12.0,
+                resets_at: None,
+            },
+        )],
+        fetched_at: now,
     }
 }
 
@@ -659,10 +715,18 @@ mod tests {
             "demo does not show an update marker"
         );
 
-        let usage = DemoSource.usage().expect("usage gauge is always present");
-        assert_eq!(usage.five.map(|(pct, _)| pct), Some(34.0));
-        assert_eq!(usage.seven.map(|(pct, _)| pct), Some(58.0));
-        assert!(!usage.stale);
+        let Usage::Ready(usage) = DemoSource.usage() else {
+            panic!("usage gauge is always present in demo data");
+        };
+        assert_eq!(usage.five.as_ref().map(|w| w.pct), Some(34.0));
+        assert_eq!(usage.seven.as_ref().map(|w| w.pct), Some(58.0));
+        assert_eq!(usage.models, vec![("Fable".to_string(), UsageWindow { pct: 12.0, resets_at: None })]);
+        // 撮影データは常に「今」取れたことにする（dim で撮れてしまわない）
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        assert!(!usage.is_stale(now));
     }
 
     /// 撮影用のセッション行は固定。実 ID・実パスは出さず、未読も出さない

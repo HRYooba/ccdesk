@@ -239,11 +239,6 @@ fn state_path() -> Option<std::path::PathBuf> {
     Some(ccdesk_dir()?.join("state.json"))
 }
 
-/// 使用率キャッシュ ~/.ccdesk/usage.json（statusline フックが書き、TUI が読む）
-pub fn usage_cache_path() -> Option<std::path::PathBuf> {
-    Some(ccdesk_dir()?.join("usage.json"))
-}
-
 /// 撤去したアカウント切り替えが使っていた保管ファイルの名前。
 /// **トークンを含む**ので、残っていれば起動時に消す（[`purge_account_store`]）
 const ACCOUNT_STORE: &str = "accounts.json";

@@ -2,7 +2,7 @@
 name = "ccdesk"
 version = "0.7.0"
 edition = "2024"
-description = "Claude Code session manager TUI modeled after Claude Desktop and Agent View — see, switch, and drive all your sessions in one terminal"
+description = "A session manager TUI for Claude Code — see, switch, and drive all your sessions in one terminal"
 license = "MIT"
 repository = "https://github.com/HRYooba/ccdesk"
 readme = "README.md"
