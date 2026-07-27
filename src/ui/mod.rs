@@ -190,44 +190,81 @@ fn usage_line(usage: &Usage, max_width: u16, fetching: bool) -> Vec<Span<'static
     Vec::new()
 }
 
-/// [`usage_line`] の 1 形。判断（何を落とすか）は呼び手が持ち、ここは組むだけ
+/// 枠 1 つ（ラベルと使用率）。**リセット時刻は付けない**（枠のグループごとに
+/// 1 つだけ出すので、時刻を出すのは [`push_reset`] の役目）
+fn push_window(spans: &mut Vec<Span<'static>>, label: &str, pct: f64, stale: bool) {
+    let ring = ["○", "◔", "◑", "◕", "●"][(pct / 25.0).min(4.0) as usize];
+    if !spans.is_empty() {
+        spans.push(Span::styled(" · ", Style::default().fg(ui().dim)));
+    }
+    spans.push(Span::styled(
+        format!("{label} "),
+        Style::default().fg(ui().dim),
+    ));
+    // 古い値は色を消して dim へ落とす（古さを黙って隠さない）
+    let value_color = if stale { ui().dim } else { usage_color(pct) };
+    spans.push(Span::styled(
+        format!("{ring} {}%", pct.round() as u32),
+        Style::default().fg(value_color),
+    ));
+}
+
+/// 直前までの枠に共通するリセット時刻
+fn push_reset(spans: &mut Vec<Span<'static>>, resets_at: u64) {
+    spans.push(Span::styled(
+        format!(" →{}", fmt_reset_at(resets_at)),
+        Style::default().fg(ui().dim),
+    ));
+}
+
+/// [`usage_line`] の 1 形。判断（何を落とすか）は呼び手が持ち、ここは組むだけ。
+///
+/// **リセット時刻は枠ではなくグループに付く。** 7d 枠とモデル別枠は同じ週次枠を
+/// 別の切り口で見たものなので（`limits[]` で `weekly_all` と `weekly_scoped` が
+/// 同じ `group: "weekly"` に入り、`weekly_all` の時刻は `seven_day` と同一）、
+/// 時刻を枠ごとに出すと同じ値が並ぶ。狭い下部バーで最も惜しいのは幅なので、
+/// **週次はまとめて末尾に 1 つ**出す:
+///
+/// ```text
+/// 5h ◔ 34% →05:35 · 7d ◑ 58% · Fable ○ 12% →7/31 07:55
+/// ```
 fn usage_spans(info: &UsageInfo, stale: bool, detail: UsageDetail) -> Vec<Span<'static>> {
     let with_resets = matches!(detail, UsageDetail::Full);
-    let with_models = !matches!(detail, UsageDetail::WindowsOnly);
-    let ring = |pct: f64| ["○", "◔", "◑", "◕", "●"][(pct / 25.0).min(4.0) as usize];
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut push = |label: &str, w: &UsageWindow| {
-        if !spans.is_empty() {
-            spans.push(Span::styled(" · ", Style::default().fg(ui().dim)));
-        }
-        spans.push(Span::styled(
-            format!("{label} "),
-            Style::default().fg(ui().dim),
-        ));
-        // 古い値は色を消して dim へ落とす（古さを黙って隠さない）
-        let value_color = if stale { ui().dim } else { usage_color(w.pct) };
-        spans.push(Span::styled(
-            format!("{} {}%", ring(w.pct), w.pct.round() as u32),
-            Style::default().fg(value_color),
-        ));
-        if with_resets && let Some(resets_at) = w.resets_at {
-            spans.push(Span::styled(
-                format!(" →{}", fmt_reset_at(resets_at)),
-                Style::default().fg(ui().dim),
-            ));
-        }
+    // モデル別を落とす形では週次枠は 7d だけになる
+    let models: &[(String, UsageWindow)] = if matches!(detail, UsageDetail::WindowsOnly) {
+        &[]
+    } else {
+        &info.models
     };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    // 5h 枠は単独のグループ（自分の時刻を持つ）
     if let Some(w) = &info.five {
-        push("5h", w);
-    }
-    if let Some(w) = &info.seven {
-        push("7d", w);
-    }
-    if with_models {
-        for (name, w) in &info.models {
-            push(name, w);
+        push_window(&mut spans, "5h", w.pct, stale);
+        if with_resets && let Some(resets_at) = w.resets_at {
+            push_reset(&mut spans, resets_at);
         }
     }
+
+    // 週次グループ: 7d → モデル別 → 共通のリセット時刻
+    if let Some(w) = &info.seven {
+        push_window(&mut spans, "7d", w.pct, stale);
+    }
+    for (name, w) in models {
+        push_window(&mut spans, name, w.pct, stale);
+    }
+    // 時刻の出どころは 7d。**モデル別しか無い形でも出せる**ように、
+    // 7d が持っていなければモデル別が持つ値を使う（どれも同じ週次枠）
+    if with_resets && (info.seven.is_some() || !models.is_empty())
+        && let Some(resets_at) = info
+            .seven
+            .as_ref()
+            .and_then(|w| w.resets_at)
+            .or_else(|| models.iter().find_map(|(_, w)| w.resets_at))
+    {
+        push_reset(&mut spans, resets_at);
+    }
+
     if !spans.is_empty() {
         spans.push(Span::raw(" "));
     }
@@ -1593,6 +1630,75 @@ mod tests {
         assert!(text.contains("Fable"), "{text}");
         assert!(text.contains("12%"), "{text}");
         assert!(text.contains('\u{2192}'), "reset time is missing: {text}");
+    }
+
+    /// **週次のリセット時刻は 1 つだけ、モデル別の後ろに出る。**
+    ///
+    /// 7d 枠とモデル別枠は同じ週次枠を別の切り口で見たものなので、枠ごとに時刻を
+    /// 出すと同じ値が並ぶ（狭い下部バーで最も惜しいのは幅）。
+    /// 出るのは 5h の 1 つと週次の 1 つで**合計 2 つ**
+    #[test]
+    fn the_weekly_reset_time_is_shown_once_after_the_model_windows() {
+        let text = usage_text(
+            &ready(vec![
+                (
+                    "Fable".to_string(),
+                    UsageWindow {
+                        pct: 12.0,
+                        resets_at: None,
+                    },
+                ),
+                (
+                    "Opus".to_string(),
+                    UsageWindow {
+                        pct: 3.0,
+                        resets_at: None,
+                    },
+                ),
+            ]),
+            200,
+        );
+        assert_eq!(
+            text.matches('\u{2192}').count(),
+            2,
+            "expected one reset time for 5h and one for the weekly group: {text}"
+        );
+        // 週次の時刻は最後のモデル別枠より後ろ（＝ グループ全体に付いている）
+        let last_model = text.rfind("Opus").expect("the model window is missing");
+        let last_reset = text.rfind('\u{2192}').expect("the reset time is missing");
+        assert!(last_reset > last_model, "the weekly reset time is not last: {text}");
+        // 7d とモデル別の間に時刻が挟まっていない
+        let seven = text.find("7d").expect("the weekly window is missing");
+        let fable = text.find("Fable").expect("the model window is missing");
+        assert!(
+            !text[seven..fable].contains('\u{2192}'),
+            "a reset time sits between 7d and the model windows: {text}"
+        );
+    }
+
+    /// モデル別枠しか無い形でも週次の時刻を出せる（時刻の出どころが 7d だけに
+    /// 縛られていないこと。7d が欠ける形は公式に「各枠が独立に欠けうる」と明記されている）
+    #[test]
+    fn the_weekly_reset_time_can_come_from_a_model_window() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let usage = Usage::Ready(UsageInfo {
+            five: None,
+            seven: None,
+            models: vec![(
+                "Fable".to_string(),
+                UsageWindow {
+                    pct: 4.0,
+                    resets_at: Some(now + 86_400),
+                },
+            )],
+            fetched_at: now,
+        });
+        let text = usage_text(&usage, 200);
+        assert!(text.contains("Fable"), "{text}");
+        assert_eq!(text.matches('\u{2192}').count(), 1, "{text}");
     }
 
     /// **狭い端末では詳しさから落とす。** 落とす順はリセット時刻 → モデル別 →
