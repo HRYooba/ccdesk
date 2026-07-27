@@ -31,7 +31,6 @@ reopen one and it resumes from its transcript.
   (verified by SHA-256; both apply on the next launch)
 - **Account line** in the footer showing the signed-in Claude account. Display only —
   switch accounts with `/login` inside a session
-  (why switching was dropped: `docs/foreground-migration.md`)
 - **Mouse-first, keyboard-light** — click to switch or focus, the `=` at the right end of
   a row for everything you can do to it. ccdesk reserves exactly two keys —
   `Alt+←/→` pane focus and `Ctrl+Q` quit — so **every other key passes through to

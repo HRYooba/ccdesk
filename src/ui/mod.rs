@@ -101,8 +101,8 @@ struct Run<'a> {
 ///   「実行が終わった」の言い換えなので、hook がそう言った実行は実行として扱わない
 ///   ＝ Stopped は必ず生死フラグが降りた状態でしか作られない
 ///
-/// 実行があるときの中身は **hook が主、`agents --json` が従**
-/// （`docs/foreground-migration.md` のフェーズ3）: hook は turn 単位で届くので
+/// 実行があるときの中身は **hook が主、`agents --json` が従**:
+/// hook は turn 単位で届くので
 /// Working / Needs input / Done を取り違えない。hook が一度も来ていない行
 /// （ccdesk が起こしていないセッション・注入が効かなかった場合）だけ `status` へ落ち、
 /// `status` も無い間は出力の変化から推す
@@ -655,7 +655,7 @@ const LOGGED_OUT_ROW: &str = "not logged in · run /login";
 ///
 /// **出すだけの行**（押しても何も起きない）。ccdesk がアカウントについて答えるのは
 /// 「今サインインしているのは誰か」だけなので、警告も進行中の語も持たない
-/// （アカウントの切り替えを撤去した理由は `docs/foreground-migration.md`）
+/// （切り替えを持たない理由は [`crate::poll::AccountStatus`]）
 fn account_row(status: &AccountStatus) -> (String, Style) {
     match status {
         // 出すのはラベル（`alice` または `alice · Acme, Inc.`）

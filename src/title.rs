@@ -1,6 +1,6 @@
 //! 行の表示名（title）。**正本は transcript**
 //! （`~/.claude/projects/<エンコード済み cwd>/<session-id>.jsonl`）で、
-//! ここは**読むだけ**。優先順の正本は `docs/foreground-migration.md`。
+//! ここは**読むだけ**（優先順は下表）。
 //!
 //! # 表示名は保存しない
 //!

@@ -4,7 +4,7 @@
 //! 起動は新規なら `claude --session-id <uuid> [prompt]`、再開なら
 //! `claude -r <session-id>`。渡した UUID がそのまま transcript の `sessionId` に
 //! なるので、一覧の行（[`crate::sessions::SessionRow`]）と claude 側の記録が
-//! 同じ鍵で結びつく。移行の全体像は `docs/foreground-migration.md`。
+//! 同じ鍵で結びつく。
 //!
 //! **一覧の行とは別物**: ここは「今開いている端末」、[`crate::sessions`] は
 //! 「一覧に載る行」。プロセスが死んでも行は残る。
