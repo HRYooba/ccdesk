@@ -320,8 +320,13 @@ fn out(cmd: &str, args: &[&str]) -> Option<String> {
 struct AuthWatch(Option<AccountStore>);
 
 impl AuthWatch {
+    /// **持ち主の再判定は必ず付ける**（[`AccountStore::with_owner_check`]）。
+    /// 追従更新は「現行の認証情報が保管と食い違ったとき」だけこれを起こすので、
+    /// 毎ティックの子プロセスにはならない。付いていないストアでは追従更新が
+    /// トークンを書かない（安全側に倒れる）ため、**付け忘れると保管が黙って腐る** ＝
+    /// 組み立て口をこの 1 つに閉じて、忘れられる場所を作らない
     fn new(store: Option<AccountStore>) -> Self {
-        Self(store)
+        Self(store.map(|store| store.with_owner_check(Arc::new(current_owner))))
     }
 
     fn detect() -> Self {
@@ -357,7 +362,11 @@ impl AuthWatch {
     ///
     /// 渡すのは **取得の前に読んだ指紋を持った観測**（[`ActiveAccount`]）。
     /// 「誰のトークンか」はここに来るより数百 ms 前（`claude auth status` が
-    /// 認証情報を読んだ時点）に決まっているので、ストア側がロック下で照合する
+    /// 認証情報を読んだ時点）に決まっているので、ストア側がロック下で照合する。
+    ///
+    /// **「書いてよいか」の判断はここに置かない**（[`Self::detect`] が渡した
+    /// 再判定の口を使って全てストア側が決める）。ポーラーが持つのは
+    /// 「いつ声を掛けるか」だけ ＝ 保管を守る規則が呼び出し口ごとに分かれない
     fn sync(&self, active: &ActiveAccount) {
         let Some(store) = self.0.as_ref() else {
             return;
@@ -1233,5 +1242,22 @@ mod tests {
                 "reading the fingerprint alone creates the directory — create_dir_all would run every second"
             );
         }
+    }
+
+    /// **ポーラーのストアは持ち主を判定し直せる。**
+    ///
+    /// 追従更新は判定できないとトークンを書かない（安全側に倒れる）ので、配線を
+    /// 落とすと**エラーも出さずに保管が腐る**（切替で復元できなくなって初めて分かる）。
+    /// 組み立て口が 1 つであること（[`AuthWatch::new`]）をここで固定する
+    #[test]
+    fn the_pollers_store_can_re_check_who_owns_the_credentials() {
+        use crate::accounts::tests::{can_check_owner, TempHome};
+
+        let home = TempHome::new("the_pollers_store_can_re_check_who_owns_the_credentials");
+        let auth = AuthWatch::new(Some(home.store()));
+        assert!(
+            can_check_owner(auth.0.as_ref().expect("the store was dropped")),
+            "the follow-up cannot re-check the owner = it will never store a rotated token"
+        );
     }
 }

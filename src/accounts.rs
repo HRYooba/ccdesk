@@ -81,6 +81,23 @@ pub(crate) fn credentials_fingerprint(path: &Path) -> CredentialsFp {
     Some((md.modified().ok()?, md.len()))
 }
 
+/// 観測した認証情報の変化が落ち着いたか（[`FOLLOW_UP_SETTLE`]）。
+///
+/// **待ちの起点は指紋が既に持っている mtime。** 「いつ変わったか」を別に覚えると
+/// 同じ知識が 2 箇所に増え、複数インスタンスで食い違う（覚えているのは自分の
+/// プロセスが見た分だけ）。ファイル自身の時刻なら誰が読んでも同じ答えになる。
+///
+/// **指紋が無い（ファイルが無い・読めない）ときと、時計が巻き戻っていて経過を
+/// 出せないときは「落ち着いていない」**（判定材料が無い側 ＝ 書かない側へ倒す）
+fn settled(seen: CredentialsFp) -> bool {
+    let Some((modified, _)) = seen else {
+        return false;
+    };
+    std::time::SystemTime::now()
+        .duration_since(modified)
+        .is_ok_and(|age| age >= FOLLOW_UP_SETTLE)
+}
+
 /// 「今 `.credentials.json` の持ち主はこのアカウント」という **いつの観測か付きの**
 /// 判断。
 ///
@@ -229,6 +246,26 @@ const STORE_LOCK_WAIT: Duration = Duration::from_secs(2);
 /// 回数を増やしても通らない ＝ 早く諦めて打つ手を返す方が速い
 const OWNER_CHECK_ATTEMPTS: u32 = 3;
 
+/// 認証情報の変化を、持ち主の判定に使ってよいと見なすまでの猶予
+/// （[`AccountStore::sync_active`]）。
+///
+/// **`claude auth status` の答えは遅れる。** email の出所は `~/.claude.json` の
+/// `oauthAccount` ＝ 遅延取得のキャッシュなので、`/login` で別アカウントへ入った
+/// 直後はまだ**前のアカウント**を答える窓がある（実機で観測: `/login` の 1 秒後に
+/// 走った追従更新が前の email を答えられ、新しいアカウントのトークンが前の
+/// アカウントの保管へ入った）。
+///
+/// **その窓の中では嘘だと分からない。** 指紋（[`CredentialsFp`]）はファイルが
+/// 動いたかしか言わず、持ち主の再判定（[`OwnerCheck`]）も同じキャッシュを読むので
+/// 同じ古い答えを返す。判定材料が全て古い以上、**窓が閉じるまで待つ以外に手が無い**。
+///
+/// 起点はファイル自身の mtime なので、待つために覚えておく状態は要らない。
+/// 実測の遅れは数秒なのでここは十分に長く、claude のトークン更新の間隔（数時間）
+/// よりはるかに短いので、待っている間に次の更新へ追い越されることは無い。
+/// 次の機会はポーラーの周期フォールバック（60 秒）で来るため、この猶予が
+/// 追従を遅らせるのは高々その 1 周期
+const FOLLOW_UP_SETTLE: Duration = Duration::from_secs(30);
+
 /// 保管への 1 件書き込み（[`AccountStore::upsert`]）の要求元。
 ///
 /// **書き込みの流儀（待つか・在否を再確認するか）を要求元から導く**ための型。
@@ -271,6 +308,22 @@ impl Upsert {
             Self::Capture | Self::FollowUp => true,
         }
     }
+}
+
+/// 追従更新が保管に対してやること（[`AccountStore::sync_active`]）。
+///
+/// **「認証情報が変わった」だけを持ち主の再判定の対象にする**ための区別。
+/// 追従更新は 1 秒周期のポーラーから呼ばれるので、毎回書く形にすると
+/// 判定（子プロセス 1 つぶん）も毎周期起きる。実際に書く必要があるのは
+/// `/login` と claude のトークン更新（数時間に 1 回）の後だけで、
+/// ラベルの追従はトークンを動かさないので判定を必要としない
+enum FollowUp {
+    /// 保管は現行の認証情報と同じ ＝ 書くことが無い
+    UpToDate,
+    /// ラベルだけが変わった（組織名が付いた等）
+    Label,
+    /// 認証情報が変わった（`/login`・claude のトークン更新）
+    Credentials,
 }
 
 /// 認証情報ファイルの**今の持ち主**を判定し直した結果（[`OwnerCheck`]）。
@@ -320,12 +373,16 @@ impl AccountStore {
         Some(Self::new(Paths::detect()?))
     }
 
-    /// 持ち主の再判定を付ける（[`Self::confirm`]）。
+    /// 持ち主の再判定を付ける（[`Self::confirm`] / [`Self::reconfirm_owner`]）。
     ///
-    /// **付けるのはユーザーが押した操作の経路だけ**（[`crate::source::LiveSource`] の
-    /// `apply_account`）: 再判定は子プロセス 1 回ぶん（~350ms）なので、
-    /// 1 秒周期のポーラーから呼ばれる追従更新には付けない（あちらは
-    /// 「次の機会がある」処理なので、疑わしければ見送るのが正しい）
+    /// **ユーザーが押した操作（[`crate::source::LiveSource`] の `apply_account`）と
+    /// 追従更新（[`crate::poll`] のポーラー）の両方に付ける。** 再判定は子プロセス
+    /// 1 回ぶん（~370ms）だが、起こすのは**認証情報が保管と食い違ったときだけ**なので
+    /// 周期あたりの費用は増えない（[`FollowUp`]）。
+    ///
+    /// 付いていない構成（撮影用の供給元・ここを通らないテスト）では、追従更新は
+    /// **トークンを書かない**（判定できない ＝ 別アカウントのトークンをこの email の
+    /// 保管へ書きうる、なので安全側に倒す）
     pub(crate) fn with_owner_check(mut self, check: OwnerCheck) -> Self {
         self.owner_check = Some(check);
         self
@@ -341,6 +398,24 @@ impl AccountStore {
     ///
     /// **未登録のアカウントは何もしない。** 明示登録するまで認証情報を勝手に
     /// コピーしない（ユーザーの決定）
+    ///
+    /// # 何を根拠に「この email のトークンだ」と言うか
+    ///
+    /// 呼び手（ポーラー）の観測だけでは足りない。実機で起きた壊れ方はこうだった:
+    /// `/login` で別アカウントへ入る → 1 秒後の追従更新が走る → そのとき
+    /// `claude auth status` はまだ前のアカウントを答える（[`FOLLOW_UP_SETTLE`]）→
+    /// **新しいアカウントのトークンが前のアカウントの保管へ入った**。指紋は
+    /// `/login` の書き込みで既に落ち着いているので、[`Self::still_current`] では
+    /// 止まらない。
+    ///
+    /// そこで書き込みの手前に 2 つ置く:
+    ///
+    /// 1. **変化が落ち着くまで待つ**（[`FOLLOW_UP_SETTLE`]）。答えが遅れている窓では
+    ///    どの材料も嘘を検出できないので、窓が閉じるまで書かない
+    /// 2. **持ち主を判定し直す**（[`Self::reconfirm_owner`]）。判定できなければ書かない
+    ///
+    /// どちらも「次の機会へ回す」＝ 失敗にはしない。トークンは次の更新まで
+    /// 数時間はファイルに残るので、1 周期見送っても取り逃さない
     pub(crate) fn sync_active(&self, active: &ActiveAccount) -> anyhow::Result<bool> {
         let account = &active.account;
         if account.email.is_empty() || !self.is_registered(&account.email) {
@@ -364,7 +439,42 @@ impl AccountStore {
         let Some(oauth) = read_oauth(&self.paths.credentials) else {
             return Ok(false);
         };
-        self.upsert(account, &oauth, Upsert::FollowUp)
+        match self.follow_up(account, &oauth) {
+            // 保管と同じ ＝ 書くことが無い。**ここで子プロセスを起こさない**ので、
+            // 1 秒周期のポーラーが claude を毎周期起動することにはならない
+            FollowUp::UpToDate => Ok(false),
+            // ラベルはトークンを動かさないので持ち主の判定は要らない
+            FollowUp::Label => self.upsert(account, &oauth, Upsert::FollowUp),
+            FollowUp::Credentials => {
+                if !settled(active.seen) {
+                    return Ok(false); // 判定材料が揃うまで次の機会へ回す
+                }
+                let Ok(confirmed) = self.reconfirm_owner(active) else {
+                    return Ok(false); // 持ち主を言えない ＝ 書かない
+                };
+                self.upsert(&confirmed.account, &oauth, Upsert::FollowUp)
+            }
+        }
+    }
+
+    /// 保管 1 件と現行の認証情報を突き合わせて、追従更新がやることを決める
+    /// （[`FollowUp`]）。
+    ///
+    /// **保管ロックの外で読む。** ここで決めるのは「持ち主を判定し直す必要があるか」
+    /// だけで、実際の書き込みは [`Self::upsert`] がロック下で読み直した内容に対して
+    /// 行う（読んだ後に別インスタンスが書いても、書く値は現行ファイル由来なので変わらない）
+    fn follow_up(&self, account: &Account, oauth: &Value) -> FollowUp {
+        let accounts = read_accounts(&self.paths.store);
+        let Some(entry) = accounts.get(&account.email) else {
+            return FollowUp::UpToDate; // 登録が外れた ＝ 書く相手が居ない
+        };
+        if entry.get(CREDENTIALS_KEY) != Some(oauth) {
+            FollowUp::Credentials
+        } else if entry_label(entry, &account.email) != account.label {
+            FollowUp::Label
+        } else {
+            FollowUp::UpToDate
+        }
     }
 
     /// 保管ファイルに載っているか
@@ -399,7 +509,25 @@ impl AccountStore {
     /// - **同じアカウントのトークン更新** → 無害。むしろ新しい値を保管すべき ＝ 続行
     /// - **別アカウントへの差し替え**（別端末での `/login` 等） → 中止
     ///
-    /// どちらかは指紋では言えないので、**持ち主を判定し直す**（[`OwnerCheck`]）。
+    /// どちらかは指紋では言えないので、**持ち主を判定し直す**
+    /// （[`Self::reconfirm_owner`]）。
+    ///
+    /// # 指紋が動いていなければ判定しない
+    ///
+    /// ユーザー操作の経路はメニューを開いてから押すまでの数秒が関心事で、その間に
+    /// ファイルが動いていないなら観測はそのまま使える ＝ 子プロセスを起こす理由が無い。
+    /// **追従更新はこの入口を通らない**（[`Self::sync_active`]）: あちらが守りたい
+    /// 壊れ方（`/login` 直後の遅れた答え）では指紋が動いていないので、
+    /// ここで打ち切ると判定そのものが省かれてしまう
+    fn confirm(&self, active: &ActiveAccount) -> anyhow::Result<ActiveAccount> {
+        if self.still_current(active) {
+            return Ok(active.clone());
+        }
+        self.reconfirm_owner(active)
+    }
+
+    /// 認証情報ファイルの**今の持ち主**を判定し直し、一致した観測を今の指紋で
+    /// 載せ直して返す（[`OwnerCheck`]）。**ロックを保持している間に呼ぶ**。
     ///
     /// # 判定できないときは中止する
     ///
@@ -418,10 +546,7 @@ impl AccountStore {
     ///
     /// **取り直すのは指紋が動いた場合だけ。** 持ち主が違う・未ログイン・判定不能は
     /// もう答えが出ているので、繰り返してもロックを長く握るだけになる
-    fn confirm(&self, active: &ActiveAccount) -> anyhow::Result<ActiveAccount> {
-        if self.still_current(active) {
-            return Ok(active.clone());
-        }
+    fn reconfirm_owner(&self, active: &ActiveAccount) -> anyhow::Result<ActiveAccount> {
         let email = &active.account.email;
         let refuse = |reason: Unconfirmed| reason.into_error(&self.paths.credentials, email);
         let Some(check) = self.owner_check.as_ref() else {
@@ -532,8 +657,9 @@ impl AccountStore {
 /// （載るのはパスと email だけ）
 enum Unconfirmed {
     /// 再判定の口が付いていない経路（[`AccountStore::with_owner_check`] を通らない）。
-    /// 追従更新はここに来ない（あちらは失敗ではなく見送り）ので、
-    /// 実際に出るのは口を付け忘れた呼び出し口だけ ＝ 文言でそれと分かる必要がある
+    /// **ログに出るのはユーザー操作の経路だけ**（追従更新はこの理由を受け取っても
+    /// 見送りに畳むので文言を出さない ＝ [`AccountStore::sync_active`]）。
+    /// つまり出たときは口を付け忘れた呼び出し口 ＝ 文言でそれと分かる必要がある
     NoOwnerCheck,
     /// 観測されたアカウントが email を持たない ＝ 再判定の結果と照合できない
     NoEmail,
@@ -888,7 +1014,7 @@ pub(crate) mod tests {
         /// 持ち主の再判定に**副作用を持たせられる**ストア。実運用の再判定は
         /// 子プロセス 1 つぶん（~370ms）かかるので、その最中に動いている claude が
         /// トークンを更新する状況が起きる ＝ それをここで作る
-        /// （[`AccountStore::confirm`] のリトライ）
+        /// （[`AccountStore::reconfirm_owner`] のリトライ）
         fn store_that_checks(
             &self,
             check: impl Fn() -> Owner + Send + Sync + 'static,
@@ -939,6 +1065,22 @@ pub(crate) mod tests {
         std::fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
     }
 
+    /// 認証情報ファイルの変化を **[`FOLLOW_UP_SETTLE`] の外へ動かす**
+    /// （＝「もう落ち着いた変化」を経過を待たずに作る）。
+    ///
+    /// 待ちの起点はファイル自身の mtime なので、時刻を動かせば実運用と同じ
+    /// 判断がその場で得られる ＝ テストが定数の値に引きずられない
+    /// （[`settled`] を短く差し替える口を作らないのはこのため。
+    ///  差し替えると「実際にどれだけ待つか」がテストから見えなくなる）
+    fn settle_credentials(path: &Path) {
+        let handle = std::fs::File::options().write(true).open(path).unwrap();
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now() - FOLLOW_UP_SETTLE - Duration::from_secs(60),
+            ))
+            .unwrap();
+    }
+
     /// 実測した認証情報ファイルの形（トークンは架空。トップレベルに
     /// `mcpOAuth` が同居し、`claudeAiOauth` に email は入らない）
     pub(crate) fn credentials_doc(access: &str, refresh: &str) -> Value {
@@ -970,6 +1112,14 @@ pub(crate) mod tests {
     /// これを省くとテストが「たまたま検出できない」で落ちる
     fn wait_for_a_new_mtime() {
         std::thread::sleep(Duration::from_millis(40));
+    }
+
+    /// 持ち主の再判定が付いているストアか。**追従更新の安全側は「判定できないなら
+    /// 書かない」なので、付け忘れは「テストは通るのに実機だけ追従しない」形で出る**
+    /// ＝ 組み立て口（[`crate::poll`] の `AuthWatch`）をテストから見るための口。
+    /// 製品側の API を増やさないよう、テスト用のここに置く
+    pub(crate) fn can_check_owner(store: &AccountStore) -> bool {
+        store.owner_check.is_some()
     }
 
     /// 保管された `claudeAiOauth`（トークン比較用）。
@@ -1308,7 +1458,10 @@ pub(crate) mod tests {
     }
 
     /// 追従更新: 登録済みアカウントのトークンが更新されたら保管も更新する。
-    /// refreshToken は使い捨てなので、追従しないと保管が腐って復元できなくなる
+    /// refreshToken は使い捨てなので、追従しないと保管が腐って復元できなくなる。
+    ///
+    /// **書く前に持ち主を判定し直す**（[`AccountStore::sync_active`]）ので、
+    /// 判定の口を付けたストアで見る。落ち着くまでの猶予は mtime を動かして満たす
     #[test]
     fn sync_follows_a_rotated_refresh_token_for_a_registered_account() {
         let home = TempHome::new("sync_follows_a_rotated_refresh_token_for_a_registered_account");
@@ -1318,8 +1471,10 @@ pub(crate) mod tests {
 
         // claude がトークンを更新した（refreshToken が新しい値に置き換わる）
         home.write_credentials(&credentials_doc("access-a2", "refresh-a2"));
+        settle_credentials(&home.paths().credentials);
+        let syncing = home.store_that_sees(Owner::LoggedIn(EMAIL_A.to_string()));
         assert!(
-            store.sync_active(&home.active(EMAIL_A, "taro")).unwrap(),
+            syncing.sync_active(&home.active(EMAIL_A, "taro")).unwrap(),
             "did not follow"
         );
 
@@ -1327,6 +1482,175 @@ pub(crate) mod tests {
             stored_oauth(&store, EMAIL_A),
             Some(oauth("access-a2", "refresh-a2")),
             "store still has the old token (switching would no longer restore it)"
+        );
+    }
+
+    /// **1 秒周期で子プロセスを起こさない。**
+    ///
+    /// 追従更新はポーラーから繰り返し呼ばれる。書く必要があるのは認証情報が
+    /// 保管と食い違ったときだけ（`/login` と claude のトークン更新 ＝ 数時間に 1 回）
+    /// なので、それ以外の周期では**保管ファイルにも触らず、持ち主も聞かない**。
+    /// ラベルの追従はトークンを動かさないので、こちらも判定を必要としない
+    #[test]
+    fn sync_asks_who_owns_the_credentials_only_when_they_changed() {
+        let home = TempHome::new("sync_asks_who_owns_the_credentials_only_when_they_changed");
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let store = home.store_that_checks(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            Owner::LoggedIn(EMAIL_A.to_string())
+        });
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+        let stored_before = std::fs::read(home.paths().store).unwrap();
+
+        // 変化が無い周期: 書かない ＝ 保管ファイルは 1 バイトも動かない
+        for _ in 0..3 {
+            assert!(
+                !store.sync_active(&home.active(EMAIL_A, "taro")).unwrap(),
+                "reported a follow-up even though nothing changed"
+            );
+        }
+        assert_eq!(
+            std::fs::read(home.paths().store).unwrap(),
+            stored_before,
+            "rewrote the store on a tick where nothing changed"
+        );
+
+        // ラベルだけの変化: 書くがトークンは動かないので判定は要らない
+        assert!(
+            store
+                .sync_active(&home.active(EMAIL_A, "taro \u{b7} Acme, Inc."))
+                .unwrap(),
+            "did not follow the label"
+        );
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "runs claude every tick (the poller calls this once a second)"
+        );
+    }
+
+    /// **持ち主を判定できない構成では、変わったトークンを書かない。**
+    ///
+    /// 判定の口が無い経路（撮影用の供給元・ここを通らないテスト）で書いてしまうと、
+    /// 指紋も判定も嘘を検出できない `/login` 直後の窓で
+    /// **別アカウントのトークンをこの email の保管へ書く**。失敗ではなく見送り
+    /// （追従更新には次の機会がある）
+    #[test]
+    fn sync_without_an_owner_check_leaves_a_changed_token_alone() {
+        let home = TempHome::new("sync_without_an_owner_check_leaves_a_changed_token_alone");
+        let store = home.store(); // 判定の口が無いストア
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+
+        home.write_credentials(&credentials_doc("access-a2", "refresh-a2"));
+        settle_credentials(&home.paths().credentials);
+
+        assert!(
+            !store.sync_active(&home.active(EMAIL_A, "taro")).unwrap(),
+            "stored a token it could not attribute to anyone"
+        );
+        assert_eq!(
+            stored_oauth(&store, EMAIL_A),
+            Some(oauth("access-a", "refresh-a")),
+            "the store followed a token without knowing whose it is"
+        );
+    }
+
+    /// **変化の直後は判定を信じない**（[`FOLLOW_UP_SETTLE`]）。
+    ///
+    /// `claude auth status` の email は `~/.claude.json` の遅延キャッシュ由来なので、
+    /// 書き換えの直後に聞いても前のアカウントを答えうる。窓の中では**聞きにも行かない**
+    /// （答えが嘘かどうかを判定する材料がそもそも無いので、子プロセスを起こす意味が無い）。
+    /// 窓が閉じれば同じ変化がそのまま追従される
+    #[test]
+    fn sync_waits_for_a_fresh_change_to_settle_before_following_it() {
+        let home = TempHome::new("sync_waits_for_a_fresh_change_to_settle_before_following_it");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let syncing = home.store_that_checks(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            Owner::LoggedIn(EMAIL_A.to_string())
+        });
+        // 書き換えられたばかりの認証情報（実運用ではポーラーの次のティック）
+        home.write_credentials(&credentials_doc("access-a2", "refresh-a2"));
+
+        assert!(
+            !syncing.sync_active(&home.active(EMAIL_A, "taro")).unwrap(),
+            "followed a change while the owner answer is still known to lag"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "asked who owns it inside the window where the answer cannot be trusted"
+        );
+        assert_eq!(stored_oauth(&store, EMAIL_A), Some(oauth("access-a", "refresh-a")));
+
+        // 同じ変化が落ち着けば追従する（見送りであって取りこぼしではない）
+        settle_credentials(&home.paths().credentials);
+        assert!(
+            syncing.sync_active(&home.active(EMAIL_A, "taro")).unwrap(),
+            "a settled change is never followed = the store rots"
+        );
+        assert_eq!(
+            stored_oauth(&store, EMAIL_A),
+            Some(oauth("access-a2", "refresh-a2"))
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// **実機で起きた汚染そのもの**（`/login` → 追従更新 → `register current`）。
+    ///
+    /// 1. A でログイン中・A は登録済み
+    /// 2. ccdesk の中で `/login` して B へ入る ＝ 認証情報が B の新しいトークンになる
+    /// 3. 1 秒後に追従更新が走る。`claude auth status` は**まだ A を答える**
+    ///    （`~/.claude.json` の `oauthAccount` が遅延取得のキャッシュ）
+    /// 4. その答えを信じると **A の保管に B のトークン**が入る
+    /// 5. 後から押した `register current`（B の正しい登録）が
+    ///    「その refreshToken は A が持っている」と拒まれる ＝ 実機のログ
+    ///
+    /// 指紋は `/login` の書き込みで既に落ち着いているので、この経路は
+    /// [`AccountStore::still_current`] では止まらない
+    #[test]
+    fn a_login_as_another_account_does_not_land_in_the_previous_accounts_entry() {
+        let home =
+            TempHome::new("a_login_as_another_account_does_not_land_in_the_previous_accounts_entry");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+
+        // /login で B へ入った（ccdesk はまだ何も知らない）
+        wait_for_a_new_mtime();
+        home.write_credentials(&credentials_doc("access-b", "refresh-b"));
+
+        // 1 秒後の追従更新。ポーラーは取得の前に指紋を読むので観測は今のファイルの
+        // もの（＝ 指紋ガードは通る）だが、答えた email は 1 つ前のアカウント
+        let lagging = home.active(EMAIL_A, "taro");
+        let syncing = home.store_that_sees(Owner::LoggedIn(EMAIL_A.to_string()));
+        assert!(
+            !syncing.sync_active(&lagging).unwrap(),
+            "stored B's token under A (A becomes unrecoverable)"
+        );
+        assert_eq!(
+            stored_oauth(&store, EMAIL_A),
+            Some(oauth("access-a", "refresh-a")),
+            "A's stored entry now holds B's token"
+        );
+
+        // 遅れが解けた後の `register current` が通る（実機ではここが拒まれた）
+        let now_correct = home.active(EMAIL_B, "hanako");
+        home.store_that_sees(Owner::LoggedIn(EMAIL_B.to_string()))
+            .register(&now_correct)
+            .expect("register current was refused because the follow-up had polluted the store");
+        assert_eq!(
+            stored_oauth(&store, EMAIL_B),
+            Some(oauth("access-b", "refresh-b"))
         );
     }
 
@@ -1339,7 +1663,10 @@ pub(crate) mod tests {
     /// アカウント行と版行の更新が遅れる。
     ///
     /// **待ち時間を詰めていないストア**（実運用と同じ [`STORE_LOCK_WAIT`]）で計るのが
-    /// 要点で、詰めると「待たない」ことを見られない
+    /// 要点で、詰めると「待たない」ことを見られない。
+    ///
+    /// 計るのは**書きに行く周期**でなければ意味が無いので、ラベルを変えて
+    /// 追従の対象を作る（変化が無い周期はロックを取りに行かない ＝ [`FollowUp`]）
     #[test]
     fn sync_does_not_wait_for_the_store_lock() {
         let home = TempHome::new("sync_does_not_wait_for_the_store_lock");
@@ -1351,7 +1678,7 @@ pub(crate) mod tests {
         // 別インスタンスが保管を書いている状態
         let held = Lock::acquire(&home.paths().store_lock(), Duration::ZERO, LOCK_STALE).unwrap();
         let started = Instant::now();
-        let result = store.sync_active(&home.active(EMAIL_A, "taro"));
+        let result = store.sync_active(&home.active(EMAIL_A, "taro \u{b7} Acme, Inc."));
         let waited = started.elapsed();
         drop(held);
 
@@ -1820,7 +2147,11 @@ pub(crate) mod tests {
 
         // 同じ email への上書き（トークン更新の追従）は当然通る
         home.write_credentials(&credentials_doc("access-b2", "refresh-b2"));
-        assert!(store.sync_active(&home.active(EMAIL_B, "hanako")).unwrap());
+        settle_credentials(&home.paths().credentials);
+        assert!(home
+            .store_that_sees(Owner::LoggedIn(EMAIL_B.to_string()))
+            .sync_active(&home.active(EMAIL_B, "hanako"))
+            .unwrap());
     }
 
     /// **保管が同一トークンになる経路そのものを塞げているか**（[`other_holder`]）。
@@ -1830,7 +2161,10 @@ pub(crate) mod tests {
     /// 追従更新が走ると **B のトークンを A の保管へ書く** ＝ 2 つの保管が同じ
     /// refreshToken を指し、どちらへ switch しても何も起きない状態になる。
     /// 指紋は「ccdesk 自身が書いた直後」なので動いておらず、そこでは止まらない ＝
-    /// **保管そのものに聞く側でしか止められない**
+    /// **保管そのものに聞く側でしか止められない**。
+    ///
+    /// **前の関門を全部通した状態で見る**（変化は落ち着かせ、持ち主の再判定も
+    /// 遅れた答え = A を返す）: 手前で止まると最後の砦が効いているか分からない
     #[test]
     fn a_lagging_owner_cannot_store_the_new_accounts_token_under_the_old_email() {
         let home =
@@ -1846,8 +2180,10 @@ pub(crate) mod tests {
             .unwrap();
 
         // 切替直後にポーラーが「今も A」と答えた（指紋は自分が書いたままで動いていない）
+        settle_credentials(&home.paths().credentials);
         let lagging = home.active(EMAIL_A, "taro");
-        let err = store
+        let err = home
+            .store_that_sees(Owner::LoggedIn(EMAIL_A.to_string()))
             .sync_active(&lagging)
             .expect_err("stored B's token under A (both accounts become unusable)");
 
@@ -1938,7 +2274,13 @@ pub(crate) mod tests {
 
         assert!(short.register(&home.active(EMAIL_B, "hanako")).is_err(), "register");
         assert!(short.unregister(EMAIL_A).is_err(), "unregister");
-        assert!(short.sync_active(&home.active(EMAIL_B, "hanako")).is_err(), "sync");
+        // 追従更新は書きに行く周期でしかロックを取らないので、ラベルを変えて作る
+        assert!(
+            short
+                .sync_active(&home.active(EMAIL_B, "hanako \u{b7} Acme, Inc."))
+                .is_err(),
+            "sync"
+        );
         // 切替は「出ていく側の巻き取り」で保管へ書くので、そこで諦める。
         // **現行の認証情報も書き換えない**（巻き取れないまま上書きするとログインが飛ぶ）
         assert!(
