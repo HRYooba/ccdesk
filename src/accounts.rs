@@ -212,6 +212,23 @@ const LOCK_WAIT: Duration = Duration::from_secs(9);
 /// claude と共有するロックの待ち（[`LOCK_WAIT`]）より短くてよい
 const STORE_LOCK_WAIT: Duration = Duration::from_secs(2);
 
+/// 持ち主の再判定（[`AccountStore::confirm`]）を試す回数の上限。
+///
+/// **1 回では足りない**: 判定は子プロセス 1 つぶん（実測 ~370ms）かかり、その間に
+/// 動いている claude がトークンを更新するとファイルが動く。動いた瞬間に諦めると、
+/// セッションを複数抱えた環境では押すたびに同じ失敗になる（リトライが無かった）。
+///
+/// **無制限にもできない**: この再判定は claude と共有する `~/.claude.lock` を
+/// **保持したまま**回る。ccdesk は保持中にロックの mtime を touch しないので
+/// （[`ccdesk::Lock`] の判断）、保持が [`LOCK_STALE`] を超えると claude 側が
+/// 死んだ保持者のものとして奪い、守っていたはずの区間で認証情報の書き換えが
+/// 始まる。1 回 ~400ms なのでここは閾値に対して十分小さく取る
+/// （残りは保管ロックの待ち [`STORE_LOCK_WAIT`] と小さなファイル 2 本の書き込み）。
+///
+/// 収束しないということは書き手が止まっていないということなので、
+/// 回数を増やしても通らない ＝ 早く諦めて打つ手を返す方が速い
+const OWNER_CHECK_ATTEMPTS: u32 = 3;
+
 /// 保管への 1 件書き込み（[`AccountStore::upsert`]）の要求元。
 ///
 /// **書き込みの流儀（待つか・在否を再確認するか）を要求元から導く**ための型。
@@ -390,30 +407,45 @@ impl AccountStore {
     /// 守っている性質は変わらない ＝ **別アカウントのトークンをこの email の保管へ
     /// 書かない**（refreshToken は使い捨てなので、それは復旧不能な破壊になる）。
     ///
-    /// 再判定の**前後で指紋が一致すること**も確かめる: ロックの下なので普通は
-    /// 動かないが、動いたなら判定はその新しいファイルについてのものではない
+    /// # 判定中に動いたら諦めずに取り直す
+    ///
+    /// 再判定の**前後で指紋が一致すること**も確かめる: 動いたなら、その判定は
+    /// 今のファイルについてのものではない。ただし**そこで失敗にしてはいけない**。
+    /// 判定は子プロセス 1 つぶん（~370ms）かかり、その窓に動いている claude の
+    /// トークン更新が入るのは珍しくないので、1 回動いただけで諦めると
+    /// 「押すたびに同じエラー」になる（リトライが無かった）。
+    /// 収束するまで [`OWNER_CHECK_ATTEMPTS`] 回だけ取り直す。
+    ///
+    /// **取り直すのは指紋が動いた場合だけ。** 持ち主が違う・未ログイン・判定不能は
+    /// もう答えが出ているので、繰り返してもロックを長く握るだけになる
     fn confirm(&self, active: &ActiveAccount) -> anyhow::Result<ActiveAccount> {
         if self.still_current(active) {
             return Ok(active.clone());
         }
         let email = &active.account.email;
-        let stale = || stale_active_error(&self.paths.credentials);
-        let (Some(check), false) = (self.owner_check.as_ref(), email.is_empty()) else {
-            return Err(stale());
+        let refuse = |reason: Unconfirmed| reason.into_error(&self.paths.credentials, email);
+        let Some(check) = self.owner_check.as_ref() else {
+            return Err(refuse(Unconfirmed::NoOwnerCheck));
         };
-        // 判定の材料になるファイルの状態を、判定の**前に**読む
-        // （[`crate::poll`] の取得と同じ順序。後から読むと「古い判断に新しい日付」が付く）
-        let seen = self.credentials_fingerprint();
-        let owner = check();
-        if seen != self.credentials_fingerprint() {
-            return Err(stale());
+        if email.is_empty() {
+            return Err(refuse(Unconfirmed::NoEmail));
         }
-        match owner {
-            Owner::LoggedIn(now) if now == *email => {
-                Ok(ActiveAccount::new(active.account.clone(), seen))
+        for _ in 0..OWNER_CHECK_ATTEMPTS {
+            // 判定の材料になるファイルの状態を、判定の**前に**読む（[`crate::poll`] の
+            // 取得と同じ順序。後から読むと「古い判断に新しい日付」が付く）
+            let seen = self.credentials_fingerprint();
+            let owner = check();
+            if seen != self.credentials_fingerprint() {
+                continue; // 判定中に書き換わった ＝ この答えは今のファイルのものではない
             }
-            _ => Err(stale()),
+            return match owner {
+                Owner::LoggedIn(now) if now == *email => {
+                    Ok(ActiveAccount::new(active.account.clone(), seen))
+                }
+                other => Err(refuse(Unconfirmed::Owner(other))),
+            };
         }
+        Err(refuse(Unconfirmed::KeptChanging))
     }
 
     /// 現行の認証情報をロック下で読んで保管する。ロックを取るのは、claude の
@@ -488,15 +520,64 @@ impl AccountStore {
     }
 }
 
-/// 観測が古かったときのエラー。**打つ手を書く**: もう一度メニューを開けば
-/// ポーラーが取り直した新しい観測で通る（＝ ccdesk 側が誰の認証情報かを
-/// 確かめられる状態に戻る）
-fn stale_active_error(credentials: &Path) -> anyhow::Error {
-    anyhow!(
-        "{} changed since ccdesk last checked which account is logged in; \
-         reopen the account menu and try again",
-        credentials.display()
-    )
+/// 観測が古く、持ち主を確かめ直せなかった理由（[`AccountStore::confirm`]）。
+///
+/// **経路ごとに違う文言を出すためだけに在る型。** 拒む理由はここに並ぶだけあるのに
+/// 全部が同じ 1 文（「変わったのでメニューを開き直せ」）を返していたので、実機で
+/// 失敗したときにログを見ても**どの経路で落ちたのか分からなかった** ＝ 原因の
+/// 切り分けができない。打つ手も経路ごとに違う（待ち直す・ログインし直す・
+/// claude を起動できるようにする）ので、1 文にまとめられる情報ではない。
+///
+/// **打つ手を必ず書く**のは元の文と同じ方針。トークンは載せない
+/// （載るのはパスと email だけ）
+enum Unconfirmed {
+    /// 再判定の口が付いていない経路（[`AccountStore::with_owner_check`] を通らない）。
+    /// 追従更新はここに来ない（あちらは失敗ではなく見送り）ので、
+    /// 実際に出るのは口を付け忘れた呼び出し口だけ ＝ 文言でそれと分かる必要がある
+    NoOwnerCheck,
+    /// 観測されたアカウントが email を持たない ＝ 再判定の結果と照合できない
+    NoEmail,
+    /// 再判定のたびに認証情報が書き換わり、[`OWNER_CHECK_ATTEMPTS`] 回で収束しなかった
+    KeptChanging,
+    /// 判定し直した持ち主が観測と食い違う（別 email・未ログイン・判定不能）
+    Owner(Owner),
+}
+
+impl Unconfirmed {
+    /// `expected` は観測されていた持ち主の email（[`Self::NoEmail`] では空）
+    fn into_error(self, credentials: &Path, expected: &str) -> anyhow::Error {
+        let path = credentials.display();
+        match self {
+            Self::NoOwnerCheck => anyhow!(
+                "{path} changed since ccdesk last checked which account is logged in, \
+                 and this code path cannot re-check the owner; \
+                 reopen the account menu and try again"
+            ),
+            Self::NoEmail => anyhow!(
+                "{path} changed since ccdesk last checked which account is logged in, \
+                 and the logged-in account has no email to re-check it against; \
+                 reopen the account menu and try again"
+            ),
+            Self::KeptChanging => anyhow!(
+                "{path} was rewritten during each of the {OWNER_CHECK_ATTEMPTS} owner \
+                 re-checks, so ccdesk never saw who owns a settled file; \
+                 let the running claude sessions go idle and try again"
+            ),
+            Self::Owner(Owner::LoggedIn(now)) => anyhow!(
+                "{path} now belongs to {now}, not {expected}, so ccdesk left it alone; \
+                 reopen the account menu and try again"
+            ),
+            Self::Owner(Owner::LoggedOut) => anyhow!(
+                "{path} changed and no account is logged in now, \
+                 so ccdesk cannot tell what belongs to {expected}; \
+                 log in and try again"
+            ),
+            Self::Owner(Owner::Unknown) => anyhow!(
+                "{path} changed and ccdesk could not run claude to see who owns it now; \
+                 make sure claude runs from this shell and try again"
+            ),
+        }
+    }
 }
 
 /// UI（アカウント切替ポップアップ）向けの公開 API。
@@ -801,8 +882,18 @@ pub(crate) mod tests {
         /// 持ち主の再判定が固定の答えを返すストア（実 CLI を叩かない）。
         /// 実運用では `claude auth status --json` が答える（[`crate::poll::current_owner`]）
         fn store_that_sees(&self, owner: Owner) -> AccountStore {
-            self.store()
-                .with_owner_check(std::sync::Arc::new(move || owner.clone()))
+            self.store_that_checks(move || owner.clone())
+        }
+
+        /// 持ち主の再判定に**副作用を持たせられる**ストア。実運用の再判定は
+        /// 子プロセス 1 つぶん（~370ms）かかるので、その最中に動いている claude が
+        /// トークンを更新する状況が起きる ＝ それをここで作る
+        /// （[`AccountStore::confirm`] のリトライ）
+        fn store_that_checks(
+            &self,
+            check: impl Fn() -> Owner + Send + Sync + 'static,
+        ) -> AccountStore {
+            self.store().with_owner_check(std::sync::Arc::new(check))
         }
 
         /// 待ち時間を詰めたストア（ロック競合を有界時間でテストするため）
@@ -827,11 +918,7 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn write_credentials(&self, value: &Value) {
-            std::fs::write(
-                self.paths().credentials,
-                serde_json::to_string_pretty(value).unwrap(),
-            )
-            .unwrap();
+            write_credentials_at(&self.paths().credentials, value);
         }
 
         pub(crate) fn read_credentials(&self) -> Value {
@@ -843,6 +930,13 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// 認証情報ファイルを書く。**[`TempHome`] を借りずに書ける形**にしてあるのは、
+    /// 持ち主の再判定（`'static` なクロージャ）の中から claude のトークン更新を
+    /// 模すため。書き方の知識は 1 箇所（[`TempHome::write_credentials`] もこれを通る）
+    fn write_credentials_at(path: &Path, value: &Value) {
+        std::fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
     }
 
     /// 実測した認証情報ファイルの形（トークンは架空。トップレベルに
@@ -1484,6 +1578,173 @@ pub(crate) mod tests {
         );
     }
 
+    /// **再判定の最中に動いても諦めない**（実機で出たバグの残り半分）。
+    ///
+    /// 再判定は子プロセス 1 つぶん（実測 ~370ms）かかるので、その窓に動いている
+    /// claude のトークン更新が入るのは珍しくない。1 回動いただけで失敗にしていた
+    /// 頃は、セッションを複数抱えた環境で押すたびに同じエラーになった。
+    /// 収束するまで有界回数だけ取り直す（[`OWNER_CHECK_ATTEMPTS`]）
+    #[test]
+    fn a_rewrite_during_the_owner_check_is_retried_instead_of_failing() {
+        let home = TempHome::new("a_rewrite_during_the_owner_check_is_retried_instead_of_failing");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-b", "refresh-b"));
+        store.register(&home.active(EMAIL_B, "hanako")).unwrap();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+        let seen = home.active(EMAIL_A, "taro");
+        // 押す前に 1 度更新された（ここまでは指紋だけで分かる）
+        home.write_credentials(&credentials_doc("access-a2", "refresh-a2"));
+
+        let credentials = home.paths().credentials;
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let switching = home.store_that_checks(move || {
+            // 1 回目の判定中に claude がもう一度トークンを更新する
+            if counted.fetch_add(1, Ordering::Relaxed) == 0 {
+                write_credentials_at(&credentials, &credentials_doc("access-a33", "refresh-a33"));
+            }
+            Owner::LoggedIn(EMAIL_A.to_string())
+        });
+
+        assert_eq!(
+            switching
+                .switch_to(EMAIL_B, &Outgoing::Known(seen))
+                .expect("gave up on the first rewrite during the owner check"),
+            AccountChange::Switched(home.active(EMAIL_B, "hanako"))
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "did not re-check the owner");
+        assert_eq!(
+            stored_oauth(&store, EMAIL_A),
+            Some(oauth("access-a33", "refresh-a33")),
+            "captured a token from before the rewrite (A becomes unreachable)"
+        );
+        assert_eq!(
+            home.read_credentials()[OAUTH_KEY],
+            oauth("access-b", "refresh-b")
+        );
+    }
+
+    /// **リトライは有界。** この再判定は claude と共有するロックを保持したまま
+    /// 回るので、収束しない相手（書き続けている claude）を無制限に待つと
+    /// [`LOCK_STALE`] を超えて claude 側にロックを奪われる ＝ 守っている区間が
+    /// 守られなくなる。回数で打ち切り、**何も書かずに**失敗する
+    #[test]
+    fn an_owner_check_that_never_settles_gives_up_without_writing() {
+        let home = TempHome::new("an_owner_check_that_never_settles_gives_up_without_writing");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-b", "refresh-b"));
+        store.register(&home.active(EMAIL_B, "hanako")).unwrap();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+        let seen = home.active(EMAIL_A, "taro");
+        home.write_credentials(&credentials_doc("access-a2", "refresh-a2"));
+        let stored_before = std::fs::read(home.paths().store).unwrap();
+
+        let credentials = home.paths().credentials;
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let switching = home.store_that_checks(move || {
+            // 判定のたびに書き換わる。**書くたびに長さを変える**ので、指紋の
+            // mtime 側（同じ時刻刻みだと動いて見えない）に依らず必ず検出される
+            // ＝ [`wait_for_a_new_mtime`] を挟まずに決定的にできる
+            let n = counted.fetch_add(1, Ordering::Relaxed) + 2;
+            let tail = "y".repeat(n);
+            write_credentials_at(
+                &credentials,
+                &credentials_doc(&format!("access-a{tail}"), &format!("refresh-a{tail}")),
+            );
+            Owner::LoggedIn(EMAIL_A.to_string())
+        });
+
+        let err = switching
+            .switch_to(EMAIL_B, &Outgoing::Known(seen))
+            .expect_err("switched without ever seeing a settled file");
+
+        assert!(
+            err.to_string().contains("try again"),
+            "does not convey that retrying would work: {err}"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            OWNER_CHECK_ATTEMPTS as usize,
+            "the retry is not bounded (holds the shared lock past its stale threshold)"
+        );
+        assert_eq!(
+            std::fs::read(home.paths().store).unwrap(),
+            stored_before,
+            "wrote the store without confirming the owner"
+        );
+        assert_eq!(
+            home.read_credentials()[OAUTH_KEY],
+            oauth("access-ayyyy", "refresh-ayyyy"),
+            "overwrote the current credentials without confirming the owner"
+        );
+    }
+
+    /// **どの経路で拒んだかが文言で分かること。**
+    ///
+    /// 4 経路が同じ 1 文を返していたので、実機で失敗してもログから原因を
+    /// 切り分けられなかった（打つ手も経路ごとに違う: 待ち直す・ログインし直す・
+    /// claude を起動できるようにする）。**同じ文言を 2 つ作らない**ことを固定する
+    #[test]
+    fn each_way_of_refusing_a_stale_view_says_which_one_it_was() {
+        let path = Path::new("C:/home/.claude/.credentials.json");
+        let reasons = [
+            Unconfirmed::NoOwnerCheck,
+            Unconfirmed::NoEmail,
+            Unconfirmed::KeptChanging,
+            Unconfirmed::Owner(Owner::LoggedIn(EMAIL_B.to_string())),
+            Unconfirmed::Owner(Owner::LoggedOut),
+            Unconfirmed::Owner(Owner::Unknown),
+        ];
+        let messages: Vec<String> = reasons
+            .into_iter()
+            .map(|reason| reason.into_error(path, EMAIL_A).to_string())
+            .collect();
+
+        for message in &messages {
+            // 打つ手を書く方針は経路が増えても変えない
+            assert!(message.contains("try again"), "no way forward: {message}");
+            // トークンは載せないが、どのファイルの話かは必ず言う
+            assert!(message.contains(".credentials.json"), "no path: {message}");
+        }
+        for (i, message) in messages.iter().enumerate() {
+            assert!(
+                !messages[..i].contains(message),
+                "two paths share one message, so the log cannot tell them apart: {message}"
+            );
+        }
+
+        // 実際の 2 経路が別の文言で出ることまで見る（型と振る舞いを繋ぐ）
+        let home = TempHome::new("each_way_of_refusing_a_stale_view_says_which_one_it_was");
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        home.store()
+            .register(&home.active(EMAIL_A, "taro"))
+            .unwrap();
+        let seen = home.active(EMAIL_A, "taro");
+        home.write_credentials(&credentials_doc("access-b", "refresh-b"));
+
+        let without_check = home
+            .store()
+            .register(&seen)
+            .expect_err("registered on a stale view")
+            .to_string();
+        let wrong_owner = home
+            .store_that_sees(Owner::LoggedIn(EMAIL_B.to_string()))
+            .register(&seen)
+            .expect_err("registered despite another owner")
+            .to_string();
+        assert_ne!(
+            without_check, wrong_owner,
+            "the two paths are indistinguishable in the log"
+        );
+        assert!(
+            wrong_owner.contains(EMAIL_B) && wrong_owner.contains(EMAIL_A),
+            "does not say who owns it now vs who was expected: {wrong_owner}"
+        );
+    }
+
     /// **持ち主が変わっていたら中止する**（守っている性質は変わらない）。
     /// 判定できない（CLI が起動できない・未ログイン）ときも同じ ＝
     /// 「分からない」を「同じ人だ」に倒さない
@@ -1560,6 +1821,50 @@ pub(crate) mod tests {
         // 同じ email への上書き（トークン更新の追従）は当然通る
         home.write_credentials(&credentials_doc("access-b2", "refresh-b2"));
         assert!(store.sync_active(&home.active(EMAIL_B, "hanako")).unwrap());
+    }
+
+    /// **保管が同一トークンになる経路そのものを塞げているか**（[`other_holder`]）。
+    ///
+    /// 実機で起きた状態を作る手順で見る: A → B へ切り替えた直後、`claude auth status`
+    /// はまだ A を答えうる（[`other_holder`] のドキュメント）。その答えを材料に
+    /// 追従更新が走ると **B のトークンを A の保管へ書く** ＝ 2 つの保管が同じ
+    /// refreshToken を指し、どちらへ switch しても何も起きない状態になる。
+    /// 指紋は「ccdesk 自身が書いた直後」なので動いておらず、そこでは止まらない ＝
+    /// **保管そのものに聞く側でしか止められない**
+    #[test]
+    fn a_lagging_owner_cannot_store_the_new_accounts_token_under_the_old_email() {
+        let home =
+            TempHome::new("a_lagging_owner_cannot_store_the_new_accounts_token_under_the_old_email");
+        let store = home.store();
+        home.write_credentials(&credentials_doc("access-b", "refresh-b"));
+        store.register(&home.active(EMAIL_B, "hanako")).unwrap();
+        home.write_credentials(&credentials_doc("access-a", "refresh-a"));
+        store.register(&home.active(EMAIL_A, "taro")).unwrap();
+
+        store
+            .switch_to(EMAIL_B, &Outgoing::Known(home.active(EMAIL_A, "taro")))
+            .unwrap();
+
+        // 切替直後にポーラーが「今も A」と答えた（指紋は自分が書いたままで動いていない）
+        let lagging = home.active(EMAIL_A, "taro");
+        let err = store
+            .sync_active(&lagging)
+            .expect_err("stored B's token under A (both accounts become unusable)");
+
+        assert!(
+            err.to_string().contains(EMAIL_B) && err.to_string().contains(REFRESH_TOKEN_KEY),
+            "does not say which entry collides: {err}"
+        );
+        assert_eq!(
+            stored_oauth(&store, EMAIL_A),
+            Some(oauth("access-a", "refresh-a")),
+            "A's stored entry now holds B's token"
+        );
+        assert_eq!(
+            stored_oauth(&store, EMAIL_B),
+            Some(oauth("access-b", "refresh-b")),
+            "B's stored entry changed"
+        );
     }
 
     /// 登録も同じ根。切替直後（ccdesk の表示がまだ前のアカウント）に
