@@ -175,6 +175,10 @@ pub(crate) trait DataSource: Send + Sync {
     /// 取得しない供給元（撮影用）では何もしない
     fn refresh_usage(&self) {}
 
+    /// **どこかのセッションがターンを終えた。** 使用率が動いた瞬間なので取り直す
+    /// （実際に取るかは供給元が間引く。[`crate::usage::spawn_poller`]）
+    fn note_turn_finished(&self) {}
+
     /// 起動時に復元するウィンドウ状態
     fn window_state(&self) -> WindowState;
 
@@ -416,6 +420,12 @@ impl DataSource for LiveSource {
     fn refresh_usage(&self) {
         if let Some((_, refresh)) = &self.usage {
             refresh.request();
+        }
+    }
+
+    fn note_turn_finished(&self) {
+        if let Some((_, refresh)) = &self.usage {
+            refresh.note_turn_finished();
         }
     }
 

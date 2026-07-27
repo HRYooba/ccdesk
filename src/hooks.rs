@@ -142,6 +142,20 @@ impl HookStates {
         self.0.get(id).map(|entry| entry.at)
     }
 
+    /// 前回の写しと比べて、**新しくターンを終えた行があるか**。
+    ///
+    /// 使用率はターンが終わった瞬間に動くので、これが取得の合図になる
+    /// （[`crate::usage`]。周期で叩き続けるより、変わった直後に 1 回叩くほうが
+    /// 正確で、何もしていない間は claude を 1 プロセスも起こさない）。
+    ///
+    /// **`at` まで比べる**のが要点: state だけを見ると、`completed` のまま残っている
+    /// 行が毎周「終わった」と言い続ける
+    pub(crate) fn any_turn_finished_since(&self, previous: &Self) -> bool {
+        self.0.iter().any(|(id, entry)| {
+            entry.state == COMPLETED && previous.0.get(id).map(|p| p.at) != Some(entry.at)
+        })
+    }
+
     /// その行が**未読**か（行頭の `●`）。
     ///
     /// **claude が何か言ったのが、最後にその行を開いた後か**で決まる。材料は
@@ -497,6 +511,34 @@ mod tests {
             assert_eq!(state_of(event), Some(state), "the receiver doesn't know {event}");
         }
         assert_eq!(state_of("PreToolUse"), None, "received an unregistered hook");
+    }
+
+    /// **ターン完了は「新しく `completed` になった」だけを合図にする。**
+    ///
+    /// `completed` のまま残っている行を state だけで見ると、毎周「終わった」と
+    /// 言い続けて使用率の取得が止まらない（`at` まで比べる理由）
+    #[test]
+    fn only_a_fresh_completion_counts_as_a_finished_turn() {
+        let none = HookStates::default();
+        let working = HookStates::from_entries([("s", WORKING, 1_000)]);
+        let finished = HookStates::from_entries([("s", COMPLETED, 2_000)]);
+
+        // 動いていた行が終わった ＝ 合図
+        assert!(finished.any_turn_finished_since(&working));
+        // 何も知らなかったところに完了が現れた ＝ 合図（起動直後）
+        assert!(finished.any_turn_finished_since(&none));
+        // 同じ完了が残っているだけ ＝ 合図にしない
+        assert!(!finished.any_turn_finished_since(&finished));
+        // 完了が無ければ合図にならない
+        assert!(!working.any_turn_finished_since(&none));
+
+        // **同じ行が次のターンを終えたら、また合図になる**（`at` が進むため）
+        let again = HookStates::from_entries([("s", COMPLETED, 3_000)]);
+        assert!(again.any_turn_finished_since(&finished));
+
+        // 別の行が終わっても合図（複数セッションを見ている）
+        let other = HookStates::from_entries([("s", COMPLETED, 2_000), ("t", COMPLETED, 2_500)]);
+        assert!(other.any_turn_finished_since(&finished));
     }
 
     /// **`Notification` は「ユーザーが動くまで進まない」通知だけを拾う。**

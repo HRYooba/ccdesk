@@ -26,9 +26,32 @@ use crate::claude_format::{
     USAGE_SEVEN_DAY, USAGE_UTILIZATION,
 };
 
-/// 取得周期。5h 枠が 1% 動くのに要する時間に対して十分細かく、かつ
-/// claude プロセスの起動（実測 3 秒前後）が積み上がらない範囲
-const POLL_INTERVAL: Duration = Duration::from_secs(120);
+/// **保険の取得周期。** 主のトリガーはターン完了（[`Trigger::TurnFinished`]）で、
+/// 使用率が動くのはそのときだけ。それでも周期取得を残すのは、イベントでは拾えない
+/// 変化が 2 つあるため:
+///
+/// - **5h 枠は時刻で減る**（リセット）。イベント駆動だけだと、リセット後に次の
+///   ターンが終わるまで古い高い数字を出し続ける
+/// - **ccdesk の外の消費**（別ターミナルの claude・claude.ai・他デバイス）
+///
+/// イベントが主なので周期は長くてよい。何もしていない間に claude を起こす回数が
+/// 2 分ごと → 15 分ごとへ落ちる
+const POLL_INTERVAL: Duration = Duration::from_secs(900);
+
+/// イベント由来の取得の最短間隔。**セッションが何本も走っていればターン完了は
+/// 連発する**ので、1 回 3 秒のプロセス起動をそのまま流さない。
+/// クリック（[`Trigger::Manual`]）はユーザーが明示的に求めた操作なので間引かない
+const EVENT_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 取得の合図。**間引くかどうかが違う**ので種類を分けてある
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Trigger {
+    /// ユーザーがフッターの使用率をクリックした。**必ず取得する**
+    Manual,
+    /// どこかのセッションがターンを終えた（使用率が動いた瞬間）。
+    /// [`EVENT_MIN_INTERVAL`] で間引く
+    TurnFinished,
+}
 
 /// 最後の成功からこれを超えたら表示を dim へ落とす。**古さを黙って隠さない**
 /// （取得が続けて失敗しているのに前の値を平然と出すと、固まった数字を信じさせる）
@@ -94,16 +117,21 @@ pub(crate) enum Usage {
 /// 使用率を持ち回る共有スロット（書き手は取得スレッド 1 つ、読み手は供給元）
 pub(crate) type UsageSlot = Arc<Mutex<Usage>>;
 
-/// 取得スレッドを外から動かす口（[`spawn_poller`] が返す）。
-/// **持つのは「今すぐ取り直せ」の 1 つだけ**
-pub(crate) struct UsageRefresh(std::sync::mpsc::Sender<()>);
+/// 取得スレッドを外から動かす口（[`spawn_poller`] が返す）
+pub(crate) struct UsageRefresh(std::sync::mpsc::Sender<Trigger>);
 
 impl UsageRefresh {
-    /// その場で取り直させる。取得スレッドが待ちから即座に起きる。
+    /// **クリックされた。** その場で取り直させる（間引かない）。
     /// 連打しても取得は 1 回に畳まれる（[`spawn_poller`] が溜まった要求を捨てる）
     pub(crate) fn request(&self) {
         // スレッドが死んでいれば送れないだけ（画面は最後の値を出し続ける）
-        let _ = self.0.send(());
+        let _ = self.0.send(Trigger::Manual);
+    }
+
+    /// **どこかのセッションがターンを終えた。** 使用率が動いた瞬間なので取り直すが、
+    /// 連発するので [`EVENT_MIN_INTERVAL`] で間引く
+    pub(crate) fn note_turn_finished(&self) {
+        let _ = self.0.send(Trigger::TurnFinished);
     }
 }
 
@@ -112,9 +140,9 @@ impl UsageRefresh {
 /// 取得結果は共有スロットへ書くだけで、画面へ伝わるのは供給元
 /// （[`crate::source::LiveSource::usage`]）経由。
 ///
-/// **待ちは `recv_timeout` 1 つ**にしてある: 周期の待ちと手動要求の待ちを
-/// 同じ場所で受けるので、「旗を短い sleep で覗きに行く」形にならない
-/// （クリックしてから最大 2 分待たされる形も避けられる）。
+/// **待ちは `recv_timeout` 1 つ**にしてある: 保険の周期と 2 種類の要求を同じ場所で
+/// 受けるので、「旗を短い sleep で覗きに行く」形にならない（クリックしてから
+/// 周期いっぱい待たされる形も避けられる）。
 ///
 /// 取得そのものにタイムアウトは持たない: `claude agents --json` の周期取得
 /// （[`crate::poll`]）と同じ扱いで、待ちに入るのはこのスレッドだけなので TUI は
@@ -124,7 +152,7 @@ pub(crate) fn spawn_poller(
     dirty: Arc<std::sync::atomic::AtomicBool>,
     fetching: Arc<std::sync::atomic::AtomicBool>,
 ) -> UsageRefresh {
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let (tx, rx) = std::sync::mpsc::channel::<Trigger>();
     std::thread::spawn(move || {
         loop {
             // 取得中であることを出す（1 回 3 秒前後かかるので、押したことが
@@ -133,6 +161,7 @@ pub(crate) fn spawn_poller(
             dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             let next = fetch();
             fetching.store(false, std::sync::atomic::Ordering::Relaxed);
+            let fetched_at = std::time::Instant::now();
 
             let mut guard = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // 取得に失敗しても、一度取れた値は捨てない（1 回の失敗で使用率行が
@@ -145,19 +174,36 @@ pub(crate) fn spawn_poller(
             // 値が据え置きでも描き直させる（取得中の表示を戻す・古さは時間で変わる）
             dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             // **枠の概念が無いアカウントでは周期取得をやめる。** 恒久的に取れないので
-            // 2 分ごとに claude を起こす意味が無い。手動要求だけは受け続ける
+            // 保険の周期で claude を起こす意味が無い。要求だけは受け続ける
             // （アカウントを切り替えたときに戻ってこられる経路を残す）
             let permanent = matches!(*guard, Usage::Unavailable);
             drop(guard);
 
-            if permanent {
-                if rx.recv().is_err() {
+            // 次に取得する合図を待つ。**間引きはここ 1 箇所**
+            loop {
+                let received = if permanent {
+                    rx.recv().map_err(|_| ())
+                } else {
+                    match rx.recv_timeout(POLL_INTERVAL.saturating_sub(fetched_at.elapsed())) {
+                        Ok(trigger) => Ok(trigger),
+                        // 保険の周期が来た
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(()),
+                    }
+                };
+                let Ok(trigger) = received else {
                     return; // 送り手が居なくなった（TUI 終了）
+                };
+                match trigger {
+                    // ユーザーが押した ＝ 間引かない
+                    Trigger::Manual => break,
+                    // ターン完了は連発するので、直前の取得から間を置く。
+                    // 間引いた分は待ち直すだけ（取得は次の合図か保険の周期で起きる）
+                    Trigger::TurnFinished if fetched_at.elapsed() >= EVENT_MIN_INTERVAL => {
+                        break
+                    }
+                    Trigger::TurnFinished => continue,
                 }
-            } else if let Err(std::sync::mpsc::RecvTimeoutError::Disconnected) =
-                rx.recv_timeout(POLL_INTERVAL)
-            {
-                return;
             }
             // 待っている間に溜まった要求は捨てる（連打の回数だけ取得しない）
             while rx.try_recv().is_ok() {}
