@@ -40,7 +40,7 @@ use crate::claude_format::CLAUDE_PID_ENV;
 use crate::poll::STOPPED;
 use crate::sessions::{SessionId, SessionRow};
 
-/// 注入する hook イベントと、それが意味する state。
+/// 注入する hook イベントと、絞り込みの matcher と、それが意味する state。
 ///
 /// **`--settings` の生成（[`inject_settings`]）と受け口（[`run_hook`]）が同じ表を読む**
 /// ので、片方だけ増えた状態にならない。state 値は [`crate::poll::classify`] が読む語彙
@@ -49,15 +49,32 @@ use crate::sessions::{SessionId, SessionRow};
 ///
 /// **turn 単位のイベントだけを載せる。** hook は毎回 ccdesk を 1 プロセス起こすので、
 /// `PreToolUse` / `PostToolUse` のような道具ごとに飛ぶイベントを足すと、Windows の
-/// プロセス起動コストがそのままセッションの遅さになる
-const HOOK_EVENTS: [(&str, &str); 5] = [
+/// プロセス起動コストがそのままセッションの遅さになる。
+///
+/// # `Notification` を絞る理由
+///
+/// `Notification` は通知の種類ごとに matcher を持つ（公式に文書化。値は完全一致で、
+/// `|` 区切りで複数指定できる）。**絞らずに全部拾うと `idle_prompt`（60 秒放置の催促）が
+/// 混ざり、ターンを終えた行が時間経過だけで入力待ちへ落ちる**。実害は 2 つあった:
+/// 「Needs input」が「claude が止まっている」意味を失い、既読にした行の未読印が復活した。
+///
+/// 拾うのは**ユーザーが動くまで進まない**通知だけ。`auth_success` /
+/// `elicitation_complete` / `elicitation_response` / `agent_completed` は完了・情報通知
+/// なので拾わない（完了は `Stop` が答える）。
+///
+/// 縮退: matcher が効かない版では `Notification` が一度も発火しない ＝ 入力待ちは
+/// `agents --json` の `status` 経由だけになる。**`done` が壊れるより取り逃すほうが軽い**
+const NOTIFICATION_MATCHER: &str = "permission_prompt|elicitation_dialog|agent_needs_input";
+
+/// 注入する hook（イベント名, matcher, state）。matcher が None のイベントは
+/// 全発火を拾う（そのイベント自体が 1 つの意味しか持たないもの）
+const HOOK_EVENTS: [(&str, Option<&str>, &str); 5] = [
     // 起動直後・再開直後はまだプロンプトを受けていない ＝ 入力待ち
-    ("SessionStart", "blocked"),
-    ("UserPromptSubmit", "working"),
-    // 入力待ち・許可待ちのどちらもユーザーの操作を待っている状態
-    ("Notification", "blocked"),
-    ("Stop", "done"),
-    ("SessionEnd", STOPPED),
+    ("SessionStart", None, "blocked"),
+    ("UserPromptSubmit", None, "working"),
+    ("Notification", Some(NOTIFICATION_MATCHER), "blocked"),
+    ("Stop", None, "done"),
+    ("SessionEnd", None, STOPPED),
 ];
 
 /// 保管ファイルのトップレベルキー（`{"states": { "<session-id>": { … } }}`）
@@ -201,8 +218,8 @@ impl HookStates {
 fn state_of(event: &str) -> Option<&'static str> {
     HOOK_EVENTS
         .iter()
-        .find(|(name, _)| *name == event)
-        .map(|(_, state)| *state)
+        .find(|(name, _, _)| *name == event)
+        .map(|(_, _, state)| *state)
 }
 
 /// `ccdesk hook <event>`。**注入した hook の受け口**（ユーザーは直接使わない）。
@@ -388,15 +405,24 @@ fn settings_document(exe_fwd: &str) -> Value {
         Value::Object(
             HOOK_EVENTS
                 .iter()
-                .map(|(event, _)| {
+                .map(|(event, matcher, _)| {
+                    // matcher を持つイベントだけ `matcher` を載せる。
+                    // **空文字を載せない**（`""` は「何にも一致しない」とも
+                    // 「全部に一致」とも読めるので、意図が伝わらない形にしない）
+                    let mut group = serde_json::Map::new();
+                    if let Some(matcher) = matcher {
+                        group.insert("matcher".to_string(), json!(matcher));
+                    }
+                    group.insert(
+                        "hooks".to_string(),
+                        json!([{
+                            "type": "command",
+                            "command": format!("\"{exe_fwd}\" hook {event}"),
+                        }]),
+                    );
                     (
                         (*event).to_string(),
-                        json!([{
-                            "hooks": [{
-                                "type": "command",
-                                "command": format!("\"{exe_fwd}\" hook {event}"),
-                            }],
-                        }]),
+                        json!([Value::Object(group)]),
                     )
                 })
                 .collect(),
@@ -455,16 +481,50 @@ mod tests {
         let document = settings_document("C:/bin/ccdesk.exe");
         let hooks = document.get("hooks").and_then(Value::as_object).unwrap();
         assert_eq!(hooks.len(), HOOK_EVENTS.len(), "number of injected hooks differs from the table");
-        for (event, state) in HOOK_EVENTS {
+        for (event, matcher, state) in HOOK_EVENTS {
             let command = hooks[event][0]["hooks"][0]["command"].as_str().unwrap();
             assert_eq!(
                 command,
                 format!("\"C:/bin/ccdesk.exe\" hook {event}"),
                 "{event} has a different invocation shape"
             );
+            // matcher は表のとおりに載る（持たないイベントにはキー自体を書かない）
+            assert_eq!(
+                hooks[event][0].get("matcher").and_then(Value::as_str),
+                matcher,
+                "{event} has a different matcher"
+            );
             assert_eq!(state_of(event), Some(state), "the receiver doesn't know {event}");
         }
         assert_eq!(state_of("PreToolUse"), None, "received an unregistered hook");
+    }
+
+    /// **`Notification` は「ユーザーが動くまで進まない」通知だけを拾う。**
+    ///
+    /// 絞らずに全部拾うと `idle_prompt`（60 秒放置の催促）が混ざり、ターンを終えた行が
+    /// 時間経過だけで入力待ちへ落ちる ＝ 「Needs input」が「claude が止まっている」
+    /// 意味を失い、既読にした行の未読印が復活する。**この 2 つは実際に起きた**
+    #[test]
+    fn the_notification_hook_ignores_the_idle_reminder() {
+        let matcher = HOOK_EVENTS
+            .iter()
+            .find(|(event, _, _)| *event == "Notification")
+            .and_then(|(_, matcher, _)| *matcher)
+            .expect("Notification must be filtered by a matcher");
+        let kinds: Vec<&str> = matcher.split('|').collect();
+        for wanted in ["permission_prompt", "elicitation_dialog", "agent_needs_input"] {
+            assert!(kinds.contains(&wanted), "{wanted} is not picked up");
+        }
+        // 催促と完了・情報通知は拾わない（完了は Stop が答える）
+        for unwanted in [
+            "idle_prompt",
+            "auth_success",
+            "elicitation_complete",
+            "elicitation_response",
+            "agent_completed",
+        ] {
+            assert!(!kinds.contains(&unwanted), "{unwanted} must not be picked up");
+        }
     }
 
     /// **道具ごとに飛ぶイベントは登録しない**（hook は毎回 ccdesk を 1 プロセス
@@ -473,7 +533,7 @@ mod tests {
     fn only_turn_level_events_are_injected() {
         for event in ["PreToolUse", "PostToolUse", "PreCompact", "SubagentStop"] {
             assert!(
-                !HOOK_EVENTS.iter().any(|(name, _)| *name == event),
+                !HOOK_EVENTS.iter().any(|(name, _, _)| *name == event),
                 "{event} is not turn-level"
             );
         }
