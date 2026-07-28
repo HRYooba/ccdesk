@@ -15,6 +15,8 @@
 //! 消えるだけで、ccdesk の他の機能は影響を受けない。
 
 use std::sync::{Arc, Mutex};
+
+use ccdesk::LockExt;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -163,7 +165,7 @@ pub(crate) fn spawn_poller(
             fetching.store(false, std::sync::atomic::Ordering::Relaxed);
             let fetched_at = std::time::Instant::now();
 
-            let mut guard = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = slot.lock_recover();
             // 取得に失敗しても、一度取れた値は捨てない（1 回の失敗で使用率行が
             // 消えるのを防ぐ）。古さは `fetched_at` に出るので嘘にはならない
             let keep_previous =
@@ -293,7 +295,7 @@ fn probe() -> Result<Value, ProbeError> {
 /// 1 回取得する（取得スレッド用。落ちた段は表示に出さないので潰す）
 fn fetch() -> Usage {
     match probe() {
-        Ok(v) => parse_response(&v, ccdesk::now_ms() / 1000),
+        Ok(v) => parse_response(&v, ccdesk::now_secs()),
         Err(_) => Usage::Failed,
     }
 }
@@ -301,7 +303,7 @@ fn fetch() -> Usage {
 /// `ccdesk doctor` 用。**取得経路をユーザー自身が 1 コマンドで確かめられる**ように、
 /// 落ちた段をそのまま返す（開発者の環境では再現しない不具合をユーザー側で切り分けるため）
 pub(crate) fn diagnose() -> Result<Usage, ProbeError> {
-    probe().map(|v| parse_response(&v, ccdesk::now_ms() / 1000))
+    probe().map(|v| parse_response(&v, ccdesk::now_secs()))
 }
 
 /// `control_response` 1 個から [`Usage`] を組む。**プロセスを起こさずに検査できる**

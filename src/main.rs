@@ -116,19 +116,9 @@ fn main() -> anyhow::Result<()> {
     let footer = source.footer();
     let window = source.window_state();
 
-    // ホスト端末の実 fg/bg を OSC 10/11 で照会。
-    // raw mode / alt screen に入る前に行う。非対応端末はヒューリスティックで
-    // 即 Err になるためハングしない（その場合は Dark+ 相当の固定値で claude に応答）
-    {
-        use terminal_colorsaurus::{color_palette, QueryOptions};
-        let host = color_palette(QueryOptions::default())
-            .map(|p| {
-                let c = |c: terminal_colorsaurus::Color| [c.r, c.g, c.b];
-                (Some(c(p.foreground)), Some(c(p.background)))
-            })
-            .unwrap_or((None, None));
-        let _ = HOST_COLORS.set(host);
-    }
+    // ホスト端末の実 fg/bg を OSC 10/11 で照会（raw mode に入る前。
+    // 照会の作法は theme 側の 1 実装 ＝ doctor と同じ経路を通る）
+    let _ = HOST_COLORS.set(theme::query_host_colors());
 
     let mut terminal = ratatui::init();
     // panic は ~/.ccdesk/error.log へ記録（TUI は画面ごと消えて panic 表示が読めない）。

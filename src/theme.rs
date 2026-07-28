@@ -33,8 +33,11 @@ static UI: std::sync::OnceLock<UiTheme> = std::sync::OnceLock::new();
 pub(crate) fn ui() -> &'static UiTheme {
     UI.get_or_init(|| {
         let (fg, bg) = HOST_COLORS.get().copied().unwrap_or((None, None));
-        let fg = fg.unwrap_or([0xcccc, 0xcccc, 0xcccc]);
-        let bg = bg.unwrap_or([0x1e1e, 0x1e1e, 0x1e1e]);
+        // フォールバックは claude への OSC 応答（`ccdesk::Responder`）と同じ既定
+        // （別の値にすると「claude に送ったテーマ」と「ccdesk の描画が仮定する
+        // テーマ」がずれる）
+        let fg = fg.unwrap_or(ccdesk::DEFAULT_FG);
+        let bg = bg.unwrap_or(ccdesk::DEFAULT_BG);
         let mix = |a: [u16; 3], b: [u16; 3], t: f32| -> Color {
             let ch = |i: usize| {
                 let v = a[i] as f32 + (b[i] as f32 - a[i] as f32) * t;
@@ -60,6 +63,20 @@ pub(crate) type HostColor = Option<[u16; 3]>;
 /// OSC 10/11 応答へ転送する = claude 自身のテーマ自動検出（theme=auto）が正しく動く。
 /// 照会失敗（WT 1.22 未満・旧 ConHost 等）は Dark+ 相当の固定値で応答する
 pub(crate) static HOST_COLORS: std::sync::OnceLock<(HostColor, HostColor)> = std::sync::OnceLock::new();
+
+/// ホスト端末の実 fg/bg を OSC 10/11 で照会する。**raw mode / alt screen に
+/// 入る前に呼ぶ**（TUI 起動と doctor が同じ照会を通る ＝ doctor の ok と
+/// 実際の転送結果が食い違わない）。非対応端末はヒューリスティックで即 Err に
+/// なるためハングしない。失敗は (None, None) ＝ Dark+ 相当のフォールバック
+pub(crate) fn query_host_colors() -> (HostColor, HostColor) {
+    use terminal_colorsaurus::{color_palette, QueryOptions};
+    color_palette(QueryOptions::default())
+        .map(|p| {
+            let c = |c: terminal_colorsaurus::Color| Some([c.r, c.g, c.b]);
+            (c(p.foreground), c(p.background))
+        })
+        .unwrap_or((None, None))
+}
 
 /// 使用率の色（緑 → 黄 → 赤の連続グラデーション。しきい値を持たないので
 /// 「何 % で色が変わるか」という設定を増やさずに済む）

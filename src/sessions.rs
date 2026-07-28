@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use ccdesk::{lock_path_for, write_json_atomically, Lock, LOCK_STALE};
+use ccdesk::{lock_path_for, write_json_atomically, Lock, LockExt, LOCK_STALE};
 
 /// 保管ファイルのトップレベルキー（`{"sessions": [ … ]}`）
 const SESSIONS_KEY: &str = "sessions";
@@ -268,32 +268,17 @@ impl SessionStore {
     }
 
     fn baseline(&self) -> std::sync::MutexGuard<'_, Vec<SessionRow>> {
-        self.baseline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// 起動時の掃除: [`write_json_atomically`] が rename する前にプロセスが死ぬと、
-    /// その `.tmp` は誰にも消されずに残る。
-    ///
-    /// **どう回収するかは [`ccdesk::reap_leftover_tmp`]**（tmp の名前を決める側と
-    /// 同じ場所）。ここが持つのは対象の指定だけ
-    pub(crate) fn cleanup_leftover_tmp(&self) {
-        ccdesk::reap_leftover_tmp(&self.store);
+        self.baseline.lock_recover()
     }
 }
 
-/// 保管ファイルの行一覧（無い・壊れている・書き換え途中はすべて空）。
+/// 保管ファイルの行一覧（無い・壊れている・書き換え途中はすべて空 ＝
+/// 読みの寛容さは [`ccdesk::read_json`] の契約）。
 /// identity を持たない行は捨てる（[`SessionRow::from_json`]）
 fn read_rows(path: &Path) -> Vec<SessionRow> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return Vec::new();
-    };
-    value
-        .get(SESSIONS_KEY)
+    ccdesk::read_json(path)
+        .as_ref()
+        .and_then(|value| value.get(SESSIONS_KEY))
         .and_then(Value::as_array)
         .map(|rows| rows.iter().filter_map(SessionRow::from_json).collect())
         .unwrap_or_default()
@@ -705,7 +690,9 @@ mod tests {
             .unwrap();
         drop(handle);
 
-        temp.store().cleanup_leftover_tmp();
+        // 回収の実体は lib 側の 1 実装（起動列は `reap_startup_leftovers` が
+        // 同じ関数を通る）
+        ccdesk::reap_leftover_tmp(&temp.path());
 
         assert!(!old.exists(), "did not reclaim the old tmp");
         assert!(fresh.exists(), "removed a tmp that might still be in progress");

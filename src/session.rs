@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
-use ccdesk::{new_parser, now_ms, Parser};
+use ccdesk::{new_parser, now_ms, LockExt, Parser};
 
 // 継承させない環境変数の一覧は claude の非公開な形なので
 // [`crate::claude_format`] が持つ（外れたときに直す場所を 1 つにするため）
@@ -276,8 +276,7 @@ impl Session {
         {
             let (fg, bg) = HOST_COLORS.get().copied().unwrap_or((None, None));
             let mut p = parser
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_recover();
             p.callbacks_mut().host_fg = fg;
             p.callbacks_mut().host_bg = bg;
         }
@@ -306,8 +305,7 @@ impl Session {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         *last_output_clone
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            .lock_recover() =
                             std::time::Instant::now();
                         dirty_clone.store(true, Ordering::Relaxed);
                         started_clone.store(true, Ordering::Relaxed);
@@ -323,8 +321,7 @@ impl Session {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             || {
                                 let mut parser = parser_clone
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    .lock_recover();
                                 parser.process(&buf[..n]);
                                 parser.callbacks_mut().take()
                             },
@@ -333,16 +330,14 @@ impl Session {
                             Ok(response) => {
                                 if !response.is_empty() {
                                     let mut writer = writer_clone
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        .lock_recover();
                                     let _ = writer.write_all(&response);
                                     let _ = writer.flush();
                                 }
                             }
                             Err(_) => {
                                 let mut guard = parser_clone
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    .lock_recover();
                                 // 端末モードを退避してから作り直す（claude は画面は再描画するが
                                 // モード再送はしないため、失うとマウス・ペースト等が死ぬ）
                                 let (rows, cols) = guard.screen().size();
@@ -425,8 +420,7 @@ impl Session {
     pub(crate) fn holds_frame(&self, since_draw: Duration) -> bool {
         let since_output = self
             .last_output
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .elapsed();
         hold_frame(
             self.updating.load(Ordering::Relaxed),
@@ -439,15 +433,14 @@ impl Session {
     pub(crate) fn send_focus(&mut self, gained: bool) {
         let wants_focus = self
             .parser
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .callbacks()
             .focus_reporting;
         if !wants_focus {
             return;
         }
         let seq: &[u8] = if gained { b"\x1b[I" } else { b"\x1b[O" };
-        let mut writer = self.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut writer = self.writer.lock_recover();
         let _ = writer.write_all(seq);
         let _ = writer.flush();
     }
@@ -457,7 +450,7 @@ impl Session {
         if !self.alive() {
             return SessionStatus::Exited;
         }
-        if self.last_output.lock().unwrap_or_else(std::sync::PoisonError::into_inner).elapsed() < Duration::from_secs(2) {
+        if self.last_output.lock_recover().elapsed() < Duration::from_secs(2) {
             SessionStatus::Working
         } else {
             SessionStatus::NeedsInput
@@ -476,7 +469,7 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         });
-        self.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner).screen_mut().set_size(rows, cols);
+        self.parser.lock_recover().screen_mut().set_size(rows, cols);
     }
 
     pub(crate) fn alive(&mut self) -> bool {

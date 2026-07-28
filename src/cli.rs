@@ -206,20 +206,23 @@ pub(crate) fn run_doctor() -> anyhow::Result<()> {
     }
 
     // ターミナルの色照会（OSC 10/11）。取れれば fg/bg を hex 表示、失敗なら warn
-    // （パイプ実行など実端末でない場合は失敗して当然。テーマ転送は dark にフォールバック）
+    // （パイプ実行など実端末でない場合は失敗して当然。テーマ転送は dark にフォールバック）。
+    // 照会は TUI 起動と同じ 1 実装（theme 側）を通る ＝ doctor の ok が本番と同じ経路の答えになる
     {
-        use terminal_colorsaurus::{color_palette, QueryOptions};
-        let hex = |c: terminal_colorsaurus::Color| {
-            format!("#{:02x}{:02x}{:02x}", (c.r >> 8) as u8, (c.g >> 8) as u8, (c.b >> 8) as u8)
+        let hex = |c: [u16; 3]| {
+            format!(
+                "#{:02x}{:02x}{:02x}",
+                (c[0] >> 8) as u8,
+                (c[1] >> 8) as u8,
+                (c[2] >> 8) as u8
+            )
         };
-        match color_palette(QueryOptions::default()) {
-            Ok(p) => println!(
-                "ok    terminal color query: fg {} bg {}",
-                hex(p.foreground),
-                hex(p.background)
-            ),
-            Err(e) => println!(
-                "warn  terminal color query failed ({e}); theme forwarding falls back to dark"
+        match crate::theme::query_host_colors() {
+            (Some(fg), Some(bg)) => {
+                println!("ok    terminal color query: fg {} bg {}", hex(fg), hex(bg));
+            }
+            _ => println!(
+                "warn  terminal color query failed; theme forwarding falls back to dark"
             ),
         }
     }

@@ -319,10 +319,7 @@ fn record(path: &Path, session_id: &SessionId, state: &str, now: u64, pid: Optio
 /// 保管ファイルの項目（`session_id` → [`Entry`]）。
 /// **無い・壊れている・書き換え途中はすべて空**（起動も turn も止めない）
 fn read_entries(path: &Path) -> BTreeMap<String, Entry> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return BTreeMap::new();
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+    let Some(value) = ccdesk::read_json(path) else {
         return BTreeMap::new();
     };
     let Some(states) = value.get(STATES_KEY).and_then(Value::as_object) else {
@@ -376,16 +373,7 @@ fn states_at(path: &Path) -> HookStates {
 /// 見る口**で、run ループがこれを毎周見て変化した周だけ読み直す
 /// （hook が来た瞬間に一覧へ反映するための合図。ファイルを開かないので安い）
 pub(crate) fn states_stamp() -> Option<(u64, std::time::SystemTime)> {
-    let meta = std::fs::metadata(ccdesk::hook_states_path()?).ok()?;
-    Some((meta.len(), meta.modified().ok()?))
-}
-
-/// 起動時の掃除: rename の前に死んだ hook プロセスが残した `.tmp` を回収する
-/// （どう回収するかは [`ccdesk::reap_leftover_tmp`]。ここが持つのは対象の指定だけ）
-pub(crate) fn cleanup_leftover_tmp() {
-    if let Some(path) = ccdesk::hook_states_path() {
-        ccdesk::reap_leftover_tmp(&path);
-    }
+    ccdesk::file_stamp(&ccdesk::hook_states_path()?)
 }
 
 /// 子の claude へ `--settings` で渡す注入ファイルを書き、そのパスを返す。

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use ccdesk::{
     load_setting, load_state, load_state_list, same_dir, save_setting, save_state,
-    update_state_list,
+    update_state_list, LockExt,
 };
 
 use crate::hooks::HookStates;
@@ -343,19 +343,12 @@ impl LiveSource {
         usage_dirty: Arc<std::sync::atomic::AtomicBool>,
         usage_fetching: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
-        // 前回の異常終了が残した書きかけの `.tmp` を回収する。実データ側だけで
-        // 行う ＝ 撮影（[`DemoSource`]）は実ファイルに触らない、という約束を
-        // 「今 demo か」の分岐を足さずに守れる置き場所
-        ccdesk::reap_leftover_kv_tmp();
+        // 前回の異常終了が残した書きかけの `.tmp`（ウィンドウ状態・設定・
+        // セッション一覧・hook の受け渡し）を 1 回の走査でまとめて回収する。
+        // 実データ側だけで行う ＝ 撮影（[`DemoSource`]）は実ファイルに触らない、
+        // という約束を「今 demo か」の分岐を足さずに守れる置き場所
+        ccdesk::reap_startup_leftovers();
         let sessions = SessionStore::detect();
-        // セッション一覧の tmp も同じ理由で回収する（中身はトークンではないが、
-        // rename の前に死んだ分は誰にも消されずに積もる）
-        if let Some(store) = &sessions {
-            store.cleanup_leftover_tmp();
-        }
-        // hook の受け渡しファイルも同じ理由（書き手は短命な hook プロセスなので、
-        // rename の前に殺されると tmp が残る）
-        crate::hooks::cleanup_leftover_tmp();
         // **opt-in の分岐はここ 1 箇所。** off なら取得スレッドを起こさない
         let usage = usage_display.then(|| {
             let slot: UsageSlot = Arc::new(Mutex::new(Usage::default()));
@@ -411,8 +404,7 @@ impl DataSource for LiveSource {
     fn usage(&self) -> Usage {
         // opt-in していなければスロットが無い ＝ 取得もしないし何も描かない
         self.usage.as_ref().map_or(Usage::Unknown, |(slot, _)| {
-            slot.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            slot.lock_recover()
                 .clone()
         })
     }
@@ -441,8 +433,7 @@ impl DataSource for LiveSource {
         // **読んだ内容が以降の書き込みでマージする基準になる**（[`merge_projects`]）
         *self
             .projects_baseline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = projects.clone();
+            .lock_recover() = projects.clone();
         WindowState {
             // 旧版は config.json に保存していたため、state.json に無ければそちらへフォールバック
             sidebar_width: load_state("sidebar_width")
@@ -502,8 +493,7 @@ impl DataSource for LiveSource {
     fn store_projects(&self, next: &[String]) -> Vec<String> {
         let mut baseline = self
             .projects_baseline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_recover();
         persist_projects(&mut baseline, next, |merge| {
             update_state_list("projects", merge)
         })
@@ -683,10 +673,7 @@ fn demo_footer() -> FooterInfo {
 /// いつ撮っても同じ見た目（残り時間の相対値）になる。
 /// `fetched_at` も今にしておく ＝ 撮影で dim（古い表示）にならない
 fn demo_usage() -> UsageInfo {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = ccdesk::now_secs();
     let window = |pct: f64, resets_at: u64| UsageWindow {
         pct,
         resets_at: Some(resets_at),
@@ -733,11 +720,7 @@ mod tests {
         assert_eq!(usage.seven.as_ref().map(|w| w.pct), Some(58.0));
         assert_eq!(usage.models, vec![("Fable".to_string(), UsageWindow { pct: 12.0, resets_at: None })]);
         // 撮影データは常に「今」取れたことにする（dim で撮れてしまわない）
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        assert!(!usage.is_stale(now));
+        assert!(!usage.is_stale(ccdesk::now_secs()));
     }
 
     /// 撮影用のセッション行は固定。実 ID・実パスは出さず、未読も出さない

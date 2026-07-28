@@ -10,7 +10,7 @@ use ratatui::Frame;
 use std::time::Duration;
 use tui_term::widget::PseudoTerminal;
 
-use ccdesk::dir_key;
+use ccdesk::{dir_key, LockExt};
 
 use crate::app::{
     selected_enter, sidebar_cols, App, Focus, Popup, RightView, RowAction,
@@ -172,10 +172,8 @@ fn usage_line(usage: &Usage, max_width: u16, fetching: bool) -> Vec<Span<'static
         }
         Usage::Ready(info) => info,
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    // 判定する側と記録する側（usage.rs の fetched_at）で epoch の取り方を分けない
+    let now = ccdesk::now_secs();
     let stale = info.is_stale(now) || fetching;
     for detail in [
         UsageDetail::Full,
@@ -642,8 +640,7 @@ fn count_key_call(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>
 fn ccdesk_update_state(app: &App) -> UpdateState {
     match &*app
         .ccdesk_update
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
     {
         SelfUpdate::Running => UpdateState::Running,
         SelfUpdate::Done => UpdateState::Restart,
@@ -1038,11 +1035,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
 
     // サイドバー: **行の正本は `~/.ccdesk/sessions.json`**（`app.sessions`）。
     // 生死は自分の子プロセス（`child.try_wait()`）が、生きている行のライブ状態は
-    // `claude agents --json` の `status` が答える
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    // `claude agents --json` の `status` が答える。
+    // 時刻は hook が `changed_at` を書いたのと同じ物差し（`ccdesk::now_ms`）で取る
+    let now_ms = ccdesk::now_ms();
 
     // 窓ごとの観測を**先に**確定させる（生死と出力ヒューリスティックは可変借用が要る）。
     // 以降は行の一覧を不変で回せるので、行の組み立ては 1 本のループで済む
@@ -1512,7 +1507,7 @@ fn draw_right_pane(frame: &mut Frame, pane: Rect, app: &mut App) -> FrameCursor 
         .iter()
         .find(|row| row.session_id == window.session_id)
         .map_or_else(|| crate::title::UNTITLED.to_string(), |row| app.titles.of(row));
-    let parser = window.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let parser = window.parser.lock_recover();
     let screen = parser.screen();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1580,10 +1575,7 @@ mod tests {
     }
 
     fn ready(models: Vec<(String, UsageWindow)>) -> Usage {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = ccdesk::now_secs();
         Usage::Ready(UsageInfo {
             five: Some(UsageWindow {
                 pct: 18.0,
@@ -1683,10 +1675,7 @@ mod tests {
     /// 縛られていないこと。7d が欠ける形は公式に「各枠が独立に欠けうる」と明記されている）
     #[test]
     fn the_weekly_reset_time_can_come_from_a_model_window() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = ccdesk::now_secs();
         let usage = Usage::Ready(UsageInfo {
             five: None,
             seven: None,

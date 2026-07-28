@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use ratatui::style::Color;
 
-use ccdesk::{claude_settings_channel, version_newer};
+use ccdesk::{claude_settings_channel, version_newer, LockExt};
 
 // `agents --json` の項目の綴りは文書化されていないので
 // [`crate::claude_format`] が持つ（外れたときに直す場所を 1 つにするため）
@@ -83,8 +83,7 @@ pub(crate) fn spawn_agents_poller(
                     })
                     .collect();
                 *shared
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = parsed;
+                    .lock_recover() = parsed;
                 dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         std::thread::sleep(Duration::from_secs(2));
@@ -259,15 +258,17 @@ fn out(cmd: &str, args: &[&str]) -> Option<String> {
         .stdin(std::process::Stdio::null())
         .output()
         .ok()?;
-    Some(String::from_utf8_lossy(&o.stdout).to_string())
+    // `into_owned` は正常な UTF-8（Borrowed）でも確保 1 回で済む
+    // （`.to_string()` は Owned のときに二重確保になる）
+    Some(String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
-/// 認証情報ファイルが書き換わっていないかを見るための印（mtime とサイズ）。
+/// 認証情報ファイルが書き換わっていないかを見るための印（サイズと mtime）。
 /// 無い・読めないときは `None`（「消えた」も変化として検出できる）。
 ///
 /// **内容のハッシュではない。** 見たいのは「アカウント行を取り直す契機があるか」
-/// だけなので、`metadata()` 1 回で足りる
-type CredentialsFp = Option<(std::time::SystemTime, u64)>;
+/// だけなので、指紋の実体は [`ccdesk::file_stamp`]（変化検出の型を 1 つに保つ）
+type CredentialsFp = Option<(u64, std::time::SystemTime)>;
 
 /// ポーラーが見張る認証情報ファイル。**パスの解決は 1 起動につき 1 回**
 /// （指紋読みは毎秒走るので、毎ティックで環境変数からパスを組み直さない）。
@@ -292,8 +293,7 @@ impl AuthWatch {
     /// **触るのは `metadata()` だけ。** 認証情報の中身は読まない（ccdesk が
     /// このファイルに対して持つ関心は「アカウント行を取り直す契機」1 つだけになった）
     fn fingerprint(&self) -> CredentialsFp {
-        let md = std::fs::metadata(self.0.as_ref()?).ok()?;
-        Some((md.modified().ok()?, md.len()))
+        ccdesk::file_stamp(self.0.as_ref()?)
     }
 }
 
@@ -306,8 +306,8 @@ impl AuthWatch {
 /// open 自体の失敗）
 fn read_profile() -> Option<(String, String)> {
     let v = ccdesk::claude_json_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())?;
+        .as_deref()
+        .and_then(ccdesk::read_json)?;
     let s = |key: &str| {
         v.pointer(&format!("/oauthAccount/{key}"))
             .and_then(|x| x.as_str())
@@ -361,21 +361,12 @@ fn fetch_version() -> (String, Option<String>) {
         .and_then(|s| s.split_whitespace().next().map(str::to_string))
         .unwrap_or_default();
     let channel = claude_settings_channel();
-    // タイムアウトは必須: このスレッドはアカウント取得と共用なので、curl が
-    // 応答しないネットワーク（DNS シンクホール・blackhole されたプロキシ）で
-    // ぶら下がるとアカウント行の更新まで止まる。返るのは版番号 1 行だけなので
-    // 接続 3s・全体 8s あれば十分で、失敗しても次は 1 時間後に再試行する
-    let latest = out(
-        "curl",
-        &[
-            "-fsSL",
-            "--connect-timeout",
-            "3",
-            "--max-time",
-            "8",
-            &format!("https://downloads.claude.ai/claude-code-releases/{channel}"),
-        ],
-    )
+    // ネットワークへ出る作法（タイムアウト等）は [`crate::update::http_get`] が持つ。
+    // このスレッドはアカウント取得と共用なので、応答しないネットワークで
+    // ぶら下がるとアカウント行の更新まで止まる ＝ タイムアウトが必須な理由
+    let latest = crate::update::http_get(&format!(
+        "https://downloads.claude.ai/claude-code-releases/{channel}"
+    ))
     .map(|s| s.trim().to_string())
     .filter(|l| l.split('.').count() >= 3 && !current.is_empty() && version_newer(l, &current));
     (current, latest)
@@ -516,8 +507,7 @@ pub(crate) fn spawn_footer_poller(
             ) {
                 shown = next.clone();
                 shared
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .lock_recover()
                     .account = next;
                 updated = true;
             }
@@ -531,8 +521,7 @@ pub(crate) fn spawn_footer_poller(
                 // バージョン表記と更新ボタン行が 1 時間消えるのを防ぐ
                 if !current.is_empty() {
                     let mut guard = shared
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        .lock_recover();
                     if guard.current != current || guard.latest != latest {
                         guard.current = current;
                         guard.latest = latest;
@@ -545,8 +534,7 @@ pub(crate) fn spawn_footer_poller(
                 if let Some(next) = crate::update::latest_tag() {
                     let next = crate::update::tag_is_newer(&next).then_some(next);
                     let mut guard = ccdesk
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        .lock_recover();
                     if *guard != next {
                         *guard = next;
                         ccdesk_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -728,7 +716,7 @@ mod tests {
 
     /// テスト用の fingerprint。値そのものに意味は無く「変わったか」だけを見る
     fn fp_of(size: u64) -> CredentialsFp {
-        Some((std::time::UNIX_EPOCH, size))
+        Some((size, std::time::UNIX_EPOCH))
     }
 
     /// 期待値の組み立て

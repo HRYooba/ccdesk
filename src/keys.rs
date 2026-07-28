@@ -3,7 +3,7 @@ use std::io::Write;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-use ccdesk::Parser;
+use ccdesk::{LockExt, Parser};
 
 use crate::app::App;
 
@@ -17,7 +17,7 @@ pub(crate) fn forward_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result
     let ox = crate::app::sidebar_cols(app) + 1;
     let window = &mut app.windows[app.active];
     let (mode, encoding, size) = {
-        let parser = window.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let parser = window.parser.lock_recover();
         let screen = parser.screen();
         (
             screen.mouse_protocol_mode(),
@@ -70,7 +70,7 @@ pub(crate) fn forward_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result
 
     let suffix = if release { 'm' } else { 'M' };
     let seq = format!("\x1b[<{code};{x};{y}{suffix}");
-    let mut writer = window.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut writer = window.writer.lock_recover();
     writer.write_all(seq.as_bytes())?;
     writer.flush()?;
     Ok(())

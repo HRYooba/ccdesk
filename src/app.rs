@@ -8,7 +8,7 @@ use crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 
-use ccdesk::{log_error, now_ms, same_dir};
+use ccdesk::{log_error, now_ms, same_dir, LockExt};
 
 use crate::hooks::HookStates;
 use crate::keys::{encode_key, forward_mouse};
@@ -764,8 +764,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         {
             app.footer = app
                 .footer_shared
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lock_recover()
                 .clone();
             force_draw = true;
         }
@@ -774,8 +773,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         let failure = {
             let mut state = app
                 .ccdesk_update
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_recover();
             match &*state {
                 SelfUpdate::Failed(msg) => {
                     let msg = msg.clone();
@@ -796,8 +794,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         {
             app.ccdesk_latest = app
                 .ccdesk_latest_shared
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lock_recover()
                 .clone();
             force_draw = true;
         }
@@ -809,8 +806,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         {
             app.agents = app
                 .agents_shared
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lock_recover()
                 .clone();
             force_draw = true;
         }
@@ -876,9 +872,9 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                     continue;
                 }
                 let window = &mut app.windows[app.active];
-                let bytes = encode_key(&key, &window.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+                let bytes = encode_key(&key, &window.parser.lock_recover());
                 if !bytes.is_empty() {
-                    let mut writer = window.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut writer = window.writer.lock_recover();
                     writer.write_all(&bytes)?;
                     writer.flush()?;
                 }
@@ -917,8 +913,8 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                     .filter(|c| matches!(c, '\n' | '\r' | '\t') || !c.is_control())
                     .collect();
                 let window = &mut app.windows[app.active];
-                let bracketed = window.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner).screen().bracketed_paste();
-                let mut writer = window.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let bracketed = window.parser.lock_recover().screen().bracketed_paste();
+                let mut writer = window.writer.lock_recover();
                 if bracketed {
                     writer.write_all(b"\x1b[200~")?;
                     writer.write_all(sanitized.as_bytes())?;
@@ -2108,8 +2104,7 @@ fn start_ccdesk_update(app: &mut App) {
     {
         let mut state = app
             .ccdesk_update
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_recover();
         // 実行中の多重起動と、済んだ更新の再実行を防ぐ
         if matches!(*state, SelfUpdate::Running | SelfUpdate::Done) {
             return;
@@ -2123,8 +2118,7 @@ fn start_ccdesk_update(app: &mut App) {
             Err(e) => SelfUpdate::Failed(format!("ccdesk update failed: {e}")),
         };
         *shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = outcome;
+            .lock_recover() = outcome;
     });
 }
 
@@ -3174,8 +3168,7 @@ mod tests {
     fn state_name(app: &App) -> &'static str {
         match &*app
             .ccdesk_update
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
         {
             SelfUpdate::Idle => "Idle",
             SelfUpdate::Running => "Running",
@@ -3338,8 +3331,7 @@ mod tests {
                 projects: match &self.projects {
                     ProjectsBackend::Absent => Vec::new(),
                     ProjectsBackend::MemoryDisk { disk, .. } => disk
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .lock_recover()
                         .clone(),
                 },
             }
@@ -3349,8 +3341,7 @@ mod tests {
         fn save_window(&self, item: WindowItem<'_>) {
             if let WindowItem::LastView(view) = item {
                 self.views
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .lock_recover()
                     .push(view.to_string());
             }
         }
@@ -3360,11 +3351,9 @@ mod tests {
                 ProjectsBackend::Absent => next.to_vec(),
                 ProjectsBackend::MemoryDisk { disk, baseline } => {
                     let mut disk = disk
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        .lock_recover();
                     let mut baseline = baseline
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        .lock_recover();
                     persist_projects(&mut baseline, next, |merge| {
                         *disk = merge(disk.clone());
                         true // メモリ上のディスクは書き込みに失敗しない
@@ -3648,8 +3637,7 @@ mod tests {
             let mut app = test_app(34, TERM);
             app.ccdesk_latest = Some("v9.9.9".to_string());
             *app.ccdesk_update
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+                .lock_recover() = state;
             start_ccdesk_update(&mut app);
             assert_eq!(
                 state_name(&app),
