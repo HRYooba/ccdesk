@@ -339,12 +339,10 @@ pub(crate) struct LiveSource {
 }
 
 impl LiveSource {
-    /// `usage_dirty` は使用率が更新されたことを run ループへ伝える合図で、
-    /// `usage_fetching` は取得中かどうか（押したことを画面に出すため）
+    /// `usage_dirty` は使用率が更新されたことを run ループへ伝える合図
     pub(crate) fn new(
         usage_display: bool,
         usage_dirty: Arc<std::sync::atomic::AtomicBool>,
-        usage_fetching: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         // 前回の異常終了が残した書きかけの `.tmp`（ウィンドウ状態・設定・
         // セッション一覧・hook の受け渡し）を 1 回の走査でまとめて回収する。
@@ -355,8 +353,7 @@ impl LiveSource {
         // **opt-in の分岐はここ 1 箇所。** off なら取得スレッドを起こさない
         let usage = usage_display.then(|| {
             let slot: UsageSlot = Arc::new(Mutex::new(Usage::default()));
-            let refresh =
-                crate::usage::spawn_poller(Arc::clone(&slot), usage_dirty, usage_fetching);
+            let refresh = crate::usage::spawn_poller(Arc::clone(&slot), usage_dirty);
             (slot, refresh)
         });
         Self {

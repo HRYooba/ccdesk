@@ -56,8 +56,12 @@ enum Trigger {
 }
 
 /// 最後の成功からこれを超えたら表示を dim へ落とす。**古さを黙って隠さない**
-/// （取得が続けて失敗しているのに前の値を平然と出すと、固まった数字を信じさせる）
-pub(crate) const STALE_AFTER_SECS: u64 = 600;
+/// （取得が続けて失敗しているのに前の値を平然と出すと、固まった数字を信じさせる）。
+///
+/// **保険の周期から導く**（周期 ＋ 取得や待ちのぶれの猶予）: 「保険の周期が 1 回
+/// 飛んだ ＝ 取得が失敗しているか止まっている」ときだけ古い。周期より短い値を
+/// 置くと、何もしていなくても毎周期の後半が必ず dim になる（警告の意味が消える）
+pub(crate) const STALE_AFTER_SECS: u64 = POLL_INTERVAL.as_secs() + 300;
 
 /// 1 つの枠。
 ///
@@ -184,17 +188,11 @@ impl UsageRefresh {
 pub(crate) fn spawn_poller(
     slot: UsageSlot,
     dirty: Arc<std::sync::atomic::AtomicBool>,
-    fetching: Arc<std::sync::atomic::AtomicBool>,
 ) -> UsageRefresh {
     let (tx, rx) = std::sync::mpsc::channel::<Trigger>();
     std::thread::spawn(move || {
         loop {
-            // 取得中であることを出す（1 回 3 秒前後かかるので、押したことが
-            // 画面に出ないと壊れているように見える）
-            fetching.store(true, std::sync::atomic::Ordering::Relaxed);
-            dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             let next = fetch();
-            fetching.store(false, std::sync::atomic::Ordering::Relaxed);
             let fetched_at = std::time::Instant::now();
 
             let mut guard = slot.lock_recover();
@@ -205,7 +203,7 @@ pub(crate) fn spawn_poller(
             if !keep_previous {
                 *guard = next;
             }
-            // 値が据え置きでも描き直させる（取得中の表示を戻す・古さは時間で変わる）
+            // 値が据え置きでも描き直させる（古さの dim は時間で変わる）
             dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             // **枠の概念が無いアカウントでは周期取得をやめる。** 恒久的に取れないので
             // 保険の周期で claude を起こす意味が無い。要求だけは受け続ける
