@@ -40,41 +40,84 @@ use crate::claude_format::CLAUDE_PID_ENV;
 use crate::poll::{COMPLETED, STOPPED, WAITING, WORKING};
 use crate::sessions::{SessionId, SessionRow};
 
-/// 注入する hook イベントと、絞り込みの matcher と、それが意味する state。
+/// 入力待ちを知らせる `Notification` の matcher（通知の種類ごとに発火を絞る。
+/// 公式に文書化。値は完全一致で、`|` 区切りで複数指定できる）。
 ///
-/// **`--settings` の生成（[`inject_settings`]）と受け口（[`run_hook`]）が同じ表を読む**
-/// ので、片方だけ増えた状態にならない。state 値は [`crate::poll::classify`] が読む語彙
-/// （`waiting` / `working` / `completed` / `stopped` ＝ 画面に出る語の小文字）で、
-/// **要約文は持たない**（行に出るのは状態だけ）。
+/// **絞らずに全部拾うと `idle_prompt`（60 秒放置の催促）が混ざり、ターンを終えた行が
+/// 時間経過だけで入力待ちへ落ちる**。実害は 2 つあった: 「Needs input」が
+/// 「claude が止まっている」意味を失い、既読にした行の未読印が復活した。
+///
+/// 拾うのは**ユーザーが動くまで進まない**通知だけ。`auth_success` / `agent_completed` /
+/// `elicitation_complete` は完了・情報通知なので拾わない（完了は `Stop` が答える）。
+///
+/// 縮退: matcher が効かない版では `Notification` が一度も発火しない ＝ 入力待ちは
+/// `agents --json` の `status` 経由だけになる。**`done` が壊れるより取り逃すほうが軽い**
+const ATTENTION_MATCHER: &str = "permission_prompt|elicitation_dialog|agent_needs_input";
+
+/// 入力待ちの**解除**を知らせる `Notification` の matcher。`elicitation_response` は
+/// ユーザーがダイアログに回答を送った瞬間に発火する ＝ [`ATTENTION_MATCHER`] で
+/// waiting に入った行を working へ戻す対のイベント。これが無いと、回答後も
+/// ターン終了（`Stop`）まで Waiting のまま固まる（状態機械が非対称になる）。
+///
+/// `elicitation_complete`（submit / dismiss の両方で発火）は**入れない**:
+/// 同じ回答から hook プロセスが 2 本走ると、遅れた `working` が `Stop → completed` の
+/// 後に保存され、終わったターンが Working に戻る競合の面が広がる。dismiss で
+/// Waiting が残るのは従来と同じ挙動 ＝ 悪化ではない。
+///
+/// 回答→`Stop` の間には必ず claude の応答生成（API 往復）が挟まるので、
+/// `working` と `completed` の保存が入れ違う余地は実用上小さい
+const RESUME_MATCHER: &str = "elicitation_response";
+
+/// 注入する hook 1 件。**`--settings` の生成（[`inject_settings`]）と受け口
+/// （[`run_hook`]）が同じ表を読む**ので、片方だけ増えた状態にならない。
+struct HookEvent {
+    event: &'static str,
+    /// 発火を絞る matcher。None は全発火を拾う（そのイベント自体が 1 つの意味しか
+    /// 持たないもの）
+    matcher: Option<&'static str>,
+    /// この hook が意味する state。[`crate::poll::classify`] が読む語彙
+    /// （`waiting` / `working` / `completed` / `stopped` ＝ 画面に出る語の小文字）で、
+    /// **要約文は持たない**（行に出るのは状態だけ）
+    state: &'static str,
+    /// この hook が**ユーザーの見るべき新しい出来事**か（未読 `●` の材料）。
+    /// 状態と未読を同じ時刻で判定していた頃は、`SessionEnd` の記録が
+    /// 「claude が何か言った」に数えられ、stop しただけの行が再起動後に未読になった
+    activity: bool,
+}
+
+/// 注入する hook の表。同じイベント名を複数載せてよい（matcher で発火を分ける。
+/// `Notification` は waiting に入る通知と working へ戻す通知の 2 枚）。
 ///
 /// **turn 単位のイベントだけを載せる。** hook は毎回 ccdesk を 1 プロセス起こすので、
 /// `PreToolUse` / `PostToolUse` のような道具ごとに飛ぶイベントを足すと、Windows の
 /// プロセス起動コストがそのままセッションの遅さになる。
-///
-/// # `Notification` を絞る理由
-///
-/// `Notification` は通知の種類ごとに matcher を持つ（公式に文書化。値は完全一致で、
-/// `|` 区切りで複数指定できる）。**絞らずに全部拾うと `idle_prompt`（60 秒放置の催促）が
-/// 混ざり、ターンを終えた行が時間経過だけで入力待ちへ落ちる**。実害は 2 つあった:
-/// 「Needs input」が「claude が止まっている」意味を失い、既読にした行の未読印が復活した。
-///
-/// 拾うのは**ユーザーが動くまで進まない**通知だけ。`auth_success` /
-/// `elicitation_complete` / `elicitation_response` / `agent_completed` は完了・情報通知
-/// なので拾わない（完了は `Stop` が答える）。
-///
-/// 縮退: matcher が効かない版では `Notification` が一度も発火しない ＝ 入力待ちは
-/// `agents --json` の `status` 経由だけになる。**`done` が壊れるより取り逃すほうが軽い**
-const NOTIFICATION_MATCHER: &str = "permission_prompt|elicitation_dialog|agent_needs_input";
+const HOOK_EVENTS: [HookEvent; 6] = [
+    // 起動直後・再開直後はまだプロンプトを受けていない ＝ 入力待ち。
+    // ユーザー自身の操作なので未読にはしない
+    HookEvent { event: "SessionStart", matcher: None, state: WAITING, activity: false },
+    HookEvent { event: "UserPromptSubmit", matcher: None, state: WORKING, activity: false },
+    HookEvent { event: "Notification", matcher: Some(ATTENTION_MATCHER), state: WAITING, activity: true },
+    // 回答はユーザー自身の操作 ＝ 状態は動くが未読は作らない
+    HookEvent { event: "Notification", matcher: Some(RESUME_MATCHER), state: WORKING, activity: false },
+    HookEvent { event: "Stop", matcher: None, state: COMPLETED, activity: true },
+    // プロセスの終了は「claude が何か言った」ではない
+    HookEvent { event: "SessionEnd", matcher: None, state: STOPPED, activity: false },
+];
 
-/// 注入する hook（イベント名, matcher, state）。matcher が None のイベントは
-/// 全発火を拾う（そのイベント自体が 1 つの意味しか持たないもの）
-const HOOK_EVENTS: [(&str, Option<&str>, &str); 5] = [
-    // 起動直後・再開直後はまだプロンプトを受けていない ＝ 入力待ち
-    ("SessionStart", None, WAITING),
-    ("UserPromptSubmit", None, WORKING),
-    ("Notification", Some(NOTIFICATION_MATCHER), WAITING),
-    ("Stop", None, COMPLETED),
-    ("SessionEnd", None, STOPPED),
+/// state 引数を持たない旧形式 `ccdesk hook <event>` の解決表。
+///
+/// 旧 settings で起きた claude セッション（注入ファイルは起動時に読まれるので、
+/// ccdesk を更新しても走行中のセッションは旧コマンドを呼び続ける）のための
+/// 後方互換で、**[`HOOK_EVENTS`] の並び順から独立させる**: 「表の最初の一致」で
+/// 解決すると、並べ替えが旧 settings の意味を黙って変える。
+/// ここの組はすべて [`HOOK_EVENTS`] に存在しなければならない（テストが固定する）
+const LEGACY_HOOK_STATES: [(&str, &str); 5] = [
+    ("SessionStart", WAITING),
+    ("UserPromptSubmit", WORKING),
+    // 旧形式の Notification は waiting 系 matcher でしか注入されていない
+    ("Notification", WAITING),
+    ("Stop", COMPLETED),
+    ("SessionEnd", STOPPED),
 ];
 
 /// 保管ファイルのトップレベルキー（`{"states": { "<session-id>": { … } }}`）
@@ -83,6 +126,7 @@ const STATES_KEY: &str = "states";
 const STATE_KEY: &str = "state";
 const AT_KEY: &str = "at";
 const PID_KEY: &str = "pid";
+const ACTIVITY_AT_KEY: &str = "activity_at";
 
 
 /// 受けた state を保つ期間。**動いているセッションは毎 turn 書き直す**ので、
@@ -121,6 +165,12 @@ struct Entry {
     /// 取れない環境では None ＝ pid での引き当て（[`HookStates::session_of`]）に
     /// 出てこないだけで、state の受け渡しには影響しない
     pid: Option<u32>,
+    /// **ユーザーの見るべき新しい出来事**が最後に起きた時刻（未読 `●` の材料）。
+    /// activity を持たない hook（[`HookEvent::activity`] が false）は前回の値を
+    /// 引き継ぐ ＝ `Stop(completed)` の後に `SessionEnd(stopped)` が来ても
+    /// 「まだ見ていない完了」の記録は消えない。None は一度も起きていない
+    /// （旧形式の保管を含む）
+    activity_at: Option<u64>,
 }
 
 /// hook が書いた state の写し（`session_id` → [`Entry`]）
@@ -169,15 +219,21 @@ impl HookStates {
 
     /// その行が**未読**か（行頭の `●`）。
     ///
-    /// **claude が何か言ったのが、最後にその行を開いた後か**で決まる。材料は
-    /// hook の `at` だけで、行の `updated_at` は見ない。だから:
+    /// **ユーザーの見るべき出来事（入力待ち・ターン完了）が、最後にその行を
+    /// 開いた後に起きたか**で決まる。材料は hook の `activity_at` だけで、
+    /// 行の `updated_at` も state の `at` も見ない。だから:
     ///
     /// - ピン留め・メニュー操作など**ユーザー自身の操作では未読にならない**
     ///   （行を書き換えても hook の記録は動かない）
     /// - **ccdesk を起動し直しただけでも未読にならない**（`last_opened_at` は
-    ///   保管されるので、hook の記録がそれより古ければ既読のまま）
+    ///   保管されるので、記録がそれより古ければ既読のまま）
+    /// - **stop やアプリ終了でも未読にならない**（`SessionEnd` は状態を stopped に
+    ///   するだけで activity を持たない。`at` で判定していた頃は、終了の記録が
+    ///   「claude が何か言った」に数えられ、再起動後に未読が生えた）
     pub(crate) fn unread(&self, row: &SessionRow) -> bool {
-        self.last_at(&row.session_id)
+        self.0
+            .get(&row.session_id)
+            .and_then(|entry| entry.activity_at)
             .is_some_and(|at| at > row.last_opened_at)
     }
 
@@ -209,6 +265,8 @@ impl HookStates {
             .map(|(id, _)| id)
     }
 
+    /// テスト用の組み立て。**activity_at は at と同じ値**で入る（「その hook が
+    /// 未読の材料でもある」素朴な形。区別が要るテストは [`record`] を通して作る）
     #[cfg(test)]
     pub(crate) fn from_entries<'a>(
         entries: impl IntoIterator<Item = (&'a str, &'a str, u64)>,
@@ -230,6 +288,7 @@ impl HookStates {
                             state: state.to_string(),
                             at,
                             pid,
+                            activity_at: Some(at),
                         },
                     )
                 })
@@ -238,16 +297,28 @@ impl HookStates {
     }
 }
 
-/// イベント名 → state（[`HOOK_EVENTS`] の引き）。未知のイベントは None
-/// （知らない名前で呼ばれても何も書かない）
-fn state_of(event: &str) -> Option<&'static str> {
+/// (イベント名, state 引数) → (state, activity)。**受理するのは [`HOOK_EVENTS`] に
+/// ある組だけ**（知らない名前・表に無い組で呼ばれても何も書かない ＝ 表が正本のまま）。
+///
+/// state 引数なしは旧形式（[`LEGACY_HOOK_STATES`]）で state を補ってから同じ表を引く
+fn resolve(event: &str, state: Option<&str>) -> Option<(&'static str, bool)> {
+    let state = match state {
+        Some(state) => state,
+        None => {
+            LEGACY_HOOK_STATES
+                .iter()
+                .find(|(name, _)| *name == event)
+                .map(|(_, state)| *state)?
+        }
+    };
     HOOK_EVENTS
         .iter()
-        .find(|(name, _, _)| *name == event)
-        .map(|(_, _, state)| *state)
+        .find(|row| row.event == event && row.state == state)
+        .map(|row| (row.state, row.activity))
 }
 
-/// `ccdesk hook <event>`。**注入した hook の受け口**（ユーザーは直接使わない）。
+/// `ccdesk hook <event> <state>`。**注入した hook の受け口**（ユーザーは直接使わない）。
+/// state 引数なしは旧 settings からの呼び出し（後方互換。[`LEGACY_HOOK_STATES`]）。
 ///
 /// claude は hook の入力を stdin の JSON で渡すので、そこから `session_id` を取る
 /// （どのセッションの state かは呼び出し側からしか分からない）。
@@ -255,28 +326,33 @@ fn state_of(event: &str) -> Option<&'static str> {
 /// **fail-open**: 何が起きても `Ok` で返り、**標準出力へ何も書かない**。
 /// `UserPromptSubmit` の標準出力はそのままセッションの文脈へ足されるため、
 /// ここが何か書くと ccdesk がユーザーの会話に割り込むことになる
-pub(crate) fn run_hook(event: &str) -> anyhow::Result<()> {
+pub(crate) fn run_hook(event: &str, state: Option<&str>) -> anyhow::Result<()> {
     use std::io::Read as _;
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
-    let Some((session_id, state, pid)) = hook_entry(event, &input) else {
+    let Some((session_id, state, activity, pid)) = hook_entry(event, state, &input) else {
         return Ok(());
     };
     if let Some(path) = ccdesk::hook_states_path() {
-        record(&path, &session_id, state, now_ms(), pid);
+        record(&path, &session_id, state, activity, now_ms(), pid);
     }
     Ok(())
 }
 
-/// hook 1 回で保管へ載せるもの（イベント名・stdin・環境から決まる）。
+/// hook 1 回で保管へ載せるもの（イベント名・state 引数・stdin・環境から決まる）。
 /// **[`run_hook`] が持つ判断はこれだけ**で、残りはファイルの読み書き ＝
 /// 環境から pid を拾う経路も含めて、保管を触らずに検査できる。
 ///
-/// 知らないイベント / `session_id` が読めない入力は None（何も書かない）
-fn hook_entry(event: &str, input: &str) -> Option<(SessionId, &'static str, Option<u32>)> {
-    let state = state_of(event)?;
+/// 知らないイベント / 表に無い (event, state) / `session_id` が読めない入力は
+/// None（何も書かない）
+fn hook_entry(
+    event: &str,
+    state: Option<&str>,
+    input: &str,
+) -> Option<(SessionId, &'static str, bool, Option<u32>)> {
+    let (state, activity) = resolve(event, state)?;
     let session_id = session_id_of(input)?;
-    Some((session_id, state, claude_pid()))
+    Some((session_id, state, activity, claude_pid()))
 }
 
 /// この hook を呼んだ claude の pid（[`CLAUDE_PID_ENV`]）。
@@ -298,20 +374,29 @@ fn session_id_of(input: &str) -> Option<SessionId> {
 /// （hook は複数のセッションから同時に走るので、読みと書きの間に他の hook の
 /// 書き込みが挟まると、その turn の state が落ちる）。
 ///
+/// activity を持たない hook は前回の `activity_at` を引き継ぐ（状態の上書きで
+/// 未読の記録を消さない。[`Entry::activity_at`]）。
+///
 /// 古い項目はここで落とす（[`KEEP`]）。掃除の契機を別に持たないのは、
 /// 書くのがこの 1 箇所だけで、**書くたびに掃除すれば積もらない**ため
-fn record(path: &Path, session_id: &SessionId, state: &str, now: u64, pid: Option<u32>) {
+fn record(path: &Path, session_id: &SessionId, state: &str, activity: bool, now: u64, pid: Option<u32>) {
     let Ok(_guard) = Lock::acquire(&lock_path_for(path), LOCK_WAIT, LOCK_STALE) else {
         return;
     };
     let mut entries = read_entries(path, now);
     entries.retain(|_, entry| now.saturating_sub(entry.at) < KEEP.as_millis() as u64);
+    let activity_at = if activity {
+        Some(now)
+    } else {
+        entries.get(session_id).and_then(|entry| entry.activity_at)
+    };
     entries.insert(
         session_id.clone(),
         Entry {
             state: state.to_string(),
             at: now,
             pid,
+            activity_at,
         },
     );
     let document = json!({
@@ -321,6 +406,7 @@ fn record(path: &Path, session_id: &SessionId, state: &str, now: u64, pid: Optio
                 STATE_KEY: entry.state,
                 AT_KEY: entry.at,
                 PID_KEY: entry.pid,
+                ACTIVITY_AT_KEY: entry.activity_at,
             })))
             .collect::<serde_json::Map<_, _>>()
     });
@@ -353,6 +439,9 @@ fn read_entries(path: &Path, now: u64) -> BTreeMap<SessionId, Entry> {
                 .get(PID_KEY)
                 .and_then(Value::as_u64)
                 .and_then(|pid| u32::try_from(pid).ok());
+            // 旧形式の保管（キーが無い）は None で読む ＝ 未読は付かない。
+            // 移行データ（KEEP=7日）としてそのまま許容する
+            let activity_at = entry.get(ACTIVITY_AT_KEY).and_then(Value::as_u64);
             (!id.is_empty() && !state.is_empty() && at <= horizon).then(|| {
                 (
                     SessionId::new(id.clone()),
@@ -360,6 +449,7 @@ fn read_entries(path: &Path, now: u64) -> BTreeMap<SessionId, Entry> {
                         state: state.to_string(),
                         at,
                         pid,
+                        activity_at,
                     },
                 )
             })
@@ -436,35 +526,35 @@ fn write_inject_settings() -> Option<PathBuf> {
 /// 注入ファイルの中身（[`inject_settings`] の判断だけを取り出したもの。
 /// ファイルを書かずに検査できる）
 fn settings_document(exe_fwd: &str) -> Value {
+    // イベント名をキーに、表の行を**配列へ足し込む**（同名イベントを 2 枚
+    // 載せられる形。キー単位の `.collect()` だと同名の後の行が前の行を黙って潰す）
+    let mut hooks = serde_json::Map::new();
+    for row in &HOOK_EVENTS {
+        // matcher を持つ行だけ `matcher` を載せる。
+        // **空文字を載せない**（`""` は「何にも一致しない」とも
+        // 「全部に一致」とも読めるので、意図が伝わらない形にしない）
+        let mut group = serde_json::Map::new();
+        if let Some(matcher) = row.matcher {
+            group.insert("matcher".to_string(), json!(matcher));
+        }
+        group.insert(
+            "hooks".to_string(),
+            json!([{
+                "type": "command",
+                // state まで運ぶ（受け口は (event, state) の組で表を引く。
+                // 同名イベントの 2 枚をイベント名だけでは区別できない）
+                "command": format!("\"{exe_fwd}\" hook {} {}", row.event, row.state),
+            }]),
+        );
+        if let Value::Array(groups) = hooks
+            .entry(row.event.to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+        {
+            groups.push(Value::Object(group));
+        }
+    }
     let mut settings = serde_json::Map::new();
-    settings.insert(
-        "hooks".to_string(),
-        Value::Object(
-            HOOK_EVENTS
-                .iter()
-                .map(|(event, matcher, _)| {
-                    // matcher を持つイベントだけ `matcher` を載せる。
-                    // **空文字を載せない**（`""` は「何にも一致しない」とも
-                    // 「全部に一致」とも読めるので、意図が伝わらない形にしない）
-                    let mut group = serde_json::Map::new();
-                    if let Some(matcher) = matcher {
-                        group.insert("matcher".to_string(), json!(matcher));
-                    }
-                    group.insert(
-                        "hooks".to_string(),
-                        json!([{
-                            "type": "command",
-                            "command": format!("\"{exe_fwd}\" hook {event}"),
-                        }]),
-                    );
-                    (
-                        (*event).to_string(),
-                        json!([Value::Object(group)]),
-                    )
-                })
-                .collect(),
-        ),
-    );
+    settings.insert("hooks".to_string(), Value::Object(hooks));
     Value::Object(settings)
 }
 
@@ -498,28 +588,64 @@ mod tests {
     }
 
     /// **注入する表と受け口が同じ表を読む。** 片方だけ知っているイベントがあると、
-    /// 注入したのに何も起きない（または登録されていない口が残る）
+    /// 注入したのに何も起きない（または登録されていない口が残る）。
+    /// 同名イベント（`Notification` の 2 枚）は**同じキーの配列に並ぶ**
+    /// （キー単位で潰すと後の行が前の行を黙って消す）
     #[test]
     fn every_injected_event_is_understood_by_the_receiver() {
         let document = settings_document("C:/bin/ccdesk.exe");
         let hooks = document.get("hooks").and_then(Value::as_object).unwrap();
-        assert_eq!(hooks.len(), HOOK_EVENTS.len(), "number of injected hooks differs from the table");
-        for (event, matcher, state) in HOOK_EVENTS {
-            let command = hooks[event][0]["hooks"][0]["command"].as_str().unwrap();
+        let mut seen = 0;
+        for row in &HOOK_EVENTS {
+            let groups = hooks[row.event].as_array().unwrap();
+            let group = groups
+                .iter()
+                .find(|group| {
+                    group["hooks"][0]["command"].as_str()
+                        == Some(&format!("\"C:/bin/ccdesk.exe\" hook {} {}", row.event, row.state))
+                })
+                .unwrap_or_else(|| panic!("{} {} is not injected", row.event, row.state));
+            // matcher は表のとおりに載る（持たない行にはキー自体を書かない）
             assert_eq!(
-                command,
-                format!("\"C:/bin/ccdesk.exe\" hook {event}"),
-                "{event} has a different invocation shape"
+                group.get("matcher").and_then(Value::as_str),
+                row.matcher,
+                "{} {} has a different matcher",
+                row.event,
+                row.state
             );
-            // matcher は表のとおりに載る（持たないイベントにはキー自体を書かない）
+            // 注入した組は受け口が受理し、activity まで表のとおりに引ける
             assert_eq!(
-                hooks[event][0].get("matcher").and_then(Value::as_str),
-                matcher,
-                "{event} has a different matcher"
+                resolve(row.event, Some(row.state)),
+                Some((row.state, row.activity)),
+                "the receiver doesn't accept {} {}",
+                row.event,
+                row.state
             );
-            assert_eq!(state_of(event), Some(state), "the receiver doesn't know {event}");
+            seen += 1;
         }
-        assert_eq!(state_of("PreToolUse"), None, "received an unregistered hook");
+        let injected: usize = hooks.values().map(|groups| groups.as_array().unwrap().len()).sum();
+        assert_eq!(injected, seen, "injected a hook that is not in the table");
+        // 表に無い組・知らないイベントは受けない
+        assert_eq!(resolve("PreToolUse", None), None, "received an unregistered hook");
+        assert_eq!(resolve("Notification", Some(STOPPED)), None, "accepted a pair not in the table");
+    }
+
+    /// **state 引数の無い旧形式は、専用の表で解決する。** [`HOOK_EVENTS`] の並び順で
+    /// 解決すると、並べ替えが旧 settings の意味を黙って変える。
+    /// 旧形式の組はすべて注入表にも存在する（勝手な状態を作らない）
+    #[test]
+    fn a_legacy_call_resolves_from_its_own_table() {
+        for (event, state) in LEGACY_HOOK_STATES {
+            let resolved = resolve(event, None);
+            assert_eq!(resolved.map(|(state, _)| state), Some(state), "{event} resolves differently");
+            assert_eq!(
+                resolved,
+                resolve(event, Some(state)),
+                "{event}'s legacy pair is missing from HOOK_EVENTS"
+            );
+        }
+        // 旧形式の Notification は waiting（入力待ちの通知でしか注入されていなかった）
+        assert_eq!(resolve("Notification", None), Some((WAITING, true)));
     }
 
     /// **ターン完了は「新しく `completed` になった」だけを合図にする。**
@@ -550,19 +676,14 @@ mod tests {
         assert!(other.any_turn_finished_since(&finished));
     }
 
-    /// **`Notification` は「ユーザーが動くまで進まない」通知だけを拾う。**
+    /// **waiting に入れる `Notification` は「ユーザーが動くまで進まない」通知だけを拾う。**
     ///
     /// 絞らずに全部拾うと `idle_prompt`（60 秒放置の催促）が混ざり、ターンを終えた行が
     /// 時間経過だけで入力待ちへ落ちる ＝ 「Needs input」が「claude が止まっている」
     /// 意味を失い、既読にした行の未読印が復活する。**この 2 つは実際に起きた**
     #[test]
     fn the_notification_hook_ignores_the_idle_reminder() {
-        let matcher = HOOK_EVENTS
-            .iter()
-            .find(|(event, _, _)| *event == "Notification")
-            .and_then(|(_, matcher, _)| *matcher)
-            .expect("Notification must be filtered by a matcher");
-        let kinds: Vec<&str> = matcher.split('|').collect();
+        let kinds: Vec<&str> = ATTENTION_MATCHER.split('|').collect();
         for wanted in ["permission_prompt", "elicitation_dialog", "agent_needs_input"] {
             assert!(kinds.contains(&wanted), "{wanted} is not picked up");
         }
@@ -578,13 +699,28 @@ mod tests {
         }
     }
 
+    /// **working へ戻す `Notification` は回答の通知だけを拾う。**
+    /// `elicitation_complete` を足すと同じ回答から hook プロセスが 2 本走り、
+    /// 遅れた `working` が `Stop → completed` を上書きする競合の面が広がる。
+    /// waiting 系と重なると同じ発火が両方の state を書いて後勝ちが運任せになる
+    #[test]
+    fn the_resume_notification_picks_up_only_the_dialog_response() {
+        assert_eq!(RESUME_MATCHER, "elicitation_response");
+        for kind in RESUME_MATCHER.split('|') {
+            assert!(
+                !ATTENTION_MATCHER.split('|').any(|attention| attention == kind),
+                "{kind} is in both matchers"
+            );
+        }
+    }
+
     /// **道具ごとに飛ぶイベントは登録しない**（hook は毎回 ccdesk を 1 プロセス
     /// 起こすので、turn より細かい粒度を足すとセッションが目に見えて遅くなる）
     #[test]
     fn only_turn_level_events_are_injected() {
         for event in ["PreToolUse", "PostToolUse", "PreCompact", "SubagentStop"] {
             assert!(
-                !HOOK_EVENTS.iter().any(|(name, _, _)| *name == event),
+                !HOOK_EVENTS.iter().any(|row| row.event == event),
                 "{event} is not turn-level"
             );
         }
@@ -611,15 +747,15 @@ mod tests {
         let temp = TempStore::new("a_recorded_state_reaches_the_reader");
         assert_eq!(states_at(&temp.path()), HookStates::default(), "not empty for a missing file");
 
-        record(&temp.path(), &id("s-1"), "working", 1_000, None);
-        record(&temp.path(), &id("s-2"), "blocked", 1_000, None);
+        record(&temp.path(), &id("s-1"), "working", true, 1_000, None);
+        record(&temp.path(), &id("s-2"), "blocked", true, 1_000, None);
         assert_eq!(
             states_at(&temp.path()),
             HookStates::from_entries([("s-1", "working", 1_000), ("s-2", "blocked", 1_000)])
         );
 
         // 同じセッションの次のイベントは上書き（状態は最後に受けたものが正しい）
-        record(&temp.path(), &id("s-1"), "done", 2_000, None);
+        record(&temp.path(), &id("s-1"), "done", true, 2_000, None);
         let states = states_at(&temp.path());
         assert_eq!(stored(&states, &id("s-1")).as_deref(), Some("done"));
         assert_eq!(
@@ -651,9 +787,9 @@ mod tests {
         assert_eq!(states.get(&id("other"), Some(0)), None);
     }
 
-    /// **未読は「claude が何か言ったのが、最後に開いた後か」。**
+    /// **未読は「ユーザーの見るべき出来事が、最後に開いた後に起きたか」。**
     ///
-    /// 材料が hook の `at` だけなので、次の 2 つは**書けなくなっている**:
+    /// 材料が hook の `activity_at` だけなので、次の 2 つは**書けなくなっている**:
     /// ユーザー自身の操作で未読が付くこと（行を書き換えても記録は動かない）と、
     /// ccdesk を起動し直しただけで未読になること（`last_opened_at` は保管される）
     #[test]
@@ -674,6 +810,84 @@ mod tests {
         pinned.pinned = true;
         pinned.updated_at = 9_999;
         assert!(!states.unread(&pinned), "an edit to the row created an unread mark");
+    }
+
+    /// **ダイアログへの回答は状態を working へ戻すが、未読は作らない。**
+    ///
+    /// 回答（`elicitation_response`）はユーザー自身の操作なので、これで未読が
+    /// 生えると「claude が何か言った」印の意味が壊れる。activity を持たない記録は
+    /// 前回の `activity_at` を引き継ぐだけ
+    #[test]
+    fn an_answered_dialog_resumes_working_without_creating_unread() {
+        let temp = TempStore::new("an_answered_dialog_resumes_working_without_creating_unread");
+        let row = |last_opened_at| SessionRow {
+            last_opened_at,
+            ..SessionRow::new(id("s"), "C:\\dev\\app", 0)
+        };
+        // 質問ダイアログ表示（waiting・未読の材料）→ 回答（working・材料ではない）
+        record(&temp.path(), &id("s"), WAITING, true, 1_000, None);
+        record(&temp.path(), &id("s"), WORKING, false, 2_000, None);
+        let states = states_at(&temp.path());
+        assert_eq!(stored(&states, &id("s")).as_deref(), Some(WORKING), "the answer did not resume the state");
+        // 未読の起点は質問の時刻のまま（回答の時刻に進まない）
+        assert!(states.unread(&row(999)), "the question is no longer unread");
+        assert!(!states.unread(&row(1_000)), "the answer itself created an unread mark");
+    }
+
+    /// **stop・アプリ終了は未読を作らず、消しもしない。**
+    ///
+    /// `SessionEnd(stopped)` が未読の材料に数えられていた頃は、stop した行が
+    /// 再起動後に未読 ● で復活した（実際に報告された）。逆に、まだ見ていない
+    /// 完了（`Stop(completed)`）の記録は stopped の上書きでも消えない
+    #[test]
+    fn a_session_end_neither_creates_nor_destroys_unread() {
+        let temp = TempStore::new("a_session_end_neither_creates_nor_destroys_unread");
+        let row = |last_opened_at| SessionRow {
+            last_opened_at,
+            ..SessionRow::new(id("s"), "C:\\dev\\app", 0)
+        };
+        // ターン完了（未読の材料）→ stop（材料ではない）
+        record(&temp.path(), &id("s"), COMPLETED, true, 1_000, None);
+        record(&temp.path(), &id("s"), STOPPED, false, 2_000, None);
+        let states = states_at(&temp.path());
+        assert_eq!(stored(&states, &id("s")).as_deref(), Some(STOPPED));
+        // 完了を見ていない ＝ stop 後も未読のまま
+        assert!(states.unread(&row(500)), "the unseen completion was destroyed by the stop");
+        // 完了を見た後に stop ＝ 未読は生えない（stop の時刻 2_000 では判定しない）
+        assert!(!states.unread(&row(1_500)), "the stop itself created an unread mark");
+
+        // 一度も activity が無い行（起動して stop しただけ）はいつでも既読
+        record(&temp.path(), &id("t"), WAITING, false, 3_000, None);
+        record(&temp.path(), &id("t"), STOPPED, false, 4_000, None);
+        assert!(
+            !states_at(&temp.path()).unread(&SessionRow {
+                last_opened_at: 0,
+                ..SessionRow::new(id("t"), "C:\\dev\\app", 0)
+            }),
+            "a row with no activity became unread"
+        );
+    }
+
+    /// **`activity_at` は保管を往復する。** 落ちると再起動のたびに未読が全部消える。
+    /// 旧形式（キーが無い保管）は None で読む ＝ 未読は付かない（7 日で消える移行データ）
+    #[test]
+    fn the_activity_time_survives_a_round_trip() {
+        let temp = TempStore::new("the_activity_time_survives_a_round_trip");
+        record(&temp.path(), &id("s"), COMPLETED, true, 1_000, None);
+        record(&temp.path(), &id("s"), STOPPED, false, 2_000, None);
+        let row = SessionRow {
+            last_opened_at: 500,
+            ..SessionRow::new(id("s"), "C:\\dev\\app", 0)
+        };
+        assert!(states_at(&temp.path()).unread(&row), "activity_at did not survive the file");
+
+        // 旧形式の項目（activity_at 無し）は未読にならない
+        std::fs::write(
+            temp.path(),
+            r#"{"states":{"s":{"state":"completed","at":9000}}}"#,
+        )
+        .unwrap();
+        assert!(!states_at(&temp.path()).unread(&row), "a legacy entry created an unread mark");
     }
 
     /// **経過時間の起点は未読とは別の材料。** 行の姿は「claude が言った状態」と
@@ -700,33 +914,33 @@ mod tests {
     fn the_pid_comes_from_the_environment_claude_gives_the_hook() {
         let input = r#"{"session_id":"s-1","source":"clear"}"#;
         unsafe { std::env::set_var(CLAUDE_PID_ENV, " 4242 ") };
-        let padded = hook_entry("SessionStart", input);
+        let padded = hook_entry("SessionStart", None, input);
         let bare = claude_pid();
         unsafe { std::env::set_var(CLAUDE_PID_ENV, "not a number") };
-        let broken = hook_entry("SessionStart", input);
+        let broken = hook_entry("SessionStart", None, input);
         unsafe { std::env::remove_var(CLAUDE_PID_ENV) };
-        let missing = hook_entry("SessionStart", input);
+        let missing = hook_entry("SessionStart", None, input);
 
         // **記録に pid まで載る**（載らないと pid での引き当てが黙って効かなくなる）
         assert_eq!(
             padded,
-            Some((id("s-1"), WAITING, Some(4242))),
+            Some((id("s-1"), WAITING, false, Some(4242))),
             "the pid did not reach the record"
         );
         assert_eq!(bare, Some(4242), "the pid is not read from the environment");
         assert_eq!(
             broken,
-            Some((id("s-1"), WAITING, None)),
+            Some((id("s-1"), WAITING, false, None)),
             "built a pid out of something that is not a number"
         );
         assert_eq!(
             missing,
-            Some((id("s-1"), WAITING, None)),
+            Some((id("s-1"), WAITING, false, None)),
             "answered with a pid when the variable is not set"
         );
         // 知らないイベント / 読めない入力は何も書かない
-        assert_eq!(hook_entry("PreToolUse", input), None);
-        assert_eq!(hook_entry("SessionStart", "not json"), None);
+        assert_eq!(hook_entry("PreToolUse", None, input), None);
+        assert_eq!(hook_entry("SessionStart", None, "not json"), None);
     }
 
     /// **pid は保管を往復する。** ここが落ちると、ペイン内の `/resume` `/clear` に
@@ -734,13 +948,13 @@ mod tests {
     #[test]
     fn the_pid_of_the_calling_claude_survives_a_round_trip() {
         let temp = TempStore::new("the_pid_of_the_calling_claude_survives_a_round_trip");
-        record(&temp.path(), &id("s"), "working", 1_000, Some(4242));
+        record(&temp.path(), &id("s"), "working", true, 1_000, Some(4242));
         assert_eq!(
             states_at(&temp.path()),
             HookStates::from_records([("s", "working", 1_000, Some(4242))])
         );
         // pid の無い記録も読める（環境変数が取れなかった場合）
-        record(&temp.path(), &id("s"), "done", 2_000, None);
+        record(&temp.path(), &id("s"), "done", true, 2_000, None);
         assert_eq!(
             states_at(&temp.path()),
             HookStates::from_records([("s", "done", 2_000, None)])
@@ -780,9 +994,9 @@ mod tests {
                 .map(|m| (m.len(), m.modified().ok()))
         };
         assert_eq!(stamp(&temp.path()), None, "answered for a missing file");
-        record(&temp.path(), &id("s"), "working", 1_000, Some(1));
+        record(&temp.path(), &id("s"), "working", true, 1_000, Some(1));
         let before = stamp(&temp.path()).expect("no stamp after a write");
-        record(&temp.path(), &id("s-2"), "blocked", 2_000, Some(2));
+        record(&temp.path(), &id("s-2"), "blocked", true, 2_000, Some(2));
         assert_ne!(stamp(&temp.path()), Some(before), "the stamp did not move");
     }
 
@@ -793,10 +1007,10 @@ mod tests {
     fn recording_drops_entries_older_than_the_keep_window() {
         let temp = TempStore::new("recording_drops_entries_older_than_the_keep_window");
         let keep = KEEP.as_millis() as u64;
-        record(&temp.path(), &id("old"), "done", 0, None);
-        record(&temp.path(), &id("fresh"), "working", keep, None);
+        record(&temp.path(), &id("old"), "done", true, 0, None);
+        record(&temp.path(), &id("fresh"), "working", true, keep, None);
         // old は keep をちょうど過ぎた時点で落ちる
-        record(&temp.path(), &id("now"), "blocked", keep + 1, None);
+        record(&temp.path(), &id("now"), "blocked", true, keep + 1, None);
         let states = states_at(&temp.path());
         assert_eq!(stored(&states, &id("old")), None, "an entry past the keep window remains");
         assert_eq!(
@@ -816,7 +1030,7 @@ mod tests {
     fn records_from_a_future_clock_are_ignored_and_swept() {
         let temp = TempStore::new("records_from_a_future_clock_are_ignored_and_swept");
         let skew = FUTURE_SKEW.as_millis() as u64;
-        record(&temp.path(), &id("future"), "stopped", 1_000_000, None);
+        record(&temp.path(), &id("future"), "stopped", true, 1_000_000, None);
 
         // 時計が 1_000 まで巻き戻った世界では、その記録は見えない
         assert_eq!(
@@ -831,7 +1045,7 @@ mod tests {
         );
 
         // 巻き戻った時計で次の記録が載ると、未来の記録はファイルからも落ちる
-        record(&temp.path(), &id("s"), "working", 1_000, None);
+        record(&temp.path(), &id("s"), "working", true, 1_000, None);
         assert_eq!(
             stored(&states_at(&temp.path()), &id("future")),
             None,
@@ -889,7 +1103,7 @@ mod tests {
     #[test]
     fn writes_land_atomically_without_leaving_a_tmp_or_a_lock() {
         let temp = TempStore::new("writes_land_atomically_without_leaving_a_tmp_or_a_lock");
-        record(&temp.path(), &id("s"), "working", 1_000, None);
+        record(&temp.path(), &id("s"), "working", true, 1_000, None);
         let leftovers: Vec<_> = std::fs::read_dir(temp.0.path())
             .unwrap()
             .flatten()
@@ -905,19 +1119,19 @@ mod tests {
     #[test]
     fn a_held_lock_makes_the_hook_give_up_instead_of_waiting() {
         let temp = TempStore::new("a_held_lock_makes_the_hook_give_up_instead_of_waiting");
-        record(&temp.path(), &id("s"), "working", 1_000, None);
+        record(&temp.path(), &id("s"), "working", true, 1_000, None);
         let before = std::fs::read(temp.path()).unwrap();
 
         let held = Lock::acquire(&lock_path_for(&temp.path()), Duration::ZERO, LOCK_STALE).unwrap();
         let started = std::time::Instant::now();
-        record(&temp.path(), &id("s"), "done", 2_000, None);
+        record(&temp.path(), &id("s"), "done", true, 2_000, None);
         let waited = started.elapsed();
         drop(held);
 
         assert!(waited < Duration::from_secs(5), "wait was not bounded: {waited:?}");
         assert_eq!(std::fs::read(temp.path()).unwrap(), before, "wrote even though the lock wasn't acquired");
         // 解放後は通常どおり載る（ロックが理由で壊れているわけではない）
-        record(&temp.path(), &id("s"), "done", 2_000, None);
+        record(&temp.path(), &id("s"), "done", true, 2_000, None);
         assert_eq!(stored(&states_at(&temp.path()), &id("s")).as_deref(), Some("done"));
     }
 }
