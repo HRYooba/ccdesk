@@ -192,9 +192,12 @@ impl HookStates {
     /// **「行が生きているか」では判断しない。** 生死の観測（`try_wait`）は
     /// 2 秒周期で遅れて届くので、それを材料にすると `stop` 直後の**正当な
     /// `stopped` が捨てられ**、前の state（`blocked` ＝ Needs input）に戻る
-    pub(crate) fn get(&self, id: &SessionId, launched: Option<u64>) -> Option<&str> {
+    ///
+    /// 返り値は (state, 記録時刻)。時刻は `status` の観測時刻との新旧裁定
+    /// （[`crate::poll::row_state`]）の材料
+    pub(crate) fn get(&self, id: &SessionId, launched: Option<u64>) -> Option<(&str, u64)> {
         let entry = self.0.get(id)?;
-        (entry.at >= launched?).then_some(entry.state.as_str())
+        (entry.at >= launched?).then_some((entry.state.as_str(), entry.at))
     }
 
     /// その行について **hook が最後に何か書いた時刻**（記録が無ければ None）。
@@ -584,7 +587,7 @@ mod tests {
     /// [`a_hook_state_belongs_to_the_run_that_was_launched_before_it`] が固定する**ので、
     /// 保管の読み書きを見る他のテストは起動時刻 0（＝ 何でも受ける）で引く
     fn stored(states: &HookStates, id: &SessionId) -> Option<String> {
-        states.get(id, Some(0)).map(str::to_string)
+        states.get(id, Some(0)).map(|(state, _)| state.to_string())
     }
 
     /// **注入する表と受け口が同じ表を読む。** 片方だけ知っているイベントがあると、
@@ -775,10 +778,10 @@ mod tests {
     #[test]
     fn a_hook_state_belongs_to_the_run_that_was_launched_before_it() {
         let states = HookStates::from_entries([("s", "stopped", 2_000)]);
-        // 起動より後に記録された ＝ 今の実行のもの
-        assert_eq!(states.get(&id("s"), Some(1_000)), Some("stopped"));
+        // 起動より後に記録された ＝ 今の実行のもの（記録時刻も一緒に返る）
+        assert_eq!(states.get(&id("s"), Some(1_000)), Some(("stopped", 2_000)));
         // 起動と同時刻も今の実行（時計の分解能で同じ ms に並び得る）
-        assert_eq!(states.get(&id("s"), Some(2_000)), Some("stopped"));
+        assert_eq!(states.get(&id("s"), Some(2_000)), Some(("stopped", 2_000)));
         // 起動より前に記録された ＝ 前回の実行の残骸
         assert_eq!(states.get(&id("s"), Some(3_000)), None);
         // 窓が無い行は動いていない ＝ 保管の値は過去の実行のもの

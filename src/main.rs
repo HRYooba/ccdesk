@@ -163,6 +163,7 @@ fn main() -> anyhow::Result<()> {
         windows: Vec::new(),
         active: 0,
         agents: Vec::new(),
+        agents_observed_at: 0,
         agents_shared: Arc::new(Mutex::new(Vec::new())),
         agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         sessions,

@@ -674,8 +674,12 @@ pub(crate) const STOPPED: &str = "stopped";
 /// ないならユーザーの入力を待っているため（`idle` = プロンプト待ち、
 /// `waiting` = 確認待ち）
 pub(crate) fn foreground_state(status: &str) -> &'static str {
-    if status == "busy" { WORKING } else { WAITING }
+    if status == STATUS_BUSY { WORKING } else { WAITING }
 }
+
+/// `agents --json` の `status` が「claude が動いている」を表す値。
+/// [`foreground_state`] と [`row_state`] の裁定則が同じ綴りを見る
+const STATUS_BUSY: &str = "busy";
 
 /// state 値。**書く側（hook）と読む側（[`classify`]）が同じ綴りを見る**ための 1 箇所。
 /// 語は [`Group`] の小文字（画面に出る語と内部の値を別にしない）
@@ -710,14 +714,18 @@ pub(crate) fn classify(live_state: &str, alive: bool) -> StateView {
 /// 実行は `agents --json` の status 経由で、撮影用の供給元は固定表で名乗る
 /// （材料をどこから集めるかは描画側 ＝ [`crate::ui`] が持つ）
 pub(crate) struct Run<'a> {
-    /// その実行が hook で報告した最新の state（一度も来ていなければ None）。
+    /// その実行が hook で報告した最新の (state, 記録時刻)（一度も来ていなければ None）。
     /// 前回の実行の残骸を捨てる判断は [`crate::hooks::HookStates::get`] が
     /// 窓の起動時刻で済ませてあるので、ここへ来るのは今の実行が書いたものだけ
-    pub(crate) hook: Option<&'a str>,
-    /// `agents --json` の `status`（hook が一度も来ていない行の従経路。
-    /// 空 ＝ ポーラーがまだ拾っていない）
+    pub(crate) hook: Option<(&'a str, u64)>,
+    /// `agents --json` の `status`（hook が一度も来ていない行の従経路と、
+    /// waiting の裁定（[`row_state`]）の材料。空 ＝ ポーラーがまだ拾っていない）
     pub(crate) status: &'a str,
-    /// PTY の出力から推した「動いているらしい」（`status` も無い間の最後の手段）
+    /// `status` を観測した時刻（ms）。hook の記録時刻との新旧裁定の材料。
+    /// 0 ＝ 一度も観測していない（裁定は起きない）
+    pub(crate) status_at: u64,
+    /// PTY の出力から推した「動いているらしい」（`status` も無い間の最後の手段。
+    /// フォーカスの出入りや再描画でも動くので、**裁定の材料にはしない**）
     pub(crate) busy: bool,
 }
 
@@ -742,16 +750,35 @@ pub(crate) struct Run<'a> {
 /// hook は turn 単位で届くので
 /// Working / Waiting / Completed を取り違えない。hook が一度も来ていない行
 /// （ccdesk が起こしていないセッション・注入が効かなかった場合）だけ `status` へ落ち、
-/// `status` も無い間は出力の変化から推す
+/// `status` も無い間は出力の変化から推す。
+///
+/// # 例外 ＝ waiting の裁定則
+///
+/// **hook の `waiting` だけは、より新しい `busy` 観測に負ける。**
+/// `waiting` は「ユーザーが動くまで claude は進まない」という主張なので、
+/// その後に観測された「動いている」はその主張の反証になる（許可プロンプトの
+/// 許可のように**「解除された」を知らせる hook イベントが存在しない**操作が
+/// あり、イベントの列挙では状態機械が閉じない。裁定則は原因が何であれ
+/// 最大ポーリング 1 周期の遅れで自己修復する）。
+///
+/// waiting 以外は status で覆さない: `busy` は「このターンの続き」と「次のターン」を
+/// 区別できないので、`completed` を覆すと Done の意味が壊れる（次のターンが
+/// 始まれば `UserPromptSubmit` hook が即 `working` を書くので、覆す必要も無い）。
+/// 逆向き（busy でない観測で `working` を waiting へ落とす）もしない:
+/// 「動いていない」は idle_prompt の誤検知と同じ轍で、ターンを終えた行が
+/// 時間経過で入力待ちへ落ちる
 pub(crate) fn row_state(run: Option<Run<'_>>) -> StateView {
-    let Some(run) = run.filter(|run| run.hook != Some(STOPPED)) else {
+    let Some(run) = run.filter(|run| run.hook.map(|(state, _)| state) != Some(STOPPED)) else {
         return classify(STOPPED, false);
     };
-    match (run.hook, run.status) {
-        (Some(state), _) => classify(state, true),
-        (None, "") if run.busy => classify(WORKING, true),
-        (None, "") => classify(WAITING, true),
-        (None, status) => classify(foreground_state(status), true),
+    match run.hook {
+        Some((WAITING, at)) if run.status == STATUS_BUSY && run.status_at > at => {
+            classify(WORKING, true)
+        }
+        Some((state, _)) => classify(state, true),
+        None if run.status.is_empty() && run.busy => classify(WORKING, true),
+        None if run.status.is_empty() => classify(WAITING, true),
+        None => classify(foreground_state(run.status), true),
     }
 }
 

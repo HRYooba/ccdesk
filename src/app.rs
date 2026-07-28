@@ -320,6 +320,10 @@ pub(crate) struct App {
     pub(crate) active: usize,
     // claude agents --json のライブ状態（正規 IF。バックグラウンドスレッドが更新）
     pub(crate) agents: Vec<AgentInfo>,
+    /// [`Self::agents`] を取り込んだ時刻（ms）。**status の観測時刻**として
+    /// hook の記録時刻と新旧を比べる材料（[`crate::poll::row_state`] の裁定則）。
+    /// 取り込みと同じ 1 箇所（run ループの swap）でだけ刻む ＝ 中身とずれない
+    pub(crate) agents_observed_at: u64,
     pub(crate) agents_shared: Arc<Mutex<Vec<AgentInfo>>>,
     pub(crate) agents_dirty: Arc<std::sync::atomic::AtomicBool>,
     /// サイドバーに並ぶ行。**正本は `~/.ccdesk/sessions.json`**（供給元が読み書きする）
@@ -449,6 +453,7 @@ impl Default for App {
             windows: Vec::new(),
             active: 0,
             agents: Vec::new(),
+            agents_observed_at: 0,
             agents_shared: Arc::new(Mutex::new(Vec::new())),
             agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Vec::new(),
@@ -867,6 +872,9 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 .agents_shared
                 .lock_recover()
                 .clone();
+            // 観測時刻は取り込みの瞬間（取得完了 → swap の遅れは 1 フレーム未満で、
+            // 2 秒周期の裁定には効かない）
+            app.agents_observed_at = ccdesk::now_ms();
             force_draw = true;
         }
         // claude が画面を作り替えている最中は掴まない（[`Session::holds_frame`]）。
@@ -4748,7 +4756,10 @@ mod tests {
         adopt_hook_states(&mut app);
         assert_eq!(app.sessions, rows, "a leftover hook wrote to the row");
         // 写しそのものは取り直されている（表示はここから導く）
-        assert_eq!(app.hook_states.get(&SessionId::new("s"), Some(0)), Some("blocked"));
+        assert_eq!(
+            app.hook_states.get(&SessionId::new("s"), Some(0)).map(|(state, _)| state),
+            Some("blocked")
+        );
     }
 
     /// **未読は「claude が何か言ったのが、最後に開いた後か」。**
