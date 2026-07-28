@@ -386,6 +386,9 @@ pub(crate) struct App {
     /// 使用率が更新されたことを取得スレッドが立てる合図（フッターと同じ作法）。
     /// **周期で読みに行かない**ので、使用率を切った環境ではこの旗が一度も立たない
     pub(crate) usage_dirty: Arc<std::sync::atomic::AtomicBool>,
+    /// マウスが使用率ゲージの上にいるか（押せることを帯で示す）。
+    /// 一覧の行ではないので [`Self::hovered`]（[`SidebarPos`]）では表せない
+    pub(crate) usage_hovered: bool,
     // 画面に出す値の供給元（実データ / 撮影用の固定データ）。起動時に 1 度だけ選ばれ、
     // 以降ここを通る限り「今 demo か」を問う必要が無い
     pub(crate) source: Arc<dyn DataSource>,
@@ -467,6 +470,7 @@ impl Default for App {
             ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             usage: Usage::default(),
             usage_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            usage_hovered: false,
             // 撮影用の供給元は state.json / config.json を書かないので、
             // テストが開発者の設定を踏まない
             source: Arc::new(crate::source::DemoSource),
@@ -947,11 +951,11 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 send_to_active(app, &bytes);
             }
             Event::Mouse(mouse) => {
-                let prev_hover = app.hovered;
+                let prev_hover = (app.hovered, app.usage_hovered);
                 if handle_mouse(app, &mouse)? {
                     return Ok(());
                 }
-                if !mouse_needs_redraw(mouse.kind, prev_hover, app.hovered) {
+                if !mouse_needs_redraw(mouse.kind, prev_hover, (app.hovered, app.usage_hovered)) {
                     force_draw = false;
                 }
             }
@@ -1617,12 +1621,13 @@ fn resize_terminal(app: &mut App, w: u16, h: u16) {
 
 /// マウスイベントの後に描き直す必要があるか（FPS 対策）。
 ///
-/// **移動だけのイベントで変わり得る表示はホバー位置 1 つ**なので、そこが同じなら
-/// 描き直さない。移動以外（クリック・ホイール・ドラッグ）は表示を変えるので常に描く
+/// **移動だけのイベントで変わり得る表示はホバー（一覧の行と使用率ゲージ）だけ**
+/// なので、そこが同じなら描き直さない。移動以外（クリック・ホイール・ドラッグ）は
+/// 表示を変えるので常に描く
 fn mouse_needs_redraw(
     kind: MouseEventKind,
-    prev_hover: Option<SidebarPos>,
-    hover: Option<SidebarPos>,
+    prev_hover: (Option<SidebarPos>, bool),
+    hover: (Option<SidebarPos>, bool),
 ) -> bool {
     !matches!(kind, MouseEventKind::Moved) || prev_hover != hover
 }
@@ -1675,11 +1680,11 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
     // 右ペインの列範囲に描かれるため、後回しにするとペインのクリックに食われる。
     // 当たり判定は描画と同じ導出（[`crate::ui::usage_hit`]）なので、
     // 出していないとき（notice 表示中・狭い端末・使用率を切っている）は当たらない
-    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
-        && let Some(hit) = crate::ui::usage_hit(app)
-        && mouse.row == hit.row
-        && hit.columns.contains(&mouse.column)
-    {
+    let on_usage = crate::ui::usage_hit(app)
+        .is_some_and(|hit| mouse.row == hit.row && hit.columns.contains(&mouse.column));
+    // 乗っている間は帯で「押せる」ことを示す（一覧の行のホバーと同じ手段）
+    app.usage_hovered = on_usage;
+    if on_usage && let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
         app.source.refresh_usage();
         return Ok(false);
     }
@@ -2413,6 +2418,36 @@ mod tests {
             handle_mouse(&mut app, &click(column, row)).unwrap();
         }
         assert_eq!(refreshes.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// **使用率の上では帯が点き、外れたら消える。** 判定はクリックと同じ導出
+    /// （`ui::usage_hit`）なので、光る場所と押せる場所がずれない。
+    /// 点いた・消えた瞬間は描き直し、乗ったまま動いても描き直さない（FPS 対策）
+    #[test]
+    fn hovering_the_usage_gauge_lights_it_up_and_redraws_once() {
+        let (mut app, _) = usage_app();
+        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
+
+        // 乗った ＝ 点く + 描き直す
+        let prev = (app.hovered, app.usage_hovered);
+        handle_mouse(&mut app, &moved(hit.columns.start, hit.row)).unwrap();
+        assert!(app.usage_hovered, "the gauge is not marked as hovered");
+        assert!(
+            mouse_needs_redraw(MouseEventKind::Moved, prev, (app.hovered, app.usage_hovered)),
+            "entering the gauge must ask for a redraw"
+        );
+
+        // 乗ったまま動いた ＝ 描き直さない
+        let prev = (app.hovered, app.usage_hovered);
+        handle_mouse(&mut app, &moved(hit.columns.end - 1, hit.row)).unwrap();
+        assert!(
+            !mouse_needs_redraw(MouseEventKind::Moved, prev, (app.hovered, app.usage_hovered)),
+            "moving inside the gauge must not ask for a redraw"
+        );
+
+        // 外れた ＝ 消える（1 桁左はゲージの外）
+        handle_mouse(&mut app, &moved(hit.columns.start - 1, hit.row)).unwrap();
+        assert!(!app.usage_hovered, "the mark stays after the mouse left");
     }
 
     /// **出ていないものは押せない。** 使用率を切っている（`Unknown`）ときは
@@ -3492,25 +3527,25 @@ mod tests {
         let mut app = app_with_hoverable_rows();
         let sl = sidebar_layout(&app);
         handle_mouse(&mut app, &moved(3, sl.account_y)).unwrap();
-        let prev = app.hovered;
+        let prev = (app.hovered, app.usage_hovered);
         handle_mouse(&mut app, &moved(10, sl.account_y)).unwrap();
-        assert_eq!(app.hovered, prev, "the same row must resolve to the same hover");
+        assert_eq!(app.hovered, prev.0, "the same row must resolve to the same hover");
         assert!(
-            !mouse_needs_redraw(MouseEventKind::Moved, prev, app.hovered),
+            !mouse_needs_redraw(MouseEventKind::Moved, prev, (app.hovered, app.usage_hovered)),
             "moving inside the account row must not ask for a redraw"
         );
         // 行が変われば描き直す
-        let prev = app.hovered;
+        let prev = (app.hovered, app.usage_hovered);
         handle_mouse(&mut app, &moved(3, 1)).unwrap();
         assert!(
-            mouse_needs_redraw(MouseEventKind::Moved, prev, app.hovered),
+            mouse_needs_redraw(MouseEventKind::Moved, prev, (app.hovered, app.usage_hovered)),
             "leaving the account row must ask for a redraw"
         );
         // 移動以外は表示を変えるので常に描き直す
         assert!(mouse_needs_redraw(
             MouseEventKind::Down(MouseButton::Left),
-            app.hovered,
-            app.hovered
+            (app.hovered, app.usage_hovered),
+            (app.hovered, app.usage_hovered)
         ));
     }
 

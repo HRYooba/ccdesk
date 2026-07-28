@@ -241,16 +241,26 @@ fn usage_spans(info: &UsageInfo, stale: bool, detail: UsageDetail) -> Vec<Span<'
 
 /// 下部バーに出す使用率。**描画とクリック判定がこの 1 つの導出を共有する**
 /// （位置の答えが 2 つあると、クリックできる場所と見えている場所がずれる）。
-/// notice を出している間は下部バーが notice に置き換わるので、使用率は出ない
+/// notice を出している間は下部バーが notice に置き換わるので、使用率は出ない。
+///
+/// マウスが乗っている間は帯（`hl_bg`）で「押せる」ことを示す。一覧の行の
+/// ホバーと同じ手段（[`Look`]）。**帯は背景だけ ＝ 幅を変えない**ので、
+/// 乗った瞬間に当たり判定（[`usage_hit`]）が動かない
 fn usage_footer(app: &App) -> Vec<Span<'static>> {
     if app.notice.is_some() {
         return Vec::new();
     }
-    usage_line(
+    let mut spans = usage_line(
         &app.usage,
         // キーヒントを押し出さないよう、使用率に渡すのは幅の半分まで
         app.term_size.0 / 2,
-    )
+    );
+    if app.usage_hovered {
+        for span in &mut spans {
+            span.style = span.style.bg(ui().hl_bg);
+        }
+    }
+    spans
 }
 
 /// 使用率のクリック当たり判定（右下の使用率を押すとその場で取り直す）
@@ -1685,6 +1695,36 @@ pub(crate) mod tests {
         assert!(
             usage_text(&Usage::Failed, 80).contains("usage"),
             "a failed fetch must be visible"
+        );
+    }
+
+    /// **使用率はマウスが乗っている間だけ帯が乗る**（押せることを示す。
+    /// 一覧の行のホバーと同じ手段）。帯は背景だけで**幅を変えない** ＝
+    /// 乗った瞬間に当たり判定（[`usage_hit`]）が動かない
+    #[test]
+    fn the_usage_gauge_is_banded_only_while_hovered() {
+        let mut app = App {
+            usage: crate::usage::sample_ready(Vec::new()),
+            term_size: (120, 30),
+            ..Default::default()
+        };
+        let plain = usage_footer(&app);
+        assert!(!plain.is_empty(), "the fixture's premise broke — nothing is drawn");
+        assert!(
+            plain.iter().all(|s| s.style.bg.is_none()),
+            "banded before the mouse arrived"
+        );
+
+        app.usage_hovered = true;
+        let hovered = usage_footer(&app);
+        assert!(
+            hovered.iter().all(|s| s.style.bg == Some(ui().hl_bg)),
+            "the hover puts no band on the gauge"
+        );
+        assert_eq!(
+            span_width(&plain),
+            span_width(&hovered),
+            "the band changed the width"
         );
     }
 
