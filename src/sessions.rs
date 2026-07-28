@@ -204,8 +204,12 @@ pub(crate) struct SessionStore {
     ///
     /// **ストアが持つ**のは、基準を進めてよい瞬間（＝ 書けたことが確認できた瞬間）が
     /// ロックの内側にしか無いため。呼び出し側に持たせると「書けたか」と「基準」が
-    /// 別の場所に分かれ、片方だけ進んだ状態を作れてしまう
-    baseline: Mutex<Vec<SessionRow>>,
+    /// 別の場所に分かれ、片方だけ進んだ状態を作れてしまう。
+    ///
+    /// **持つのは ID だけ。** マージが基準に問うのは「この行を知っていたか」だけ
+    /// なので（[`merge_sessions`]）、行の中身まで複製して持つ理由が無い
+    /// （2 秒周期の読みのたびに全行のディープコピーが走っていた）
+    baseline: Mutex<std::collections::HashSet<SessionId>>,
 }
 
 impl SessionStore {
@@ -214,7 +218,7 @@ impl SessionStore {
             store,
             lock_wait: STORE_LOCK_WAIT,
             lock_stale: LOCK_STALE,
-            baseline: Mutex::new(Vec::new()),
+            baseline: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -236,7 +240,7 @@ impl SessionStore {
     /// **読んだ内容が以降の書き込みでマージする基準になる**（[`merge_sessions`]）
     pub(crate) fn list(&self) -> Vec<SessionRow> {
         let rows = read_rows(&self.store);
-        *self.baseline() = rows.clone();
+        *self.baseline() = ids_of(&rows);
         rows
     }
 
@@ -263,13 +267,18 @@ impl SessionStore {
         if write_json_atomically(&self.store, &document).is_err() {
             return next.to_vec();
         }
-        *baseline = merged.clone();
+        *baseline = ids_of(&merged);
         merged
     }
 
-    fn baseline(&self) -> std::sync::MutexGuard<'_, Vec<SessionRow>> {
+    fn baseline(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<SessionId>> {
         self.baseline.lock_recover()
     }
+}
+
+/// マージの基準に持つ ID 集合（[`SessionStore::baseline`]）
+fn ids_of(rows: &[SessionRow]) -> std::collections::HashSet<SessionId> {
+    rows.iter().map(|row| row.session_id.clone()).collect()
 }
 
 /// 保管ファイルの行一覧（無い・壊れている・書き換え途中はすべて空 ＝
@@ -316,7 +325,7 @@ fn read_rows(path: &Path) -> Vec<SessionRow> {
 /// 同じ性質）。削除をもう一度押せば済む頻度の問題として割り切っている
 fn merge_sessions(
     disk: &[SessionRow],
-    baseline: &[SessionRow],
+    baseline: &std::collections::HashSet<SessionId>,
     next: &[SessionRow],
 ) -> Vec<SessionRow> {
     let mut merged: Vec<SessionRow> = next.to_vec();
@@ -329,7 +338,7 @@ fn merge_sessions(
             Some(mine) if row.updated_at > mine.updated_at => *mine = row.clone(),
             Some(_) => {}
             // baseline に居る ＝ このインスタンスが削除した行なので足さない
-            None if baseline.iter().any(|b| b.session_id == row.session_id) => {}
+            None if baseline.contains(&row.session_id) => {}
             None => merged.push(row.clone()),
         }
     }
@@ -410,7 +419,7 @@ mod tests {
         let disk = [row("a", "C:\\dev\\disk", 2)];
         let next = [row("a", "C:\\dev\\local", 1)];
         assert_eq!(
-            merge_sessions(&disk, &[], &next).len(),
+            merge_sessions(&disk, &ids_of(&[]), &next).len(),
             1,
             "same-ID row split into two"
         );
@@ -424,7 +433,7 @@ mod tests {
         let disk = [row("shared", "C:\\dev\\shared", 1), row("from-b", "C:\\dev\\b", 2)];
         let next = [row("shared", "C:\\dev\\shared", 1), row("from-a", "C:\\dev\\a", 3)];
         assert_eq!(
-            ids(&merge_sessions(&disk, &baseline, &next)),
+            ids(&merge_sessions(&disk, &ids_of(&baseline), &next)),
             ["shared", "from-a", "from-b"],
             "another instance's session is missing from the list"
         );
@@ -435,8 +444,8 @@ mod tests {
     #[test]
     fn merging_is_a_no_op_for_a_single_instance() {
         let next = [row("a", "C:\\dev\\a", 1), row("b", "C:\\dev\\b", 2)];
-        assert_eq!(merge_sessions(&next, &next, &next), next);
-        assert_eq!(merge_sessions(&[], &next, &next), next);
+        assert_eq!(merge_sessions(&next, &ids_of(&next), &next), next);
+        assert_eq!(merge_sessions(&[], &ids_of(&next), &next), next);
     }
 
     /// **両方が知っている行は後に触った側が勝つ。** 他インスタンスが状態を
@@ -446,12 +455,12 @@ mod tests {
         let baseline = [row("s", "C:\\dev\\before", 1)];
         let disk = [row("s", "C:\\dev\\changed-by-b", 5)];
         let next = [row("s", "C:\\dev\\before", 1)];
-        let merged = merge_sessions(&disk, &baseline, &next);
+        let merged = merge_sessions(&disk, &ids_of(&baseline), &next);
         assert_eq!(merged[0].cwd, "C:\\dev\\changed-by-b", "clobbered another instance's update");
 
         // こちらの方が新しければこちらが残る（自分の操作が保存の往復で巻き戻らない）
         let next = [row("s", "C:\\dev\\changed-by-a", 9)];
-        let merged = merge_sessions(&disk, &baseline, &next);
+        let merged = merge_sessions(&disk, &ids_of(&baseline), &next);
         assert_eq!(merged[0].cwd, "C:\\dev\\changed-by-a", "own change got rolled back");
     }
 
@@ -465,7 +474,7 @@ mod tests {
         let disk = [row("keep", "C:\\dev\\keep", 1), row("dropped", "C:\\dev\\drop", 9)];
         let next = [row("keep", "C:\\dev\\keep", 1)];
         assert_eq!(
-            ids(&merge_sessions(&disk, &baseline, &next)),
+            ids(&merge_sessions(&disk, &ids_of(&baseline), &next)),
             ["keep"],
             "deleted row came back (even though the disk side is newer)"
         );

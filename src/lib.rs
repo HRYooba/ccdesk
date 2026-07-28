@@ -816,6 +816,40 @@ fn kv_update_list(
     })
 }
 
+/// 起動時にまとめて読むためのスナップショット。**1 度だけ読み、以降のキー引きは
+/// メモリ上**で行う（`load_state` / `load_setting` はキーごとにファイルを
+/// 読み直すので、起動列で 5 キー引くと同じファイルを 5 回読む）。
+/// 値の解釈（文字列・文字列配列）は単発読みと同じ寛容さ
+pub struct KvSnapshot(serde_json::Value);
+
+impl KvSnapshot {
+    pub fn string(&self, key: &str) -> Option<String> {
+        Some(self.0.get(key)?.as_str()?.to_string())
+    }
+
+    pub fn list(&self, key: &str) -> Vec<String> {
+        value_strings(self.0.get(key))
+    }
+}
+
+/// state.json のスナップショット（[`KvSnapshot`]）
+pub fn state_snapshot() -> KvSnapshot {
+    kv_snapshot(state_path())
+}
+
+/// config.json のスナップショット（[`KvSnapshot`]）
+pub fn settings_snapshot() -> KvSnapshot {
+    kv_snapshot(settings_path())
+}
+
+fn kv_snapshot(path: Option<std::path::PathBuf>) -> KvSnapshot {
+    KvSnapshot(
+        path.as_deref()
+            .and_then(read_json)
+            .unwrap_or_else(|| serde_json::json!({})),
+    )
+}
+
 pub fn load_setting(key: &str) -> Option<String> {
     kv_load(settings_path(), key)
 }

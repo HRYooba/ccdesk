@@ -522,8 +522,8 @@ impl App {
 
     pub(crate) fn open_new_view(&mut self) {
         self.right_view = RightView::New(NewState::browse(&self.dispatch_cwd));
-        // 次回起動時に同じ画面を復元する
-        self.source.save_window(WindowItem::LastView("new"));
+        // 次回起動時に同じ画面を復元する（None = new session 画面）
+        self.source.save_window(WindowItem::LastView(None));
     }
 
     /// ポーラーの書き込み先をまとめて渡す。どのポーラーを起こすかは供給元が決めるので、
@@ -567,7 +567,7 @@ impl App {
         self.right_view = RightView::Sessions;
         // 次回起動時に同じセッションを復元する
         if let Some(id) = self.windows.get(idx).map(|w| w.session_id.clone()) {
-            self.source.save_window(WindowItem::LastView(id.as_str()));
+            self.source.save_window(WindowItem::LastView(Some(&id)));
         }
         if self.focus == Focus::Terminal
             && let Some(window) = self.windows.get_mut(idx) {
@@ -725,7 +725,8 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         // `/resume` `/clear` すると claude は新しいセッションの `SessionStart` を
         // その場で撃つので、これが「一覧に新しい行を出す合図」になる。
         // 見るのはファイルの長さと更新時刻だけ（中身は読まない）ので毎周でも安い
-        if hook_store_changed(&mut app.hook_stamp, app.source.hook_stamp()) {
+        let hooks_changed = hook_store_changed(&mut app.hook_stamp, app.source.hook_stamp());
+        if hooks_changed {
             app.last_scan = instant_ago(SCAN_INTERVAL);
         }
         if app.last_scan.elapsed() > SCAN_INTERVAL {
@@ -733,8 +734,12 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             // 一覧を読み直した直後に hook の state を載せる。**順序に意味がある**:
             // 読み直しは丸ごとの置き換えなので、先に載せるとその場で上書きされる。
             // **張り替えより前**でもある: ペインの中で切り替わったことに気づく材料が
-            // hook の写しなので、古い写しのまま張り替えを判断させない
-            adopt_hook_states(app);
+            // hook の写しなので、古い写しのまま張り替えを判断させない。
+            // **読み直すのはファイルが実際に動いた周だけ**（何も起きていない
+            // 2 秒周期のたびに全読み + JSON パースをやり直さない）
+            if hooks_changed {
+                adopt_hook_states(app);
+            }
             // ペインの中で `/resume` された窓を新しいセッションの行へ張り替える。
             // **名前の読み直しの前**に置く: 張り替えで作った行の表示名は
             // transcript から来るので、同じ周期の refresh_transcripts が拾う
@@ -1321,7 +1326,7 @@ fn adopt_switched_session(app: &mut App, previous: &SessionId, next: &SessionId,
     // ccdesk の外（claude の `/resume`）なのでその経路を通らない ＝ ここで書く。
     // 呼ばれるのは張り替わった周期だけなので、書き込みも張り替え 1 回につき 1 度
     if shown {
-        app.source.save_window(WindowItem::LastView(next.as_str()));
+        app.source.save_window(WindowItem::LastView(Some(next)));
         // **離れた行へは何も書かない。** 窓が新しいセッションへ移った時点でその行を
         // 動かしているものは無くなり、次の描画でそのまま Stopped になる
         // （書き戻していた頃は、hook が持つ新しい記録より古い `stopped` が行に残った）。
@@ -1452,12 +1457,10 @@ fn register_project(app: &mut App, cwd: &str) {
         None => cwd.to_string(),
     };
     app.projects.push(entry);
-    // 上限を超えたら**最も長く使っていない側**から落とす。登録が自動なので、放っておくと
-    // 「一度試しただけのフォルダ」が state.json に永久に積まれ見出しも際限なく増える。
-    // 落ちたフォルダにセッションが残っていれば見出しは cwd 由来で出続けるので、
-    // 落ちたこと自体が操作の邪魔にならない
-    let excess = app.projects.len().saturating_sub(PROJECTS_LIMIT);
-    app.projects.drain(..excess);
+    // 上限の適用はここではやらない。**上限と追い出しの規則は保存の正本
+    // （`merge_projects`）1 箇所**にあり、[`save_projects`] が適用後の一覧を
+    // 取り込むので画面もそれに揃う（2 箇所で削ると、追い出しの向きを変えた
+    // ときに片方だけ直して「画面では消えたのに次の保存で戻る」が作れる）
     save_projects(app);
 }
 
@@ -1576,7 +1579,7 @@ fn start_foreground(app: &mut App, cwd: &str, prompt: &str) -> Launched {
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
     // state を取る hook を注入する（statusLine は載せない ＝ ユーザーの
     // statusline を奪わない。[`crate::hooks::inject_settings`]）
-    let settings = crate::hooks::inject_settings();
+    let settings = hook_settings(app);
     let (rows, cols) = app.pane_size();
     let window = Session::spawn(
         &session_id,
@@ -2038,6 +2041,22 @@ fn menu_close(app: &mut App, id: &SessionId) {
     }
 }
 
+/// hook 注入ファイルのパス（実体は [`crate::hooks::inject_settings`]）。
+/// **書けなかったことを黙らせない**: hooks 無しで起動したセッションは状態報告が
+/// 縮退する（入力待ち・完了が導出できなくなる）ので、下部バーへ 1 行出す。
+/// セッション自体は hooks 無しで起動を続ける（起動を止めるほどの失敗ではない）
+fn hook_settings(app: &mut App) -> Option<std::path::PathBuf> {
+    let settings = crate::hooks::inject_settings();
+    if settings.is_none() {
+        set_notice(
+            app,
+            "could not write the hook settings; session states may not update (see ccdesk logs)"
+                .to_string(),
+        );
+    }
+    settings
+}
+
 /// 指定セッションのウィンドウを閉じる（＝ 子プロセスを終わらせる）。
 /// 窓が開いていなければ何もしない
 fn close_window_of(app: &mut App, id: &SessionId) {
@@ -2322,7 +2341,7 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
     };
     let (launch, cwd) = relaunch(&app.titles, row);
     let cwd = cwd.into_owned();
-    let settings = crate::hooks::inject_settings();
+    let settings = hook_settings(app);
     let (rows, cols) = app.pane_size();
     match Session::spawn(id, &cwd, rows, cols, launch, settings.as_deref()) {
         Ok(window) => {
@@ -3371,12 +3390,14 @@ mod tests {
             }
         }
 
-        // 記録するのは「次に開く画面」だけ（他の項目は実ファイルへも書かない）
+        // 記録するのは「次に開く画面」だけ（他の項目は実ファイルへも書かない）。
+        // None（new session 画面）の保存表記は live 側の持ち物なので、
+        // ここでは Option の形をそのまま記録する
         fn save_window(&self, item: WindowItem<'_>) {
             if let WindowItem::LastView(view) = item {
                 self.views
                     .lock_recover()
-                    .push(view.to_string());
+                    .push(view.map(|id| id.to_string()).unwrap_or_default());
             }
         }
 
@@ -4080,10 +4101,12 @@ mod tests {
         assert_eq!(app.projects, ["C:\\dev\\api", "C:\\dev\\web"]);
     }
 
-    /// 上限を超えたら古い側から落とす（登録が自動なので放っておくと際限なく積まれる）
+    /// 上限を超えたら古い側から落とす（登録が自動なので放っておくと際限なく積まれる）。
+    /// **上限の適用は保存の正本（`merge_projects`）だけ**なので、保存を通る
+    /// 供給元で検査する（`register_project` 自身は上限を知らない）
     #[test]
     fn registering_beyond_the_limit_drops_the_oldest() {
-        let mut app = test_app(34, TERM);
+        let mut app = app_with_disk(&[], &[]);
         for i in 0..PROJECTS_LIMIT + 1 {
             register_project(&mut app, &format!("C:\\dev\\p{i}"));
         }
@@ -4105,7 +4128,7 @@ mod tests {
     /// （登録が消え、最後のセッションを消した時点で見出し＝入口まで消える）
     #[test]
     fn reusing_a_folder_keeps_it_when_the_limit_evicts() {
-        let mut app = test_app(34, TERM);
+        let mut app = app_with_disk(&[], &[]);
         for i in 0..PROJECTS_LIMIT {
             register_project(&mut app, &format!("C:\\dev\\p{i}"));
         }

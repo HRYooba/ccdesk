@@ -559,6 +559,29 @@ pub(crate) enum Grouping {
     Directory,
 }
 
+impl Grouping {
+    /// 表示順（メニューの項目の並びもこれに従う）
+    pub(crate) const ORDER: [Self; 2] = [Self::State, Self::Directory];
+
+    /// **保存値（config.json）と画面表示の唯一の綴り**。
+    /// 読み・書き・メニュー・現在値表示が別々に綴りを持つと、片方だけ変えたときに
+    /// 保存値が読めなくなる（設定が黙って既定へ戻る）
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::State => "state",
+            Self::Directory => "directory",
+        }
+    }
+
+    /// 保存値からの復元。未知の値は既定（State）へ倒す
+    pub(crate) fn parse(text: &str) -> Self {
+        Self::ORDER
+            .into_iter()
+            .find(|g| g.as_str() == text)
+            .unwrap_or(Self::State)
+    }
+}
+
 /// 行の状態。**行のラベル・節の見出し・集計の項目がこの 1 つ**で、
 /// 並びは緊急度の順（上ほどユーザーの手が要る）。
 ///

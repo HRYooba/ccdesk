@@ -197,8 +197,14 @@ pub(crate) fn spawn_poller(
                     return; // 送り手が居なくなった（TUI 終了）
                 };
                 match trigger {
-                    // ユーザーが押した ＝ 間引かない
+                    // ユーザーが押した ＝ 間引かない（アカウントを切り替えたときに
+                    // Unavailable から戻ってこられる唯一の経路でもある）
                     Trigger::Manual => break,
+                    // **枠の概念が無いアカウントではターン完了を無視する。** 恒久的に
+                    // 取れないのに、ターンのたびに claude を起こし続ける意味が無い
+                    // （README の「stop polling entirely (click still re-checks)」が
+                    // この挙動の正本）
+                    Trigger::TurnFinished if permanent => continue,
                     // ターン完了は連発するので、直前の取得から間を置く。
                     // 間引いた分は待ち直すだけ（取得は次の合図か保険の周期で起きる）
                     Trigger::TurnFinished if fetched_at.elapsed() >= EVENT_MIN_INTERVAL => {
