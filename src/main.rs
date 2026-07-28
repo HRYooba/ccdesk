@@ -194,6 +194,7 @@ fn main() -> anyhow::Result<()> {
         // まだ取れていないので Unknown ＝ 何も描かない）
         usage: source.usage(),
         usage_dirty,
+        usage_hovered: false,
         input_gate: None,
         notice: None,
         grouping: window.grouping,
