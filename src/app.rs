@@ -5,7 +5,7 @@ use std::time::Duration;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::Position;
 
 use ccdesk::{log_error, now_ms, same_dir, LockExt};
 
@@ -18,18 +18,9 @@ use crate::sessions::{SessionId, SessionRow};
 use crate::source::{DataSource, PollSinks, WindowItem, PROJECTS_LIMIT};
 use crate::title::Titles;
 use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
-use crate::ui::{draw, menu_zone, popup_rect, row_at, row_y, sidebar_layout};
-
-/// サイドバー幅の下限（ドラッグで詰められる限界）。
-///
-/// **根拠は 1 行が固定で食う桁**（`ui::mod` の `MIN_ROW_COLS` ＝ 行頭の印と
-/// 状態アイコン + 名前の下限 + 行末のメニュー記号）に、枠の左右 1 桁ずつを足したもの。
-/// **足し算の正本は ui 側**なので、行頭や行末に何かを足せばこの下限も一緒に動く
-/// （0 桁にすると、詰め切ったサイドバーがどの行も見分けられない帯になる）。
-///
-/// **描画のテストが「一番狭い状態」を作るのにも使う**ので、この値は ui 側からも読める
-pub(crate) const MIN_SIDEBAR: u16 = crate::ui::MIN_ROW_COLS + 2;
-const MIN_PANE: u16 = 40;
+use crate::ui::{
+    draw, fit_sidebar, menu_zone, popup_rect, row_at, row_y, sidebar_cols, sidebar_layout,
+};
 
 // 一覧の正本（~/.ccdesk/sessions.json）を読み直す周期。**他インスタンスが起こした
 // セッションを取り込むため**に要る（小さな JSON 1 本の read。描画は dirty 時のみ）
@@ -38,8 +29,12 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const LIVE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// イベント待ちの上限（＝ 何も起きないときの周回間隔）
 const POLL_IDLE: Duration = Duration::from_millis(33);
-/// 何も変わっていなくても描き直す間隔（スピナー・経過時間が動くため）
-const IDLE_REDRAW: Duration = Duration::from_millis(250);
+/// スピナーが回っている間の描き直し間隔（点滅周期 400ms の半周期 ＝
+/// これより短くしても見た目は変わらず、フレームが増えるだけ）
+const SPINNER_REDRAW: Duration = Duration::from_millis(200);
+/// 何も動いていないときの描き直す間隔。動くものは経過時間表示（`· 23s`）だけで、
+/// その粒度は 1 秒なので、これより短い周期は**前フレームと同一の出力**を組み直すだけ
+const IDLE_REDRAW: Duration = Duration::from_secs(1);
 /// 描画を見送っている間のイベント待ちの上限。子が静まったことに早く気づくため
 /// 短くする（見送りは [`crate::session::REDRAW_HOLD_MAX`] で打ち切られるので、
 /// この短い周回が続くのは出力が途切れない間だけ）
@@ -411,6 +406,9 @@ pub(crate) struct App {
     pub(crate) projects: Vec<String>,
     pub(crate) popup: Option<Popup>,
     pub(crate) focus: Focus,
+    // 直前のフレームでスピナー（Working の点滅）が出ていたか。
+    // run ループがアイドル時の描き直し間隔を選ぶ材料（描画が毎フレーム更新する）
+    pub(crate) spinner_active: bool,
 }
 
 /// テストの土台になる中立な `App`。各テストは関心のあるフィールドだけを
@@ -483,6 +481,7 @@ impl Default for App {
             popup: None,
             // サイドバー側にしておく（set_focus が PTY へ通知を出さない）
             focus: Focus::Sidebar,
+            spinner_active: false,
         }
     }
 }
@@ -495,14 +494,13 @@ type Launched = Result<Option<SessionId>, String>;
 
 impl App {
     fn pane_size(&self) -> (u16, u16) {
-        // 右ペインの Block 枠線 2 行 + 下部バー 1 行を引いた内側サイズ (rows, cols)
-        let rows = self.term_size.1.saturating_sub(3).max(1);
-        let cols = self
-            .term_size
-            .0
-            .saturating_sub(sidebar_cols(self) + 2)
-            .max(1);
-        (rows, cols)
+        // 右ペインの矩形（正本は ui::pane_rect）から Block 枠線 2 桁/2 行を引いた
+        // 内側サイズ (rows, cols)
+        let pane = crate::ui::pane_rect(self);
+        (
+            pane.height.saturating_sub(2).max(1),
+            pane.width.saturating_sub(2).max(1),
+        )
     }
 
     fn resize_sessions(&mut self) {
@@ -627,8 +625,12 @@ pub(crate) fn instant_ago(d: Duration) -> std::time::Instant {
 struct SyncOutput;
 
 impl SyncOutput {
+    /// **flush はしない（queue のみ）。** Begin は次の `terminal.draw` の flush と
+    /// 一緒に端末へ届けば足りる（生 stdout と CrosstermBackend は同一のグローバル
+    /// stdout バッファを共有するので順序は保たれる）。execute! で書くと
+    /// 1 フレームにつき write+flush の syscall が 2〜3 回余計に増える
     fn begin() -> Self {
-        let _ = crossterm::execute!(
+        let _ = crossterm::queue!(
             std::io::stdout(),
             crossterm::terminal::BeginSynchronizedUpdate
         );
@@ -638,10 +640,11 @@ impl SyncOutput {
 
 impl Drop for SyncOutput {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::EndSynchronizedUpdate
-        );
+        // フレームの終端なのでここでだけ flush する（駐車の MoveTo も一緒に流れる）
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        let _ = crossterm::queue!(out, crossterm::terminal::EndSynchronizedUpdate);
+        let _ = out.flush();
     }
 }
 
@@ -682,7 +685,8 @@ fn draw_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow:
     });
     drawn?;
     if let Some(pos) = park {
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::MoveTo(pos.x, pos.y));
+        // queue のみ（flush は SyncOutput の Drop が 1 回だけ行う）
+        let _ = crossterm::queue!(std::io::stdout(), crossterm::cursor::MoveTo(pos.x, pos.y));
     }
     Ok(())
 }
@@ -711,8 +715,10 @@ fn send_to_active(app: &mut App, bytes: &[u8]) {
 /// フレームはカーソルが中間位置で確定し、IME の変換窓がそこへ飛ぶ
 /// （判断は [`crate::session::Session::holds_frame`]、上限も向こうが持つので
 /// ここが false を返し続けることはない）
-fn should_draw(holding: bool, force: bool, pty_dirty: bool, since_draw: Duration) -> bool {
-    !holding && (force || pty_dirty || since_draw > IDLE_REDRAW)
+/// `idle_after` は無変化でも描き直す間隔（スピナーが回っている間だけ短くする ＝
+/// [`SPINNER_REDRAW`] / [`IDLE_REDRAW`]）
+fn should_draw(holding: bool, force: bool, pty_dirty: bool, since_draw: Duration, idle_after: Duration) -> bool {
+    !holding && (force || pty_dirty || since_draw > idle_after)
 }
 
 pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
@@ -858,7 +864,14 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             .windows
             .iter()
             .any(|w| w.dirty.load(std::sync::atomic::Ordering::Relaxed));
-        if should_draw(holding, force_draw, pty_dirty, last_draw.elapsed()) {
+        // スピナー（Working の点滅）が出ている間だけ短い周期で描き直す。
+        // 出ていなければ動くのは経過時間（1 秒粒度）だけなので、それに合わせる
+        let idle_after = if app.spinner_active {
+            SPINNER_REDRAW
+        } else {
+            IDLE_REDRAW
+        };
+        if should_draw(holding, force_draw, pty_dirty, last_draw.elapsed(), idle_after) {
             for window in &app.windows {
                 window
                     .dirty
@@ -1616,24 +1629,6 @@ fn resize_terminal(app: &mut App, w: u16, h: u16) {
     app.resize_sessions();
 }
 
-/// **描画とヒットテストが使うサイドバー幅**（＝ 画面に出ている桁数）。
-///
-/// [`App::sidebar_width`] はユーザーが選んだ幅の正本で、ここはそれを
-/// 今の端末に収まる範囲へ丸めた**導出値**。丸めた結果を保存値へ書き戻さないのが
-/// 要点で、**端末が一時的に狭くなっただけでユーザーの選んだ幅を失わない**
-/// （書き戻していた頃は、PTY の破棄が端末サイズ変化イベントを連れてくる Windows で
-/// セッションを止めるたびにサイドバーが数桁ずつ縮み、端末が元に戻っても復元しなかった）
-pub(crate) fn sidebar_cols(app: &App) -> u16 {
-    fit_sidebar(app.sidebar_width, app.term_size.0)
-}
-
-/// 幅 1 つを端末幅へ収める（下限 [`MIN_SIDEBAR`]、右ペインに [`MIN_PANE`] を残す）。
-/// **丸めの規則はここ 1 箇所**（導出とドラッグの確定が同じ式を見る）
-fn fit_sidebar(width: u16, term_w: u16) -> u16 {
-    let max = term_w.saturating_sub(MIN_PANE).max(MIN_SIDEBAR);
-    width.clamp(MIN_SIDEBAR, max)
-}
-
 /// マウスイベントの後に描き直す必要があるか（FPS 対策）。
 ///
 /// **移動だけのイベントで変わり得る表示はホバー位置 1 つ**なので、そこが同じなら
@@ -1778,19 +1773,15 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         if let MouseEventKind::Down(_) = mouse.kind {
             app.set_focus(Focus::Terminal);
         }
+        // 右ペイン矩形は state の可変借用の前に取る（正本は ui::pane_rect）
+        let pane = crate::ui::pane_rect(app);
         // New 画面: クリックでフォルダ選択・プロンプト欄フォーカス
         if let RightView::New(state) = &mut app.right_view {
             // 起動ボタン行のクリックは state の借用を抜けてからディスパッチする
             let mut launch = false;
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    // 描画と同じジオメトリでヒットテスト（右ペイン矩形を chunks[1] と同一に再構成）
-                    let pane = Rect::new(
-                        drawn,
-                        0,
-                        app.term_size.0.saturating_sub(drawn),
-                        app.term_size.1.saturating_sub(1),
-                    );
+                    // 描画と同じジオメトリでヒットテスト
                     let layout = NewLayout::compute(pane);
                     let box_bottom = layout.prompt_box.y + layout.prompt_box.height;
                     if !layout.ok {
@@ -2397,6 +2388,7 @@ mod tests {
     use super::*;
 
     use crate::source::{persist_projects, WindowState};
+    use crate::ui::MIN_SIDEBAR;
 
     const TERM: (u16, u16) = (120, 40);
 
@@ -3627,17 +3619,21 @@ mod tests {
             (false, false, IDLE_REDRAW * 10),
         ] {
             assert!(
-                should_draw(false, force, pty_dirty, since_draw),
+                should_draw(false, force, pty_dirty, since_draw, IDLE_REDRAW),
                 "nothing asked for a redraw: force={force} dirty={pty_dirty}"
             );
             assert!(
-                !should_draw(true, force, pty_dirty, since_draw),
+                !should_draw(true, force, pty_dirty, since_draw, IDLE_REDRAW),
                 "a frame was grabbed while the child was mid-redraw: \
                  force={force} dirty={pty_dirty}"
             );
         }
         // 何も起きていない周は描かない（無条件 60fps にしない）
-        assert!(!should_draw(false, false, false, fresh));
+        assert!(!should_draw(false, false, false, fresh, IDLE_REDRAW));
+        // スピナーが回っている間だけ短い周期でも描く（回っていなければ 1 秒粒度）
+        let between = SPINNER_REDRAW + Duration::from_millis(50);
+        assert!(should_draw(false, false, false, between, SPINNER_REDRAW));
+        assert!(!should_draw(false, false, false, between, IDLE_REDRAW));
     }
 
     /// **一覧とアカウント行は 1 つの輪。** 下端の先がアカウント行で、その先は

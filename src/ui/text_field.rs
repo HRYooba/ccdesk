@@ -89,20 +89,10 @@ impl TextField {
             .sum()
     }
 
-    /// クリックされた表示列 → カーソル位置
+    /// クリックされた表示列 → カーソル位置。
+    /// 境界の走査は幅で切る側と同じ [`crate::ui::width_prefix`]（物差しを 2 つ持たない）
     pub(crate) fn click(&mut self, x: u16) {
-        use unicode_width::UnicodeWidthChar;
-        let mut acc = 0u16;
-        let mut idx = 0;
-        for c in self.text.chars() {
-            let w = c.width().unwrap_or(0) as u16;
-            if acc + w > x {
-                break;
-            }
-            acc += w;
-            idx += 1;
-        }
-        self.cursor = idx;
+        self.cursor = crate::ui::width_prefix(&self.text, x as usize).0;
     }
 
     /// フィールド共通のキー処理。処理したら true

@@ -12,8 +12,8 @@ use tui_term::widget::PseudoTerminal;
 use ccdesk::{dir_key, LockExt};
 
 use crate::app::{
-    selected_enter, sidebar_cols, App, Focus, Popup, PopupKind, RightView, RowAction,
-    SelfUpdate, SidebarPos, SidebarRow,
+    selected_enter, App, Focus, Popup, PopupKind, RightView, RowAction, SelfUpdate, SidebarPos,
+    SidebarRow,
 };
 use crate::poll::{row_state, AccountStatus, Group, Grouping, Run, StateView};
 use crate::sessions::SessionId;
@@ -59,9 +59,34 @@ const HEAD_COLS: usize = 4;
 const MIN_NAME_COLS: usize = 4;
 
 /// **セッション行 1 本が要る内側の桁数**（行頭 + 名前の下限 + 行末のメニュー）。
-/// [`crate::app::MIN_SIDEBAR`] はこれに枠の 2 桁を足したもの ＝
+/// [`MIN_SIDEBAR`] はこれに枠の 2 桁を足したもの ＝
 /// **桁の予算を持っているのはこの 1 箇所だけ**で、下限の値を別に書き写さない
 pub(crate) const MIN_ROW_COLS: u16 = (HEAD_COLS + MIN_NAME_COLS + MENU_COLS) as u16;
+
+/// サイドバー幅の下限（ドラッグで詰められる限界）。
+/// 根拠は 1 行が固定で食う桁（[`MIN_ROW_COLS`]）+ 枠の左右 1 桁ずつ。
+/// 「枠が 2 桁」という事実を描く側と同じファイルで数える
+pub(crate) const MIN_SIDEBAR: u16 = MIN_ROW_COLS + 2;
+/// 右ペインに最低限残す桁（サイドバーを広げても claude の画面が潰れない下限）
+const MIN_PANE: u16 = 40;
+
+/// **描画とヒットテストが使うサイドバー幅**（＝ 画面に出ている桁数）。
+///
+/// `App::sidebar_width` はユーザーが選んだ幅の正本で、ここはそれを
+/// 今の端末に収まる範囲へ丸めた**導出値**。丸めた結果を保存値へ書き戻さないのが
+/// 要点で、**端末が一時的に狭くなっただけでユーザーの選んだ幅を失わない**
+/// （書き戻していた頃は、PTY の破棄が端末サイズ変化イベントを連れてくる Windows で
+/// セッションを止めるたびにサイドバーが数桁ずつ縮み、端末が元に戻っても復元しなかった）
+pub(crate) fn sidebar_cols(app: &App) -> u16 {
+    fit_sidebar(app.sidebar_width, app.term_size.0)
+}
+
+/// 幅 1 つを端末幅へ収める（下限 [`MIN_SIDEBAR`]、右ペインに [`MIN_PANE`] を残す）。
+/// **丸めの規則はここ 1 箇所**（導出とドラッグの確定が同じ式を見る）
+pub(crate) fn fit_sidebar(width: u16, term_w: u16) -> u16 {
+    let max = term_w.saturating_sub(MIN_PANE).max(MIN_SIDEBAR);
+    width.clamp(MIN_SIDEBAR, max)
+}
 
 fn mark(on: bool, yes: &'static str, no: &'static str) -> &'static str {
     if on { yes } else { no }
@@ -633,18 +658,26 @@ fn claude_update_state(app: &App) -> UpdateState {
 /// 文字列なので全角を含み得て、文字数で数えると桁が溢れて枠を壊す
 /// （`⟳` は実測 1 桁なので版行には影響しないが、切り方の知識を 1 つにしておく）
 fn clip_to_width(s: &str, width: u16) -> String {
+    let (chars, _) = width_prefix(s, width as usize);
+    s.chars().take(chars).collect()
+}
+
+/// 先頭から表示幅を積み、`cols` 桁に収まる**最長の前置き**を（文字数, 表示幅）で
+/// 返す。**表示幅の境界を探す走査はここ 1 箇所**（全角 = 2 桁・幅 0 文字の扱いを、
+/// 幅で切る側とクリック位置 → カーソルの側で別々に持たない ＝ 片方だけ直して
+/// 「カーソル位置と描画位置が 1 桁ずれる」形を作らない）
+pub(crate) fn width_prefix(text: &str, cols: usize) -> (usize, usize) {
     use unicode_width::UnicodeWidthChar;
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in s.chars() {
+    let (mut chars, mut used) = (0usize, 0usize);
+    for ch in text.chars() {
         let w = ch.width().unwrap_or(0);
-        if used + w > width as usize {
+        if used + w > cols {
             break;
         }
-        out.push(ch);
         used += w;
+        chars += 1;
     }
-    out
+    (chars, used)
 }
 
 /// **サイドバーの行がどう光るか。** 3 つの状態を 1 つの型に集めてあるので、
@@ -834,7 +867,7 @@ pub(crate) fn popup_rect(app: &App, popup: &Popup) -> Rect {
     // 左へ寄せ、それでも広ければ右ペインへ食い込ませる（端末の外へは出さない）
     let max_x = term_w - width;
     let min_x = 1u16.min(max_x);
-    let mark_right = *menu_zone(crate::app::sidebar_cols(app)).end();
+    let mark_right = *menu_zone(sidebar_cols(app)).end();
     let x = mark_right.saturating_add(1).saturating_sub(width).clamp(min_x, max_x);
     let y = popup.anchor_y.saturating_add(1).min(term_h - height);
     Rect::new(x, y, width, height)
@@ -1012,12 +1045,25 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// 右ペインの矩形（枠を含む。最下行の横断バーは含まない）。
+///
+/// **「右ペインはどこか」の答えはこの 1 つ**: 描画（[`draw`]）・PTY サイズ
+/// （`App::pane_size`）・New 画面のヒットテスト・マウス転送の座標変換
+/// （`keys::forward_mouse`）が全部ここから導く。別々の式で持つと、下部バーの
+/// 行数や枠を変えたときに「見えている場所と押せる場所」が黙ってずれる
+pub(crate) fn pane_rect(app: &App) -> Rect {
+    let (w, h) = (app.term_size.0, app.term_size.1);
+    let sidebar = sidebar_cols(app).min(w);
+    Rect::new(sidebar, 0, w - sidebar, h.saturating_sub(1))
+}
+
 pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // 最下行は横断のキーヒントバー
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(frame.area());
+    // 横の分割は pane_rect と同じ答えになる（右ペインの矩形の正本はあちら）
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(sidebar_cols(app)), Constraint::Min(1)])
@@ -1137,6 +1183,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         .iter()
         .map(|group| (*group, data.iter().filter(|d| d.group == *group).count()))
         .collect();
+    // スピナーが出ているか（run ループがアイドル時の描き直し間隔を選ぶ材料）。
+    // Working の行だけが点滅する ＝ 集計と同じ表示行から導く
+    app.spinner_active = data.iter().any(|d| d.group == Group::Working);
 
     // ---- 描画 ----
     // 行の見え方の規則は [`Look`] 1 つ（帯 = 選択・ホバー / 印 = ペインに出ている）。
@@ -1876,7 +1925,6 @@ mod tests {
     /// ので、行頭や行末に何かを足したらこのテストが落ちる
     #[test]
     fn the_row_head_marks_are_one_column_wide() {
-        use crate::app::MIN_SIDEBAR;
         use unicode_width::UnicodeWidthStr;
         assert_eq!(UPDATE_MARK.width(), 1, "the update mark is not 1 column wide");
         assert_eq!(MENU_MARK.width(), 1, "the menu mark is not 1 column wide");
@@ -1930,7 +1978,7 @@ mod tests {
             .expect("no session row");
         assert!(line.ends_with(MENU_MARK), "the menu mark is not at the end: {line:?}");
         // 行は内側の幅ちょうど（＝ 記号は内側の右端の桁に来る）
-        let drawn = crate::app::sidebar_cols(&app);
+        let drawn = sidebar_cols(&app);
         assert_eq!(
             line.width(),
             usize::from(drawn - 2),
@@ -3501,7 +3549,7 @@ mod tests {
     /// メニューが動く**状態になる
     #[test]
     fn a_menu_wider_than_the_sidebar_is_drawn_over_the_right_pane() {
-        use crate::app::{PopupKind, MIN_SIDEBAR};
+        use crate::app::PopupKind;
         let mut app = App {
             term_size: (60, 20),
             sidebar_width: MIN_SIDEBAR,

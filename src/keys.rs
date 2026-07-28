@@ -12,9 +12,10 @@ use crate::app::App;
 pub(crate) fn forward_mouse(app: &mut App, mouse: &MouseEvent) {
     use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
-    // 右ペイン内側（枠線 1px）基準の x 原点。**当たり判定は描画と同じ導出幅**
-    // （[`crate::app::sidebar_cols`]）で、窓を借りる前に取る
-    let ox = crate::app::sidebar_cols(app) + 1;
+    // 右ペイン内側（枠線 1px）基準の原点。**矩形の正本は描画と同じ
+    // [`crate::ui::pane_rect`]**（窓を借りる前に取る）
+    let pane = crate::ui::pane_rect(app);
+    let (ox, oy) = (pane.x + 1, pane.y + 1);
     let window = &mut app.windows[app.active];
     let (mode, encoding, size) = {
         let parser = window.parser.lock_recover();
@@ -29,7 +30,6 @@ pub(crate) fn forward_mouse(app: &mut App, mouse: &MouseEvent) {
         return; // claude は SGR(1006) を有効化する。他エンコーディングは対象外
     }
 
-    let oy = 1;
     if mouse.column < ox || mouse.row < oy {
         return;
     }

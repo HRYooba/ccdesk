@@ -204,6 +204,7 @@ fn main() -> anyhow::Result<()> {
         projects: window.projects,
         popup: None,
         focus: Focus::Terminal,
+        spinner_active: false,
         source,
     };
     // 既にあるセッションのフォルダを登録へ埋め戻す（以前から使っているフォルダの
