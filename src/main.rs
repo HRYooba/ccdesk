@@ -55,9 +55,12 @@ fn main() -> anyhow::Result<()> {
         Some("doctor") => return run_doctor(),
         Some("logs") => return show_logs(),
         // セッションの状態を受け取る内部フック（`--settings` で注入し、
-        // 子の claude が turn ごとに `ccdesk hook <event>` として起こす）
+        // 子の claude が turn ごとに `ccdesk hook <event> <state>` として起こす。
+        // state 無しは旧 settings で起きたセッションからの呼び出し）
         Some("hook") => {
-            return hooks::run_hook(std::env::args().nth(2).unwrap_or_default().as_str())
+            let event = std::env::args().nth(2).unwrap_or_default();
+            let state = std::env::args().nth(3);
+            return hooks::run_hook(&event, state.as_deref());
         }
         Some("update") => return update_self(),
         Some("--help" | "-h" | "help") => {
