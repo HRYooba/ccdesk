@@ -4831,19 +4831,28 @@ mod tests {
         }
     }
 
-    /// **セッションのメニューの `open` で本当にセッションが開く。** キーボードから
-    /// セッションを開く導線はこれ 1 本なので、項目が並んでいるだけでなく
-    /// 行クリックと同じ結果（[`open_session`] を通って既読になり、打ち先が端末へ移る）
-    /// になることを見る。
+    /// **セッションのメニューの `open` が行クリックと同じ [`open_session`] を通る。**
+    /// キーボードからセッションを開く導線はこれ 1 本なので、先頭項目であることと、
+    /// open_session の判断（ここでは already-running ガード）が効くことを見る。
     ///
-    /// 行の cwd に**存在しないフォルダ**を置いてあるのは、この単体テストで本物の
-    /// `claude -r` を起こさないため（起動は cwd の解決で失敗して終わる）
+    /// **本物の `claude -r` は起こさない**: 行を「別インスタンスで稼働中」にして
+    /// ガードで止める。spawn の成否は環境（claude の有無・portable-pty の cwd
+    /// フォールバック）で変わるので、spawn に到達する形はこの単体テストでは扱えない。
+    /// 開けなかったのだから、未読は残りフォーカスも移らない
+    /// （成功時に既読になる順序は open_session 自身が持つ）
     #[test]
-    fn the_session_menu_open_entry_opens_the_session() {
+    fn the_session_menu_open_entry_routes_through_open_session() {
         let mut app = test_app(34, TERM);
         app.sessions = vec![session_row("s", "C:\\ccdesk-test-no-such-folder", 1)];
         // claude が行を開いた後に何か言った ＝ 未読
         app.hook_states = HookStates::from_entries([("s", "done", 2)]);
+        // 別インスタンスで稼働中 ＝ open_session のガードが決定的に止める
+        app.agents = vec![AgentInfo {
+            session_id: "s".to_string(),
+            kind: "interactive".to_string(),
+            status: "busy".to_string(),
+            pid: Some(4242),
+        }];
         app.sidebar_rows = vec![SidebarRow::Action(RowAction::Open(SessionId::new("s")))];
         app.sidebar_header_rows = 1;
         app.selection = SidebarPos::Row(0);
@@ -4866,13 +4875,18 @@ mod tests {
 
         activate_popup(&mut app, index);
         assert!(app.popup.is_none(), "the menu stayed open after open ran");
-        // 開いた行は既読になり（[`mark_read`] ＝ open_session の唯一の入口）、
-        // 打鍵の宛先はそのセッションになる
+        // open_session のガードに到達した証拠 ＝ already-running の通知
         assert!(
-            !app.hook_states.unread(only_row(&app)),
-            "open did not mark the row as read"
+            app.notice.as_ref().is_some_and(|(msg, _)| msg.contains("already running")),
+            "the menu entry did not reach open_session: {:?}",
+            app.notice
         );
-        assert_eq!(app.focus, Focus::Terminal, "open did not move the keys to the pane");
+        // 開けなかったので、内容を見ていない行の未読は残り、打ち先も移らない
+        assert!(
+            app.hook_states.unread(only_row(&app)),
+            "a session that did not open was marked as read"
+        );
+        assert_ne!(app.focus, Focus::Terminal, "keys moved to a pane that did not open");
     }
 
     /// **`←` `→` はサイドバーから撤去した。** 「開く」と「メニュー」の 2 つを持つのは
