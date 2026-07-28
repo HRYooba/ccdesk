@@ -429,6 +429,16 @@ impl Session {
         )
     }
 
+    /// PTY へバイト列を書く。**この窓への書き込み（キー・貼り付け・マウス・
+    /// フォーカス通知）はすべてここを通す**: 書き方（lock → write → flush）と
+    /// 失敗の報告を 1 箇所に保つ。失敗をどう扱うかは呼び手が決める
+    /// （キー入力は窓を閉じる、フォーカス通知やマウスは落としてよい）
+    pub(crate) fn send(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut writer = self.writer.lock_recover();
+        writer.write_all(bytes)?;
+        writer.flush()
+    }
+
     /// フォーカス変化を PTY へ通知する（DECSET 1004 を有効化した子にだけ送る）
     pub(crate) fn send_focus(&mut self, gained: bool) {
         let wants_focus = self
@@ -439,10 +449,8 @@ impl Session {
         if !wants_focus {
             return;
         }
-        let seq: &[u8] = if gained { b"\x1b[I" } else { b"\x1b[O" };
-        let mut writer = self.writer.lock_recover();
-        let _ = writer.write_all(seq);
-        let _ = writer.flush();
+        // 通知の取りこぼしは害が小さい（次のフォーカス変化で上書きされる）
+        let _ = self.send(if gained { b"\x1b[I" } else { b"\x1b[O" });
     }
 
     /// 出力変化ヒューリスティックによるステータス判定（registry に居ないときのフォールバック）

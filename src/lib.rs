@@ -75,8 +75,11 @@ impl vt100::Callbacks for Responder {
                     let known = |on: bool| if on { 1 } else { 2 };
                     let value = match mode {
                         25 => known(!screen.hide_cursor()),
-                        1000 => known(screen.mouse_protocol_mode() == MM::Press
-                            || screen.mouse_protocol_mode() == MM::PressRelease),
+                        // X10(9) と通常(1000) は**別のモード**。X10 有効中の 1000 照会に
+                        // 「有効」と答えると、応答を信じた子は X10 では送られない
+                        // ボタン解放（release）を待ち続ける
+                        9 => known(screen.mouse_protocol_mode() == MM::Press),
+                        1000 => known(screen.mouse_protocol_mode() == MM::PressRelease),
                         1002 => known(screen.mouse_protocol_mode() == MM::ButtonMotion),
                         1003 => known(screen.mouse_protocol_mode() == MM::AnyMotion),
                         1006 => known(
@@ -1364,6 +1367,27 @@ mod tests {
             err.contains("empty directory") && err.contains("deleted"),
             "does not say what to do (that it's safe to delete): {err}"
         );
+    }
+
+    /// **DECRQM のマウスモード照会は X10(9) と通常(1000) を区別する。**
+    /// X10 有効中に 1000 を「有効」と答えると、応答を信じた子は
+    /// X10 では送られないボタン解放（release）を待ち続ける
+    #[test]
+    fn decrqm_distinguishes_x10_from_normal_mouse_mode() {
+        let mut parser = new_parser(24, 80, 0);
+        parser.process(b"\x1b[?9h\x1b[?9$p\x1b[?1000$p");
+        let reply = String::from_utf8(parser.callbacks_mut().take()).unwrap();
+        assert!(reply.contains("\x1b[?9;1$y"), "X10 not reported as set: {reply:?}");
+        assert!(
+            reply.contains("\x1b[?1000;2$y"),
+            "mode 1000 reported as set while only X10 is: {reply:?}"
+        );
+
+        // 通常モード（1000）を有効化した子には従来どおり「有効」と答える
+        let mut parser = new_parser(24, 80, 0);
+        parser.process(b"\x1b[?1000h\x1b[?1000$p");
+        let reply = String::from_utf8(parser.callbacks_mut().take()).unwrap();
+        assert!(reply.contains("\x1b[?1000;1$y"), "mode 1000 not reported as set: {reply:?}");
     }
 
     /// フォルダの同一判定。**大小と末尾の区切りは無視する**（登録リスト・claude が記録した

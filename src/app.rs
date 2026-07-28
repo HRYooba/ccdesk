@@ -1,5 +1,4 @@
 //! App 状態機械・イベントループ（run）・マウス／キー処理・セッションのディスパッチ。
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -695,6 +694,22 @@ fn draw_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow:
     Ok(())
 }
 
+/// アクティブ窓へバイト列を送る。**書き込みエラーで run ループを抜けない**:
+/// 壊れたのはその窓の PTY だけなので、その窓を閉じて通知する
+/// （live-scan の「死んだ PTY は自分の窓だけ閉じる」と同じ扱い。以前は `?` で
+/// run() ごと抜け、健全な全セッションを道連れに ccdesk が終了していた）
+fn send_to_active(app: &mut App, bytes: &[u8]) {
+    let Some(window) = app.windows.get(app.active) else {
+        return;
+    };
+    if window.send(bytes).is_ok() {
+        return;
+    }
+    let id = window.session_id.clone();
+    set_notice(app, format!("could not write to session {id}; closing its window"));
+    close_window_of(app, &id);
+}
+
 /// この周に描くか。**再描画は「PTY に新出力」「UI イベント」「無変化でも
 /// [`IDLE_REDRAW`] 周期（スピナー・経過時間）」のときだけ**（無条件 60fps は
 /// claude 画面全体の再構築が毎フレーム走り重い）。
@@ -893,12 +908,12 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 if app.windows.is_empty() {
                     continue;
                 }
-                let window = &mut app.windows[app.active];
-                let bytes = encode_key(&key, &window.parser.lock_recover());
+                let bytes = {
+                    let window = &app.windows[app.active];
+                    encode_key(&key, &window.parser.lock_recover())
+                };
                 if !bytes.is_empty() {
-                    let mut writer = window.writer.lock_recover();
-                    writer.write_all(&bytes)?;
-                    writer.flush()?;
+                    send_to_active(app, &bytes);
                 }
             }
             Event::Paste(text) => {
@@ -929,22 +944,13 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 if app.windows.is_empty() {
                     continue;
                 }
-                // paste injection 対策: 制御文字（特に ESC = ペースト終端の偽装）を除去
-                let sanitized: String = text
-                    .chars()
-                    .filter(|c| matches!(c, '\n' | '\r' | '\t') || !c.is_control())
-                    .collect();
-                let window = &mut app.windows[app.active];
-                let bracketed = window.parser.lock_recover().screen().bracketed_paste();
-                let mut writer = window.writer.lock_recover();
-                if bracketed {
-                    writer.write_all(b"\x1b[200~")?;
-                    writer.write_all(sanitized.as_bytes())?;
-                    writer.write_all(b"\x1b[201~")?;
-                } else {
-                    writer.write_all(sanitized.as_bytes())?;
-                }
-                writer.flush()?;
+                // sanitize と bracketed paste の包みはキー入力と同じ keys 側
+                // （「入力を VT バイト列にする」知識を run ループに置かない）
+                let bytes = {
+                    let window = &app.windows[app.active];
+                    crate::keys::encode_paste(&text, &window.parser.lock_recover())
+                };
+                send_to_active(app, &bytes);
             }
             Event::Mouse(mouse) => {
                 let prev_hover = app.hovered;
@@ -1875,7 +1881,7 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             return Ok(false);
         }
         // 右ペイン: イベントを claude へ転送（ホイールも claude 自身がスクロール処理する）
-        forward_mouse(app, mouse)?;
+        forward_mouse(app, mouse);
     }
     Ok(false)
 }

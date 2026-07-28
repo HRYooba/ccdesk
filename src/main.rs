@@ -132,6 +132,16 @@ fn main() -> anyhow::Result<()> {
             std::backtrace::Backtrace::force_capture()
         ));
         if std::thread::current().name() != Some("pty-reader") {
+            // ratatui の復旧 hook は raw mode 解除 + alt screen 離脱**だけ**なので、
+            // main 末尾の正常経路が解除している 3 モードはここでも戻す
+            // （unwind ではあの 3 行に到達しない ＝ 戻さないとクラッシュ後の
+            // シェルにマウスエスケープ列 `<35;12;5M` 等が流れ込み続ける）
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                DisableFocusChange,
+                DisableMouseCapture,
+                DisableBracketedPaste
+            );
             prev_hook(info);
         }
     }));
