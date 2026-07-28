@@ -93,14 +93,20 @@ fn main() -> anyhow::Result<()> {
     //
     // **判断はここ 1 箇所**で、以降は供給元の中に閉じる
     let usage_display = load_setting("usage_display").as_deref() == Some("on");
-    // 使用率の更新を run ループへ伝える旗。供給元と App が同じものを持つ
+    // 使用率の更新を run ループへ伝える旗と、クリック起点の取得が進行中か。
+    // 供給元と App が同じものを持つ
     let usage_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let usage_fetching = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // demo / 実データの選択はこの 1 箇所だけ。以降のコードは供給元を通すので
     // 「今 demo か」を問う分岐を持たない（＝分岐の書き漏らしで実データが漏れない）
     let source: Arc<dyn DataSource> = if demo {
         Arc::new(DemoSource)
     } else {
-        Arc::new(LiveSource::new(usage_display, Arc::clone(&usage_dirty)))
+        Arc::new(LiveSource::new(
+            usage_display,
+            Arc::clone(&usage_dirty),
+            Arc::clone(&usage_fetching),
+        ))
     };
     // セッション一覧・フッター・ウィンドウ状態はすべて供給元から受け取る
     let sessions = source.sessions();
@@ -194,6 +200,7 @@ fn main() -> anyhow::Result<()> {
         // まだ取れていないので Unknown ＝ 何も描かない）
         usage: source.usage(),
         usage_dirty,
+        usage_fetching,
         usage_hovered: false,
         input_gate: None,
         notice: None,

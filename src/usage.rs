@@ -177,6 +177,8 @@ impl UsageRefresh {
 ///
 /// 取得結果は共有スロットへ書くだけで、画面へ伝わるのは供給元
 /// （[`crate::source::LiveSource::usage`]）経由。
+/// `fetching` は**クリック起点の取得が進行中**の間だけ立つ（ゲージをスピナーに
+/// 変える材料。1 回 3 秒前後かかるので、押したことが画面に出ないと壊れて見える）。
 ///
 /// **待ちは `recv_timeout` 1 つ**にしてある: 保険の周期と 2 種類の要求を同じ場所で
 /// 受けるので、「旗を短い sleep で覗きに行く」形にならない（クリックしてから
@@ -188,11 +190,24 @@ impl UsageRefresh {
 pub(crate) fn spawn_poller(
     slot: UsageSlot,
     dirty: Arc<std::sync::atomic::AtomicBool>,
+    fetching: Arc<std::sync::atomic::AtomicBool>,
 ) -> UsageRefresh {
     let (tx, rx) = std::sync::mpsc::channel::<Trigger>();
     std::thread::spawn(move || {
+        // 直前の待ちを破ったのがクリック（Manual）だったか。**旗を立てるのは
+        // クリック起点の取得だけ**: 自動取得（保険の周期・ターン完了）でも立てると、
+        // 何もしていないのに画面がスピナーで動く
+        let mut manual = false;
         loop {
+            if manual {
+                // クリック側（`App::handle_mouse`）が先に立てているのが普通。
+                // ここでも立てるのは、旗の生涯（立てる → 取得 → 降ろす）を
+                // このスレッド単独でも完結させるため
+                fetching.store(true, std::sync::atomic::Ordering::Relaxed);
+                dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             let next = fetch();
+            fetching.store(false, std::sync::atomic::Ordering::Relaxed);
             let fetched_at = std::time::Instant::now();
 
             let mut guard = slot.lock_recover();
@@ -212,6 +227,7 @@ pub(crate) fn spawn_poller(
             drop(guard);
 
             // 次に取得する合図を待つ。**間引きはここ 1 箇所**
+            manual = false;
             loop {
                 let received = if permanent {
                     rx.recv().map_err(|_| ())
@@ -229,7 +245,10 @@ pub(crate) fn spawn_poller(
                 match trigger {
                     // ユーザーが押した ＝ 間引かない（アカウントを切り替えたときに
                     // Unavailable から戻ってこられる唯一の経路でもある）
-                    Trigger::Manual => break,
+                    Trigger::Manual => {
+                        manual = true;
+                        break;
+                    }
                     // **枠の概念が無いアカウントではターン完了を無視する。** 恒久的に
                     // 取れないのに、ターンのたびに claude を起こし続ける意味が無い
                     // （README の「stop polling entirely (click still re-checks)」が
