@@ -774,6 +774,10 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         if expire_input_gate(app) {
             force_draw = true;
         }
+        // 期限切れの通知を落とす（キーヒントと使用率の表示に戻す）
+        if expire_notice(app) {
+            force_draw = true;
+        }
         // 使用率の更新を取り込む（取得スレッドが旗を立てたときだけ。
         // 実データなら [`crate::usage`] の取得結果、撮影用なら固定値で、
         // どちらを読むかは供給元が決める）
@@ -1737,19 +1741,21 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             app.sidebar_header_rows,
             app.sidebar_scroll,
         );
-        let hit = app.sidebar_rows.get(row).cloned();
-        let action = hit.as_ref().and_then(SidebarRow::action).cloned();
         // hover: **実体のある行**の上にいるときだけハイライト（飾りは光らせない）。
-        // 押しても何も起きない行も行なので、ここは動作の有無では見ない
-        app.hovered = hit
-            .as_ref()
-            .filter(|row| row.selectable())
-            .map(|_| SidebarPos::Row(row));
+        // 押しても何も起きない行も行なので、ここは動作の有無では見ない。
+        // **hover の判断に clone は要らない**（マウス移動は毎秒 100 回以上届くので、
+        // Down のときだけ動作を写し取る）
+        let selectable = app
+            .sidebar_rows
+            .get(row)
+            .is_some_and(SidebarRow::selectable);
+        app.hovered = selectable.then_some(SidebarPos::Row(row));
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            let action = app.sidebar_rows.get(row).and_then(SidebarRow::action).cloned();
             // サイドバー内クリックはサイドバーへフォーカス。
             // 行クリックは右ペインの内容だけ切り替える（フォーカス移動は右ペインクリック or Enter）
             app.set_focus(Focus::Sidebar);
-            if hit.as_ref().is_some_and(SidebarRow::selectable) {
+            if selectable {
                 app.selection = SidebarPos::Row(row);
             }
             // 行末の `=` クリック → コンテキストメニューを開く。
@@ -2172,6 +2178,26 @@ fn start_claude_update(app: &mut App) {
     });
 }
 
+/// 通知の寿命。**表示だけでなく当たり判定にも効く**（notice 表示中は下部バーの
+/// 使用率が出ない ＝ 使用率クリックの有無が notice の生死で決まる）ので、
+/// 失効の判断は描画ではなく run ループ（[`expire_notice`]) が持つ
+const NOTICE_TTL: Duration = Duration::from_secs(5);
+
+/// 期限を過ぎた通知を落とす（消えたら true ＝ 描き直す）。
+/// **描画の中で落とさない**: 期限切れでも描画が走らない間は `notice` が残り、
+/// 「消えたはずの通知が使用率クリックを殺し続ける」形になる
+fn expire_notice(app: &mut App) -> bool {
+    if app
+        .notice
+        .as_ref()
+        .is_some_and(|(_, at)| at.elapsed() >= NOTICE_TTL)
+    {
+        app.notice = None;
+        return true;
+    }
+    false
+}
+
 /// 下部バーに数秒表示する通知（起動失敗など、無反応に見せないため）。
 /// あわせて ~/.ccdesk/error.log にも残す
 fn set_notice(app: &mut App, msg: String) {
@@ -2323,6 +2349,22 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
         // 同じく、生きた窓だけを「開いている」と数える）
         let _ = app.windows[i].child.kill();
         remove_window(app, i);
+    }
+    // **別のインスタンス（または ccdesk の外）で動いているセッションを
+    // `claude -r` で二重に起こさない**: 同じ会話を 2 プロセスが同時に更新する。
+    // 判定材料は `agents --json`（生きている前景セッションだけが載る）。
+    // 観測は 2 秒周期なので、止めた直後の自分のセッションが最大 2 秒ほど
+    // 残って見えることがある（その間の open は 1 度空振りするだけで、壊れない）
+    if app
+        .agents
+        .iter()
+        .any(|a| a.is_interactive() && a.session_id == id.as_str())
+    {
+        set_notice(
+            app,
+            format!("session {id} is already running in another window"),
+        );
+        return false;
     }
     let Some(row) = app.row(id) else {
         return false; // 再読み込みで消えた行（クリックと削除の競合）は何もしない
@@ -3685,6 +3727,30 @@ mod tests {
             updated_at,
             ..SessionRow::new(SessionId::new(id), cwd, updated_at)
         }
+    }
+
+    /// **別インスタンス（や ccdesk の外）で動いているセッションを `claude -r` で
+    /// 二重に起こさない。** `agents --json` に interactive で載っている ＝
+    /// どこかで生きて動いている ＝ 二重に開くと同じ会話を 2 プロセスが同時更新する
+    #[test]
+    fn opening_a_session_running_elsewhere_does_not_double_resume() {
+        let mut app = test_app(34, TERM);
+        app.sessions = vec![session_row("s", "C:\\dev\\api", 1)];
+        app.agents = vec![AgentInfo {
+            session_id: "s".to_string(),
+            kind: "interactive".to_string(),
+            status: "busy".to_string(),
+            pid: Some(4242),
+        }];
+        assert!(
+            !open_session(&mut app, &SessionId::new("s")),
+            "reported the pane as opened"
+        );
+        assert!(
+            app.windows.is_empty(),
+            "spawned a second claude for a session that is already running"
+        );
+        assert!(app.notice.is_some(), "the user was not told why nothing opened");
     }
 
     fn project(cwd: &str, has_sessions: bool) -> PopupKind {

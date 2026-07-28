@@ -197,15 +197,6 @@ pub(crate) enum Launch<'a> {
     Resume,
 }
 
-/// 出力ヒューリスティックの判定結果（agents --json に居ないときのフォールバック専用。
-/// 表示への変換は classify() が一元的に行う）
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum SessionStatus {
-    Working,
-    NeedsInput,
-    Exited,
-}
-
 /// 起こす claude のコマンドライン。**PTY を開かずに組める形にしてある**ので、
 /// 引数と環境変数の除去をテストで固定できる（どちらも失敗が静かに効く:
 /// 引数を間違えれば起動が落ち、除去を落とせば transcript が保存されない）
@@ -453,16 +444,12 @@ impl Session {
         let _ = self.send(if gained { b"\x1b[I" } else { b"\x1b[O" });
     }
 
-    /// 出力変化ヒューリスティックによるステータス判定（registry に居ないときのフォールバック）
-    pub(crate) fn status_heuristic(&mut self) -> SessionStatus {
-        if !self.alive() {
-            return SessionStatus::Exited;
-        }
-        if self.last_output.lock_recover().elapsed() < Duration::from_secs(2) {
-            SessionStatus::Working
-        } else {
-            SessionStatus::NeedsInput
-        }
+    /// 出力変化ヒューリスティック: 直近 2 秒に出力があれば「動いているらしい」
+    /// （hook も `agents --json` の status も無い行の最後の手段）。
+    /// **生死は見ない**: 生死の観測（try_wait）は呼び手が別に持っていて、
+    /// ここでも呼ぶと同じ syscall が 1 フレームに 2 回走る
+    pub(crate) fn looks_busy(&self) -> bool {
+        self.last_output.lock_recover().elapsed() < Duration::from_secs(2)
     }
 
 

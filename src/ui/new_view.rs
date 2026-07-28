@@ -9,7 +9,7 @@ use ratatui::Frame;
 use crate::app::{start_new_session, App, RightView};
 use crate::theme::{ui, C_OK, C_WORKING, FOCUS_BORDER, MUTED_FG};
 use crate::ui::text_field::TextField;
-use crate::ui::{pane_fallback_pos, FrameCursor};
+use crate::ui::{border_style, pane_fallback_pos, FrameCursor};
 
 /// New 画面のフォーカス対象フィールド
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -577,15 +577,10 @@ pub(crate) fn draw_new_view(
     starting: bool,
     can_leave: bool,
 ) -> FrameCursor {
-    let border = if focused {
-        Style::default().fg(FOCUS_BORDER)
-    } else {
-        Style::default().fg(ui().dim)
-    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title("new session")
-        .border_style(border);
+        .border_style(border_style(focused));
     frame.render_widget(block, area);
 
     // 描画とマウス判定で同一のジオメトリを使う（フォーム型レイアウト）

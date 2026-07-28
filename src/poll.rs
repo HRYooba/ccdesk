@@ -697,6 +697,55 @@ pub(crate) fn classify(live_state: &str, alive: bool) -> StateView {
     }
 }
 
+/// その行を**今動かしている実行**の観測。窓 1 つが実行 1 つで、他インスタンスの
+/// 実行は `agents --json` の status 経由で、撮影用の供給元は固定表で名乗る
+/// （材料をどこから集めるかは描画側 ＝ [`crate::ui`] が持つ）
+pub(crate) struct Run<'a> {
+    /// その実行が hook で報告した最新の state（一度も来ていなければ None）。
+    /// 前回の実行の残骸を捨てる判断は [`crate::hooks::HookStates::get`] が
+    /// 窓の起動時刻で済ませてあるので、ここへ来るのは今の実行が書いたものだけ
+    pub(crate) hook: Option<&'a str>,
+    /// `agents --json` の `status`（hook が一度も来ていない行の従経路。
+    /// 空 ＝ ポーラーがまだ拾っていない）
+    pub(crate) status: &'a str,
+    /// PTY の出力から推した「動いているらしい」（`status` も無い間の最後の手段）
+    pub(crate) busy: bool,
+}
+
+/// 1 行に出す状態を決める。**行に保存せず、そのつど導く。**
+///
+/// ```text
+/// state(row) = 動かしている実行がある ? その実行が報告した最新 : Stopped
+/// ```
+///
+/// この形から出る性質が 3 つあり、どれも**構造的に**成り立つ:
+///
+/// - **ccdesk の起動直後は窓が 1 つも無いので必ず全部 Stopped**（保存値が
+///   「動いていた頃の state」を出し続けることが起こり得ない ＝ ccdesk が
+///   異常終了しても次の起動で正しくなる）
+/// - `stop` / `/clear` / `/resume` の**どれで止まっても同じ表示**（止まる ＝
+///   その行を動かす実行が無くなる、の 1 通りしかない）
+/// - **`Stopped` なのに `✻`（生存形）という矛盾が作れない**: `stopped` は
+///   「実行が終わった」の言い換えなので、hook がそう言った実行は実行として扱わない
+///   ＝ Stopped は必ず生死フラグが降りた状態でしか作られない
+///
+/// 実行があるときの中身は **hook が主、`agents --json` が従**:
+/// hook は turn 単位で届くので
+/// Working / Waiting / Completed を取り違えない。hook が一度も来ていない行
+/// （ccdesk が起こしていないセッション・注入が効かなかった場合）だけ `status` へ落ち、
+/// `status` も無い間は出力の変化から推す
+pub(crate) fn row_state(run: Option<Run<'_>>) -> StateView {
+    let Some(run) = run.filter(|run| run.hook != Some(STOPPED)) else {
+        return classify(STOPPED, false);
+    };
+    match (run.hook, run.status) {
+        (Some(state), _) => classify(state, true),
+        (None, "") if run.busy => classify(WORKING, true),
+        (None, "") => classify(WAITING, true),
+        (None, status) => classify(foreground_state(status), true),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

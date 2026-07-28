@@ -7,7 +7,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem};
 use ratatui::Frame;
-use std::time::Duration;
 use tui_term::widget::PseudoTerminal;
 
 use ccdesk::{dir_key, LockExt};
@@ -16,11 +15,7 @@ use crate::app::{
     selected_enter, sidebar_cols, App, Focus, Popup, PopupKind, RightView, RowAction,
     SelfUpdate, SidebarPos, SidebarRow,
 };
-use crate::poll::{
-    classify, foreground_state, AccountStatus, Group, Grouping, StateView, STOPPED, WAITING,
-    WORKING,
-};
-use crate::session::SessionStatus;
+use crate::poll::{row_state, AccountStatus, Group, Grouping, Run, StateView};
 use crate::sessions::SessionId;
 use crate::theme::{
     ui, usage_color, C_ATTENTION, C_FAIL, C_WORKING, FOCUS_BORDER, MUTED_FG,
@@ -70,54 +65,6 @@ pub(crate) const MIN_ROW_COLS: u16 = (HEAD_COLS + MIN_NAME_COLS + MENU_COLS) as 
 
 fn mark(on: bool, yes: &'static str, no: &'static str) -> &'static str {
     if on { yes } else { no }
-}
-
-/// その行を**今動かしている実行**の観測。窓 1 つが実行 1 つで、
-/// 撮影用の供給元だけは窓を持たずにこれを名乗る（[`crate::source`] の固定表）
-struct Run<'a> {
-    /// その実行が hook で報告した最新の state（一度も来ていなければ None）。
-    /// 前回の実行の残骸を捨てる判断は [`crate::hooks::HookStates::get`] が
-    /// 窓の起動時刻で済ませてあるので、ここへ来るのは今の実行が書いたものだけ
-    hook: Option<&'a str>,
-    /// `agents --json` の `status`（hook が一度も来ていない行の従経路。
-    /// 空 ＝ ポーラーがまだ拾っていない）
-    status: &'a str,
-    /// PTY の出力から推した状態（`status` も無い間の最後の手段）
-    heuristic: Option<SessionStatus>,
-}
-
-/// 1 行に出す状態を決める。**行に保存せず、そのつど導く。**
-///
-/// ```text
-/// state(row) = 動かしている実行がある ? その実行が報告した最新 : Stopped
-/// ```
-///
-/// この形から出る性質が 3 つあり、どれも**構造的に**成り立つ:
-///
-/// - **ccdesk の起動直後は窓が 1 つも無いので必ず全部 Stopped**（保存値が
-///   「動いていた頃の state」を出し続けることが起こり得ない ＝ ccdesk が
-///   異常終了しても次の起動で正しくなる）
-/// - `stop` / `/clear` / `/resume` の**どれで止まっても同じ表示**（止まる ＝
-///   その行を動かす実行が無くなる、の 1 通りしかない）
-/// - **`Stopped` なのに `✻`（生存形）という矛盾が作れない**: `stopped` は
-///   「実行が終わった」の言い換えなので、hook がそう言った実行は実行として扱わない
-///   ＝ Stopped は必ず生死フラグが降りた状態でしか作られない
-///
-/// 実行があるときの中身は **hook が主、`agents --json` が従**:
-/// hook は turn 単位で届くので
-/// Working / Waiting / Completed を取り違えない。hook が一度も来ていない行
-/// （ccdesk が起こしていないセッション・注入が効かなかった場合）だけ `status` へ落ち、
-/// `status` も無い間は出力の変化から推す
-fn row_state(run: Option<Run<'_>>) -> StateView {
-    let Some(run) = run.filter(|run| run.hook != Some(STOPPED)) else {
-        return classify(STOPPED, false);
-    };
-    match (run.hook, run.status, run.heuristic) {
-        (Some(state), _, _) => classify(state, true),
-        (None, "", Some(SessionStatus::Working)) => classify(WORKING, true),
-        (None, "", _) => classify(WAITING, true),
-        (None, status, _) => classify(foreground_state(status), true),
-    }
 }
 
 /// リセット時刻のローカル表記。当日なら "14:00"、別日なら "7/29 09:00"
@@ -386,6 +333,16 @@ fn row_visible(row: usize, header_rows: usize, scroll: usize, tail_capacity: usi
 /// サイドバーを横断する区切り線のテキスト（枠の内側幅ぶん）
 fn separator_text(inner_width: u16) -> String {
     "─".repeat(inner_width as usize)
+}
+
+/// ペイン枠の色（フォーカスの有無）。**枠色の規則はこの 1 箇所**
+/// （サイドバー・右ペイン・New 画面が同じ答えを読む）
+pub(crate) fn border_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(FOCUS_BORDER)
+    } else {
+        Style::default().fg(ui().dim)
+    }
 }
 
 /// **行末のメニュー記号**（クリックで二次操作のメニューが開く）。
@@ -995,66 +952,63 @@ fn sidebar_hint(app: &App) -> String {
 /// **呼ぶのはサイドバーを積んだ後**（[`draw`] の並び）: 案内は選択行の種類で
 /// 変わり、その選択行は [`App::sidebar_rows`] を組んだ結果に依るので、
 /// 先に描くと 1 フレーム古い行の案内が出る
-fn draw_bottom_bar(frame: &mut Frame, area: Rect, app: &mut App) {
-    // 下部バー: 通知（起動失敗等）があれば数秒それを出し、無ければキーヒント
-    if let Some((msg, at)) = &app.notice {
-        if at.elapsed() < Duration::from_secs(5) {
-            frame.render_widget(
-                ratatui::widgets::Paragraph::new(Line::from(format!(" {msg}")))
-                    .style(Style::default().fg(C_FAIL)),
-                area,
-            );
-        } else {
-            app.notice = None;
-        }
-    }
-    if app.notice.is_none() {
-        let mut hint_spans = vec![
-            Span::styled(" app:", Style::default().fg(MUTED_FG)),
-            Span::raw(" Ctrl+Q quit · Alt+←→ focus"),
-        ];
-        if let Some((label, keys)) = context_hint(app) {
-            hint_spans.push(Span::styled(
-                format!("  {label}:"),
-                Style::default().fg(MUTED_FG),
-            ));
-            hint_spans.push(Span::raw(format!(" {keys}")));
-        }
-        // 起こした子がまだ端末を掴んでいないことを出す。**見出しメニューの
-        // new session は右ペインの表示を変えない**ので、ここに出さないと無反応に見える。
-        // 判定は `input_gate` 1 つ（起動中かどうかの正本を増やさない）。
-        // New 画面は入力欄に自前の starting 表示を持つので、そこでは二重に出さない
-        if app.input_gate.is_some() && !matches!(app.right_view, RightView::New(_)) {
-            hint_spans.push(Span::styled(
-                "  starting session…",
-                Style::default().fg(C_WORKING),
-            ));
-        }
-        // 右端: 使用率（opt-in）。中身は [`crate::usage`] が取ったもので、
-        // **statusline には一切関与しない**。
-        //
-        // **無言の空白を作らない**のが要点。以前は「opt-in していない」
-        // 「取得が効いていない」「枠が無いアカウント」「壊れた」が全部同じ
-        // 見え方（何も出ない）で、opt-in したのに出ない人へ渡せる情報が無かった
-        // **当たり判定（[`usage_hit`]）と同じ導出**を通す
-        let usage_spans = usage_footer(app);
-        let usage_w = span_width(&usage_spans);
-        let bar = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(1), Constraint::Length(usage_w)])
-            .split(area);
-        // new session 画面のヒントはペイン内に出すため、下部バーには重ねない
+fn draw_bottom_bar(frame: &mut Frame, area: Rect, app: &App) {
+    // 下部バー: 通知（起動失敗等）があれば数秒それを出し、無ければキーヒント。
+    // **通知の失効は run ループが持つ**（ここで落とすと、期限切れでも描画が
+    // 走らない間は notice が残り、使用率クリックの当たり判定まで殺し続ける）
+    if let Some((msg, _)) = &app.notice {
         frame.render_widget(
-            ratatui::widgets::Paragraph::new(Line::from(hint_spans))
-                .style(Style::default().fg(ui().dim)),
-            bar[0],
+            ratatui::widgets::Paragraph::new(Line::from(format!(" {msg}")))
+                .style(Style::default().fg(C_FAIL)),
+            area,
         );
-        if usage_w > 0 {
-            frame.render_widget(
-                ratatui::widgets::Paragraph::new(Line::from(usage_spans)),
-                bar[1],
-            );
-        }
+        return;
+    }
+    let mut hint_spans = vec![
+        Span::styled(" app:", Style::default().fg(MUTED_FG)),
+        Span::raw(" Ctrl+Q quit · Alt+←→ focus"),
+    ];
+    if let Some((label, keys)) = context_hint(app) {
+        hint_spans.push(Span::styled(
+            format!("  {label}:"),
+            Style::default().fg(MUTED_FG),
+        ));
+        hint_spans.push(Span::raw(format!(" {keys}")));
+    }
+    // 起こした子がまだ端末を掴んでいないことを出す。**見出しメニューの
+    // new session は右ペインの表示を変えない**ので、ここに出さないと無反応に見える。
+    // 判定は `input_gate` 1 つ（起動中かどうかの正本を増やさない）。
+    // New 画面は入力欄に自前の starting 表示を持つので、そこでは二重に出さない
+    if app.input_gate.is_some() && !matches!(app.right_view, RightView::New(_)) {
+        hint_spans.push(Span::styled(
+            "  starting session…",
+            Style::default().fg(C_WORKING),
+        ));
+    }
+    // 右端: 使用率（opt-in）。中身は [`crate::usage`] が取ったもので、
+    // **statusline には一切関与しない**。
+    //
+    // **無言の空白を作らない**のが要点。以前は「opt-in していない」
+    // 「取得が効いていない」「枠が無いアカウント」「壊れた」が全部同じ
+    // 見え方（何も出ない）で、opt-in したのに出ない人へ渡せる情報が無かった
+    // **当たり判定（[`usage_hit`]）と同じ導出**を通す
+    let usage_spans = usage_footer(app);
+    let usage_w = span_width(&usage_spans);
+    let bar = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(usage_w)])
+        .split(area);
+    // new session 画面のヒントはペイン内に出すため、下部バーには重ねない
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(Line::from(hint_spans))
+            .style(Style::default().fg(ui().dim)),
+        bar[0],
+    );
+    if usage_w > 0 {
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(Line::from(usage_spans)),
+            bar[1],
+        );
     }
 }
 
@@ -1080,7 +1034,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     struct WindowView {
         session_id: crate::sessions::SessionId,
         alive: bool,
-        heuristic: SessionStatus,
+        busy: bool,
         /// この窓が claude を起こした時刻（hook の新旧判断の材料）
         launched_at: u64,
     }
@@ -1089,8 +1043,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         .iter_mut()
         .map(|w| WindowView {
             session_id: w.session_id.clone(),
+            // 生死の観測（try_wait = プロセス状態の syscall）は**窓 1 つにつき
+            // 1 フレーム 1 回**。looks_busy は出力時刻を見るだけで生死を見ない
             alive: w.alive(),
-            heuristic: w.status_heuristic(),
+            busy: w.looks_busy(),
             launched_at: w.started_at,
         })
         .collect();
@@ -1123,20 +1079,32 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             .find(|a| a.is_interactive() && a.session_id == row.session_id.as_str())
             .map(|a| a.status.as_str())
             .unwrap_or_default();
-        // **その行を動かしている実行**。窓（＝ ccdesk の子プロセス）が生きている行だけが
-        // 持ち、窓を持たない行は撮影用の固定表だけが名乗れる（実データでは常に空）
+        // **その行を動かしている実行**。自分の窓（＝ ccdesk の子プロセス）が
+        // 生きている行が主で、無ければ撮影用の固定表、それも無ければ
+        // `agents --json` が拾っている前景セッション（＝ 別インスタンスや
+        // ccdesk の外で動いている実行）を実行として扱う
         let run = window
             .filter(|(_, w)| w.alive)
             .map(|(_, w)| Run {
                 hook: app.hook_states.get(&row.session_id, Some(w.launched_at)),
                 status,
-                heuristic: Some(w.heuristic),
+                busy: w.busy,
             })
             .or_else(|| {
                 app.fixed_states.get(&row.session_id).map(|state| Run {
                     hook: Some(state.as_str()),
                     status: "",
-                    heuristic: None,
+                    busy: false,
+                })
+            })
+            .or_else(|| {
+                // 別インスタンスで動いている行を Stopped と描かない（Stopped の行は
+                // open で `claude -r` を起こすので、嘘の Stopped は二重再開の入口になる）。
+                // hook の記録は起動時刻で新旧を判断できない（他人の窓）ので使わない
+                (!status.is_empty()).then_some(Run {
+                    hook: None,
+                    status,
+                    busy: false,
                 })
             });
         let view = row_state(run);
@@ -1184,6 +1152,22 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         items.push(ListItem::new(session_row_line(d, look, inner_width)));
         rows.push(SidebarRow::Action(d.action.clone()));
     };
+    // セッション行以外の 1 行を積む。**items と rows が 1:1 であること**と
+    // 「帯（選択・ホバー）を載せるのは触れる行だけ」の規則を、行種ごとに
+    // 書き写さずここ 1 箇所で守る（片方だけ push すると全行のヒットテストがずれる）
+    let push_row = |items: &mut Vec<ListItem>,
+                    rows: &mut Vec<SidebarRow>,
+                    line: Line<'static>,
+                    base: Style,
+                    kind: SidebarRow| {
+        let style = if kind.selectable() {
+            Look::at(app, SidebarPos::Row(rows.len()), false).band(base)
+        } else {
+            base
+        };
+        items.push(ListItem::new(line.style(style)));
+        rows.push(kind);
+    };
 
     // 先頭: ccdesk / claude の版行と区切り線。更新があるときだけ行全体がクリック可
     for (text, style, row) in version_rows(
@@ -1192,53 +1176,44 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         claude_update_state(app),
         inner_width,
     ) {
-        let cur = rows.len();
-        let mut style = style;
-        // ハイライトの条件は他の行と同じ「実体のある行か」だけ
-        // （更新が無い版行も選択・ホバーできる ＝ 触れる行と光る行がずれない）
-        if row.selectable() {
-            style = Look::at(app, SidebarPos::Row(cur), false).band(style);
-        }
-        items.push(ListItem::new(Line::from(text).style(style)));
-        rows.push(row);
+        push_row(&mut items, &mut rows, Line::from(text), style, row);
     }
 
     // 新規セッション
-    {
-        let cur = rows.len();
-        let style = Look::at(app, SidebarPos::Row(cur), false).band(Style::default());
-        items.push(ListItem::new(Line::from("+ new session").style(style)));
-        rows.push(SidebarRow::Action(RowAction::New));
-    }
+    push_row(
+        &mut items,
+        &mut rows,
+        Line::from("+ new session"),
+        Style::default(),
+        SidebarRow::Action(RowAction::New),
+    );
     // 区切り線: new session（アクション）とセッション一覧領域を分ける（Desktop 風）
-    items.push(ListItem::new(
-        Line::from(separator_text(inner_width)).style(Style::default().fg(ui().dim)),
-    ));
-    rows.push(SidebarRow::Decoration);
-    // グルーピング切替（クリックで state ⇔ directory）
-    {
-        let cur = rows.len();
-        let style = Look::at(app, SidebarPos::Row(cur), false).band(Style::default().fg(ui().dim));
-        let chosen = if app.grouping == Grouping::State {
-            "state"
-        } else {
-            "directory"
-        };
-        items.push(ListItem::new(
-            Line::from(vec![
-                Span::raw("⊞ group: "),
-                Span::styled(chosen, Style::default().fg(ui().emph)),
-            ])
-            .style(style),
-        ));
-        rows.push(SidebarRow::Action(RowAction::ToggleGroup));
-    }
+    push_row(
+        &mut items,
+        &mut rows,
+        Line::from(separator_text(inner_width)),
+        Style::default().fg(ui().dim),
+        SidebarRow::Decoration,
+    );
+    // グルーピング切替（クリックでメニューが開く）。現在値の綴りは Grouping::as_str
+    push_row(
+        &mut items,
+        &mut rows,
+        Line::from(vec![
+            Span::raw("⊞ group: "),
+            Span::styled(app.grouping.as_str(), Style::default().fg(ui().emph)),
+        ]),
+        Style::default().fg(ui().dim),
+        SidebarRow::Action(RowAction::ToggleGroup),
+    );
     // 集計行。**語は節の見出しの小文字**（[`Group::title`] が唯一の綴り）なので、
     // 見出し・行ラベル・集計で別の語が出ることがない。
     //
     // **0 件の項目は出さない。** 語が 4 つになって行が長くなったので、
     // `0 stopped` のような情報を持たない項目で幅を使わない（1 本も無ければ空行）
-    items.push(ListItem::new(
+    push_row(
+        &mut items,
+        &mut rows,
         Line::from(
             counts
                 .iter()
@@ -1246,10 +1221,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 .map(|(group, n)| format!("{n} {}", group.title().to_lowercase()))
                 .collect::<Vec<_>>()
                 .join(" · "),
-        )
-        .style(Style::default().fg(ui().dim)),
-    ));
-    rows.push(SidebarRow::Decoration);
+        ),
+        Style::default().fg(ui().dim),
+        SidebarRow::Decoration,
+    );
     // ここまでが固定ヘッダー。積んだ数をそのまま正本にする
     // （ヒットテストとスクロール計算が読む。定数と二重管理にしない）
     let header_n = rows.len();
@@ -1263,12 +1238,14 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         if members.is_empty() {
             return;
         }
-        items.push(ListItem::new(Line::from("")));
-        rows.push(SidebarRow::Decoration);
-        items.push(ListItem::new(
-            Line::from(title.to_string()).style(Style::default().fg(ui().dim)),
-        ));
-        rows.push(SidebarRow::Decoration);
+        push_row(items, rows, Line::from(""), Style::default(), SidebarRow::Decoration);
+        push_row(
+            items,
+            rows,
+            Line::from(title.to_string()),
+            Style::default().fg(ui().dim),
+            SidebarRow::Decoration,
+        );
         for d in members {
             push_data_row(items, rows, d);
         }
@@ -1305,13 +1282,14 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             // なる。見出し側のキーは project_rows が持っている）
             let data_keys: Vec<String> = unpinned.iter().map(|d| dir_key_of(&d.cwd)).collect();
             for row in project_rows(&app.projects, &cwds) {
-                items.push(ListItem::new(Line::from("")));
-                rows.push(SidebarRow::Decoration);
-                let cur = rows.len();
-                let style =
-                    Look::at(app, SidebarPos::Row(cur), false).band(Style::default().fg(ui().dim));
-                items.push(ListItem::new(Line::from(row.heading).style(style)));
-                rows.push(SidebarRow::Action(RowAction::Project(row.cwd)));
+                push_row(&mut items, &mut rows, Line::from(""), Style::default(), SidebarRow::Decoration);
+                push_row(
+                    &mut items,
+                    &mut rows,
+                    Line::from(row.heading),
+                    Style::default().fg(ui().dim),
+                    SidebarRow::Action(RowAction::Project(row.cwd)),
+                );
                 // 配下のセッション行。見出しの一覧と同じ同一判定キーで振り分ける
                 // （ここだけ厳密一致にすると大小違いのセッションが行き場を失う）
                 for (d, _) in unpinned
@@ -1368,9 +1346,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         .sidebar_scroll
         .min(items.len().saturating_sub(header_n + tail_capacity));
 
-    // フォーカス中のペインだけ枠を少し明るく
-    let focus_style = Style::default().fg(FOCUS_BORDER);
-    let blur_style = Style::default().fg(ui().dim);
     let scroll = app.sidebar_scroll;
     let visible: Vec<ListItem> = items
         .into_iter()
@@ -1378,13 +1353,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         .filter(|(i, _)| row_visible(*i, header_n, scroll, tail_capacity))
         .map(|(_, item)| item)
         .collect();
-    let list = List::new(visible).block(Block::default().borders(Borders::ALL).border_style(
-        if app.focus == Focus::Sidebar {
-            focus_style
-        } else {
-            blur_style
-        },
-    ));
+    let list = List::new(visible).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style(app.focus == Focus::Sidebar)),
+    );
     frame.render_widget(list, chunks[0]);
 
     // ---- サイドバー下部フッター: 区切り線 / アカウント行 ----
@@ -1393,10 +1366,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         let fx = chunks[0].x + 1;
         let fw = chunks[0].width - 2;
         let account_y = sl.account_y;
-        // 区切り線（Desktop 風にフッターを本文から分ける）
+        // 区切り線（Desktop 風にフッターを本文から分ける。線の文字は separator_text が正本）
         frame.render_widget(
             ratatui::widgets::Paragraph::new(
-                Line::from("─".repeat(fw as usize)).style(Style::default().fg(ui().dim)),
+                Line::from(separator_text(fw)).style(Style::default().fg(ui().dim)),
             ),
             Rect::new(fx, account_y - 1, fw, 1),
         );
@@ -1522,8 +1495,6 @@ fn draw_popup(frame: &mut Frame, app: &App) {
 /// 右ペイン: 新規セッション画面 or アクティブセッションの画面。
 /// 終端カーソルの決定はこの中に閉じる（[`FrameCursor`] 参照）
 fn draw_right_pane(frame: &mut Frame, pane: Rect, app: &mut App) -> FrameCursor {
-    let focus_style = Style::default().fg(FOCUS_BORDER);
-    let blur_style = Style::default().fg(ui().dim);
     let terminal_focused = app.focus == Focus::Terminal;
     let starting = app.input_gate.is_some();
     // Esc で戻れる先（セッションの窓）があるか。**借用の前に取る**（New 画面の
@@ -1545,20 +1516,14 @@ fn draw_right_pane(frame: &mut Frame, pane: Rect, app: &mut App) -> FrameCursor 
     let window = &app.windows[app.active];
     // ペインの見出しもサイドバーと同じ導出（名前の正本は transcript 1 つ）
     let title = app
-        .sessions
-        .iter()
-        .find(|row| row.session_id == window.session_id)
+        .row(&window.session_id)
         .map_or_else(|| crate::title::UNTITLED.to_string(), |row| app.titles.of(row));
     let parser = window.parser.lock_recover();
     let screen = parser.screen();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(if app.focus == Focus::Terminal {
-            focus_style
-        } else {
-            blur_style
-        });
+        .border_style(border_style(terminal_focused));
     let inner = block.inner(pane);
     // tui-term 独自の █ カーソル描画は無効化し、ネイティブカーソル
     // （set_cursor_position = 本家と同じ点滅バー）だけを使う
@@ -1607,6 +1572,7 @@ fn terminal_cursor_pos(pane: Rect, inner: Rect, crow: u16, ccol: u16) -> Positio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::poll::{STOPPED, WAITING, WORKING};
 
     /// **幅の下限は「短い項目しか無いメニューが痩せない」ための床**で、
     /// grouping 切替（最長 `  directory` = 11 桁）がそれに当たる。
@@ -2028,28 +1994,19 @@ mod tests {
     /// hook は turn 単位で届くので Done を区別できるが、`status` からは出せない
     #[test]
     fn a_live_row_prefers_the_hook_state_over_the_live_status() {
-        let label = |hook, status, heuristic| {
-            row_state(Some(Run {
-                hook,
-                status,
-                heuristic,
-            }))
-            .label()
+        let label = |hook, status, busy| {
+            row_state(Some(Run { hook, status, busy })).label()
         };
         // hook が居れば status も出力ヒューリスティックも見ない
-        assert_eq!(
-            label(Some(crate::poll::COMPLETED), "busy", Some(SessionStatus::Working)),
-            "Completed"
-        );
-        assert_eq!(label(Some(WORKING), "idle", None), "Working");
-        assert_eq!(label(Some(WAITING), "busy", None), "Waiting");
+        assert_eq!(label(Some(crate::poll::COMPLETED), "busy", true), "Completed");
+        assert_eq!(label(Some(WORKING), "idle", false), "Working");
+        assert_eq!(label(Some(WAITING), "busy", false), "Waiting");
         // hook が一度も来ていない行は status から導く
-        assert_eq!(label(None, "busy", None), "Working");
-        assert_eq!(label(None, "idle", None), "Waiting");
+        assert_eq!(label(None, "busy", false), "Working");
+        assert_eq!(label(None, "idle", false), "Waiting");
         // status も無い間は出力の変化から推す
-        assert_eq!(label(None, "", Some(SessionStatus::Working)), "Working");
-        assert_eq!(label(None, "", Some(SessionStatus::NeedsInput)), "Waiting");
-        assert_eq!(label(None, "", None), "Waiting");
+        assert_eq!(label(None, "", true), "Working");
+        assert_eq!(label(None, "", false), "Waiting");
     }
 
     /// **動かしているものが無い行は、hook が何を言っていても Stopped。**
@@ -2105,13 +2062,13 @@ mod tests {
         let view = row_state(Some(Run {
             hook: Some(STOPPED),
             status: "idle",
-            heuristic: Some(SessionStatus::NeedsInput),
+            busy: false,
         }));
         assert_eq!(view.label(), "Stopped", "a fresh stopped was thrown away");
         assert!(!view.alive, "the shape says the process is alive on a stopped row");
         assert!(!view.spinning);
         // 他の state はそのまま生きている実行として出る（形は生存形）
-        assert!(row_state(Some(Run { hook: Some("done"), status: "", heuristic: None })).alive);
+        assert!(row_state(Some(Run { hook: Some("done"), status: "", busy: false })).alive);
     }
 
     /// 更新の有無で行構成が変わらない（固定ヘッダー行数もマーカー桁の位置も動かない）。
