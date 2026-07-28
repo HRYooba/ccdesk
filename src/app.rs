@@ -2375,24 +2375,10 @@ mod tests {
     }
 
     /// 使用率が出ている App と、取り直しが呼ばれた回数の記録
+    /// （fixture は型の持ち主 = usage 側の 1 つを使う）
     fn usage_app() -> (App, Arc<std::sync::atomic::AtomicUsize>) {
         let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let usage = Usage::Ready(crate::usage::UsageInfo {
-            five: Some(crate::usage::UsageWindow {
-                pct: 18.0,
-                resets_at: Some(now + 3600),
-            }),
-            seven: Some(crate::usage::UsageWindow {
-                pct: 55.0,
-                resets_at: Some(now + 4 * 86400),
-            }),
-            models: Vec::new(),
-            fetched_at: now,
-        });
+        let usage = crate::usage::sample_ready(Vec::new());
         let mut app = test_app(34, TERM);
         app.source = Arc::new(TestSource::for_usage(usage.clone(), Arc::clone(&refreshes)));
         app.usage = usage;

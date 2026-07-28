@@ -1674,19 +1674,7 @@ mod tests {
     }
 
     fn ready(models: Vec<(String, UsageWindow)>) -> Usage {
-        let now = ccdesk::now_secs();
-        Usage::Ready(UsageInfo {
-            five: Some(UsageWindow {
-                pct: 18.0,
-                resets_at: Some(now + 3600),
-            }),
-            seven: Some(UsageWindow {
-                pct: 55.0,
-                resets_at: Some(now + 4 * 86400),
-            }),
-            models,
-            fetched_at: now,
-        })
+        crate::usage::sample_ready(models)
     }
 
     /// **4 つの状態が画面上で区別できる。** 以前はどれも「無言の空白」に潰れていて、

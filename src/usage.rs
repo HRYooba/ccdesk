@@ -92,6 +92,38 @@ impl UsageInfo {
     pub(crate) fn is_stale(&self, now: u64) -> bool {
         now.saturating_sub(self.fetched_at) > STALE_AFTER_SECS
     }
+
+    /// 枠を「ラベル, 枠」の並びで配る（5h → 7d → モデル別）。
+    /// **枠のラベルの綴りと並びはここ 1 箇所**: 下部バー（ui）と `ccdesk doctor` が
+    /// 同じ答えを読む（doctor は「画面でどう出るか」を確かめる入口なので、
+    /// 表記が別実装だと目的を果たさない）
+    pub(crate) fn windows(&self) -> impl Iterator<Item = (&str, &UsageWindow)> {
+        self.five
+            .iter()
+            .map(|w| ("5h", w))
+            .chain(self.seven.iter().map(|w| ("7d", w)))
+            .chain(self.models.iter().map(|(name, w)| (name.as_str(), w)))
+    }
+}
+
+/// テスト用の Ready 値（5h 18% → 1 時間後 / 7d 55% → 4 日後 / fetched_at = 今）。
+/// **fixture は型の持ち主のそばに 1 つ**: [`UsageInfo`] にフィールドを足したら
+/// ここを直せば、使う側（ui のクリック判定・app の描画）のテストが全部追随する
+#[cfg(test)]
+pub(crate) fn sample_ready(models: Vec<(String, UsageWindow)>) -> Usage {
+    let now = ccdesk::now_secs();
+    Usage::Ready(UsageInfo {
+        five: Some(UsageWindow {
+            pct: 18.0,
+            resets_at: Some(now + 3600),
+        }),
+        seven: Some(UsageWindow {
+            pct: 55.0,
+            resets_at: Some(now + 4 * 86400),
+        }),
+        models,
+        fetched_at: now,
+    })
 }
 
 /// 使用率について ccdesk が言えること。

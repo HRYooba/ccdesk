@@ -207,6 +207,12 @@ fn main() -> anyhow::Result<()> {
         spinner_active: false,
         source,
     };
+    // バックグラウンド取得の起動。**起動列の重い処理（埋め戻し・transcript の
+    // 初回読み）より先に起こす**: ポーラーが取りに行くもの（agents --json 約 900ms・
+    // バージョン）は起動列と独立なので、後回しにすると初回のライブ状態と
+    // アカウント行の表示がその分だけ遅れる。撮影用の供給元は 1 本も起こさないので、
+    // ここに `if !demo` は要らない
+    app.source.spawn_pollers(app.poll_sinks());
     // 既にあるセッションのフォルダを登録へ埋め戻す（以前から使っているフォルダの
     // 見出しが、最後のセッションを消した時点で消えないように）。一覧を読んだ後・
     // 画面を組む前のこの位置に置く: 埋め戻しは初回の一覧に効く必要がある
@@ -214,10 +220,8 @@ fn main() -> anyhow::Result<()> {
     // **最初の描画より前に transcript を解決して名前を読む。** 走査の結果を持つのは
     // Titles のキャッシュだけなので、ここで 1 度走らせないと最初の周期（2 秒）まで
     // 全部の行が `new session` に見える。未記録の行の解決し直しも同じ 1 回で済む
+    // （読む量は予算で有界。[`crate::title::SCAN_BUDGET`]）
     app::refresh_transcripts(&mut app);
-    // バックグラウンド取得の起動。撮影用の供給元は 1 本も起こさないので、
-    // ここに `if !demo` は要らない
-    app.source.spawn_pollers(app.poll_sinks());
     // 前回開いていた画面を復元: セッションを見ていたなら `claude -r` で再開、
     // それ以外は new session 画面
     match window.last_view.map(sessions::SessionId::new) {

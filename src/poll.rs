@@ -47,45 +47,52 @@ impl AgentInfo {
     }
 }
 
+/// `claude agents --json --all` を 1 回叩いて解釈する。
+/// None ＝ 起動できなかった、または応答が JSON 配列でない。
+///
+/// **ポーラーと `ccdesk doctor` が同じこの経路を通る**: doctor は
+/// 「実際どう見えるか」を確かめる道具なので、本番と別の実装を持つと
+/// こちらだけ引数や解釈を変えたときに doctor が嘘の ok を出す
+pub(crate) fn fetch_agents() -> Option<Vec<AgentInfo>> {
+    let json = out("claude", &["agents", "--json", "--all"])?;
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(&json)
+    else {
+        return None;
+    };
+    let parsed = items
+        .iter()
+        .map(|v| {
+            let s = |k: &str| {
+                v.get(k)
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            AgentInfo {
+                session_id: s(AGENT_SESSION_ID),
+                kind: s(AGENT_KIND),
+                status: s(AGENT_STATUS),
+                // 桁が u32 に収まらない値は pid として使わない
+                pid: v
+                    .get(AGENT_PID)
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|pid| u32::try_from(pid).ok()),
+            }
+        })
+        .collect();
+    Some(parsed)
+}
+
 /// agents --json は 1 回 ~900ms かかるためバックグラウンドスレッドで回す
 pub(crate) fn spawn_agents_poller(
     shared: Arc<Mutex<Vec<AgentInfo>>>,
     dirty: Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || loop {
-        let output = std::process::Command::new("claude")
-            .args(["agents", "--json", "--all"])
-            .stdin(std::process::Stdio::null())
-            .output();
-        if let Ok(output) = output
-            && let Ok(serde_json::Value::Array(items)) =
-                serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            {
-                let parsed: Vec<AgentInfo> = items
-                    .iter()
-                    .map(|v| {
-                        let s = |k: &str| {
-                            v.get(k)
-                                .and_then(|x| x.as_str())
-                                .unwrap_or_default()
-                                .to_string()
-                        };
-                        AgentInfo {
-                            session_id: s(AGENT_SESSION_ID),
-                            kind: s(AGENT_KIND),
-                            status: s(AGENT_STATUS),
-                            // 桁が u32 に収まらない値は pid として使わない
-                            pid: v
-                                .get(AGENT_PID)
-                                .and_then(serde_json::Value::as_u64)
-                                .and_then(|pid| u32::try_from(pid).ok()),
-                        }
-                    })
-                    .collect();
-                *shared
-                    .lock_recover() = parsed;
-                dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+        if let Some(parsed) = fetch_agents() {
+            *shared.lock_recover() = parsed;
+            dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         std::thread::sleep(Duration::from_secs(2));
     });
 }
@@ -247,12 +254,14 @@ fn is_personal_org(org: &str, email: &str, subscription_type: Option<&str>) -> b
 }
 
 /// 子プロセスの stdout を取る。不正な出力は各パーサ側で弾く。
+/// **TUI 内から起こす子は必ず `stdin(null)` にする**（付け忘れると子が端末を
+/// 掴んでハングする）。この作法ごと共有するため doctor もここを通る。
 ///
 /// **終了コードは意図的に見ない。** `claude auth status --json` は未ログイン時に
 /// exit 1 を返しつつ正当な JSON（`{"loggedIn": false, …}`）を stdout に出す（実測）。
 /// ここで `status.success()` を要求すると未ログインが「取得失敗」に化けて
 /// 表示が固まるため、成否は各パーサの内容判定に委ねる
-fn out(cmd: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn out(cmd: &str, args: &[&str]) -> Option<String> {
     let o = std::process::Command::new(cmd)
         .args(args)
         .stdin(std::process::Stdio::null())
