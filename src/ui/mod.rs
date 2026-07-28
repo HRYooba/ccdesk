@@ -128,11 +128,8 @@ enum UsageDetail {
 /// | `Failed` | `usage —` | opt-in したのに取れていないことを出す（黙って消さない） |
 /// | `Ready` | 枠の一覧 | 最後の取得が古ければ全体を dim |
 ///
-/// `max_width` に収まる最も詳しい形を選ぶ（[`UsageDetail`]）。
-/// `fetching` が真の間は色を落とす（取得は 3 秒前後かかるので、
-/// **クリックしたことが画面に出ないと壊れているように見える**）。
-/// 幅は変えない ＝ 取得中にクリック位置がずれない
-fn usage_line(usage: &Usage, max_width: u16, fetching: bool) -> Vec<Span<'static>> {
+/// `max_width` に収まる最も詳しい形を選ぶ（[`UsageDetail`]）
+fn usage_line(usage: &Usage, max_width: u16) -> Vec<Span<'static>> {
     let info = match usage {
         Usage::Unknown | Usage::Unavailable => return Vec::new(),
         Usage::Failed => {
@@ -146,7 +143,7 @@ fn usage_line(usage: &Usage, max_width: u16, fetching: bool) -> Vec<Span<'static
     };
     // 判定する側と記録する側（usage.rs の fetched_at）で epoch の取り方を分けない
     let now = ccdesk::now_secs();
-    let stale = info.is_stale(now) || fetching;
+    let stale = info.is_stale(now);
     for detail in [
         UsageDetail::Full,
         UsageDetail::NoResets,
@@ -253,7 +250,6 @@ fn usage_footer(app: &App) -> Vec<Span<'static>> {
         &app.usage,
         // キーヒントを押し出さないよう、使用率に渡すのは幅の半分まで
         app.term_size.0 / 2,
-        app.usage_fetching.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 
@@ -1667,7 +1663,7 @@ pub(crate) mod tests {
 
     /// 使用率行を 1 本の文字列にして中身を見る（描画の検査用）
     fn usage_text(usage: &Usage, max_width: u16) -> String {
-        usage_line(usage, max_width, false)
+        usage_line(usage, max_width)
             .iter()
             .map(|s| s.content.as_ref())
             .collect::<String>()
@@ -1793,7 +1789,7 @@ pub(crate) mod tests {
             },
         )]);
         for max_width in [0_u16, 4, 8, 12, 16, 20, 24, 32, 48, 64, 120] {
-            let spans = usage_line(&usage, max_width, false);
+            let spans = usage_line(&usage, max_width);
             assert!(
                 span_width(&spans) <= max_width,
                 "overflowed {max_width}: {:?}",
@@ -1807,7 +1803,7 @@ pub(crate) mod tests {
             panic!("built a Ready value");
         };
         let width_of = |detail| span_width(&usage_spans(info, false, detail));
-        // 取得中は色だけ落ちて**幅は変わらない**（押した瞬間にクリック位置が動かない）
+        // 古い値は色だけ落ちて**幅は変わらない**（dim へ落ちた瞬間にクリック位置が動かない）
         for detail in [
             UsageDetail::Full,
             UsageDetail::NoResets,
@@ -1816,7 +1812,7 @@ pub(crate) mod tests {
             assert_eq!(
                 span_width(&usage_spans(info, true, detail)),
                 span_width(&usage_spans(info, false, detail)),
-                "the width changed while fetching"
+                "the width changed when the value went stale"
             );
         }
 

@@ -102,8 +102,8 @@ each per-model weekly window, with time until reset. Narrow terminals drop the
 reset times first, then the per-model windows.
 
 It refreshes **when a session finishes a turn** — the moment the numbers actually
-move — so nothing runs while you are idle. **Click it to refresh right away**;
-the numbers dim while the fetch is in flight. A slow 15-minute poll backs that up,
+move — so nothing runs while you are idle. **Click it to refresh right away.**
+A slow 15-minute poll backs that up,
 because two things no event can report: the 5-hour window resetting on a timer,
 and usage from outside ccdesk (another terminal, claude.ai, another device).
 Bursts of finished turns collapse into one fetch, and accounts with no rate-limit
@@ -124,8 +124,9 @@ thread never starts.
 
 `ccdesk doctor` reports what the probe returns on your machine, and runs even
 with the setting off so you can look before turning it on. A failed fetch shows
-as `usage —` rather than a silent blank; a reading older than 10 minutes is
-dimmed; an account with no rate-limit windows at all (API key, Bedrock, Vertex)
+as `usage —` rather than a silent blank; a reading old enough that the backup
+poll must have missed (20 minutes) is dimmed; an account with no rate-limit
+windows at all (API key, Bedrock, Vertex)
 hides the gauge instead of warning forever.
 
 ## License

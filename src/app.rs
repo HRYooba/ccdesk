@@ -386,9 +386,6 @@ pub(crate) struct App {
     /// 使用率が更新されたことを取得スレッドが立てる合図（フッターと同じ作法）。
     /// **周期で読みに行かない**ので、使用率を切った環境ではこの旗が一度も立たない
     pub(crate) usage_dirty: Arc<std::sync::atomic::AtomicBool>,
-    /// 今まさに取得中か。1 回 3 秒前後かかるので、**クリックしたことを画面に出す**
-    /// ためだけに持つ（値そのものは [`Self::usage`]）
-    pub(crate) usage_fetching: Arc<std::sync::atomic::AtomicBool>,
     // 画面に出す値の供給元（実データ / 撮影用の固定データ）。起動時に 1 度だけ選ばれ、
     // 以降ここを通る限り「今 demo か」を問う必要が無い
     pub(crate) source: Arc<dyn DataSource>,
@@ -470,7 +467,6 @@ impl Default for App {
             ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             usage: Usage::default(),
             usage_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            usage_fetching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // 撮影用の供給元は state.json / config.json を書かないので、
             // テストが開発者の設定を踏まない
             source: Arc::new(crate::source::DemoSource),
