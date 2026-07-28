@@ -175,8 +175,12 @@ pub(crate) trait DataSource: Send + Sync {
     fn usage(&self) -> Usage;
 
     /// 使用率をその場で取り直す（フッターの使用率をクリックしたとき）。
-    /// 取得しない供給元（撮影用）では何もしない
-    fn refresh_usage(&self) {}
+    /// **実際に取り直しを頼んだかを返す**: 呼び手はこれで取得中スピナーを
+    /// 始めるので、取得しない供給元（撮影用）が true を返すと永遠に回る。
+    /// 取得しない供給元では何もしない ＝ false
+    fn refresh_usage(&self) -> bool {
+        false
+    }
 
     /// **どこかのセッションがターンを終えた。** 使用率が動いた瞬間なので取り直す
     /// （実際に取るかは供給元が間引く。[`crate::usage::spawn_poller`]）
@@ -339,10 +343,12 @@ pub(crate) struct LiveSource {
 }
 
 impl LiveSource {
-    /// `usage_dirty` は使用率が更新されたことを run ループへ伝える合図
+    /// `usage_dirty` は使用率が更新されたことを run ループへ伝える合図で、
+    /// `usage_fetching` はクリック起点の取得が進行中か（スピナーの材料）
     pub(crate) fn new(
         usage_display: bool,
         usage_dirty: Arc<std::sync::atomic::AtomicBool>,
+        usage_fetching: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         // 前回の異常終了が残した書きかけの `.tmp`（ウィンドウ状態・設定・
         // セッション一覧・hook の受け渡し）を 1 回の走査でまとめて回収する。
@@ -353,7 +359,8 @@ impl LiveSource {
         // **opt-in の分岐はここ 1 箇所。** off なら取得スレッドを起こさない
         let usage = usage_display.then(|| {
             let slot: UsageSlot = Arc::new(Mutex::new(Usage::default()));
-            let refresh = crate::usage::spawn_poller(Arc::clone(&slot), usage_dirty);
+            let refresh =
+                crate::usage::spawn_poller(Arc::clone(&slot), usage_dirty, usage_fetching);
             (slot, refresh)
         });
         Self {
@@ -409,10 +416,12 @@ impl DataSource for LiveSource {
         })
     }
 
-    fn refresh_usage(&self) {
+    fn refresh_usage(&self) -> bool {
         if let Some((_, refresh)) = &self.usage {
             refresh.request();
+            return true;
         }
+        false
     }
 
     fn note_turn_finished(&self) {

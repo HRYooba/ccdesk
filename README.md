@@ -102,8 +102,8 @@ each per-model weekly window, with time until reset. Narrow terminals drop the
 reset times first, then the per-model windows.
 
 It refreshes **when a session finishes a turn** — the moment the numbers actually
-move — so nothing runs while you are idle. **Click it to refresh right away.**
-A slow 15-minute poll backs that up,
+move — so nothing runs while you are idle. **Click it to refresh right away** —
+the rings spin while that fetch is in flight. A slow 15-minute poll backs that up,
 because two things no event can report: the 5-hour window resetting on a timer,
 and usage from outside ccdesk (another terminal, claude.ai, another device).
 Bursts of finished turns collapse into one fetch, and accounts with no rate-limit

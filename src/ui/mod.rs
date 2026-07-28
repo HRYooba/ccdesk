@@ -128,14 +128,27 @@ enum UsageDetail {
 /// | `Failed` | `usage —` | opt-in したのに取れていないことを出す（黙って消さない） |
 /// | `Ready` | 枠の一覧 | 最後の取得が古ければ全体を dim |
 ///
-/// `max_width` に収まる最も詳しい形を選ぶ（[`UsageDetail`]）
-fn usage_line(usage: &Usage, max_width: u16) -> Vec<Span<'static>> {
+/// クリック起点の取得中にリングの代わりに回すコマ（すべて 1 桁幅 ＝
+/// どのコマでも全体の幅が変わらない）。回す理由は「押した」ことを画面で返すため:
+/// 取得は 1 回 3 秒前後かかるので、静止したままだと押せていないように見える
+const USAGE_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// 今この瞬間のスピナーのコマ（回す周期はスピナーの描き直し間隔と同じ 200ms）
+fn usage_spinner_frame() -> &'static str {
+    USAGE_SPINNER[(ccdesk::now_ms() / 200) as usize % USAGE_SPINNER.len()]
+}
+
+/// `max_width` に収まる最も詳しい形を選ぶ（[`UsageDetail`]）。
+/// `fetching`（クリック起点の取得中）はリングをスピナーに変える（幅は不変）
+fn usage_line(usage: &Usage, max_width: u16, fetching: bool) -> Vec<Span<'static>> {
+    let spin = fetching.then(usage_spinner_frame);
     let info = match usage {
         Usage::Unknown | Usage::Unavailable => return Vec::new(),
         Usage::Failed => {
             return vec![
                 Span::styled(" usage ", Style::default().fg(ui().dim)),
-                Span::styled("—", Style::default().fg(C_FAIL)),
+                // 取れていない状態のクリック（再挑戦）にも押した反応を返す
+                Span::styled(spin.unwrap_or("—"), Style::default().fg(C_FAIL)),
                 Span::raw(" "),
             ]
         }
@@ -149,7 +162,7 @@ fn usage_line(usage: &Usage, max_width: u16) -> Vec<Span<'static>> {
         UsageDetail::NoResets,
         UsageDetail::WindowsOnly,
     ] {
-        let spans = usage_spans(info, stale, detail);
+        let spans = usage_spans(info, stale, detail, spin);
         if span_width(&spans) <= max_width {
             return spans;
         }
@@ -159,9 +172,16 @@ fn usage_line(usage: &Usage, max_width: u16) -> Vec<Span<'static>> {
 }
 
 /// 枠 1 つ（ラベルと使用率）。**リセット時刻は付けない**（枠のグループごとに
-/// 1 つだけ出すので、時刻を出すのは [`push_reset`] の役目）
-fn push_window(spans: &mut Vec<Span<'static>>, label: &str, pct: f64, stale: bool) {
-    let ring = ["○", "◔", "◑", "◕", "●"][(pct / 25.0).min(4.0) as usize];
+/// 1 つだけ出すので、時刻を出すのは [`push_reset`] の役目）。
+/// `spin` があればリングの代わりにそのコマを出す（取得中の表示）
+fn push_window(
+    spans: &mut Vec<Span<'static>>,
+    label: &str,
+    pct: f64,
+    stale: bool,
+    spin: Option<&'static str>,
+) {
+    let ring = spin.unwrap_or(["○", "◔", "◑", "◕", "●"][(pct / 25.0).min(4.0) as usize]);
     if !spans.is_empty() {
         spans.push(Span::styled(" · ", Style::default().fg(ui().dim)));
     }
@@ -196,7 +216,12 @@ fn push_reset(spans: &mut Vec<Span<'static>>, resets_at: u64) {
 /// ```text
 /// 5h ◔ 34% →05:35 · 7d ◑ 58% · Fable ○ 12% →7/31 07:55
 /// ```
-fn usage_spans(info: &UsageInfo, stale: bool, detail: UsageDetail) -> Vec<Span<'static>> {
+fn usage_spans(
+    info: &UsageInfo,
+    stale: bool,
+    detail: UsageDetail,
+    spin: Option<&'static str>,
+) -> Vec<Span<'static>> {
     let with_resets = matches!(detail, UsageDetail::Full);
     // モデル別を落とす形では週次枠は 7d だけになる
     let models: &[(String, UsageWindow)] = if matches!(detail, UsageDetail::WindowsOnly) {
@@ -208,7 +233,7 @@ fn usage_spans(info: &UsageInfo, stale: bool, detail: UsageDetail) -> Vec<Span<'
 
     // 5h 枠は単独のグループ（自分の時刻を持つ）
     if let Some(w) = &info.five {
-        push_window(&mut spans, "5h", w.pct, stale);
+        push_window(&mut spans, "5h", w.pct, stale, spin);
         if with_resets && let Some(resets_at) = w.resets_at {
             push_reset(&mut spans, resets_at);
         }
@@ -216,10 +241,10 @@ fn usage_spans(info: &UsageInfo, stale: bool, detail: UsageDetail) -> Vec<Span<'
 
     // 週次グループ: 7d → モデル別 → 共通のリセット時刻
     if let Some(w) = &info.seven {
-        push_window(&mut spans, "7d", w.pct, stale);
+        push_window(&mut spans, "7d", w.pct, stale, spin);
     }
     for (name, w) in models {
-        push_window(&mut spans, name, w.pct, stale);
+        push_window(&mut spans, name, w.pct, stale, spin);
     }
     // 時刻の出どころは 7d。**モデル別しか無い形でも出せる**ように、
     // 7d が持っていなければモデル別が持つ値を使う（どれも同じ週次枠）
@@ -254,6 +279,7 @@ fn usage_footer(app: &App) -> Vec<Span<'static>> {
         &app.usage,
         // キーヒントを押し出さないよう、使用率に渡すのは幅の半分まで
         app.term_size.0 / 2,
+        app.usage_fetching.load(std::sync::atomic::Ordering::Relaxed),
     );
     if app.usage_hovered {
         for span in &mut spans {
@@ -1190,8 +1216,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         .map(|group| (*group, data.iter().filter(|d| d.group == *group).count()))
         .collect();
     // スピナーが出ているか（run ループがアイドル時の描き直し間隔を選ぶ材料）。
-    // Working の行だけが点滅する ＝ 集計と同じ表示行から導く
-    app.spinner_active = data.iter().any(|d| d.group == Group::Working);
+    // Working の行（集計と同じ表示行から導く）と、使用率の取得中スピナーの 2 つ
+    app.spinner_active = data.iter().any(|d| d.group == Group::Working)
+        || app
+            .usage_fetching
+            .load(std::sync::atomic::Ordering::Relaxed);
 
     // ---- 描画 ----
     // 行の見え方の規則は [`Look`] 1 つ（帯 = 選択・ホバー / 印 = ペインに出ている）。
@@ -1673,7 +1702,7 @@ pub(crate) mod tests {
 
     /// 使用率行を 1 本の文字列にして中身を見る（描画の検査用）
     fn usage_text(usage: &Usage, max_width: u16) -> String {
-        usage_line(usage, max_width)
+        usage_line(usage, max_width, false)
             .iter()
             .map(|s| s.content.as_ref())
             .collect::<String>()
@@ -1726,6 +1755,45 @@ pub(crate) mod tests {
             span_width(&hovered),
             "the band changed the width"
         );
+    }
+
+    /// **取得中はリングがスピナーに変わる**（押したことを画面で返す）。
+    /// 値も幅もそのまま ＝ 回っている間もクリック位置と読める情報が動かない。
+    /// 取れていない状態（`—`）の再挑戦クリックにも同じ反応を返す
+    #[test]
+    fn a_fetch_in_flight_spins_the_rings_without_moving_anything() {
+        let usage = ready(vec![(
+            "Fable".to_string(),
+            UsageWindow {
+                pct: 12.0,
+                resets_at: None,
+            },
+        )]);
+        let plain = usage_line(&usage, 200, false);
+        let spinning = usage_line(&usage, 200, true);
+        let text = |spans: &[Span<'_>]| {
+            spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+        };
+        // リングは 1 つ残らずスピナーへ（枠の数だけ回る）
+        assert!(
+            !text(&spinning).contains(['○', '◔', '◑', '◕', '●']),
+            "a ring survived the fetch: {}",
+            text(&spinning)
+        );
+        assert!(
+            USAGE_SPINNER.iter().any(|frame| text(&spinning).contains(frame)),
+            "no spinner frame appeared: {}",
+            text(&spinning)
+        );
+        // 値と幅はそのまま
+        assert!(text(&spinning).contains("18%"), "{}", text(&spinning));
+        assert_eq!(span_width(&plain), span_width(&spinning), "the width moved");
+
+        // Failed の「—」も取得中はスピナー（幅は同じ 1 桁）
+        let failed_plain = usage_line(&Usage::Failed, 80, false);
+        let failed_spinning = usage_line(&Usage::Failed, 80, true);
+        assert!(!text(&failed_spinning).contains('—'), "{}", text(&failed_spinning));
+        assert_eq!(span_width(&failed_plain), span_width(&failed_spinning));
     }
 
     /// 3 つの枠（5h / 7d / モデル別）が並び、リセット時刻まで出る
@@ -1829,7 +1897,7 @@ pub(crate) mod tests {
             },
         )]);
         for max_width in [0_u16, 4, 8, 12, 16, 20, 24, 32, 48, 64, 120] {
-            let spans = usage_line(&usage, max_width);
+            let spans = usage_line(&usage, max_width, false);
             assert!(
                 span_width(&spans) <= max_width,
                 "overflowed {max_width}: {:?}",
@@ -1842,17 +1910,23 @@ pub(crate) mod tests {
         let Usage::Ready(info) = &usage else {
             panic!("built a Ready value");
         };
-        let width_of = |detail| span_width(&usage_spans(info, false, detail));
-        // 古い値は色だけ落ちて**幅は変わらない**（dim へ落ちた瞬間にクリック位置が動かない）
+        let width_of = |detail| span_width(&usage_spans(info, false, detail, None));
+        // 古い値・取得中は見た目だけ変わって**幅は変わらない**
+        // （dim やスピナーに変わった瞬間にクリック位置が動かない）
         for detail in [
             UsageDetail::Full,
             UsageDetail::NoResets,
             UsageDetail::WindowsOnly,
         ] {
             assert_eq!(
-                span_width(&usage_spans(info, true, detail)),
-                span_width(&usage_spans(info, false, detail)),
+                span_width(&usage_spans(info, true, detail, None)),
+                span_width(&usage_spans(info, false, detail, None)),
                 "the width changed when the value went stale"
+            );
+            assert_eq!(
+                span_width(&usage_spans(info, false, detail, Some("⠋"))),
+                span_width(&usage_spans(info, false, detail, None)),
+                "the width changed while fetching"
             );
         }
 

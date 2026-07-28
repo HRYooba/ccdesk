@@ -386,6 +386,10 @@ pub(crate) struct App {
     /// 使用率が更新されたことを取得スレッドが立てる合図（フッターと同じ作法）。
     /// **周期で読みに行かない**ので、使用率を切った環境ではこの旗が一度も立たない
     pub(crate) usage_dirty: Arc<std::sync::atomic::AtomicBool>,
+    /// **クリック起点の**取得が進行中か（リングをスピナーに変える材料）。
+    /// 自動取得（保険の周期・ターン完了）では立たない ＝ 押していないのに回らない。
+    /// 立てるのはクリック（即時）と取得スレッド、降ろすのは取得スレッドだけ
+    pub(crate) usage_fetching: Arc<std::sync::atomic::AtomicBool>,
     /// マウスが使用率ゲージの上にいるか（押せることを帯で示す）。
     /// 一覧の行ではないので [`Self::hovered`]（[`SidebarPos`]）では表せない
     pub(crate) usage_hovered: bool,
@@ -470,6 +474,7 @@ impl Default for App {
             ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             usage: Usage::default(),
             usage_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            usage_fetching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             usage_hovered: false,
             // 撮影用の供給元は state.json / config.json を書かないので、
             // テストが開発者の設定を踏まない
@@ -1685,7 +1690,14 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
     // 乗っている間は帯で「押せる」ことを示す（一覧の行のホバーと同じ手段）
     app.usage_hovered = on_usage;
     if on_usage && let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-        app.source.refresh_usage();
+        // 取り直しを実際に頼めたときだけスピナーを始める（撮影用の供給元は
+        // 取得しない ＝ 降ろす者がいない旗を立てない）。ここで立てるのは
+        // クリック直後のフレームから回すため（取得スレッド任せだと最初の
+        // 描き直しまで押した反応が出ない）
+        if app.source.refresh_usage() {
+            app.usage_fetching
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         return Ok(false);
     }
 
@@ -2448,6 +2460,31 @@ mod tests {
         // 外れた ＝ 消える（1 桁左はゲージの外）
         handle_mouse(&mut app, &moved(hit.columns.start - 1, hit.row)).unwrap();
         assert!(!app.usage_hovered, "the mark stays after the mouse left");
+    }
+
+    /// **押した瞬間からスピナーが回る。** 旗はクリック側が立てる（取得スレッド任せ
+    /// だと最初の描き直しまで反応が出ない）。ただし立てるのは取り直しを実際に
+    /// 頼めたときだけ ＝ 取得しない供給元（撮影用）では、降ろす者がいない旗を立てない
+    #[test]
+    fn a_click_starts_the_spinner_only_when_a_fetch_was_requested() {
+        // 取り直しを頼めた ＝ 回し始める
+        let (mut app, _) = usage_app();
+        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
+        handle_mouse(&mut app, &click(hit.columns.start, hit.row)).unwrap();
+        assert!(
+            app.usage_fetching.load(std::sync::atomic::Ordering::Relaxed),
+            "the spinner did not start on click"
+        );
+
+        // 取得しない供給元（既定の DemoSource は取り直さない）＝ 立てない
+        let mut app = test_app(34, TERM);
+        app.usage = crate::usage::sample_ready(Vec::new());
+        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
+        handle_mouse(&mut app, &click(hit.columns.start, hit.row)).unwrap();
+        assert!(
+            !app.usage_fetching.load(std::sync::atomic::Ordering::Relaxed),
+            "a spinner started that no one will stop"
+        );
     }
 
     /// **出ていないものは押せない。** 使用率を切っている（`Unknown`）ときは
@@ -3325,9 +3362,10 @@ mod tests {
             self.usage.clone()
         }
 
-        fn refresh_usage(&self) {
+        fn refresh_usage(&self) -> bool {
             self.usage_refreshes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
         }
 
         fn window_state(&self) -> WindowState {
