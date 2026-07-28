@@ -1383,10 +1383,12 @@ fn adopt_hook_states(app: &mut App) {
 pub(crate) fn refresh_transcripts(app: &mut App) {
     let mut titles = std::mem::take(&mut app.titles);
     let mut changed = false;
+    // 1 周期に読む量の上限。初回の全量読み（リネーム記録の探索）を数周期へ分け、
+    // UI スレッド ＝ 最初の描画を数百 MB の read で止めない
+    // （[`crate::title::SCAN_BUDGET`]）
+    let mut budget = crate::title::SCAN_BUDGET;
     for row in &mut app.sessions {
-        let before = row.transcript.clone();
-        titles.refresh(row);
-        changed |= row.transcript != before;
+        changed |= titles.refresh(row, &mut budget);
     }
     app.titles = titles;
     if changed {
@@ -3704,7 +3706,8 @@ mod tests {
         assert_eq!(cwd, row.cwd, "a fresh start must use the row's own cwd");
         // 1 ターン終わって transcript ができたら再開になる
         titles.write_transcript(&row, "{\"type\":\"user\"}\n");
-        titles.refresh(&mut row);
+        let mut budget = u64::MAX;
+        titles.refresh(&mut row, &mut budget);
         let (launch, cwd) = relaunch(&titles, &row);
         assert!(
             matches!(launch, Launch::Resume),
