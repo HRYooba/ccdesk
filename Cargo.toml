@@ -1,6 +1,6 @@
 [package]
 name = "ccdesk"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 description = "A session manager TUI for Claude Code — see, switch, and drive all your sessions in one terminal"
 license = "MIT"
