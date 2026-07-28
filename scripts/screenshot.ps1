@@ -50,6 +50,13 @@ param(
 # instead -- that is the only point where a bad -Exe is still cheap to report.
 $ExePath = (Resolve-Path -LiteralPath $Exe -ErrorAction Stop).ProviderPath
 
+# Strip color-suppressing variables before launching. This script is typically run
+# from a Claude Code session, whose shell sets NO_COLOR=1; the demo ccdesk inherits
+# it through wt.exe and crossterm honours it, so every published screenshot came out
+# monochrome. CLICOLOR=0 would do the same, so clear both.
+Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue
+Remove-Item Env:CLICOLOR -ErrorAction SilentlyContinue
+
 Add-Type -AssemblyName System.Drawing
 Add-Type -Namespace Win -Name Api -MemberDefinition @'
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
