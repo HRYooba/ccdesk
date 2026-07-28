@@ -27,7 +27,8 @@ processes while the rows stay — reopen one and it resumes from its transcript.
 - **Unread and pinned rows** — `●` marks a row claude spoke on while you were looking
   elsewhere; pinned rows move to a section at the top of the list
 - **Version rows** for ccdesk and claude at the top of the sidebar — click one to update
-  (verified by SHA-256; both apply on the next launch)
+  (verified by SHA-256). Once ccdesk's update lands the row turns into `restart` —
+  click it to relaunch on the new build; claude applies on its next launch
 - **Account line** in the footer showing the signed-in Claude account. Display only —
   switch accounts with `/login` inside a session
 - **Mouse-first, keyboard-light** — click to switch or focus, the `=` at the right end of

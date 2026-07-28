@@ -449,8 +449,9 @@ enum UpdateState {
     Available,
     /// 更新の実行中
     Running,
-    /// 差し替え済み。ccdesk も claude も反映は次回起動なので、
-    /// そのセッション中はずっと再起動を促す
+    /// 差し替え済み。反映は次回起動なので、クリックで再起動して適用する
+    /// （この状態になるのは ccdesk の行だけ。claude 側は次の `claude --version` が
+    /// 新版を返して行が最新表示へ戻る）
     Restart,
 }
 
@@ -469,11 +470,18 @@ impl UpdateState {
         }
     }
 
-    /// 押して更新を始められるか（＝行に動作を付けるか）。実行中と再起動待ちは
-    /// もう押す意味が無いので付けない。**それでも行は行**なので、選択・ホバーの
-    /// 対象からは外れない（[`SidebarRow::Inert`]）
-    fn actionable(self) -> bool {
-        self == Self::Available
+    /// 押したときの動作（＝行に付ける [`RowAction`]）。`update` は更新の実行、
+    /// `restart` は再起動での適用で、**動詞（[`Self::verb`]）が押した結果の名前**。
+    /// 実行中と最新は押す意味が無いので付けない。**それでも行は行**なので、
+    /// 選択・ホバーの対象からは外れない（[`SidebarRow::Inert`]）。
+    /// `restart` は ccdesk の行にしか無い（claude は次回起動で勝手に適用される）ので、
+    /// 持たない行は `None` を渡す ＝ その状態になっても押せない行に留まる
+    fn action(self, update: RowAction, restart: Option<RowAction>) -> SidebarRow {
+        match (self, restart) {
+            (Self::Available, _) => SidebarRow::Action(update),
+            (Self::Restart, Some(restart)) => SidebarRow::Action(restart),
+            _ => SidebarRow::Inert,
+        }
     }
 
     /// 行のスタイル。最新は dim（背景情報）、やることがある行は本文色にする
@@ -520,7 +528,7 @@ fn version_row(name: &str, version: &str, state: UpdateState, inner_width: u16) 
 /// **行数は更新の有無で変わらない**ので、固定ヘッダー行数もマーカー桁の位置も動かない。
 /// Frame に触らない純関数なので、4 状態の文面と当たり判定をテストで固定できる。
 ///
-/// **更新が無い版行は [`SidebarRow::Inert`]**（押しても何も起きないが行の実体はある）。
+/// **やることの無い版行は [`SidebarRow::Inert`]**（押しても何も起きないが行の実体はある）。
 /// 飾りは区切り線だけ ＝ 版行は更新の有無に関係なく選択・ホバーできる
 fn version_rows(
     ccdesk: UpdateState,
@@ -528,23 +536,16 @@ fn version_rows(
     claude: UpdateState,
     inner_width: u16,
 ) -> Vec<(String, Style, SidebarRow)> {
-    let row = |state: UpdateState, action: RowAction| {
-        if state.actionable() {
-            SidebarRow::Action(action)
-        } else {
-            SidebarRow::Inert
-        }
-    };
     vec![
         (
             version_row("ccdesk", env!("CARGO_PKG_VERSION"), ccdesk, inner_width),
             ccdesk.style(),
-            row(ccdesk, RowAction::UpdateCcdesk),
+            ccdesk.action(RowAction::UpdateCcdesk, Some(RowAction::RestartCcdesk)),
         ),
         (
             version_row("claude", claude_version, claude, inner_width),
             claude.style(),
-            row(claude, RowAction::UpdateClaude),
+            claude.action(RowAction::UpdateClaude, None),
         ),
         (
             separator_text(inner_width),
@@ -657,7 +658,7 @@ fn ccdesk_update_state(app: &App) -> UpdateState {
         .lock_recover()
     {
         SelfUpdate::Running => UpdateState::Running,
-        SelfUpdate::Done => UpdateState::Restart,
+        SelfUpdate::Done(_) => UpdateState::Restart,
         // Failed は run ループが下部バーへ出して Idle へ戻すので、行は再試行可のまま
         SelfUpdate::Idle | SelfUpdate::Failed(_) => {
             if app.ccdesk_latest.is_some() {
@@ -2292,11 +2293,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// 押して更新できるのは「更新がある」行だけ。実行中・再起動待ちは押しても
+    /// 押せるのは「やることがある」行だけ: 更新あり = update、ccdesk の
+    /// 差し替え済み = restart（動詞の通りに動く）。実行中・最新は押しても
     /// 意味が無いので動作を付けない。**それでも行は行**なので
     /// [`SidebarRow::Inert`] ＝ 選択・ホバーの対象からは外れない
     #[test]
-    fn version_rows_are_clickable_only_when_an_update_is_available() {
+    fn version_rows_are_clickable_only_when_there_is_something_to_do() {
         let rows_of = |ccdesk, claude| {
             let rows = version_rows(ccdesk, "2.1.220", claude, DEFAULT_INNER);
             (rows[0].2.clone(), rows[1].2.clone())
@@ -2308,11 +2310,17 @@ pub(crate) mod tests {
                 SidebarRow::Action(RowAction::UpdateClaude)
             )
         );
-        for state in [
-            UpdateState::Current,
-            UpdateState::Running,
-            UpdateState::Restart,
-        ] {
+        // 差し替え済み: ccdesk は restart で適用できる。claude はこの状態に
+        // ならない（版チェックが新版を返して行が最新表示へ戻る）ので、
+        // 仮になっても押せない行に留まる
+        assert_eq!(
+            rows_of(UpdateState::Restart, UpdateState::Restart),
+            (
+                SidebarRow::Action(RowAction::RestartCcdesk),
+                SidebarRow::Inert
+            )
+        );
+        for state in [UpdateState::Current, UpdateState::Running] {
             assert_eq!(
                 rows_of(state, state),
                 (SidebarRow::Inert, SidebarRow::Inert),

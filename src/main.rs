@@ -193,6 +193,7 @@ fn main() -> anyhow::Result<()> {
         footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
+        restart_to: None,
         ccdesk_latest: None,
         ccdesk_latest_shared: Arc::new(Mutex::new(None)),
         ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -255,5 +256,15 @@ fn main() -> anyhow::Result<()> {
     // `?25h` を出す）。alt screen を出た後に出さないと通常画面に効かない端末があるため、
     // restore() の後で明示的に drop する（この順序は意味を持つので暗黙の drop に任せない）
     drop(terminal);
+    // 版行の restart: 差し替え済みの exe を**端末を返し終えた後**に起こす
+    // （TUI を持ったまま起こすと 2 つの TUI が同じ画面を取り合う）。
+    // 子は同じコンソールを引き継ぎ、こちらはこのまま退く。
+    // 失敗は次の起動が無いだけ ＝ 普通の終了と同じ状態なので、ログと 1 行の案内に留める
+    if let Some(exe) = app.restart_to.take()
+        && let Err(e) = std::process::Command::new(&exe).spawn()
+    {
+        log_error(&format!("could not restart {}: {e}", exe.display()));
+        eprintln!("could not restart {}: {e} — run it again yourself", exe.display());
+    }
     result
 }

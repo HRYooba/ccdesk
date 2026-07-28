@@ -61,6 +61,9 @@ pub(crate) enum RowAction {
     Open(SessionId),
     UpdateCcdesk,  // ccdesk 自身を更新（サイドバー先頭の版行）
     UpdateClaude,  // claude 本体を更新（同じく版行）
+    /// 差し替え済みの ccdesk を再起動して新しい版で立ち上げ直す
+    /// （更新完了後の版行。claude 側は次回起動で勝手に反映されるのでこの動作を持たない）
+    RestartCcdesk,
 }
 
 /// サイドバー一覧に積まれた 1 行（[`App::sidebar_rows`] の要素）。
@@ -146,8 +149,10 @@ pub(crate) enum SelfUpdate {
     /// 未実行、または失敗を通知し終えた後（＝再試行できる）
     Idle,
     Running,
-    /// 差し替え済み。反映は次回起動なので、以降このセッション中はずっと再起動を促す
-    Done,
+    /// 差し替え済み。持つのは新しい版を置いたパス（= 再起動で起こす exe）。
+    /// **`current_exe()` では代用しない**: 差し替えは走っている exe を `.old` へ改名して
+    /// いるので、実行中プロセスから見た「自分のパス」が差し替え後の本体を指す保証が無い
+    Done(std::path::PathBuf),
     /// 失敗。run ループが下部バーへ 1 度出して Idle へ戻す
     Failed(String),
 }
@@ -374,6 +379,9 @@ pub(crate) struct App {
     pub(crate) claude_updating: Arc<std::sync::atomic::AtomicBool>,
     // ccdesk 自身の更新の進行状態（版行の表示と多重起動防止の正本）
     pub(crate) ccdesk_update: Arc<Mutex<SelfUpdate>>,
+    // 版行の restart で立った再起動要求（起こす exe のパス）。run ループは
+    // これが立ったら抜け、main が端末を返した後にこの exe を spawn する
+    pub(crate) restart_to: Option<std::path::PathBuf>,
     // ccdesk 自身の新しいリリース（起動時 1 回のチェック）。
     // 新しい版があるときだけ Some = 版行に ⟳ と update が出る
     pub(crate) ccdesk_latest: Option<String>,
@@ -469,6 +477,7 @@ impl Default for App {
             footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
+            restart_to: None,
             ccdesk_latest: None,
             ccdesk_latest_shared: Arc::new(Mutex::new(None)),
             ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -730,6 +739,11 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
     let mut last_draw = std::time::Instant::now();
     let mut force_draw = true;
     loop {
+        // 版行の restart（[`request_restart`]）が立ったら run を終える。
+        // 終了処理と新しい exe の spawn は main（端末を復元した後）が行う
+        if app.restart_to.is_some() {
+            return Ok(());
+        }
         if app.last_live_scan.elapsed() > LIVE_SCAN_INTERVAL {
             // **前景では `child.try_wait()` が生死の唯一の真実。** 死んだ PTY の窓は
             // 閉じるが、**行は消さない**（一覧に残り `claude -r` で再開できる ＝
@@ -1051,6 +1065,8 @@ pub(crate) enum Enter {
     NewSession,
     UpdateCcdesk,
     UpdateClaude,
+    /// 差し替え済みの ccdesk を再起動する（更新完了後の版行）
+    RestartCcdesk,
 }
 
 impl Enter {
@@ -1061,6 +1077,8 @@ impl Enter {
             Self::NewSession => "new session",
             // どちらの版行も利用者から見れば「更新する」1 つの動作
             Self::UpdateCcdesk | Self::UpdateClaude => "update",
+            // 行の右端の動詞（ui::UpdateState::verb）と同じ語 ＝ 押した結果が書いてある通り
+            Self::RestartCcdesk => "restart",
         }
     }
 }
@@ -1080,6 +1098,7 @@ pub(crate) fn selected_enter(app: &App) -> Option<Enter> {
         RowAction::Open(_) | RowAction::Project(_) | RowAction::ToggleGroup => Some(Enter::Menu),
         RowAction::UpdateCcdesk => Some(Enter::UpdateCcdesk),
         RowAction::UpdateClaude => Some(Enter::UpdateClaude),
+        RowAction::RestartCcdesk => Some(Enter::RestartCcdesk),
     }
 }
 
@@ -1121,6 +1140,7 @@ fn run_row_action(app: &mut App, action: RowAction, anchor_y: u16) {
         // 更新行はその場で実行するだけ（右ペインを切り替えない）
         RowAction::UpdateCcdesk => start_ccdesk_update(app),
         RowAction::UpdateClaude => start_claude_update(app),
+        RowAction::RestartCcdesk => request_restart(app),
         // セッション行は呼び手が経路を選ぶ（クリック = 開く / Enter = メニュー）
         RowAction::Open(id) => {
             if open_session(app, &id) {
@@ -2057,7 +2077,8 @@ pub(crate) fn move_selection(app: &mut App, dir: i32) {
 /// **走ったまま差し替えられる。** Windows は実行中の exe を上書きできないが改名は
 /// できるので、update.rs の 3 段改名（`.new` へ置く → 現行を `.old` へ退避 →
 /// `.new` を本体へ）がそのまま成立する。反映は次回起動なので、成功後は版行が
-/// "restart" を出し続ける（`SelfUpdate::Done` はこのセッション中戻らない）。
+/// "restart" を出す（クリックで [`request_restart`]。`SelfUpdate::Done` は
+/// このセッション中戻らない）。
 /// 数 MB のダウンロードと SHA-256 検証が入るため別スレッドで行う
 fn start_ccdesk_update(app: &mut App) {
     let Some(tag) = app.ccdesk_latest.clone() else {
@@ -2068,7 +2089,7 @@ fn start_ccdesk_update(app: &mut App) {
             .ccdesk_update
             .lock_recover();
         // 実行中の多重起動と、済んだ更新の再実行を防ぐ
-        if matches!(*state, SelfUpdate::Running | SelfUpdate::Done) {
+        if matches!(*state, SelfUpdate::Running | SelfUpdate::Done(_)) {
             return;
         }
         *state = SelfUpdate::Running;
@@ -2076,12 +2097,27 @@ fn start_ccdesk_update(app: &mut App) {
     let shared = app.ccdesk_update.clone();
     std::thread::spawn(move || {
         let outcome = match crate::update::install(&tag) {
-            Ok(_) => SelfUpdate::Done,
+            Ok(installed) => SelfUpdate::Done(installed.exe),
             Err(e) => SelfUpdate::Failed(format!("ccdesk update failed: {e}")),
         };
         *shared
             .lock_recover() = outcome;
     });
+}
+
+/// 版行の restart: 差し替え済みの exe で立ち上げ直す要求を立てる。
+/// ここでは旗を立てるだけで、run ループが抜け、実際の spawn は main が
+/// 端末を復元した後に行う（TUI を持ったまま次のプロセスを起こすと、
+/// 2 つの TUI が同じ画面を取り合う）。子プロセスは終了処理
+/// （[`kill_sessions_on_exit`]）で通常の終了と同じように止まる
+fn request_restart(app: &mut App) {
+    // Done 以外で restart 行は積まれない（ui::version_rows）。積み方が変わって
+    // ずれても、パスを知らないまま再起動はできないので何もしない
+    let exe = match &*app.ccdesk_update.lock_recover() {
+        SelfUpdate::Done(exe) => exe.clone(),
+        _ => return,
+    };
+    app.restart_to = Some(exe);
 }
 
 /// claude 本体の更新を実行する（公式 `claude update`）。
@@ -3004,6 +3040,11 @@ mod tests {
                     matches!(app.right_view, RightView::New(_)),
                     "{pos:?}: the new session screen did not open"
                 ),
+                // restart は旗を立てるだけ（spawn は main）なので押しても安全
+                Some(Enter::RestartCcdesk) => assert!(
+                    app.restart_to.is_some(),
+                    "{pos:?}: Enter restart did not arm a restart"
+                ),
                 Some(Enter::UpdateCcdesk | Enter::UpdateClaude) => unreachable!(),
                 None => {
                     assert!(app.popup.is_none(), "{pos:?}: a menu opened on a row that offers nothing");
@@ -3218,7 +3259,7 @@ mod tests {
         {
             SelfUpdate::Idle => "Idle",
             SelfUpdate::Running => "Running",
-            SelfUpdate::Done => "Done",
+            SelfUpdate::Done(_) => "Done",
             SelfUpdate::Failed(_) => "Failed",
         }
     }
@@ -3686,7 +3727,10 @@ mod tests {
         start_ccdesk_update(&mut app);
         assert_eq!(state_name(&app), "Idle");
         // 実行中・再起動待ちは、タグを知っていても再実行しない
-        for (state, name) in [(SelfUpdate::Running, "Running"), (SelfUpdate::Done, "Done")] {
+        for (state, name) in [
+            (SelfUpdate::Running, "Running"),
+            (SelfUpdate::Done(std::path::PathBuf::from("ccdesk.exe")), "Done"),
+        ] {
             let mut app = test_app(34, TERM);
             app.ccdesk_latest = Some("v9.9.9".to_string());
             *app.ccdesk_update
@@ -3698,6 +3742,36 @@ mod tests {
                 "must not re-run an update that is finished or running"
             );
         }
+    }
+
+    /// 版行の restart は**差し替え済みの exe を指す再起動要求**を立てる。
+    /// `Done` 以外では立たない（行の積み方がずれても、パスを知らないまま
+    /// 再起動はできない）。要求で run ループが抜け、spawn は main が行う
+    #[test]
+    fn the_restart_row_arms_a_restart_with_the_installed_exe() {
+        let mut app = test_app(34, TERM);
+        run_row_action(&mut app, RowAction::RestartCcdesk, 0);
+        assert_eq!(app.restart_to, None, "armed a restart with no installed exe");
+
+        let exe = std::path::PathBuf::from("C:\\bin\\ccdesk.exe");
+        *app.ccdesk_update
+            .lock_recover() = SelfUpdate::Done(exe.clone());
+        run_row_action(&mut app, RowAction::RestartCcdesk, 0);
+        assert_eq!(app.restart_to, Some(exe), "the restart must point at the installed exe");
+    }
+
+    /// 更新完了後の版行は下部バーで `Enter restart` を案内し、押すと要求が立つ
+    /// （案内と実行が同じ [`selected_enter`] を読むのは他の行と同じ）
+    #[test]
+    fn the_restart_row_offers_enter_restart_and_it_works() {
+        let mut app = app_with_every_row_kind();
+        *app.ccdesk_update
+            .lock_recover() = SelfUpdate::Done(std::path::PathBuf::from("ccdesk.exe"));
+        let bar = drawn_bottom_bar(&mut app);
+        assert_eq!(app.selection, SidebarPos::Row(0), "the fixture's premise broke");
+        assert!(bar.contains("Enter restart"), "the hint does not say restart: {bar:?}");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.restart_to.is_some(), "Enter on the restart row did not arm a restart");
     }
 
     /// テスト用の一覧行 1 本（cwd と更新時刻だけが関心事）。
