@@ -17,7 +17,7 @@ use crate::session::{Launch, Session};
 use crate::sessions::{SessionId, SessionRow};
 use crate::source::{DataSource, PollSinks, WindowItem, PROJECTS_LIMIT};
 use crate::title::Titles;
-use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
+use crate::ui::new_view::{handle_new_view_key, NewState};
 use crate::ui::{
     draw, fit_sidebar, menu_zone, popup_rect, row_at, row_y, sidebar_cols, sidebar_layout,
 };
@@ -927,21 +927,9 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 }
             }
             Event::Paste(text) => {
-                // New 画面の D&D/貼り付けはフォーカス中のフィールドで受ける:
-                // Folder: → フォルダ切替（一覧も更新）/ それ以外 → プロンプトへ挿入
-                // （パスを最初のメッセージ本文に書きたいケースがあるため）
+                // New 画面の D&D/貼り付けの解釈は new_view 側（キー・マウスと同じ場所）
                 if let RightView::New(state) = &mut app.right_view {
-                    if state.focus == NewFocus::Path {
-                        if let Some(dir) = NewState::extract_dir(&text) {
-                            state.set_dir(dir); // パスは丸ごと置き換える
-                        } else {
-                            state.path.insert_str(text.trim());
-                            state.refresh_from_input();
-                        }
-                    } else {
-                        state.prompt.insert_str(text.trim());
-                        state.focus = NewFocus::Prompt;
-                    }
+                    state.handle_paste(&text);
                     continue;
                 }
                 if app.focus != Focus::Terminal {
@@ -1775,72 +1763,11 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         }
         // 右ペイン矩形は state の可変借用の前に取る（正本は ui::pane_rect）
         let pane = crate::ui::pane_rect(app);
-        // New 画面: クリックでフォルダ選択・プロンプト欄フォーカス
+        // New 画面: 入力の解釈は new_view 側（ヒットテストのジオメトリ知識を
+        // レイアウトと同じファイルに閉じる）。起動だけは state の借用を抜けて実行
         if let RightView::New(state) = &mut app.right_view {
-            // 起動ボタン行のクリックは state の借用を抜けてからディスパッチする
-            let mut launch = false;
-            match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    // 描画と同じジオメトリでヒットテスト
-                    let layout = NewLayout::compute(pane);
-                    let box_bottom = layout.prompt_box.y + layout.prompt_box.height;
-                    if !layout.ok {
-                        // ペインが小さすぎて未描画。フィールド判定はしない
-                    } else if mouse.row >= layout.folder_hd_y && mouse.row <= layout.sep_y {
-                        // FOLDER セクション（見出し・パス値・┄ 区切り）クリック → パスフィールド。
-                        // パス値の行ならカーソルも移動、他はカーソル位置維持
-                        state.focus = NewFocus::Path;
-                        if mouse.row == layout.path_y {
-                            let text_x = mouse.column.saturating_sub(layout.path_text_x);
-                            state.path.click(text_x);
-                        }
-                    } else if mouse.row >= layout.prompt_hd_y && mouse.row < box_bottom {
-                        // PROMPT セクション（見出し + 入力枠 3 行）クリック → プロンプト欄
-                        state.focus = NewFocus::Prompt;
-                        if mouse.row == layout.input_y {
-                            let text_x = mouse.column.saturating_sub(layout.input_text_x);
-                            state.prompt.click(text_x);
-                        }
-                    } else if mouse.row >= layout.list_top
-                        && mouse.row < layout.list_top + layout.list_height
-                    {
-                        // フォルダ一覧エリア（空白部分も含む）→ 一覧フォーカス。
-                        // 実在する行の上なら選択も動かし、選択済み行の再クリックで実行する
-                        let row_in = (mouse.row - layout.list_top) as usize;
-                        if row_in < state.shown {
-                            let idx = state.scroll + row_in;
-                            // 起動ボタン行もフォルダ行と同じ 2 段階（選択 → 再クリック）にする。
-                            // 1 クリックで起動すると、プロンプト入力中に一覧へフォーカスを
-                            // 移すだけのクリックが書きかけのプロンプトでセッションを起動して
-                            // しまう（送ったメッセージは取り消せない）。
-                            // 判定はクリックで選択を動かす前に取る（動かした後では
-                            // 常に dir_idx == idx になり 2 段階が崩れる）
-                            let reclick = state.click_activates(idx);
-                            state.select(idx);
-                            state.focus = NewFocus::Browser;
-                            if reclick {
-                                if state.selected_is_launch() {
-                                    launch = true;
-                                } else {
-                                    state.descend(); // 選択済みを再クリック = 潜る
-                                }
-                            }
-                        } else {
-                            state.focus = NewFocus::Browser;
-                        }
-                    }
-                }
-                MouseEventKind::ScrollUp => {
-                    state.focus = NewFocus::Browser;
-                    state.select_prev();
-                }
-                MouseEventKind::ScrollDown => {
-                    state.focus = NewFocus::Browser;
-                    state.select_next();
-                }
-                _ => {}
-            }
-            if launch {
+            let action = state.handle_mouse(pane, mouse);
+            if action == Some(crate::ui::new_view::NewAction::Launch) {
                 start_new_session(app)?;
             }
             return Ok(false);
