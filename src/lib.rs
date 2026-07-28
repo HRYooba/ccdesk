@@ -75,8 +75,11 @@ impl vt100::Callbacks for Responder {
                     let known = |on: bool| if on { 1 } else { 2 };
                     let value = match mode {
                         25 => known(!screen.hide_cursor()),
-                        1000 => known(screen.mouse_protocol_mode() == MM::Press
-                            || screen.mouse_protocol_mode() == MM::PressRelease),
+                        // X10(9) と通常(1000) は**別のモード**。X10 有効中の 1000 照会に
+                        // 「有効」と答えると、応答を信じた子は X10 では送られない
+                        // ボタン解放（release）を待ち続ける
+                        9 => known(screen.mouse_protocol_mode() == MM::Press),
+                        1000 => known(screen.mouse_protocol_mode() == MM::PressRelease),
                         1002 => known(screen.mouse_protocol_mode() == MM::ButtonMotion),
                         1003 => known(screen.mouse_protocol_mode() == MM::AnyMotion),
                         1006 => known(
@@ -147,11 +150,11 @@ impl vt100::Callbacks for Responder {
             };
             match params[0] {
                 b"10" => {
-                    let fg = self.host_fg.unwrap_or([0xcccc, 0xcccc, 0xcccc]);
+                    let fg = self.host_fg.unwrap_or(DEFAULT_FG);
                     self.pending.extend_from_slice(reply(10, fg).as_bytes());
                 }
                 b"11" => {
-                    let bg = self.host_bg.unwrap_or([0x1e1e, 0x1e1e, 0x1e1e]);
+                    let bg = self.host_bg.unwrap_or(DEFAULT_BG);
                     self.pending.extend_from_slice(reply(11, bg).as_bytes());
                 }
                 _ => {}
@@ -160,6 +163,15 @@ impl vt100::Callbacks for Responder {
     }
 }
 
+/// 色照会に失敗したときのフォールバック前景色（VS Code Dark+ 相当、16bit/ch）。
+/// **claude へ返す OSC 応答（[`Responder`]）と ccdesk 自身の UI トーン合成
+/// （`theme::ui`）が同じ既定を仮定する**ので、値はここ 1 箇所に置く
+/// （片方だけ変えると「claude に送った既定テーマ」と「ccdesk の描画が仮定する
+/// テーマ」がずれる）
+pub const DEFAULT_FG: [u16; 3] = [0xcccc, 0xcccc, 0xcccc];
+/// 同・背景色
+pub const DEFAULT_BG: [u16; 3] = [0x1e1e, 0x1e1e, 0x1e1e];
+
 /// Responder 付き vt100 パーサ
 pub type Parser = vt100::Parser<Responder>;
 
@@ -167,21 +179,26 @@ pub fn new_parser(rows: u16, cols: u16, scrollback: usize) -> Parser {
     vt100::Parser::new_with_callbacks(rows, cols, scrollback, Responder::default())
 }
 
+/// ホームディレクトリ（Windows 専用ツールなので USERPROFILE）。
+/// **環境変数を読む場所はここ 1 箇所**: フォールバック（`HOME` を見る等）を
+/// 足すことになったとき、直す場所が散らばらない
+fn home() -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from(std::env::var_os("USERPROFILE")?))
+}
+
 /// Claude Code の設定ディレクトリ。公式に CLAUDE_CONFIG_DIR で移動可能と明記されている
 pub fn claude_dir() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         return Some(std::path::PathBuf::from(dir));
     }
-    Some(std::path::PathBuf::from(std::env::var_os("USERPROFILE")?).join(".claude"))
+    Some(home()?.join(".claude"))
 }
 
 /// claude の更新チャネル。settings.json の autoUpdatesChannel（公式に文書化された
 /// 設定。"latest"(既定) / "stable"）を読む。CLAUDE_CONFIG_DIR にも追従する
 pub fn claude_settings_channel() -> String {
     claude_dir()
-        .map(|d| d.join("settings.json"))
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|d| read_json(&d.join("settings.json")))
         .and_then(|v| {
             v.get("autoUpdatesChannel")
                 .and_then(|c| c.as_str())
@@ -207,19 +224,31 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
     parse(latest) > parse(current)
 }
 
-/// ~/.claude.json（CLAUDE_CONFIG_DIR 設定時はその配下）
+/// ~/.claude.json（CLAUDE_CONFIG_DIR 設定時はその配下）。
+/// 既定の置き場は **ホーム直下**であって `.claude` の中ではないので、
+/// CLAUDE_CONFIG_DIR の分岐だけを [`claude_dir`] へ寄せる
 pub fn claude_json_path() -> Option<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        return Some(std::path::PathBuf::from(dir).join(".claude.json"));
+    if std::env::var_os("CLAUDE_CONFIG_DIR").is_some() {
+        return Some(claude_dir()?.join(".claude.json"));
     }
-    Some(std::path::PathBuf::from(std::env::var_os("USERPROFILE")?).join(".claude.json"))
+    Some(home()?.join(".claude.json"))
 }
 
 /// ccdesk 自身のデータ置き場 ~/.ccdesk/（config.json と error.log）。無ければ作る。
-/// doctor の書き込み可否チェックで参照するため公開する
+/// doctor の書き込み可否チェックで参照するため公開する。
+///
+/// **成功したら以降はキャッシュを返す**: run ループの毎周回（33ms）から
+/// hook-states の stamp 読み経由で呼ばれるので、環境変数読みと
+/// `create_dir_all` を毎回やり直さない。失敗はキャッシュしない
+/// （一時的に作れなかっただけなら次の呼び出しで再試行する）
 pub fn ccdesk_dir() -> Option<std::path::PathBuf> {
-    let dir = std::path::PathBuf::from(std::env::var_os("USERPROFILE")?).join(".ccdesk");
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    if let Some(dir) = DIR.get() {
+        return Some(dir.clone());
+    }
+    let dir = home()?.join(".ccdesk");
     std::fs::create_dir_all(&dir).ok()?;
+    let _ = DIR.set(dir.clone());
     Some(dir)
 }
 
@@ -271,18 +300,11 @@ fn remove_account_store(store: &Path) -> bool {
     let removed = std::fs::remove_file(store).is_ok();
     // ロックの実体はディレクトリ（[`Lock`]）
     let _ = std::fs::remove_dir_all(lock_path_for(store));
-    if let (Some(dir), Some(name)) = (store.parent(), store.file_name().and_then(|n| n.to_str()))
-        && let Ok(entries) = std::fs::read_dir(dir)
-    {
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|file| is_leftover_tmp(file, name))
-            {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
+    // tmp の回収は他の書き手と同じ 1 実装（[`reap_tmp_in`]）。古さは見ない:
+    // このファイルを書く者はもう居ないので、「今まさに書いている別インスタンスの
+    // tmp」は存在しない
+    if let (Some(dir), Some(name)) = (store.parent(), store.file_name().and_then(|n| n.to_str())) {
+        reap_tmp_in(dir, &[name], None);
     }
     removed
 }
@@ -310,6 +332,13 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 現在時刻の epoch 秒。**使用率のリセット時刻・鮮度判定はこの単位**
+/// （[`now_ms`] と同じ物差しから導く ＝ 記録する側と判定する側で epoch の
+/// 取り方が分かれない）
+pub fn now_secs() -> u64 {
+    now_ms() / 1000
+}
+
 /// エラーログを書いてよいか。**決めるのは `main` だけ**（[`enable_error_log`]）。
 ///
 /// **既定は「書かない」。** ログの出力先はプロセス全体で 1 つしかない隠れた
@@ -333,7 +362,9 @@ pub fn log_error(msg: &str) {
     if !ERROR_LOG_ENABLED.load(Ordering::Relaxed) {
         return;
     }
-    let Some(path) = ccdesk_dir().map(|d| d.join("error.log")) else {
+    // 書き先は `ccdesk logs` が読む先と同じ関数から取る（別の式で組むと、
+    // 名前を変えたときに「書いた場所と読む場所が違う」状態を作れる）
+    let Some(path) = error_log_path() else {
         return;
     };
     use std::io::Write as _;
@@ -348,10 +379,7 @@ pub fn log_error(msg: &str) {
 
 /// 現在時刻の UTC ISO 表記（Howard Hinnant の civil_from_days。依存を増やさない最小実装）
 fn now_iso() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0) as i64;
+    let secs = now_secs() as i64;
     let (days, sod) = (secs.div_euclid(86400), secs.rem_euclid(86400));
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -541,6 +569,35 @@ pub fn is_leftover_tmp(name: &str, target: &str) -> bool {
 }
 
 
+/// ファイルを読んで JSON にする。**無い・読めない・壊れている・書き換え途中は
+/// すべて None**（呼び手は既定値で先へ進む）。この寛容さは共有ファイルの読み全部に
+/// 共通の契約なので、実装をここ 1 箇所に持つ ＝ 1 箇所だけ厳格に変わって
+/// 「起動が止まる」側へ倒れることがない
+pub fn read_json(path: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// ファイルの「見え方」（長さ + mtime）。**中身を読まずに「変わったか」だけを
+/// 見る指紋**で、変化検出（hook-states・認証情報・transcript）が同じ型を使う。
+/// 無い・読めないときは None（「消えた」も変化として検出できる）
+pub fn file_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let md = std::fs::metadata(path).ok()?;
+    Some((md.len(), md.modified().ok()?))
+}
+
+/// Mutex のポイズン回復。**「パニックしたスレッドが居ても値は使い続ける」方針を
+/// ここ 1 箇所に持つ**（呼び出し約 40 箇所が同じ長い式を書き写さない ＝
+/// 1 箇所だけ `unwrap()` に戻って方針が黙って割れることがない）
+pub trait LockExt<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockExt<T> for std::sync::Mutex<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// tmp → rename で置く（読み手が書きかけの JSON を見ないため）。
 /// tmp は同じディレクトリに作る（別ボリュームだと rename が失敗する）。
 /// 名前は pid + 連番で一意にする（同じパスへの同時書き込みで tmp を共有しない）。
@@ -597,36 +654,56 @@ pub fn reap_leftover_tmp(target: &Path) {
     else {
         return;
     };
+    reap_tmp_in(dir, &[name], Some(TMP_KEEP));
+}
+
+/// 回収の実体: `dir` を 1 度だけ列挙し、`targets` のいずれかの書きかけ `.tmp` を消す。
+/// `min_age` が Some のときは十分に古いものだけを消す（今まさに書いている
+/// 別インスタンスの tmp を消さないため）。None は無条件（書く者が居ない対象専用）
+fn reap_tmp_in(dir: &Path, targets: &[&str], min_age: Option<Duration>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        if !entry
-            .file_name()
-            .to_str()
-            .is_some_and(|file| is_leftover_tmp(file, name))
-        {
+        let file_name = entry.file_name();
+        let Some(file) = file_name.to_str() else {
+            continue;
+        };
+        if !targets.iter().any(|target| is_leftover_tmp(file, target)) {
             continue;
         }
-        let old = entry
-            .metadata()
-            .and_then(|md| md.modified())
-            .ok()
-            .and_then(|m| m.elapsed().ok())
-            .is_some_and(|age| age >= TMP_KEEP);
+        let old = min_age.is_none_or(|keep| {
+            entry
+                .metadata()
+                .and_then(|md| md.modified())
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age >= keep)
+        });
         if old {
             let _ = std::fs::remove_file(entry.path());
         }
     }
 }
 
-/// 起動時の掃除: ウィンドウ状態・設定の書きかけ `.tmp` を回収する。
-/// **他の書き手（`SessionStore` / `hooks`）と同じ理由**で、
-/// tmp 名が一意になった以上、rename 前に死んだ分は積もる
-pub fn reap_leftover_kv_tmp() {
-    for target in [state_path(), settings_path()].into_iter().flatten() {
-        reap_leftover_tmp(&target);
-    }
+/// 起動時の掃除: `~/.ccdesk` 配下の**全書き手**（ウィンドウ状態・設定・セッション
+/// 一覧・hook の受け渡し）の書きかけ `.tmp` を、**1 回の走査**でまとめて回収する。
+/// 対象は各書き手のパス関数から導く（名前を書き写すと、置き場を変えたときに
+/// 片方だけ古い名前を掃除し続ける）
+pub fn reap_startup_leftovers() {
+    let Some(dir) = ccdesk_dir() else { return };
+    let names: Vec<String> = [
+        state_path(),
+        settings_path(),
+        sessions_store_path(),
+        hook_states_path(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+    .collect();
+    let targets: Vec<&str> = names.iter().map(String::as_str).collect();
+    reap_tmp_in(&dir, &targets, Some(TMP_KEEP));
 }
 
 /// kv_save の read-modify-write を直列化するプロセス内ロック
@@ -634,8 +711,7 @@ pub fn reap_leftover_kv_tmp() {
 static KV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn kv_load(path: Option<std::path::PathBuf>, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(path?).ok()?;
-    let v = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    let v = read_json(&path?)?;
     Some(v.get(key)?.as_str()?.to_string())
 }
 
@@ -644,11 +720,7 @@ fn kv_load(path: Option<std::path::PathBuf>, key: &str) -> Option<String> {
 /// 要素が文字列でない）。state.json はユーザーが手で直す想定のファイルではないので、
 /// 壊れていたら起動を止めるより既定値で先へ進むのが唯一の親切な選択になる
 fn kv_load_list(path: Option<std::path::PathBuf>, key: &str) -> Vec<String> {
-    let Some(path) = path else { return Vec::new() };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+    let Some(v) = path.as_deref().and_then(read_json) else {
         return Vec::new();
     };
     value_strings(v.get(key))
@@ -709,16 +781,13 @@ fn kv_edit(
     edit: impl FnOnce(Option<&serde_json::Value>) -> serde_json::Value,
 ) -> bool {
     let Some(path) = path else { return false };
-    let _guard = KV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = KV_LOCK.lock_recover();
     // 別インスタンスとの直列化。**ファイルごとに別のロック**（state.json と
     // config.json は別物で、片方の保存が他方を待つ理由が無い）
     let Ok(_shared) = Lock::acquire(&lock_path_for(&path), KV_LOCK_WAIT, LOCK_STALE) else {
         return false;
     };
-    let mut v = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+    let mut v = read_json(&path).unwrap_or_else(|| serde_json::json!({}));
     if !v.is_object() {
         v = serde_json::json!({});
     }
@@ -748,6 +817,40 @@ fn kv_update_list(
                 .collect(),
         )
     })
+}
+
+/// 起動時にまとめて読むためのスナップショット。**1 度だけ読み、以降のキー引きは
+/// メモリ上**で行う（`load_state` / `load_setting` はキーごとにファイルを
+/// 読み直すので、起動列で 5 キー引くと同じファイルを 5 回読む）。
+/// 値の解釈（文字列・文字列配列）は単発読みと同じ寛容さ
+pub struct KvSnapshot(serde_json::Value);
+
+impl KvSnapshot {
+    pub fn string(&self, key: &str) -> Option<String> {
+        Some(self.0.get(key)?.as_str()?.to_string())
+    }
+
+    pub fn list(&self, key: &str) -> Vec<String> {
+        value_strings(self.0.get(key))
+    }
+}
+
+/// state.json のスナップショット（[`KvSnapshot`]）
+pub fn state_snapshot() -> KvSnapshot {
+    kv_snapshot(state_path())
+}
+
+/// config.json のスナップショット（[`KvSnapshot`]）
+pub fn settings_snapshot() -> KvSnapshot {
+    kv_snapshot(settings_path())
+}
+
+fn kv_snapshot(path: Option<std::path::PathBuf>) -> KvSnapshot {
+    KvSnapshot(
+        path.as_deref()
+            .and_then(read_json)
+            .unwrap_or_else(|| serde_json::json!({})),
+    )
 }
 
 pub fn load_setting(key: &str) -> Option<String> {
@@ -1264,6 +1367,27 @@ mod tests {
             err.contains("empty directory") && err.contains("deleted"),
             "does not say what to do (that it's safe to delete): {err}"
         );
+    }
+
+    /// **DECRQM のマウスモード照会は X10(9) と通常(1000) を区別する。**
+    /// X10 有効中に 1000 を「有効」と答えると、応答を信じた子は
+    /// X10 では送られないボタン解放（release）を待ち続ける
+    #[test]
+    fn decrqm_distinguishes_x10_from_normal_mouse_mode() {
+        let mut parser = new_parser(24, 80, 0);
+        parser.process(b"\x1b[?9h\x1b[?9$p\x1b[?1000$p");
+        let reply = String::from_utf8(parser.callbacks_mut().take()).unwrap();
+        assert!(reply.contains("\x1b[?9;1$y"), "X10 not reported as set: {reply:?}");
+        assert!(
+            reply.contains("\x1b[?1000;2$y"),
+            "mode 1000 reported as set while only X10 is: {reply:?}"
+        );
+
+        // 通常モード（1000）を有効化した子には従来どおり「有効」と答える
+        let mut parser = new_parser(24, 80, 0);
+        parser.process(b"\x1b[?1000h\x1b[?1000$p");
+        let reply = String::from_utf8(parser.callbacks_mut().take()).unwrap();
+        assert!(reply.contains("\x1b[?1000;1$y"), "mode 1000 not reported as set: {reply:?}");
     }
 
     /// フォルダの同一判定。**大小と末尾の区切りは無視する**（登録リスト・claude が記録した

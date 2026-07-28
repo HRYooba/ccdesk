@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
-use ccdesk::{new_parser, now_ms, Parser};
+use ccdesk::{new_parser, now_ms, LockExt, Parser};
 
 // 継承させない環境変数の一覧は claude の非公開な形なので
 // [`crate::claude_format`] が持つ（外れたときに直す場所を 1 つにするため）
@@ -197,15 +197,6 @@ pub(crate) enum Launch<'a> {
     Resume,
 }
 
-/// 出力ヒューリスティックの判定結果（agents --json に居ないときのフォールバック専用。
-/// 表示への変換は classify() が一元的に行う）
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum SessionStatus {
-    Working,
-    NeedsInput,
-    Exited,
-}
-
 /// 起こす claude のコマンドライン。**PTY を開かずに組める形にしてある**ので、
 /// 引数と環境変数の除去をテストで固定できる（どちらも失敗が静かに効く:
 /// 引数を間違えれば起動が落ち、除去を落とせば transcript が保存されない）
@@ -276,8 +267,7 @@ impl Session {
         {
             let (fg, bg) = HOST_COLORS.get().copied().unwrap_or((None, None));
             let mut p = parser
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_recover();
             p.callbacks_mut().host_fg = fg;
             p.callbacks_mut().host_bg = bg;
         }
@@ -306,8 +296,7 @@ impl Session {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         *last_output_clone
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            .lock_recover() =
                             std::time::Instant::now();
                         dirty_clone.store(true, Ordering::Relaxed);
                         started_clone.store(true, Ordering::Relaxed);
@@ -323,8 +312,7 @@ impl Session {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             || {
                                 let mut parser = parser_clone
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    .lock_recover();
                                 parser.process(&buf[..n]);
                                 parser.callbacks_mut().take()
                             },
@@ -333,16 +321,14 @@ impl Session {
                             Ok(response) => {
                                 if !response.is_empty() {
                                     let mut writer = writer_clone
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        .lock_recover();
                                     let _ = writer.write_all(&response);
                                     let _ = writer.flush();
                                 }
                             }
                             Err(_) => {
                                 let mut guard = parser_clone
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    .lock_recover();
                                 // 端末モードを退避してから作り直す（claude は画面は再描画するが
                                 // モード再送はしないため、失うとマウス・ペースト等が死ぬ）
                                 let (rows, cols) = guard.screen().size();
@@ -425,8 +411,7 @@ impl Session {
     pub(crate) fn holds_frame(&self, since_draw: Duration) -> bool {
         let since_output = self
             .last_output
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .elapsed();
         hold_frame(
             self.updating.load(Ordering::Relaxed),
@@ -435,33 +420,36 @@ impl Session {
         )
     }
 
+    /// PTY へバイト列を書く。**この窓への書き込み（キー・貼り付け・マウス・
+    /// フォーカス通知）はすべてここを通す**: 書き方（lock → write → flush）と
+    /// 失敗の報告を 1 箇所に保つ。失敗をどう扱うかは呼び手が決める
+    /// （キー入力は窓を閉じる、フォーカス通知やマウスは落としてよい）
+    pub(crate) fn send(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut writer = self.writer.lock_recover();
+        writer.write_all(bytes)?;
+        writer.flush()
+    }
+
     /// フォーカス変化を PTY へ通知する（DECSET 1004 を有効化した子にだけ送る）
     pub(crate) fn send_focus(&mut self, gained: bool) {
         let wants_focus = self
             .parser
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .callbacks()
             .focus_reporting;
         if !wants_focus {
             return;
         }
-        let seq: &[u8] = if gained { b"\x1b[I" } else { b"\x1b[O" };
-        let mut writer = self.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = writer.write_all(seq);
-        let _ = writer.flush();
+        // 通知の取りこぼしは害が小さい（次のフォーカス変化で上書きされる）
+        let _ = self.send(if gained { b"\x1b[I" } else { b"\x1b[O" });
     }
 
-    /// 出力変化ヒューリスティックによるステータス判定（registry に居ないときのフォールバック）
-    pub(crate) fn status_heuristic(&mut self) -> SessionStatus {
-        if !self.alive() {
-            return SessionStatus::Exited;
-        }
-        if self.last_output.lock().unwrap_or_else(std::sync::PoisonError::into_inner).elapsed() < Duration::from_secs(2) {
-            SessionStatus::Working
-        } else {
-            SessionStatus::NeedsInput
-        }
+    /// 出力変化ヒューリスティック: 直近 2 秒に出力があれば「動いているらしい」
+    /// （hook も `agents --json` の status も無い行の最後の手段）。
+    /// **生死は見ない**: 生死の観測（try_wait）は呼び手が別に持っていて、
+    /// ここでも呼ぶと同じ syscall が 1 フレームに 2 回走る
+    pub(crate) fn looks_busy(&self) -> bool {
+        self.last_output.lock_recover().elapsed() < Duration::from_secs(2)
     }
 
 
@@ -476,7 +464,7 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         });
-        self.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner).screen_mut().set_size(rows, cols);
+        self.parser.lock_recover().screen_mut().set_size(rows, cols);
     }
 
     pub(crate) fn alive(&mut self) -> bool {

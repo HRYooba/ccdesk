@@ -14,10 +14,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use ccdesk::{
-    load_setting, load_state, load_state_list, same_dir, save_setting, save_state,
-    update_state_list,
-};
+use ccdesk::{same_dir, save_setting, save_state, update_state_list, LockExt};
 
 use crate::hooks::HookStates;
 use crate::poll::{
@@ -96,12 +93,18 @@ pub(crate) struct WindowState {
     pub(crate) projects: Vec<String>,
 }
 
+/// 「復元するセッションは無い ＝ new session 画面」を表す `last_view` の保存表記。
+/// UUID と衝突しない値なら何でもよい。**符号化・復号ともこのファイルの中だけ**で
+/// 使う（外は [`WindowItem::LastView`] の `Option` で意図を表す）
+const LAST_VIEW_NEW: &str = "new";
+
 /// 永続化するウィンドウ状態の 1 項目。
 /// live は state.json / config.json へ書き、demo は捨てる
 /// （撮影が開発者の設定を書き換えないため）。
 /// 項目を増やすと live 側の match が非網羅になるので、保存先の指定漏れは起きない
 pub(crate) enum WindowItem<'a> {
-    LastView(&'a str),
+    /// 次回起動で開く画面。None = new session 画面（保存表記は [`LAST_VIEW_NEW`]）
+    LastView(Option<&'a SessionId>),
     SidebarWidth(u16),
     LastFolder(&'a str),
     Grouping(Grouping),
@@ -343,19 +346,12 @@ impl LiveSource {
         usage_dirty: Arc<std::sync::atomic::AtomicBool>,
         usage_fetching: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
-        // 前回の異常終了が残した書きかけの `.tmp` を回収する。実データ側だけで
-        // 行う ＝ 撮影（[`DemoSource`]）は実ファイルに触らない、という約束を
-        // 「今 demo か」の分岐を足さずに守れる置き場所
-        ccdesk::reap_leftover_kv_tmp();
+        // 前回の異常終了が残した書きかけの `.tmp`（ウィンドウ状態・設定・
+        // セッション一覧・hook の受け渡し）を 1 回の走査でまとめて回収する。
+        // 実データ側だけで行う ＝ 撮影（[`DemoSource`]）は実ファイルに触らない、
+        // という約束を「今 demo か」の分岐を足さずに守れる置き場所
+        ccdesk::reap_startup_leftovers();
         let sessions = SessionStore::detect();
-        // セッション一覧の tmp も同じ理由で回収する（中身はトークンではないが、
-        // rename の前に死んだ分は誰にも消されずに積もる）
-        if let Some(store) = &sessions {
-            store.cleanup_leftover_tmp();
-        }
-        // hook の受け渡しファイルも同じ理由（書き手は短命な hook プロセスなので、
-        // rename の前に殺されると tmp が残る）
-        crate::hooks::cleanup_leftover_tmp();
         // **opt-in の分岐はここ 1 箇所。** off なら取得スレッドを起こさない
         let usage = usage_display.then(|| {
             let slot: UsageSlot = Arc::new(Mutex::new(Usage::default()));
@@ -411,8 +407,7 @@ impl DataSource for LiveSource {
     fn usage(&self) -> Usage {
         // opt-in していなければスロットが無い ＝ 取得もしないし何も描かない
         self.usage.as_ref().map_or(Usage::Unknown, |(slot, _)| {
-            slot.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            slot.lock_recover()
                 .clone()
         })
     }
@@ -430,6 +425,10 @@ impl DataSource for LiveSource {
     }
 
     fn window_state(&self) -> WindowState {
+        // 起動列なので state.json / config.json は 1 度だけ読む
+        // （キーごとの単発読みだと同じファイルを 5 回読み直す）
+        let state = ccdesk::state_snapshot();
+        let settings = ccdesk::settings_snapshot();
         // **存在しないディレクトリも落とさない**（dispatch_cwd の is_dir と対照的）:
         // リムーバブルドライブ・ネットワークドライブ・未マウントの作業領域は
         // 「今この瞬間見えない」だけで、消えたわけではない。ここで黙って隠すと
@@ -437,50 +436,50 @@ impl DataSource for LiveSource {
         // 登録を外す操作（remove project）も出せなくなる。
         // 見えないフォルダで new session を選んだ場合は claude の起動が
         // 失敗して下部バーに出るので、間違いは操作した時点で伝わる
-        let projects = load_state_list("projects");
+        let projects = state.list("projects");
         // **読んだ内容が以降の書き込みでマージする基準になる**（[`merge_projects`]）
-        *self
-            .projects_baseline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = projects.clone();
+        *self.projects_baseline.lock_recover() = projects.clone();
         WindowState {
             // 旧版は config.json に保存していたため、state.json に無ければそちらへフォールバック
-            sidebar_width: load_state("sidebar_width")
-                .or_else(|| load_setting("sidebar_width"))
+            sidebar_width: state
+                .string("sidebar_width")
+                .or_else(|| settings.string("sidebar_width"))
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_SIDEBAR_WIDTH),
-            // "new" は new session 画面を意味する保存値（＝復元するセッションは無い）
-            last_view: load_state("last_view").filter(|view| view != "new"),
+            // LAST_VIEW_NEW は new session 画面を意味する保存値（＝復元するセッションは無い）
+            last_view: state.string("last_view").filter(|view| view != LAST_VIEW_NEW),
             // 前回使ったフォルダを復元（無ければ起動ディレクトリ）
-            dispatch_cwd: load_state("last_folder")
+            dispatch_cwd: state
+                .string("last_folder")
                 .filter(|p| std::path::Path::new(p).is_dir())
                 .unwrap_or_else(|| {
                     std::env::current_dir()
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_default()
                 }),
-            // デフォルトは公式 Agent View と同じ State 別グルーピング
-            grouping: match load_setting("grouping").as_deref() {
-                Some("directory") => Grouping::Directory,
-                _ => Grouping::State,
-            },
+            // デフォルトは公式 Agent View と同じ State 別グルーピング。
+            // 綴りの正本は [`Grouping::as_str`]
+            grouping: settings
+                .string("grouping")
+                .as_deref()
+                .map(Grouping::parse)
+                .unwrap_or(Grouping::State),
             projects,
         }
     }
 
     fn save_window(&self, item: WindowItem<'_>) {
         match item {
-            WindowItem::LastView(view) => save_state("last_view", view),
+            // 「セッションではなく new session 画面」の符号化はこの match と
+            // 復号（[`Self::window_state`]）の 2 箇所 ＝ このファイルに閉じる
+            WindowItem::LastView(view) => save_state(
+                "last_view",
+                view.map_or(LAST_VIEW_NEW, SessionId::as_str),
+            ),
             WindowItem::SidebarWidth(width) => save_state("sidebar_width", &width.to_string()),
             WindowItem::LastFolder(cwd) => save_state("last_folder", cwd),
             // グルーピングだけはユーザー設定なので config.json 側
-            WindowItem::Grouping(grouping) => save_setting(
-                "grouping",
-                match grouping {
-                    Grouping::Directory => "directory",
-                    Grouping::State => "state",
-                },
-            ),
+            WindowItem::Grouping(grouping) => save_setting("grouping", grouping.as_str()),
         }
     }
 
@@ -502,8 +501,7 @@ impl DataSource for LiveSource {
     fn store_projects(&self, next: &[String]) -> Vec<String> {
         let mut baseline = self
             .projects_baseline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_recover();
         persist_projects(&mut baseline, next, |merge| {
             update_state_list("projects", merge)
         })
@@ -683,10 +681,7 @@ fn demo_footer() -> FooterInfo {
 /// いつ撮っても同じ見た目（残り時間の相対値）になる。
 /// `fetched_at` も今にしておく ＝ 撮影で dim（古い表示）にならない
 fn demo_usage() -> UsageInfo {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = ccdesk::now_secs();
     let window = |pct: f64, resets_at: u64| UsageWindow {
         pct,
         resets_at: Some(resets_at),
@@ -710,6 +705,7 @@ fn demo_usage() -> UsageInfo {
 mod tests {
     use super::*;
     use crate::poll::classify;
+    use ccdesk::{load_state, load_state_list};
 
     /// 撮影データは固定。実セッション・実アカウント・実使用率が混ざらないことを、
     /// 中身そのもので固定する（描画側はこの値をそのまま出す）
@@ -733,11 +729,7 @@ mod tests {
         assert_eq!(usage.seven.as_ref().map(|w| w.pct), Some(58.0));
         assert_eq!(usage.models, vec![("Fable".to_string(), UsageWindow { pct: 12.0, resets_at: None })]);
         // 撮影データは常に「今」取れたことにする（dim で撮れてしまわない）
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        assert!(!usage.is_stale(now));
+        assert!(!usage.is_stale(ccdesk::now_secs()));
     }
 
     /// 撮影用のセッション行は固定。実 ID・実パスは出さず、未読も出さない
@@ -1017,8 +1009,9 @@ mod tests {
     #[test]
     fn demo_does_not_persist_window_state() {
         let view = write_sentinel("view");
+        let view_id = SessionId::new(view.clone());
         let folder = write_sentinel("folder");
-        DemoSource.save_window(WindowItem::LastView(&view));
+        DemoSource.save_window(WindowItem::LastView(Some(&view_id)));
         DemoSource.save_window(WindowItem::LastFolder(&folder));
         assert_ne!(
             load_state("last_view").as_deref(),

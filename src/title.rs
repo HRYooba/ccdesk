@@ -47,8 +47,13 @@ use crate::claude_format::{
 use crate::git::worktrees_of;
 use crate::sessions::{SessionId, SessionRow};
 
-/// 行に出す表示名の桁数。**名前の長さの正本はここ 1 箇所**
-pub(crate) const TITLE_LEN: usize = 30;
+/// 畳んだ名前として**保持する**文字数の上限。
+///
+/// **表示の切り詰めはここではなく ui が表示幅で行う**（サイドバーの行は幅の
+/// 予算で、ペインの見出しは枠で切れる）。ここで短く切ると、サイドバーを
+/// 広げても名前がそこで止まる ＝ 「どこで切れたか」の原因が 2 ファイルに割れる。
+/// 上限を持つのは、`lastPrompt`（打った文字そのもの）を丸ごと保持しないため
+const TITLE_MAX_CHARS: usize = 120;
 
 /// transcript から何も拾えないセッションの表示名。**起こしただけで 1 ターンも
 /// 終わっていない行と、材料が本当に無い行が同じ名前になる**のは仕様
@@ -63,7 +68,7 @@ pub(crate) const UNTITLED: &str = "new session";
 const TAIL_BYTES: u64 = 64 * 1024;
 
 /// 候補が transcript の**どこに現れるか**。走査の範囲はこの性質から機械的に決まる
-/// （[`first_scan_from`] / [`Titles::refresh`]）ので、候補と範囲の対応表を別に持たない。
+/// （[`Titles::refresh`]）ので、候補と範囲の対応表を別に持たない。
 ///
 /// **この区別を落とすと実害が出る**: `custom-title` を末尾 64 KiB だけで探していた
 /// 頃は、長い会話の早い段階でリネームした記録が範囲の外に出て拾えず、
@@ -88,18 +93,25 @@ const CANDIDATES: [(crate::claude_format::Record, Span); 3] = [
 /// 走査 1 回で見つかった候補（[`CANDIDATES`] と同じ並び）
 type Found = [Option<String>; CANDIDATES.len()];
 
-/// **初回にファイルのどこから読むか。** [`CANDIDATES`] の性質から導く:
-/// どこに現れるか分からない候補が 1 つでもあれば先頭から、全部が追記型なら末尾だけ
-fn first_scan_from(len: u64) -> u64 {
-    if CANDIDATES.iter().any(|(_, span)| *span == Span::Rare) {
-        0
-    } else {
-        len.saturating_sub(TAIL_BYTES)
-    }
+/// [`Span::Rare`] の候補にまだ答えが無いか（＝ 先頭側の走査を続ける理由があるか）
+fn rare_missing(found: &Found) -> bool {
+    CANDIDATES
+        .iter()
+        .enumerate()
+        .any(|(i, (_, span))| *span == Span::Rare && found[i].is_none())
 }
 
+/// [`Titles::refresh`] が 1 周期（一覧の読み直し 1 回）に読んでよいバイト数。
+///
+/// **初回の先頭側スキャン（[`Span::Rare`] ＝ リネーム記録の探索）を数周期に
+/// 分けるための予算。** 予算なしで全量を読んでいた頃は、最初の描画の前に
+/// 全セッションの transcript（数百 MB になり得る）を UI スレッドで読み切り、
+/// 起動が数秒〜数十秒固まった。末尾（[`TAIL_BYTES`]）は予算内で必ず読むので、
+/// 追記型の候補（ai-title / last-prompt）による名前は最初の周期から出る
+pub(crate) const SCAN_BUDGET: u64 = 4 * 1024 * 1024;
+
 /// 表示名として使える 1 行へ整える。改行・連続空白は 1 つの空白へ畳み、
-/// [`TITLE_LEN`] 文字で切る。
+/// [`TITLE_MAX_CHARS`] 文字で切る。
 ///
 /// **サイドバーは 1 行**なので、改行や制御文字をそのまま入れると行が崩れる
 /// （transcript の値はユーザーが打った文字そのもの）
@@ -112,14 +124,14 @@ pub(crate) fn title_text(raw: &str) -> String {
             gap = len > 0; // 先頭の空白は落とす（末尾の空白は詰めた時点で消える）
             continue;
         }
-        if len >= TITLE_LEN {
+        if len >= TITLE_MAX_CHARS {
             break;
         }
         if gap {
             out.push(' ');
             len += 1;
             gap = false;
-            if len >= TITLE_LEN {
+            if len >= TITLE_MAX_CHARS {
                 break;
             }
         }
@@ -143,18 +155,14 @@ fn read_from(path: &Path, from: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// `want` バイト目以前で一番後ろの行の切れ目（先頭からの位置）。
-/// 走査の範囲を行の途中で割らないための計算で、`\n` の位置しか見ないので
-/// UTF-8 の境界を踏み外さない
-fn line_boundary_before(text: &str, want: usize) -> usize {
-    let mut at = 0;
-    for (index, _) in text.match_indices('\n') {
-        if index + 1 > want {
-            break;
-        }
-        at = index + 1;
-    }
-    at
+/// ファイルの `from` バイト目から `len` バイトだけを文字列で読む
+/// （先頭側スキャンの塊読み用。lossy の理由は [`read_from`] と同じ）
+fn read_range(path: &Path, from: u64, len: u64) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut buf = vec![0u8; len as usize];
+    file.read_exact(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// 範囲 `text` を走査して候補を拾う。`spans` に載る性質の候補だけを見るので、
@@ -222,6 +230,10 @@ struct Scan {
     found: Found,
     /// どのファイルを読んでいたか（解決し直されたら走査もやり直す）
     path: PathBuf,
+    /// 初回に読み残した先頭側の範囲（[`Span::Rare`] ＝ リネーム記録の探索）。
+    /// 予算（[`SCAN_BUDGET`]）の範囲で**末尾側からさかのぼって**消化する
+    /// （[`Titles::drain_head`]）。None ＝ 読み残し無し
+    head_pending: Option<std::ops::Range<u64>>,
 }
 
 /// transcript が前回から変わったかの判定材料（長さ・更新時刻）
@@ -281,24 +293,31 @@ impl Titles {
     ///
     /// **行を書き換えるのは `transcript` だけ**（解決した場所の記録）。表示名も
     /// `updated_at` も触らないので、**名前が変わっても行の経過時間は動かない**。
+    /// **戻り値は「transcript の記録を書き換えたか」**（呼び手が保存の要否に使う）。
     ///
-    /// 読む範囲の決め方は 2 段:
+    /// 読む範囲の決め方は 3 段:
     ///
-    /// - **初回**は [`first_scan_from`]（＝ [`CANDIDATES`] の性質）が決める。
-    ///   先頭側ではどこに現れるか分からない候補（[`Span::Rare`]）だけを探し、末尾
-    ///   [`TAIL_BYTES`] では全部を探す ＝ 追記型の候補を先頭側でパースしない
+    /// - **初回**は末尾 [`TAIL_BYTES`] だけを全候補で走査する ＝ 追記型の候補
+    ///   （ai-title / last-prompt）による名前は最初の周期から出る
+    /// - 先頭側は [`Span::Rare`]（リネーム記録）の探索として読み残し
+    ///   （`head_pending`）、**予算の範囲で数周期に分けて**消化する
+    ///   （[`Self::drain_head`]。予算の理由は [`SCAN_BUDGET`]）
     /// - **2 回目以降**は増えたぶんだけを全候補で走査する。transcript は追記しか
-    ///   されないので、これで初回と同じ答えが保たれる（`/resume` のピッカーと同じ）
-    pub(crate) fn refresh(&mut self, row: &mut SessionRow) {
-        // 解決できない ＝ 読む対象が消えた。**拾った値も一緒に落とす**
+    ///   されないので、これで全量を読んだのと同じ答えが保たれる
+    pub(crate) fn refresh(&mut self, row: &mut SessionRow, budget: &mut u64) -> bool {
+        let (path, resolved_changed) = self.resolve(row);
+        // 解決できない・消えた ＝ 読む対象が無い。**拾った値も一緒に落とす**
         // （残すと、消えたファイルから拾った名前が行に出続ける ＝ キャッシュが
-        // 状態になってしまう）
-        let Some(path) = self.resolve(row).filter(|path| path.is_file()) else {
+        // 状態になってしまう）。ここが唯一の stat（resolve の確認と合わせて
+        // 1 周期 2 回。以前は同じファイルを 3 回 stat していた）
+        let Some((path, meta)) = path
+            .and_then(|path| {
+                let meta = std::fs::metadata(&path).ok().filter(|m| m.is_file())?;
+                Some((path, meta))
+            })
+        else {
             self.seen.remove(&row.session_id);
-            return;
-        };
-        let Ok(meta) = std::fs::metadata(&path) else {
-            return;
+            return resolved_changed;
         };
         let stamp = (meta.len(), meta.modified().ok());
         let scan = self.seen.entry(row.session_id.clone()).or_default();
@@ -310,37 +329,93 @@ impl Titles {
                 ..Scan::default()
             };
         }
-        if scan.stamp == Some(stamp) {
-            return;
+        if scan.stamp.is_none() {
+            // 初回: まず末尾だけを読む（予算が尽きていれば次の周期に回す）
+            if *budget > 0 {
+                Self::first_scan(scan, meta.len(), stamp, budget);
+            }
+        } else if scan.stamp != Some(stamp) {
+            // 追記ぶんの読み直し（常に行の切れ目 = scanned から始まる）
+            if let Some(text) = read_from(&scan.path, scan.scanned) {
+                *budget = budget.saturating_sub(text.len() as u64);
+                // 走査するのは行が完結している範囲まで（書きかけの最終行は次回に回す）
+                let complete = text.rfind('\n').map_or(0, |at| at + 1);
+                scan_into(&text[..complete], &EVERY_SPAN, &mut scan.found);
+                scan.stamp = Some(stamp);
+                scan.scanned += complete as u64;
+            }
         }
-        let first = scan.stamp.is_none();
-        let from = if first {
-            first_scan_from(meta.len())
-        } else {
-            scan.scanned
-        };
-        let Some(mut text) = read_from(&path, from) else {
+        Self::drain_head(scan, budget);
+        resolved_changed
+    }
+
+    /// 初回の走査: 末尾 [`TAIL_BYTES`] を全候補で読み、先頭側を読み残しとして記録する
+    fn first_scan(scan: &mut Scan, len: u64, stamp: Stamp, budget: &mut u64) {
+        let from = len.saturating_sub(TAIL_BYTES);
+        let Some(mut text) = read_from(&scan.path, from) else {
             return;
         };
+        *budget = budget.saturating_sub(text.len() as u64);
         let mut start = from;
-        // 行の途中から読んだ初回だけ、壊れた先頭行を落とす
-        // （追記ぶんの読み直しは常に行の切れ目から始まる）
-        if first && from > 0 {
+        // 行の途中から読んだときだけ、壊れた先頭行を落とす（その行は先頭側の
+        // 読み残しに含まれるので、取りこぼしにはならない）
+        if from > 0 {
             let at = text.find('\n').map_or(text.len(), |at| at + 1);
             text = text.split_off(at);
             start += at as u64;
         }
-        // 走査するのは行が完結している範囲まで（書きかけの最終行は次回に回す）
         let complete = text.rfind('\n').map_or(0, |at| at + 1);
-        let text = &text[..complete];
+        scan_into(&text[..complete], &EVERY_SPAN, &mut scan.found);
         scan.stamp = Some(stamp);
         scan.scanned = start + complete as u64;
-        if first {
-            let split = line_boundary_before(text, text.len().saturating_sub(TAIL_BYTES as usize));
-            scan_into(&text[..split], &[Span::Rare], &mut scan.found);
-            scan_into(&text[split..], &EVERY_SPAN, &mut scan.found);
-        } else {
-            scan_into(text, &EVERY_SPAN, &mut scan.found);
+        scan.head_pending = (start > 0).then_some(0..start);
+    }
+
+    /// 先頭側の読み残し（[`Span::Rare`] の探索）を、予算の範囲で**末尾側から
+    /// さかのぼって**消化する。
+    ///
+    /// Rare の答えは「ファイル中で最後に現れた値」なので、末尾に近い塊から読めば
+    /// **最初に見つかった値が答え**になり、見つかった時点で残りは読まずに済む
+    /// （末尾スキャンで既に見つかっていれば先頭側は 1 バイトも読まない）
+    fn drain_head(scan: &mut Scan, budget: &mut u64) {
+        while let Some(range) = scan.head_pending.clone() {
+            if range.is_empty() || !rare_missing(&scan.found) {
+                scan.head_pending = None;
+                return;
+            }
+            if *budget == 0 {
+                return; // 続きは次の周期（予算は呼び手が配る）
+            }
+            let take = (*budget).min(range.end - range.start);
+            let from = range.end - take;
+            let Some(text) = read_range(&scan.path, from, take) else {
+                // 読めない（消えた・置き換わった）。次の周期の解決やり直しに任せる
+                scan.head_pending = None;
+                return;
+            };
+            *budget = budget.saturating_sub(text.len() as u64);
+            // 塊の先頭が行の途中なら、その行は次（さらに前）の塊が読む
+            let skip = if from > range.start {
+                text.find('\n').map_or(text.len(), |at| at + 1)
+            } else {
+                0
+            };
+            let mut fresh = Found::default();
+            scan_into(&text[skip..], &[Span::Rare], &mut fresh);
+            for (i, (_, span)) in CANDIDATES.iter().enumerate() {
+                // 既にある値（末尾側 ＝ より新しい塊で見つけたもの）は上書きしない
+                if *span == Span::Rare && scan.found[i].is_none() {
+                    scan.found[i] = fresh[i].take();
+                }
+            }
+            let new_end = if skip == text.len() && from > range.start {
+                // 塊の中に行の切れ目が無い（予算より長い 1 行）。その行の走査は
+                // 諦めて先へ進む（リネーム記録は短い行なので実害は無い）
+                from
+            } else {
+                from + skip as u64
+            };
+            scan.head_pending = (range.start < new_end).then_some(range.start..new_end);
         }
     }
 
@@ -377,11 +452,15 @@ impl Titles {
     /// `~/.claude/projects` の全走査はしない（実機で 67 ディレクトリある）。
     /// 見つからなければ記録も残さない ＝ 1 ターン終わって transcript ができた
     /// 時点で次の周期が拾う
-    fn resolve(&self, row: &mut SessionRow) -> Option<PathBuf> {
+    /// 戻り値の bool は「行の `transcript` 記録を書き換えたか」（呼び手が
+    /// 保存の要否に使う ＝ 変化検出のためだけの clone を呼び手に持たせない）
+    fn resolve(&self, row: &mut SessionRow) -> (Option<PathBuf>, bool) {
         if row.transcript.as_ref().is_some_and(|p| p.is_file()) {
-            return row.transcript.clone();
+            return (row.transcript.clone(), false);
         }
-        let projects = self.projects.as_ref()?;
+        let Some(projects) = self.projects.as_ref() else {
+            return (None, false);
+        };
         let file = transcript_file_name(row.session_id.as_str());
         let at = |cwd: &str| {
             let path = projects.join(project_dir_name(cwd)).join(&file);
@@ -393,8 +472,9 @@ impl Titles {
                 .find_map(|tree| at(&tree.display().to_string()))
         });
         // 見つからなかったときは記録を消す（消えた worktree の記録を残さない）
+        let changed = row.transcript != found;
         row.transcript = found.clone();
-        found
+        (found, changed)
     }
 }
 
@@ -427,9 +507,12 @@ impl Titles {
     }
 
     /// テスト用: 解決 + 走査 + 引き当てを 1 度に通す（本番は
-    /// [`Self::refresh`] が周期で、[`Self::of`] が描画で走る）
+    /// [`Self::refresh`] が周期で、[`Self::of`] が描画で走る）。
+    /// 予算は無制限 ＝ 1 回で読み切る（予算の分割そのものを見るテストは
+    /// 予算を明示して [`Self::refresh`] を直接呼ぶ）
     pub(crate) fn title_now(&mut self, row: &mut SessionRow) -> String {
-        self.refresh(row);
+        let mut budget = u64::MAX;
+        self.refresh(row, &mut budget);
         self.of(row)
     }
 }
@@ -455,30 +538,16 @@ pub(crate) mod tests {
     /// **実ユーザーの transcript を絶対に触らない**ための境界で、Drop で丸ごと消す。
     /// [`crate::app`] のテスト（起こし直し方の判断）も同じ道具を使う ＝
     /// transcript を作る手順を 2 通り持たない
-    pub(crate) struct TempProjects(PathBuf);
+    pub(crate) struct TempProjects(crate::testutil::TempDir);
 
     impl TempProjects {
         pub(crate) fn new(test: &str) -> Self {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static SEQ: AtomicUsize = AtomicUsize::new(0);
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "ccdesk-projects-{test}-{}-{seq}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&root).expect("mkdir failed");
-            Self(root)
+            Self(crate::testutil::TempDir::new("projects", test))
         }
 
         /// その置き場を見る [`Titles`]
         pub(crate) fn titles(&self) -> Titles {
-            Titles::with_projects(self.0.clone())
-        }
-    }
-
-    impl Drop for TempProjects {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            Titles::with_projects(self.0.path().to_path_buf())
         }
     }
 
@@ -488,25 +557,28 @@ pub(crate) mod tests {
     ///
     /// 実例: 行の cwd が `…\claude-kaizen` なのに transcript は
     /// `projects/C--Users-admin-Documents-Work-claude-kaizen--claude-worktrees-fix-kaizen-window-and-design/`
-    /// に在った（セッションが `EnterWorktree` で移った）
-    struct TempRepo(PathBuf);
+    /// に在った（セッションが `EnterWorktree` で移った）。
+    /// **[`crate::git`] のテストも同じ fixture を使う**（git のレイアウト解釈を
+    /// 直すとき、追随すべき fixture が 2 つあると片方だけ古い形のまま通る）
+    pub(crate) struct TempRepo(crate::testutil::TempDir);
 
     impl TempRepo {
-        fn new(test: &str) -> Self {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static SEQ: AtomicUsize = AtomicUsize::new(0);
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir()
-                .join(format!("ccdesk-repo-{test}-{}-{seq}", std::process::id()));
-            std::fs::create_dir_all(root.join(".git")).expect("mkdir failed");
-            Self(root)
+        pub(crate) fn new(test: &str) -> Self {
+            let dir = crate::testutil::TempDir::new("repo", test);
+            std::fs::create_dir_all(dir.join(".git")).expect("mkdir failed");
+            Self(dir)
+        }
+
+        /// 主ツリーのパス（git 側のテストが一覧と突き合わせる）
+        pub(crate) fn root(&self) -> &Path {
+            self.0.path()
         }
 
         fn cwd(&self) -> String {
-            self.0.display().to_string()
+            self.root().display().to_string()
         }
 
-        fn add_worktree(&self, name: &str) -> String {
+        pub(crate) fn add_worktree(&self, name: &str) -> String {
             let tree = self.0.join(".claude").join("worktrees").join(name);
             std::fs::create_dir_all(&tree).expect("mkdir failed");
             let admin = self.0.join(".git").join("worktrees").join(name);
@@ -530,11 +602,6 @@ pub(crate) mod tests {
         }
     }
 
-    impl Drop for TempRepo {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     /// テスト用の行（cwd は transcript のディレクトリ名を決める材料）
     fn row(id: &str) -> SessionRow {
@@ -569,12 +636,12 @@ pub(crate) mod tests {
         let custom = line("custom-title", "customTitle", "named early on");
         let prompt = line("last-prompt", "lastPrompt", "a later prompt");
         // 追記を重ねて、増分走査の状態を積む
-        titles_write(&warm, &row, &format!("{custom}\n"));
+        warm.write_transcript(&row, &format!("{custom}\n"));
         assert_eq!(warm.title_now(&mut row), "named early on");
-        titles_write(&warm, &row, &format!("{custom}\n{prompt}\n"));
+        warm.write_transcript(&row, &format!("{custom}\n{prompt}\n"));
         assert_eq!(warm.title_now(&mut row), "named early on");
         let ai = line("ai-title", "aiTitle", "a generated name");
-        titles_write(&warm, &row, &format!("{custom}\n{prompt}\n{ai}\n"));
+        warm.write_transcript(&row, &format!("{custom}\n{prompt}\n{ai}\n"));
         let warm_answer = warm.title_now(&mut row);
 
         // キャッシュを丸ごと捨てて解決からやり直す
@@ -670,7 +737,8 @@ pub(crate) mod tests {
         // 探索の材料（作業ツリーの台帳）を消しても、記録が生きているので影響しない
         repo.remove_worktree("fix+two");
         assert!(row.transcript.as_ref().unwrap().is_file(), "the premise broke");
-        titles.refresh(&mut row);
+        let mut budget = u64::MAX;
+        titles.refresh(&mut row, &mut budget);
         assert_eq!(titles.of(&row), "resolved once", "resolved again despite a live record");
         assert!(row.transcript.is_some());
     }
@@ -690,7 +758,7 @@ pub(crate) mod tests {
         titles.write_transcript(&row, &body);
         let path = temp
             .0
-            .join(project_dir_name(&row.cwd))
+            .join(&project_dir_name(&row.cwd))
             .join(transcript_file_name(row.session_id.as_str()));
 
         assert_eq!(titles.title_now(&mut row), "a name");
@@ -699,7 +767,7 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), body, "the transcript changed");
     }
 
-    /// 表示名は 1 行に畳んで [`TITLE_LEN`] 文字で切る
+    /// 表示名は 1 行に畳んで [`TITLE_MAX_CHARS`] 文字で切る
     /// （改行入りのプロンプトがそのまま行に入るとサイドバーが崩れる）
     #[test]
     fn a_title_is_folded_into_one_line_and_cut_to_the_display_width() {
@@ -707,16 +775,16 @@ pub(crate) mod tests {
         assert_eq!(title_text(""), "");
         assert_eq!(title_text(" \n\t "), "");
         // ちょうど / 超過。切るのは文字数（バイト数ではない）
-        let exact = "a".repeat(TITLE_LEN);
+        let exact = "a".repeat(TITLE_MAX_CHARS);
         assert_eq!(title_text(&exact), exact);
-        assert_eq!(title_text(&"a".repeat(TITLE_LEN + 10)).chars().count(), TITLE_LEN);
+        assert_eq!(title_text(&"a".repeat(TITLE_MAX_CHARS + 10)).chars().count(), TITLE_MAX_CHARS);
         // 日本語ではなく全角ラテンを使う（マルチバイト文字であることを検証したいだけで、
         // tests/no_japanese_in_code.rs のチェック対象を避けるため）
-        assert_eq!(title_text(&"\u{ff21}".repeat(TITLE_LEN + 10)).chars().count(), TITLE_LEN);
+        assert_eq!(title_text(&"\u{ff21}".repeat(TITLE_MAX_CHARS + 10)).chars().count(), TITLE_MAX_CHARS);
         // 切れ目に空白が来ても、詰めた空白で桁が溢れない
-        let words = "ab ".repeat(TITLE_LEN);
+        let words = "ab ".repeat(TITLE_MAX_CHARS);
         let folded = title_text(&words);
-        assert!(folded.chars().count() <= TITLE_LEN, "width overflowed: {folded:?}");
+        assert!(folded.chars().count() <= TITLE_MAX_CHARS, "width overflowed: {folded:?}");
         assert!(!folded.ends_with(' '), "trailing whitespace remains: {folded:?}");
     }
 
@@ -879,17 +947,36 @@ pub(crate) mod tests {
         assert!(took < std::time::Duration::from_secs(2), "scanning took {took:?}");
     }
 
-    /// 走査の範囲を行の途中で割らない（`\n` の位置だけを見る）
+    /// **初回の先頭側スキャンは予算で数周期に分かれても答えが変わらない。**
+    /// 末尾から遠い位置のリネーム記録は、予算が尽きた周期では拾えず、
+    /// 続きの周期（同じ Titles への次の refresh）で拾える
     #[test]
-    fn the_scan_range_ends_on_a_line_boundary() {
-        let text = "aaa\nbbb\nccc\n";
-        assert_eq!(line_boundary_before(text, 0), 0);
-        assert_eq!(line_boundary_before(text, 4), 4);
-        assert_eq!(line_boundary_before(text, 7), 4);
-        assert_eq!(line_boundary_before(text, 8), 8);
-        assert_eq!(line_boundary_before(text, 999), 12);
-        // 改行が 1 つも無ければ「切れ目は先頭だけ」
-        assert_eq!(line_boundary_before("no newline here", 5), 0);
+    fn the_head_scan_spreads_across_refreshes_within_the_budget() {
+        let temp = TempProjects::new("the_head_scan_spreads_across_refreshes");
+        let mut titles = temp.titles();
+        let mut row = row("55555555-5555-4555-8555-555555555555");
+        // 先頭にリネーム記録、その後ろに末尾窓（TAIL_BYTES）を超える詰め物
+        let filler = format!("{}\n", line("noise", "text", &"x".repeat(200))).repeat(1_000);
+        assert!(filler.len() as u64 > TAIL_BYTES, "the premise broke — filler fits in the tail");
+        titles.write_transcript(
+            &row,
+            &format!("{}\n{filler}", line("custom-title", "customTitle", "named at the top")),
+        );
+
+        // 1 周期目: 予算が末尾ぶんしか無い ＝ 先頭のリネームまで届かない
+        let mut budget = TAIL_BYTES;
+        titles.refresh(&mut row, &mut budget);
+        assert_eq!(titles.of(&row), UNTITLED, "found the rename without reading the head");
+
+        // 2 周期目以降: 読み残しが予算の範囲で消化され、答えが揃う
+        for _ in 0..64 {
+            if titles.of(&row) != UNTITLED {
+                break;
+            }
+            let mut budget = TAIL_BYTES;
+            titles.refresh(&mut row, &mut budget);
+        }
+        assert_eq!(titles.of(&row), "named at the top", "the head scan never finished");
     }
 
     /// 撮影用の固定表は transcript を 1 つも読まずに名前を返す
@@ -903,10 +990,5 @@ pub(crate) mod tests {
         assert_eq!(titles.of(&staged), "a staged name");
         // 表に無い行は既定名（撮影でも実データは 1 つも出さない）
         assert_eq!(titles.of(&row("00000000-0000-4000-8000-000000000000")), UNTITLED);
-    }
-
-    /// テストの書き味を揃えるための小さな別名（本番の経路は通さない）
-    fn titles_write(titles: &Titles, row: &SessionRow, contents: &str) {
-        titles.write_transcript(row, contents);
     }
 }

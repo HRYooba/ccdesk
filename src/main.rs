@@ -22,6 +22,8 @@ mod poll;
 mod session;
 mod sessions;
 mod source;
+#[cfg(test)]
+mod testutil;
 mod theme;
 mod title;
 mod ui;
@@ -116,19 +118,9 @@ fn main() -> anyhow::Result<()> {
     let footer = source.footer();
     let window = source.window_state();
 
-    // ホスト端末の実 fg/bg を OSC 10/11 で照会。
-    // raw mode / alt screen に入る前に行う。非対応端末はヒューリスティックで
-    // 即 Err になるためハングしない（その場合は Dark+ 相当の固定値で claude に応答）
-    {
-        use terminal_colorsaurus::{color_palette, QueryOptions};
-        let host = color_palette(QueryOptions::default())
-            .map(|p| {
-                let c = |c: terminal_colorsaurus::Color| [c.r, c.g, c.b];
-                (Some(c(p.foreground)), Some(c(p.background)))
-            })
-            .unwrap_or((None, None));
-        let _ = HOST_COLORS.set(host);
-    }
+    // ホスト端末の実 fg/bg を OSC 10/11 で照会（raw mode に入る前。
+    // 照会の作法は theme 側の 1 実装 ＝ doctor と同じ経路を通る）
+    let _ = HOST_COLORS.set(theme::query_host_colors());
 
     let mut terminal = ratatui::init();
     // panic は ~/.ccdesk/error.log へ記録（TUI は画面ごと消えて panic 表示が読めない）。
@@ -142,6 +134,16 @@ fn main() -> anyhow::Result<()> {
             std::backtrace::Backtrace::force_capture()
         ));
         if std::thread::current().name() != Some("pty-reader") {
+            // ratatui の復旧 hook は raw mode 解除 + alt screen 離脱**だけ**なので、
+            // main 末尾の正常経路が解除している 3 モードはここでも戻す
+            // （unwind ではあの 3 行に到達しない ＝ 戻さないとクラッシュ後の
+            // シェルにマウスエスケープ列 `<35;12;5M` 等が流れ込み続ける）
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                DisableFocusChange,
+                DisableMouseCapture,
+                DisableBracketedPaste
+            );
             prev_hook(info);
         }
     }));
@@ -204,8 +206,15 @@ fn main() -> anyhow::Result<()> {
         projects: window.projects,
         popup: None,
         focus: Focus::Terminal,
+        spinner_active: false,
         source,
     };
+    // バックグラウンド取得の起動。**起動列の重い処理（埋め戻し・transcript の
+    // 初回読み）より先に起こす**: ポーラーが取りに行くもの（agents --json 約 900ms・
+    // バージョン）は起動列と独立なので、後回しにすると初回のライブ状態と
+    // アカウント行の表示がその分だけ遅れる。撮影用の供給元は 1 本も起こさないので、
+    // ここに `if !demo` は要らない
+    app.source.spawn_pollers(app.poll_sinks());
     // 既にあるセッションのフォルダを登録へ埋め戻す（以前から使っているフォルダの
     // 見出しが、最後のセッションを消した時点で消えないように）。一覧を読んだ後・
     // 画面を組む前のこの位置に置く: 埋め戻しは初回の一覧に効く必要がある
@@ -213,14 +222,12 @@ fn main() -> anyhow::Result<()> {
     // **最初の描画より前に transcript を解決して名前を読む。** 走査の結果を持つのは
     // Titles のキャッシュだけなので、ここで 1 度走らせないと最初の周期（2 秒）まで
     // 全部の行が `new session` に見える。未記録の行の解決し直しも同じ 1 回で済む
+    // （読む量は予算で有界。[`crate::title::SCAN_BUDGET`]）
     app::refresh_transcripts(&mut app);
-    // バックグラウンド取得の起動。撮影用の供給元は 1 本も起こさないので、
-    // ここに `if !demo` は要らない
-    app.source.spawn_pollers(app.poll_sinks());
     // 前回開いていた画面を復元: セッションを見ていたなら `claude -r` で再開、
     // それ以外は new session 画面
     match window.last_view.map(sessions::SessionId::new) {
-        Some(id) if app.sessions.iter().any(|row| row.session_id == id) => {
+        Some(id) if app.row(&id).is_some() => {
             open_session(&mut app, &id);
             if app.windows.is_empty() {
                 app.open_new_view(); // 再開に失敗したときのフォールバック

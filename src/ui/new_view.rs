@@ -1,5 +1,8 @@
 //! 新規セッション画面（フォルダブラウザ + 初回プロンプト入力）。
-use crossterm::event::{KeyCode, KeyEvent};
+//! **入力（キー・マウス・貼り付け）の解釈はすべてこのファイルに置く**:
+//! ヒットテストのジオメトリは [`NewLayout`] と同じ場所でしか変えられない ＝
+//! レイアウトを動かした変更が app 側の比較式に散らばらない
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -9,7 +12,7 @@ use ratatui::Frame;
 use crate::app::{start_new_session, App, RightView};
 use crate::theme::{ui, C_OK, C_WORKING, FOCUS_BORDER, MUTED_FG};
 use crate::ui::text_field::TextField;
-use crate::ui::{pane_fallback_pos, FrameCursor};
+use crate::ui::{border_style, pane_fallback_pos, FrameCursor};
 
 /// New 画面のフォーカス対象フィールド
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -163,44 +166,26 @@ impl NewState {
     /// 実行するのは「利用者が選んだ行を、一覧にフォーカスしたまま再クリックした」
     /// ときだけ。一覧の作り直しで既定へ戻った選択は対象外
     /// （[`NewState::selection_from_rebuild`] 参照）
-    pub(crate) fn click_activates(&self, idx: usize) -> bool {
+    fn click_activates(&self, idx: usize) -> bool {
         self.focus == NewFocus::Browser && self.dir_idx == idx && !self.selection_from_rebuild
     }
 
-    /// Folder フィールドの内容を確定: 存在するディレクトリならそこへ移動して true
-    fn apply_path_input(&mut self) -> bool {
+    /// Folder フィールドの内容を確定: 存在するディレクトリならそこへ移動する。
+    /// 判定は D&D と同じ [`dir_of`]（Enter と貼り付けで開けるものが食い違わない）
+    fn apply_path_input(&mut self) {
         let path = self.path.text.trim().trim_matches('"').to_string();
         if path.is_empty() {
             self.path.set_text(&self.cur_dir.clone());
-            return false;
+            return;
         }
-        let p = std::path::Path::new(&path);
-        let dir = if p.is_dir() {
-            Some(path.clone())
-        } else if p.is_file() {
-            // ファイルを渡されたら親フォルダを使う（D&D でファイルを落とした場合）
-            p.parent().map(|d| d.to_string_lossy().to_string())
-        } else {
-            None
-        };
-        let Some(dir) = dir else { return false };
-        self.set_dir(dir);
-        true
+        if let Some(dir) = dir_of(&path) {
+            self.set_dir(dir);
+        }
     }
 
     /// テキストから実在ディレクトリを取り出す（引用符除去 / ファイルなら親フォルダ /
     /// 既存テキストの途中に D&D パスが挿入されて壊れた場合は末尾のドライブレター以降を救済）
     pub(crate) fn extract_dir(text: &str) -> Option<String> {
-        let dir_of = |s: &str| -> Option<String> {
-            let p = std::path::Path::new(s);
-            if p.is_dir() {
-                Some(s.to_string())
-            } else if p.is_file() {
-                p.parent().map(|d| d.to_string_lossy().to_string())
-            } else {
-                None
-            }
-        };
         let t = text.trim().trim_matches('"').trim_end();
         if let Some(dir) = dir_of(t) {
             return Some(dir);
@@ -211,6 +196,92 @@ impl NewState {
             return None;
         }
         dir_of(t[i - 1..].trim().trim_matches('"'))
+    }
+
+    /// この画面のマウス処理（[`handle_new_view_key`] のマウス版）。
+    /// ヒットテストは描画と同じ [`NewLayout`]。戻り値の [`NewAction::Launch`] は
+    /// 「選択済みの起動ボタンを再クリックした」で、起動の実行（`start_new_session`）は
+    /// App を持つ呼び手が行う
+    pub(crate) fn handle_mouse(&mut self, pane: Rect, mouse: &MouseEvent) -> Option<NewAction> {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let layout = NewLayout::compute(pane);
+                let box_bottom = layout.prompt_box.y + layout.prompt_box.height;
+                if !layout.ok {
+                    // ペインが小さすぎて未描画。フィールド判定はしない
+                } else if mouse.row >= layout.folder_hd_y && mouse.row <= layout.sep_y {
+                    // FOLDER セクション（見出し・パス値・┄ 区切り）クリック → パスフィールド。
+                    // パス値の行ならカーソルも移動、他はカーソル位置維持
+                    self.focus = NewFocus::Path;
+                    if mouse.row == layout.path_y {
+                        let text_x = mouse.column.saturating_sub(layout.path_text_x);
+                        self.path.click(text_x);
+                    }
+                } else if mouse.row >= layout.prompt_hd_y && mouse.row < box_bottom {
+                    // PROMPT セクション（見出し + 入力枠 3 行）クリック → プロンプト欄
+                    self.focus = NewFocus::Prompt;
+                    if mouse.row == layout.input_y {
+                        let text_x = mouse.column.saturating_sub(layout.input_text_x);
+                        self.prompt.click(text_x);
+                    }
+                } else if mouse.row >= layout.list_top
+                    && mouse.row < layout.list_top + layout.list_height
+                {
+                    // フォルダ一覧エリア（空白部分も含む）→ 一覧フォーカス。
+                    // 実在する行の上なら選択も動かし、選択済み行の再クリックで実行する
+                    let row_in = (mouse.row - layout.list_top) as usize;
+                    if row_in < self.shown {
+                        let idx = self.scroll + row_in;
+                        // 起動ボタン行もフォルダ行と同じ 2 段階（選択 → 再クリック）にする。
+                        // 1 クリックで起動すると、プロンプト入力中に一覧へフォーカスを
+                        // 移すだけのクリックが書きかけのプロンプトでセッションを起動して
+                        // しまう（送ったメッセージは取り消せない）。
+                        // 判定はクリックで選択を動かす前に取る（動かした後では
+                        // 常に dir_idx == idx になり 2 段階が崩れる）
+                        let reclick = self.click_activates(idx);
+                        self.select(idx);
+                        self.focus = NewFocus::Browser;
+                        if reclick {
+                            if self.selected_is_launch() {
+                                return Some(NewAction::Launch);
+                            }
+                            self.descend(); // 選択済みを再クリック = 潜る
+                        }
+                    } else {
+                        self.focus = NewFocus::Browser;
+                    }
+                }
+                None
+            }
+            MouseEventKind::ScrollUp => {
+                self.focus = NewFocus::Browser;
+                self.select_prev();
+                None
+            }
+            MouseEventKind::ScrollDown => {
+                self.focus = NewFocus::Browser;
+                self.select_next();
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// この画面の貼り付け / D&D。フォーカス中のフィールドで受ける:
+    /// Folder → フォルダ切替（一覧も更新）/ それ以外 → プロンプトへ挿入
+    /// （パスを最初のメッセージ本文に書きたいケースがあるため）
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        if self.focus == NewFocus::Path {
+            if let Some(dir) = Self::extract_dir(text) {
+                self.set_dir(dir); // パスは丸ごと置き換える
+            } else {
+                self.path.insert_str(text.trim());
+                self.refresh_from_input();
+            }
+        } else {
+            self.prompt.insert_str(text.trim());
+            self.focus = NewFocus::Prompt;
+        }
     }
 
     fn list_entries(dir: &str) -> Vec<BrowseRow> {
@@ -314,6 +385,30 @@ impl NewState {
 /// Browser の Enter は「選択行の実行」なので、フォルダ行では移動になる。
 /// 起動ボタン行の Enter は 1 打鍵で起動する（明示的な操作なので確認を挟まない）。
 /// マウスは同じ扱いにしない: 誤クリックで起動しないよう、クリックはフォルダ行と同じ
+/// 文字列から実在ディレクトリを解決する（ディレクトリならそれ、ファイルなら
+/// 親フォルダ ＝ D&D でファイルを落とした場合）。
+/// **Enter 確定（`apply_path_input`）と D&D（`extract_dir`）が同じ規則を読む**:
+/// 別々に持つと、片方だけ挙動を足して「貼り付けでは開けるのに Enter では
+/// 開けない」形の食い違いになる。引用符の除去は呼び手が済ませる
+fn dir_of(text: &str) -> Option<String> {
+    let p = std::path::Path::new(text);
+    if p.is_dir() {
+        Some(text.to_string())
+    } else if p.is_file() {
+        p.parent().map(|d| d.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+/// New 画面のマウス処理が呼び手（App を持つ側）へ返す指示。
+/// 起動そのもの（`start_new_session`）は state の借用を抜けてから実行する
+#[derive(PartialEq, Debug)]
+pub(crate) enum NewAction {
+    /// 選択済みの起動ボタンを再クリックした ＝ セッションを起こす
+    Launch,
+}
+
 /// 「選択 → 再クリックで実行」の 2 段階（判定は [`NewState::click_activates`]）
 pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Result<()> {
     let RightView::New(state) = &mut app.right_view else {
@@ -577,15 +672,10 @@ pub(crate) fn draw_new_view(
     starting: bool,
     can_leave: bool,
 ) -> FrameCursor {
-    let border = if focused {
-        Style::default().fg(FOCUS_BORDER)
-    } else {
-        Style::default().fg(ui().dim)
-    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title("new session")
-        .border_style(border);
+        .border_style(border_style(focused));
     frame.render_widget(block, area);
 
     // 描画とマウス判定で同一のジオメトリを使う（フォーム型レイアウト）
@@ -785,11 +875,8 @@ pub(crate) fn draw_new_view(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// pos が矩形の内側にあるか（幅・高さ 0 の矩形は「内側なし」なので常に false）
-    fn contains(rect: Rect, pos: Position) -> bool {
-        pos.x >= rect.x && pos.x < rect.right() && pos.y >= rect.y && pos.y < rect.bottom()
-    }
+    // 矩形の内包判定（幅 0 の扱いを含む）は ui 側の 1 実装を使う
+    use crate::ui::tests::contains;
 
     const FOCUSES: [NewFocus; 3] = [NewFocus::Prompt, NewFocus::Path, NewFocus::Browser];
 
@@ -883,39 +970,21 @@ mod tests {
         }
     }
 
-    /// テスト用の一時ディレクトリ。drop で必ず再帰削除するので、
-    /// アサーション失敗（= panic）で抜けても後片付けが漏れない
-    struct TempDir(std::path::PathBuf);
+    /// テスト用の一時ディレクトリ（安全な置き場の実装は
+    /// [`crate::testutil::TempDir`] 1 つ。ここが持つのは sub_a / sub_b の準備だけ）
+    struct TempDir(crate::testutil::TempDir);
 
     impl TempDir {
-        /// sub_a / sub_b を持つ一時ディレクトリを作る。
-        /// パスはプロセス ID + 連番で一意にする: プロセス ID で別チェックアウトとの
-        /// 並行実行を、連番で同一プロセス内の並行テストスレッド同士を分ける
-        /// （tag の手書き重複に一意性を賭けない）
+        /// sub_a / sub_b を持つ一時ディレクトリを作る
         fn new(tag: &str) -> Self {
-            static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "ccdesk-new-view-{}-{tag}-{seq}",
-                std::process::id()
-            ));
-            // ディレクトリ作成より先にガードを組み立てる。作成中に panic しても
-            // ガードが所有しているので Drop で作りかけのディレクトリを片付けられる
-            let guard = Self(root);
-            let _ = std::fs::remove_dir_all(guard.path());
-            std::fs::create_dir_all(guard.path().join("sub_a")).unwrap();
-            std::fs::create_dir_all(guard.path().join("sub_b")).unwrap();
-            guard
+            let dir = crate::testutil::TempDir::new("new-view", tag);
+            std::fs::create_dir_all(dir.join("sub_a")).unwrap();
+            std::fs::create_dir_all(dir.join("sub_b")).unwrap();
+            Self(dir)
         }
 
         fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            self.0.path()
         }
     }
 

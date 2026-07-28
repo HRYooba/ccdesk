@@ -97,45 +97,9 @@ fn normalize(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// テスト専用のリポジトリ（**実データを写した形**: 実機の
-    /// `<repo>\.git\worktrees\<名前>\gitdir` と `commondir` をそのまま作る）
-    struct TempRepo(PathBuf);
-
-    impl TempRepo {
-        fn new(test: &str) -> Self {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static SEQ: AtomicUsize = AtomicUsize::new(0);
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir()
-                .join(format!("ccdesk-git-{test}-{}-{seq}", std::process::id()));
-            std::fs::create_dir_all(root.join(".git")).unwrap();
-            Self(root)
-        }
-
-        /// 作業ツリーを 1 本足す（実機と同じ `<repo>\.claude\worktrees\<名前>`）
-        fn add_worktree(&self, name: &str) -> PathBuf {
-            let tree = self.0.join(".claude").join("worktrees").join(name);
-            std::fs::create_dir_all(&tree).unwrap();
-            let admin = self.0.join(".git").join("worktrees").join(name);
-            std::fs::create_dir_all(&admin).unwrap();
-            // 実測: gitdir は作業ツリーの `.git` を**スラッシュ区切りの絶対パス**で持つ
-            let git_file = tree.join(".git");
-            std::fs::write(
-                admin.join("gitdir"),
-                format!("{}\n", git_file.display().to_string().replace('\\', "/")),
-            )
-            .unwrap();
-            std::fs::write(admin.join("commondir"), "../..\n").unwrap();
-            std::fs::write(&git_file, format!("gitdir: {}\n", admin.display())).unwrap();
-            tree
-        }
-    }
-
-    impl Drop for TempRepo {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    // fixture は title 側と共有する（`.git/worktrees` のレイアウト解釈を直すとき、
+    // 追随すべき fixture が 2 つあると片方だけ古い形のまま通ってしまう）
+    use crate::title::tests::TempRepo;
 
     fn names(trees: &[PathBuf]) -> Vec<String> {
         trees
@@ -149,13 +113,13 @@ mod tests {
     #[test]
     fn every_worktree_of_the_repository_is_listed_from_any_of_them() {
         let repo = TempRepo::new("every_worktree_of_the_repository_is_listed");
-        let a = repo.add_worktree("fix+one");
-        let b = repo.add_worktree("docs+two");
+        let a = PathBuf::from(repo.add_worktree("fix+one"));
+        let b = PathBuf::from(repo.add_worktree("docs+two"));
 
-        let from_main = names(&worktrees_of(&repo.0.display().to_string()));
+        let from_main = names(&worktrees_of(&repo.root().display().to_string()));
         assert_eq!(
             from_main,
-            names(&[repo.0.clone(), b.clone(), a.clone()]),
+            names(&[repo.root().to_path_buf(), b.clone(), a.clone()]),
             "the main tree and both worktrees must be listed"
         );
         // 作業ツリーの中から見ても同じ（`.git` がファイルの側）
@@ -174,8 +138,8 @@ mod tests {
 
         let repo = TempRepo::new("a_directory_outside_a_repository_lists_nothing");
         assert_eq!(
-            names(&worktrees_of(&repo.0.display().to_string())),
-            names(std::slice::from_ref(&repo.0)),
+            names(&worktrees_of(&repo.root().display().to_string())),
+            names(std::slice::from_ref(&repo.root().to_path_buf())),
             "a repository with no linked worktree is just its main tree"
         );
     }

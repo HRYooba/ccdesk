@@ -42,23 +42,23 @@ pub(crate) struct Installed {
     pub(crate) old: std::path::PathBuf,
 }
 
-/// 最新リリースタグ（"v0.3.0"）。取得・パースできなければ None。
-/// タイムアウトは必須: 応答しないネットワーク（DNS シンクホール等）で
-/// 呼び出し元のスレッドをぶら下げない
-pub(crate) fn latest_tag() -> Option<String> {
+/// 小さなテキスト 1 本の HTTP GET（版番号・リリース JSON）。
+/// **ネットワークへ出る作法（curl のフラグ・タイムアウト）はここ 1 箇所**:
+/// タイムアウトは必須で、応答しないネットワーク（DNS シンクホール・blackhole
+/// されたプロキシ）で呼び出し元のスレッドをぶら下げない。返るのは短いテキスト
+/// なので接続 3s・全体 8s で足りる。失敗しても呼び手が周期で再試行する
+pub(crate) fn http_get(url: &str) -> Option<String> {
     let out = std::process::Command::new("curl")
-        .args([
-            "-fsSL",
-            "--connect-timeout",
-            "3",
-            "--max-time",
-            "8",
-            LATEST_RELEASE_API,
-        ])
+        .args(["-fsSL", "--connect-timeout", "3", "--max-time", "8", url])
         .stdin(std::process::Stdio::null())
         .output()
         .ok()?;
-    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// 最新リリースタグ（"v0.3.0"）。取得・パースできなければ None
+pub(crate) fn latest_tag() -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&http_get(LATEST_RELEASE_API)?)
         .ok()?
         .get("tag_name")
         .and_then(|t| t.as_str())
@@ -500,26 +500,13 @@ mod tests {
         assert!(!is_plausible_tag(&"v1.0.0".repeat(20)));
     }
 
-    /// スコープを抜けるときにディレクトリごと消す作業場。
-    /// アサート失敗でパニックしても Drop は走るので一時ファイルを残さない
-    struct Workspace(std::path::PathBuf);
-
-    impl Drop for Workspace {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// スコープを抜けるときにディレクトリごと消す作業場
+    /// （安全な置き場の実装は [`crate::testutil::TempDir`] 1 つ）
+    struct Workspace(crate::testutil::TempDir);
 
     impl Workspace {
-        /// 並列実行・別チェックアウトと衝突しないようテスト名とプロセス ID で一意にする
         fn new(test_name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "ccdesk-test-{test_name}-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
+            Self(crate::testutil::TempDir::new("update", test_name))
         }
 
         fn write(&self, name: &str, body: &str) -> std::path::PathBuf {

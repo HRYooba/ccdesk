@@ -1,14 +1,13 @@
 //! App 状態機械・イベントループ（run）・マウス／キー処理・セッションのディスパッチ。
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::Position;
 
-use ccdesk::{log_error, now_ms, same_dir};
+use ccdesk::{log_error, now_ms, same_dir, LockExt};
 
 use crate::hooks::HookStates;
 use crate::keys::{encode_key, forward_mouse};
@@ -18,19 +17,10 @@ use crate::session::{Launch, Session};
 use crate::sessions::{SessionId, SessionRow};
 use crate::source::{DataSource, PollSinks, WindowItem, PROJECTS_LIMIT};
 use crate::title::Titles;
-use crate::ui::new_view::{handle_new_view_key, NewFocus, NewLayout, NewState};
-use crate::ui::{draw, menu_zone, popup_rect, row_at, row_y, sidebar_layout};
-
-/// サイドバー幅の下限（ドラッグで詰められる限界）。
-///
-/// **根拠は 1 行が固定で食う桁**（`ui::mod` の `MIN_ROW_COLS` ＝ 行頭の印と
-/// 状態アイコン + 名前の下限 + 行末のメニュー記号）に、枠の左右 1 桁ずつを足したもの。
-/// **足し算の正本は ui 側**なので、行頭や行末に何かを足せばこの下限も一緒に動く
-/// （0 桁にすると、詰め切ったサイドバーがどの行も見分けられない帯になる）。
-///
-/// **描画のテストが「一番狭い状態」を作るのにも使う**ので、この値は ui 側からも読める
-pub(crate) const MIN_SIDEBAR: u16 = crate::ui::MIN_ROW_COLS + 2;
-const MIN_PANE: u16 = 40;
+use crate::ui::new_view::{handle_new_view_key, NewState};
+use crate::ui::{
+    draw, fit_sidebar, menu_zone, popup_rect, row_at, row_y, sidebar_cols, sidebar_layout,
+};
 
 // 一覧の正本（~/.ccdesk/sessions.json）を読み直す周期。**他インスタンスが起こした
 // セッションを取り込むため**に要る（小さな JSON 1 本の read。描画は dirty 時のみ）
@@ -39,8 +29,12 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const LIVE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// イベント待ちの上限（＝ 何も起きないときの周回間隔）
 const POLL_IDLE: Duration = Duration::from_millis(33);
-/// 何も変わっていなくても描き直す間隔（スピナー・経過時間が動くため）
-const IDLE_REDRAW: Duration = Duration::from_millis(250);
+/// スピナーが回っている間の描き直し間隔（点滅周期 400ms の半周期 ＝
+/// これより短くしても見た目は変わらず、フレームが増えるだけ）
+const SPINNER_REDRAW: Duration = Duration::from_millis(200);
+/// 何も動いていないときの描き直す間隔。動くものは経過時間表示（`· 23s`）だけで、
+/// その粒度は 1 秒なので、これより短い周期は**前フレームと同一の出力**を組み直すだけ
+const IDLE_REDRAW: Duration = Duration::from_secs(1);
 /// 描画を見送っている間のイベント待ちの上限。子が静まったことに早く気づくため
 /// 短くする（見送りは [`crate::session::REDRAW_HOLD_MAX`] で打ち切られるので、
 /// この短い周回が続くのは出力が途切れない間だけ）
@@ -158,17 +152,10 @@ pub(crate) enum SelfUpdate {
     Failed(String),
 }
 
-/// メニュー枠が食う桁数: 左右の枠線 2 + 項目行の先頭空白 1（描画が `" {label}"` を出す）
-const POPUP_CHROME: u16 = 3;
-/// メニュー幅の下限。短い項目だけのメニュー（grouping 切替）が細く痩せて
-/// 押しにくくならないようにするための床で、**広げる側の判断ではない**
-/// （項目が長ければ [`PopupKind::width`] がそちらを採る）
-const POPUP_MIN_WIDTH: u16 = 14;
-
-/// モーダルの種類。**メニューの中身（項目・幅・項目の意味）はこの型が答える**。
+/// モーダルの種類。**メニューの中身（項目・項目の意味）はこの型が答える**。
 /// [`Popup`] は「どこに開いたか・どれを選んでいるか」だけを持つので、
-/// 種類を足すときの変更は [`PopupKind::entries`] と [`PopupKind::action`] の
-/// 2 つの match に閉じる（幅は項目から導くので触らない）
+/// 種類を足すときの変更は [`PopupKind::entries`] の 1 つの match に閉じる
+/// （幅は項目から導くので触らない。枠の桁は描く側 ＝ `ui::popup_rect` が持つ）
 #[derive(Debug, PartialEq)]
 pub(crate) enum PopupKind {
     /// セッション 1 行への二次操作。**`pinned` / `open` は開いた時点の写し**
@@ -213,10 +200,19 @@ enum PopupAction {
     RemoveProject(String),
 }
 
+/// メニューの項目 1 つ。**表示（label / enabled）と動作（action）を 1 つの表で持つ**:
+/// 以前は表示の match と動作の match が index で暗黙に対応しており、項目を
+/// 1 つ挿入すると対応がずれ「押した項目と違う動作が走る」形が作れた。
+/// 描画・幅計算・実行のすべてがこの 1 つの表を読む
+pub(crate) struct PopupEntry {
+    pub(crate) label: String,
+    pub(crate) enabled: bool,
+    action: PopupAction,
+}
+
 impl PopupKind {
-    /// (表示名, 実行可能か)。並びは [`PopupKind::action`] の index 解釈と対になるので、
-    /// 項目を足すときは両方を同じ順で直す
-    pub(crate) fn entries(&self, grouping: Grouping) -> Vec<(String, bool)> {
+    /// メニューの項目表（並び順 = 表示順）
+    pub(crate) fn entries(&self, grouping: Grouping) -> Vec<PopupEntry> {
         match self {
             // 二次操作はここに集約する（ショートカットキーを併設しない ＝
             // 入口を 2 つ持たない）。
@@ -241,68 +237,59 @@ impl PopupKind {
             // **アーカイブは持たない**: `close` は行を忘れるだけで
             // `~/.claude/projects/**/*.jsonl` を消さないので、アーカイブとの差は
             // 「戻す導線があるか」だけになる ＝ 節を 1 つ増やす価値が無い
-            PopupKind::Session { pinned, open, .. } => vec![
-                ("open".to_string(), true),
-                (if *pinned { "unpin" } else { "pin" }.to_string(), true),
-                ("mark as read".to_string(), true),
-                ("stop".to_string(), *open),
-                ("close".to_string(), true),
-            ],
-            PopupKind::Group => {
-                let mark = |g: Grouping| if grouping == g { "● " } else { "  " };
+            PopupKind::Session { id, pinned, open } => {
+                let entry = |label: &str, enabled: bool, action: PopupAction| PopupEntry {
+                    label: label.to_string(),
+                    enabled,
+                    action,
+                };
                 vec![
-                    (format!("{}state", mark(Grouping::State)), true),
-                    (format!("{}directory", mark(Grouping::Directory)), true),
+                    entry("open", true, PopupAction::OpenSession(id.clone())),
+                    entry(
+                        if *pinned { "unpin" } else { "pin" },
+                        true,
+                        PopupAction::TogglePin(id.clone()),
+                    ),
+                    entry("mark as read", true, PopupAction::MarkRead(id.clone())),
+                    entry("stop", *open, PopupAction::Stop(id.clone())),
+                    entry("close", true, PopupAction::Close(id.clone())),
                 ]
             }
+            // 項目は [`Grouping::ORDER`] から導く（variant を足すとここも自動で増える ＝
+            // メニューだけ古い 2 分岐のまま、という形を作れない）
+            PopupKind::Group => Grouping::ORDER
+                .into_iter()
+                .map(|g| PopupEntry {
+                    label: format!("{}{}", if grouping == g { "● " } else { "  " }, g.as_str()),
+                    enabled: true,
+                    action: PopupAction::SetGrouping(g),
+                })
+                .collect(),
             // **セッションが残っているフォルダは登録解除させない。** 見出しの一覧は
             // 「登録リスト ∪ セッションの cwd」なので、登録を外してもセッション由来で
             // 見出しは出続ける。押せるのに表示が変わらないのは嘘なので、
             // stop と同じ仕組み（実行可能フラグ）で落とす
-            PopupKind::Project { has_sessions, .. } => vec![
-                ("new session".to_string(), true),
-                ("remove project".to_string(), !has_sessions),
+            PopupKind::Project { cwd, has_sessions } => vec![
+                PopupEntry {
+                    label: "new session".to_string(),
+                    enabled: true,
+                    action: PopupAction::NewSessionIn(cwd.clone()),
+                },
+                PopupEntry {
+                    label: "remove project".to_string(),
+                    enabled: !has_sessions,
+                    action: PopupAction::RemoveProject(cwd.clone()),
+                },
             ],
         }
     }
 
-    /// メニュー幅。**項目の表示幅から決める**ので、アカウント表示名や email のような
-    /// 動的な項目でも切れない。種類ごとに固定値を置くと項目を足した時点で嘘になるため、
-    /// 幅の知識はここ 1 箇所だけに持たせる。端末へ収める責任は `popup_rect` 側
-    pub(crate) fn width(&self, grouping: Grouping) -> u16 {
-        use unicode_width::UnicodeWidthStr;
-        let widest = self
-            .entries(grouping)
-            .iter()
-            .map(|(label, _)| label.width().min(u16::MAX as usize) as u16)
-            .max()
-            .unwrap_or(0);
-        widest.saturating_add(POPUP_CHROME).max(POPUP_MIN_WIDTH)
-    }
-
-    /// 選択 index の項目が意味する動作（範囲外・意味を持たない index は None）。
-    /// 動的な項目は index で対象（アカウント）を引く
-    fn action(&self, index: usize) -> Option<PopupAction> {
-        match self {
-            PopupKind::Session { id, .. } => match index {
-                0 => Some(PopupAction::OpenSession(id.clone())),
-                1 => Some(PopupAction::TogglePin(id.clone())),
-                2 => Some(PopupAction::MarkRead(id.clone())),
-                3 => Some(PopupAction::Stop(id.clone())),
-                4 => Some(PopupAction::Close(id.clone())),
-                _ => None,
-            },
-            PopupKind::Group => match index {
-                0 => Some(PopupAction::SetGrouping(Grouping::State)),
-                1 => Some(PopupAction::SetGrouping(Grouping::Directory)),
-                _ => None,
-            },
-            PopupKind::Project { cwd, .. } => match index {
-                0 => Some(PopupAction::NewSessionIn(cwd.clone())),
-                1 => Some(PopupAction::RemoveProject(cwd.clone())),
-                _ => None,
-            },
-        }
+    /// 選択 index の項目が意味する動作（範囲外は None）。**表（[`Self::entries`]）から
+    /// 引く**ので、表示と動作が index でずれることは構造的に無い
+    #[cfg(test)]
+    fn action(&self, grouping: Grouping, index: usize) -> Option<PopupAction> {
+        let mut entries = self.entries(grouping);
+        (index < entries.len()).then(|| entries.swap_remove(index).action)
     }
 }
 
@@ -419,6 +406,9 @@ pub(crate) struct App {
     pub(crate) projects: Vec<String>,
     pub(crate) popup: Option<Popup>,
     pub(crate) focus: Focus,
+    // 直前のフレームでスピナー（Working の点滅）が出ていたか。
+    // run ループがアイドル時の描き直し間隔を選ぶ材料（描画が毎フレーム更新する）
+    pub(crate) spinner_active: bool,
 }
 
 /// テストの土台になる中立な `App`。各テストは関心のあるフィールドだけを
@@ -491,6 +481,7 @@ impl Default for App {
             popup: None,
             // サイドバー側にしておく（set_focus が PTY へ通知を出さない）
             focus: Focus::Sidebar,
+            spinner_active: false,
         }
     }
 }
@@ -503,14 +494,13 @@ type Launched = Result<Option<SessionId>, String>;
 
 impl App {
     fn pane_size(&self) -> (u16, u16) {
-        // 右ペインの Block 枠線 2 行 + 下部バー 1 行を引いた内側サイズ (rows, cols)
-        let rows = self.term_size.1.saturating_sub(3).max(1);
-        let cols = self
-            .term_size
-            .0
-            .saturating_sub(sidebar_cols(self) + 2)
-            .max(1);
-        (rows, cols)
+        // 右ペインの矩形（正本は ui::pane_rect）から Block 枠線 2 桁/2 行を引いた
+        // 内側サイズ (rows, cols)
+        let pane = crate::ui::pane_rect(self);
+        (
+            pane.height.saturating_sub(2).max(1),
+            pane.width.saturating_sub(2).max(1),
+        )
     }
 
     fn resize_sessions(&mut self) {
@@ -522,8 +512,8 @@ impl App {
 
     pub(crate) fn open_new_view(&mut self) {
         self.right_view = RightView::New(NewState::browse(&self.dispatch_cwd));
-        // 次回起動時に同じ画面を復元する
-        self.source.save_window(WindowItem::LastView("new"));
+        // 次回起動時に同じ画面を復元する（None = new session 画面）
+        self.source.save_window(WindowItem::LastView(None));
     }
 
     /// ポーラーの書き込み先をまとめて渡す。どのポーラーを起こすかは供給元が決めるので、
@@ -567,7 +557,7 @@ impl App {
         self.right_view = RightView::Sessions;
         // 次回起動時に同じセッションを復元する
         if let Some(id) = self.windows.get(idx).map(|w| w.session_id.clone()) {
-            self.source.save_window(WindowItem::LastView(id.as_str()));
+            self.source.save_window(WindowItem::LastView(Some(&id)));
         }
         if self.focus == Focus::Terminal
             && let Some(window) = self.windows.get_mut(idx) {
@@ -588,6 +578,23 @@ impl App {
     /// 流すかどうかを決める側（[`lift_input_gate`]）がこれを材料にする
     fn showing(&self, id: &SessionId) -> bool {
         self.shown_session() == Some(id)
+    }
+
+    /// 一覧の行を ID で引く。**「消えた行は何もしない」の判断ごと 1 箇所に置く**
+    /// （読み直し・他インスタンスの削除とクリックは競合しうるので、
+    /// 引き当てが空振りする経路はどの呼び手にもある）
+    pub(crate) fn row(&self, id: &SessionId) -> Option<&SessionRow> {
+        self.sessions.iter().find(|row| &row.session_id == id)
+    }
+
+    /// [`Self::row`] の可変版
+    fn row_mut(&mut self, id: &SessionId) -> Option<&mut SessionRow> {
+        self.sessions.iter_mut().find(|row| &row.session_id == id)
+    }
+
+    /// その行の窓の添字（開いていなければ None）
+    fn window_index(&self, id: &SessionId) -> Option<usize> {
+        self.windows.iter().position(|w| &w.session_id == id)
     }
 }
 
@@ -618,8 +625,12 @@ pub(crate) fn instant_ago(d: Duration) -> std::time::Instant {
 struct SyncOutput;
 
 impl SyncOutput {
+    /// **flush はしない（queue のみ）。** Begin は次の `terminal.draw` の flush と
+    /// 一緒に端末へ届けば足りる（生 stdout と CrosstermBackend は同一のグローバル
+    /// stdout バッファを共有するので順序は保たれる）。execute! で書くと
+    /// 1 フレームにつき write+flush の syscall が 2〜3 回余計に増える
     fn begin() -> Self {
-        let _ = crossterm::execute!(
+        let _ = crossterm::queue!(
             std::io::stdout(),
             crossterm::terminal::BeginSynchronizedUpdate
         );
@@ -629,10 +640,11 @@ impl SyncOutput {
 
 impl Drop for SyncOutput {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::EndSynchronizedUpdate
-        );
+        // フレームの終端なのでここでだけ flush する（駐車の MoveTo も一緒に流れる）
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        let _ = crossterm::queue!(out, crossterm::terminal::EndSynchronizedUpdate);
+        let _ = out.flush();
     }
 }
 
@@ -673,9 +685,26 @@ fn draw_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow:
     });
     drawn?;
     if let Some(pos) = park {
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::MoveTo(pos.x, pos.y));
+        // queue のみ（flush は SyncOutput の Drop が 1 回だけ行う）
+        let _ = crossterm::queue!(std::io::stdout(), crossterm::cursor::MoveTo(pos.x, pos.y));
     }
     Ok(())
+}
+
+/// アクティブ窓へバイト列を送る。**書き込みエラーで run ループを抜けない**:
+/// 壊れたのはその窓の PTY だけなので、その窓を閉じて通知する
+/// （live-scan の「死んだ PTY は自分の窓だけ閉じる」と同じ扱い。以前は `?` で
+/// run() ごと抜け、健全な全セッションを道連れに ccdesk が終了していた）
+fn send_to_active(app: &mut App, bytes: &[u8]) {
+    let Some(window) = app.windows.get(app.active) else {
+        return;
+    };
+    if window.send(bytes).is_ok() {
+        return;
+    }
+    let id = window.session_id.clone();
+    set_notice(app, format!("could not write to session {id}; closing its window"));
+    close_window_of(app, &id);
 }
 
 /// この周に描くか。**再描画は「PTY に新出力」「UI イベント」「無変化でも
@@ -686,8 +715,10 @@ fn draw_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow:
 /// フレームはカーソルが中間位置で確定し、IME の変換窓がそこへ飛ぶ
 /// （判断は [`crate::session::Session::holds_frame`]、上限も向こうが持つので
 /// ここが false を返し続けることはない）
-fn should_draw(holding: bool, force: bool, pty_dirty: bool, since_draw: Duration) -> bool {
-    !holding && (force || pty_dirty || since_draw > IDLE_REDRAW)
+/// `idle_after` は無変化でも描き直す間隔（スピナーが回っている間だけ短くする ＝
+/// [`SPINNER_REDRAW`] / [`IDLE_REDRAW`]）
+fn should_draw(holding: bool, force: bool, pty_dirty: bool, since_draw: Duration, idle_after: Duration) -> bool {
+    !holding && (force || pty_dirty || since_draw > idle_after)
 }
 
 pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
@@ -708,7 +739,8 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         // `/resume` `/clear` すると claude は新しいセッションの `SessionStart` を
         // その場で撃つので、これが「一覧に新しい行を出す合図」になる。
         // 見るのはファイルの長さと更新時刻だけ（中身は読まない）ので毎周でも安い
-        if hook_store_changed(&mut app.hook_stamp, app.source.hook_stamp()) {
+        let hooks_changed = hook_store_changed(&mut app.hook_stamp, app.source.hook_stamp());
+        if hooks_changed {
             app.last_scan = instant_ago(SCAN_INTERVAL);
         }
         if app.last_scan.elapsed() > SCAN_INTERVAL {
@@ -716,8 +748,12 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             // 一覧を読み直した直後に hook の state を載せる。**順序に意味がある**:
             // 読み直しは丸ごとの置き換えなので、先に載せるとその場で上書きされる。
             // **張り替えより前**でもある: ペインの中で切り替わったことに気づく材料が
-            // hook の写しなので、古い写しのまま張り替えを判断させない
-            adopt_hook_states(app);
+            // hook の写しなので、古い写しのまま張り替えを判断させない。
+            // **読み直すのはファイルが実際に動いた周だけ**（何も起きていない
+            // 2 秒周期のたびに全読み + JSON パースをやり直さない）
+            if hooks_changed {
+                adopt_hook_states(app);
+            }
             // ペインの中で `/resume` された窓を新しいセッションの行へ張り替える。
             // **名前の読み直しの前**に置く: 張り替えで作った行の表示名は
             // transcript から来るので、同じ周期の refresh_transcripts が拾う
@@ -744,6 +780,10 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         if expire_input_gate(app) {
             force_draw = true;
         }
+        // 期限切れの通知を落とす（キーヒントと使用率の表示に戻す）
+        if expire_notice(app) {
+            force_draw = true;
+        }
         // 使用率の更新を取り込む（取得スレッドが旗を立てたときだけ。
         // 実データなら [`crate::usage`] の取得結果、撮影用なら固定値で、
         // どちらを読むかは供給元が決める）
@@ -764,8 +804,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         {
             app.footer = app
                 .footer_shared
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lock_recover()
                 .clone();
             force_draw = true;
         }
@@ -774,8 +813,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         let failure = {
             let mut state = app
                 .ccdesk_update
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .lock_recover();
             match &*state {
                 SelfUpdate::Failed(msg) => {
                     let msg = msg.clone();
@@ -796,8 +834,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         {
             app.ccdesk_latest = app
                 .ccdesk_latest_shared
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lock_recover()
                 .clone();
             force_draw = true;
         }
@@ -809,8 +846,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         {
             app.agents = app
                 .agents_shared
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lock_recover()
                 .clone();
             force_draw = true;
         }
@@ -828,7 +864,14 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             .windows
             .iter()
             .any(|w| w.dirty.load(std::sync::atomic::Ordering::Relaxed));
-        if should_draw(holding, force_draw, pty_dirty, last_draw.elapsed()) {
+        // スピナー（Working の点滅）が出ている間だけ短い周期で描き直す。
+        // 出ていなければ動くのは経過時間（1 秒粒度）だけなので、それに合わせる
+        let idle_after = if app.spinner_active {
+            SPINNER_REDRAW
+        } else {
+            IDLE_REDRAW
+        };
+        if should_draw(holding, force_draw, pty_dirty, last_draw.elapsed(), idle_after) {
             for window in &app.windows {
                 window
                     .dirty
@@ -875,30 +918,18 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 if app.windows.is_empty() {
                     continue;
                 }
-                let window = &mut app.windows[app.active];
-                let bytes = encode_key(&key, &window.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+                let bytes = {
+                    let window = &app.windows[app.active];
+                    encode_key(&key, &window.parser.lock_recover())
+                };
                 if !bytes.is_empty() {
-                    let mut writer = window.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    writer.write_all(&bytes)?;
-                    writer.flush()?;
+                    send_to_active(app, &bytes);
                 }
             }
             Event::Paste(text) => {
-                // New 画面の D&D/貼り付けはフォーカス中のフィールドで受ける:
-                // Folder: → フォルダ切替（一覧も更新）/ それ以外 → プロンプトへ挿入
-                // （パスを最初のメッセージ本文に書きたいケースがあるため）
+                // New 画面の D&D/貼り付けの解釈は new_view 側（キー・マウスと同じ場所）
                 if let RightView::New(state) = &mut app.right_view {
-                    if state.focus == NewFocus::Path {
-                        if let Some(dir) = NewState::extract_dir(&text) {
-                            state.set_dir(dir); // パスは丸ごと置き換える
-                        } else {
-                            state.path.insert_str(text.trim());
-                            state.refresh_from_input();
-                        }
-                    } else {
-                        state.prompt.insert_str(text.trim());
-                        state.focus = NewFocus::Prompt;
-                    }
+                    state.handle_paste(&text);
                     continue;
                 }
                 if app.focus != Focus::Terminal {
@@ -911,22 +942,13 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 if app.windows.is_empty() {
                     continue;
                 }
-                // paste injection 対策: 制御文字（特に ESC = ペースト終端の偽装）を除去
-                let sanitized: String = text
-                    .chars()
-                    .filter(|c| matches!(c, '\n' | '\r' | '\t') || !c.is_control())
-                    .collect();
-                let window = &mut app.windows[app.active];
-                let bracketed = window.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner).screen().bracketed_paste();
-                let mut writer = window.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if bracketed {
-                    writer.write_all(b"\x1b[200~")?;
-                    writer.write_all(sanitized.as_bytes())?;
-                    writer.write_all(b"\x1b[201~")?;
-                } else {
-                    writer.write_all(sanitized.as_bytes())?;
-                }
-                writer.flush()?;
+                // sanitize と bracketed paste の包みはキー入力と同じ keys 側
+                // （「入力を VT バイト列にする」知識を run ループに置かない）
+                let bytes = {
+                    let window = &app.windows[app.active];
+                    crate::keys::encode_paste(&text, &window.parser.lock_recover())
+                };
+                send_to_active(app, &bytes);
             }
             Event::Mouse(mouse) => {
                 let prev_hover = app.hovered;
@@ -1061,39 +1083,45 @@ pub(crate) fn selected_enter(app: &App) -> Option<Enter> {
 /// なので、方向で区別すると他の行では嘘の案内になる。セッションを開く導線は
 /// メニューの `open`（[`PopupKind::Session`] の先頭項目）へ寄せた。
 ///
-/// 何をするかの判断は [`selected_enter`] が持ち、ここは実行だけ
+/// **実行表はクリックと同じ [`run_row_action`]**。違うのはセッション行だけ
+/// （Enter = メニュー / クリック = 開く）で、その 1 つの差だけをここに書く。
+/// 位置はクリックで開くときと同じ [`selected_row_y`]（開き方で場所が変わらない）
 fn run_enter(app: &mut App) {
-    match selected_enter(app) {
-        Some(Enter::Menu) => open_row_menu(app),
-        Some(Enter::NewSession) => {
-            app.open_new_view();
-            app.set_focus(Focus::Terminal);
-        }
-        Some(Enter::UpdateCcdesk) => start_ccdesk_update(app),
-        Some(Enter::UpdateClaude) => start_claude_update(app),
-        None => {}
-    }
-}
-
-/// 選択行のメニューを開く（[`Enter::Menu`] の実行）。
-/// **位置はクリックで開くときと同じ [`selected_row_y`]**（開き方で場所が変わらない）
-fn open_row_menu(app: &mut App) {
     let anchor_y = selected_row_y(app);
     let SidebarPos::Row(row) = app.selection else {
         return; // メニューを持たない位置（アカウント行）
     };
-    match app.sidebar_rows.get(row).and_then(SidebarRow::action).cloned() {
-        Some(RowAction::Open(id)) => open_session_popup(app, &id, anchor_y),
-        Some(RowAction::Project(cwd)) => open_project_popup(app, cwd, anchor_y),
-        Some(RowAction::ToggleGroup) => {
-            app.popup = Some(Popup {
-                kind: PopupKind::Group,
-                anchor_y,
-                selected: 0,
-            })
+    let Some(action) = app.sidebar_rows.get(row).and_then(SidebarRow::action).cloned() else {
+        return;
+    };
+    match action {
+        RowAction::Open(id) => open_session_popup(app, &id, anchor_y),
+        other => run_row_action(app, other, anchor_y),
+    }
+}
+
+/// 行の動作の実行表。**キーボード（Enter）とクリックが同じ 1 つの表を通る**ので、
+/// [`RowAction`] を足したときに「クリックでは効くのに Enter では無反応」の形が
+/// 作れない（match は網羅なのでコンパイラが両経路ぶんを一度に要求する）。
+/// セッション行（Open）だけは入口ごとに意味が違うので、呼び手が先に分岐する
+fn run_row_action(app: &mut App, action: RowAction, anchor_y: u16) {
+    match action {
+        RowAction::New => {
+            app.open_new_view();
+            app.set_focus(Focus::Terminal);
         }
-        // メニューを持たない行と、行の無い位置
-        Some(RowAction::New | RowAction::UpdateCcdesk | RowAction::UpdateClaude) | None => {}
+        RowAction::ToggleGroup => open_popup(app, PopupKind::Group, anchor_y),
+        // 見出し行はメニューを開くだけ。**フォーカスは移さない**（メニューがキーを受ける）
+        RowAction::Project(cwd) => open_project_popup(app, cwd, anchor_y),
+        // 更新行はその場で実行するだけ（右ペインを切り替えない）
+        RowAction::UpdateCcdesk => start_ccdesk_update(app),
+        RowAction::UpdateClaude => start_claude_update(app),
+        // セッション行は呼び手が経路を選ぶ（クリック = 開く / Enter = メニュー）
+        RowAction::Open(id) => {
+            if open_session(app, &id) {
+                app.set_focus(Focus::Terminal);
+            }
+        }
     }
 }
 
@@ -1296,12 +1324,10 @@ fn follow_session_switches(app: &mut App) {
 /// **名前は行が持たない**ので、作った行の表示名は次の描画で transcript から導かれる
 fn adopt_switched_session(app: &mut App, previous: &SessionId, next: &SessionId, shown: bool) {
     let cwd = app
-        .sessions
-        .iter()
-        .find(|row| &row.session_id == previous)
+        .row(previous)
         .map(|row| row.cwd.clone())
         .unwrap_or_default();
-    if !app.sessions.iter().any(|row| &row.session_id == next) {
+    if app.row(next).is_none() {
         app.sessions.push(SessionRow::new(next.clone(), cwd, now_ms()));
         save_sessions(app);
     }
@@ -1310,13 +1336,14 @@ fn adopt_switched_session(app: &mut App, previous: &SessionId, next: &SessionId,
     // ccdesk の外（claude の `/resume`）なのでその経路を通らない ＝ ここで書く。
     // 呼ばれるのは張り替わった周期だけなので、書き込みも張り替え 1 回につき 1 度
     if shown {
-        app.source.save_window(WindowItem::LastView(next.as_str()));
+        app.source.save_window(WindowItem::LastView(Some(next)));
+        // **離れた行へは何も書かない。** 窓が新しいセッションへ移った時点でその行を
+        // 動かしているものは無くなり、次の描画でそのまま Stopped になる
+        // （書き戻していた頃は、hook が持つ新しい記録より古い `stopped` が行に残った）。
+        // 既読にするのは**ペインに出ている窓**の張り替えだけ: 裏へ回した窓の
+        // `/resume` が遅れて反映された周で、見てもいない行の未読 ● を消さない
+        mark_read(app, next);
     }
-    // **離れた行へは何も書かない。** 窓が新しいセッションへ移った時点でその行を
-    // 動かしているものは無くなり、次の描画でそのまま Stopped になる
-    // （書き戻していた頃は、hook が持つ新しい記録より古い `stopped` が行に残った）。
-    // 開いている窓の行は既読（今まさに見ている会話）
-    mark_read(app, next);
 }
 
 /// hook が書いた state を読み直す。**行へは何も写さない**（写していた頃は
@@ -1356,10 +1383,12 @@ fn adopt_hook_states(app: &mut App) {
 pub(crate) fn refresh_transcripts(app: &mut App) {
     let mut titles = std::mem::take(&mut app.titles);
     let mut changed = false;
+    // 1 周期に読む量の上限。初回の全量読み（リネーム記録の探索）を数周期へ分け、
+    // UI スレッド ＝ 最初の描画を数百 MB の read で止めない
+    // （[`crate::title::SCAN_BUDGET`]）
+    let mut budget = crate::title::SCAN_BUDGET;
     for row in &mut app.sessions {
-        let before = row.transcript.clone();
-        titles.refresh(row);
-        changed |= row.transcript != before;
+        changed |= titles.refresh(row, &mut budget);
     }
     app.titles = titles;
     if changed {
@@ -1376,15 +1405,16 @@ pub(crate) fn refresh_transcripts(app: &mut App) {
 /// 既に読み終えている行なら書き込みもしない（周期処理が毎周保管を書かない）
 fn mark_read(app: &mut App, id: &SessionId) {
     let now = now_ms();
-    let Some(index) = app.sessions.iter().position(|r| &r.session_id == id) else {
+    let Some(row) = app.row(id) else {
         return;
     };
-    let row = &app.sessions[index];
     // 時計が巻き戻っても既読を巻き戻さない。既読の行は書かない
     if row.last_opened_at >= now || !app.hook_states.unread(row) {
         return;
     }
-    app.sessions[index].last_opened_at = now;
+    if let Some(row) = app.row_mut(id) {
+        row.last_opened_at = now;
+    }
     save_sessions(app);
 }
 
@@ -1401,7 +1431,7 @@ fn mark_read(app: &mut App, id: &SessionId) {
 /// `●` は点かないし消えない ＝ 「自分の操作で未読が生えない」は保証ではなく構造
 fn edit_row(app: &mut App, id: &SessionId, edit: impl FnOnce(&mut SessionRow)) {
     let changed = {
-        let Some(row) = app.sessions.iter_mut().find(|r| &r.session_id == id) else {
+        let Some(row) = app.row_mut(id) else {
             return;
         };
         let before = row.clone();
@@ -1439,12 +1469,10 @@ fn register_project(app: &mut App, cwd: &str) {
         None => cwd.to_string(),
     };
     app.projects.push(entry);
-    // 上限を超えたら**最も長く使っていない側**から落とす。登録が自動なので、放っておくと
-    // 「一度試しただけのフォルダ」が state.json に永久に積まれ見出しも際限なく増える。
-    // 落ちたフォルダにセッションが残っていれば見出しは cwd 由来で出続けるので、
-    // 落ちたこと自体が操作の邪魔にならない
-    let excess = app.projects.len().saturating_sub(PROJECTS_LIMIT);
-    app.projects.drain(..excess);
+    // 上限の適用はここではやらない。**上限と追い出しの規則は保存の正本
+    // （`merge_projects`）1 箇所**にあり、[`save_projects`] が適用後の一覧を
+    // 取り込むので画面もそれに揃う（2 箇所で削ると、追い出しの向きを変えた
+    // ときに片方だけ直して「画面では消えたのに次の保存で戻る」が作れる）
     save_projects(app);
 }
 
@@ -1509,11 +1537,7 @@ fn project_has_sessions(app: &App, cwd: &str) -> bool {
 /// `has_sessions` は開いた時点の写しにする（[`PopupKind::Project`] 参照）
 fn open_project_popup(app: &mut App, cwd: String, anchor_y: u16) {
     let has_sessions = project_has_sessions(app, &cwd);
-    app.popup = Some(Popup {
-        kind: PopupKind::Project { cwd, has_sessions },
-        anchor_y,
-        selected: 0,
-    });
+    open_popup(app, PopupKind::Project { cwd, has_sessions }, anchor_y);
 }
 
 /// キーボード選択位置の画面 y。**式そのものは描画側が持つ**（一覧の行は [`row_y`]、
@@ -1563,7 +1587,7 @@ fn start_foreground(app: &mut App, cwd: &str, prompt: &str) -> Launched {
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
     // state を取る hook を注入する（statusLine は載せない ＝ ユーザーの
     // statusline を奪わない。[`crate::hooks::inject_settings`]）
-    let settings = crate::hooks::inject_settings();
+    let settings = hook_settings(app);
     let (rows, cols) = app.pane_size();
     let window = Session::spawn(
         &session_id,
@@ -1593,24 +1617,6 @@ fn start_foreground(app: &mut App, cwd: &str, prompt: &str) -> Launched {
 fn resize_terminal(app: &mut App, w: u16, h: u16) {
     app.term_size = (w, h);
     app.resize_sessions();
-}
-
-/// **描画とヒットテストが使うサイドバー幅**（＝ 画面に出ている桁数）。
-///
-/// [`App::sidebar_width`] はユーザーが選んだ幅の正本で、ここはそれを
-/// 今の端末に収まる範囲へ丸めた**導出値**。丸めた結果を保存値へ書き戻さないのが
-/// 要点で、**端末が一時的に狭くなっただけでユーザーの選んだ幅を失わない**
-/// （書き戻していた頃は、PTY の破棄が端末サイズ変化イベントを連れてくる Windows で
-/// セッションを止めるたびにサイドバーが数桁ずつ縮み、端末が元に戻っても復元しなかった）
-pub(crate) fn sidebar_cols(app: &App) -> u16 {
-    fit_sidebar(app.sidebar_width, app.term_size.0)
-}
-
-/// 幅 1 つを端末幅へ収める（下限 [`MIN_SIDEBAR`]、右ペインに [`MIN_PANE`] を残す）。
-/// **丸めの規則はここ 1 箇所**（導出とドラッグの確定が同じ式を見る）
-fn fit_sidebar(width: u16, term_w: u16) -> u16 {
-    let max = term_w.saturating_sub(MIN_PANE).max(MIN_SIDEBAR);
-    width.clamp(MIN_SIDEBAR, max)
 }
 
 /// マウスイベントの後に描き直す必要があるか（FPS 対策）。
@@ -1720,19 +1726,21 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             app.sidebar_header_rows,
             app.sidebar_scroll,
         );
-        let hit = app.sidebar_rows.get(row).cloned();
-        let action = hit.as_ref().and_then(SidebarRow::action).cloned();
         // hover: **実体のある行**の上にいるときだけハイライト（飾りは光らせない）。
-        // 押しても何も起きない行も行なので、ここは動作の有無では見ない
-        app.hovered = hit
-            .as_ref()
-            .filter(|row| row.selectable())
-            .map(|_| SidebarPos::Row(row));
+        // 押しても何も起きない行も行なので、ここは動作の有無では見ない。
+        // **hover の判断に clone は要らない**（マウス移動は毎秒 100 回以上届くので、
+        // Down のときだけ動作を写し取る）
+        let selectable = app
+            .sidebar_rows
+            .get(row)
+            .is_some_and(SidebarRow::selectable);
+        app.hovered = selectable.then_some(SidebarPos::Row(row));
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            let action = app.sidebar_rows.get(row).and_then(SidebarRow::action).cloned();
             // サイドバー内クリックはサイドバーへフォーカス。
             // 行クリックは右ペインの内容だけ切り替える（フォーカス移動は右ペインクリック or Enter）
             app.set_focus(Focus::Sidebar);
-            if hit.as_ref().is_some_and(SidebarRow::selectable) {
+            if selectable {
                 app.selection = SidebarPos::Row(row);
             }
             // 行末の `=` クリック → コンテキストメニューを開く。
@@ -1743,32 +1751,11 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                     open_session_popup(app, &id.clone(), mouse.row);
                     return Ok(false);
                 }
-            // セッション行・new session クリックは右ペインへフォーカスを移す
-            match action {
-                Some(RowAction::New) => {
-                    app.open_new_view();
-                    app.set_focus(Focus::Terminal);
-                }
-                Some(RowAction::ToggleGroup) => {
-                    app.popup = Some(Popup {
-                        kind: PopupKind::Group,
-                        anchor_y: mouse.row,
-                        selected: 0,
-                    });
-                }
-                // 見出し行クリックはメニューを開くだけ。**フォーカスは移さない**
-                // （メニューがキーを受ける。セッション行クリックとは動作が違う）
-                Some(RowAction::Project(cwd)) => {
-                    open_project_popup(app, cwd, mouse.row);
-                }
-                Some(RowAction::Open(id)) => {
-                    open_session(app, &id);
-                    app.set_focus(Focus::Terminal);
-                }
-                // 更新行はその場で実行するだけ（右ペインを切り替えない）
-                Some(RowAction::UpdateCcdesk) => start_ccdesk_update(app),
-                Some(RowAction::UpdateClaude) => start_claude_update(app),
-                None => {}
+            // 実行表はキーボードの Enter と同じ [`run_row_action`]。
+            // セッション行のクリックは「開く」（Enter はメニュー）で、開けたとき
+            // だけフォーカスを端末へ移す判断も表の側にある
+            if let Some(action) = action {
+                run_row_action(app, action, mouse.row);
             }
         }
     } else {
@@ -1776,78 +1763,13 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         if let MouseEventKind::Down(_) = mouse.kind {
             app.set_focus(Focus::Terminal);
         }
-        // New 画面: クリックでフォルダ選択・プロンプト欄フォーカス
+        // 右ペイン矩形は state の可変借用の前に取る（正本は ui::pane_rect）
+        let pane = crate::ui::pane_rect(app);
+        // New 画面: 入力の解釈は new_view 側（ヒットテストのジオメトリ知識を
+        // レイアウトと同じファイルに閉じる）。起動だけは state の借用を抜けて実行
         if let RightView::New(state) = &mut app.right_view {
-            // 起動ボタン行のクリックは state の借用を抜けてからディスパッチする
-            let mut launch = false;
-            match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    // 描画と同じジオメトリでヒットテスト（右ペイン矩形を chunks[1] と同一に再構成）
-                    let pane = Rect::new(
-                        drawn,
-                        0,
-                        app.term_size.0.saturating_sub(drawn),
-                        app.term_size.1.saturating_sub(1),
-                    );
-                    let layout = NewLayout::compute(pane);
-                    let box_bottom = layout.prompt_box.y + layout.prompt_box.height;
-                    if !layout.ok {
-                        // ペインが小さすぎて未描画。フィールド判定はしない
-                    } else if mouse.row >= layout.folder_hd_y && mouse.row <= layout.sep_y {
-                        // FOLDER セクション（見出し・パス値・┄ 区切り）クリック → パスフィールド。
-                        // パス値の行ならカーソルも移動、他はカーソル位置維持
-                        state.focus = NewFocus::Path;
-                        if mouse.row == layout.path_y {
-                            let text_x = mouse.column.saturating_sub(layout.path_text_x);
-                            state.path.click(text_x);
-                        }
-                    } else if mouse.row >= layout.prompt_hd_y && mouse.row < box_bottom {
-                        // PROMPT セクション（見出し + 入力枠 3 行）クリック → プロンプト欄
-                        state.focus = NewFocus::Prompt;
-                        if mouse.row == layout.input_y {
-                            let text_x = mouse.column.saturating_sub(layout.input_text_x);
-                            state.prompt.click(text_x);
-                        }
-                    } else if mouse.row >= layout.list_top
-                        && mouse.row < layout.list_top + layout.list_height
-                    {
-                        // フォルダ一覧エリア（空白部分も含む）→ 一覧フォーカス。
-                        // 実在する行の上なら選択も動かし、選択済み行の再クリックで実行する
-                        let row_in = (mouse.row - layout.list_top) as usize;
-                        if row_in < state.shown {
-                            let idx = state.scroll + row_in;
-                            // 起動ボタン行もフォルダ行と同じ 2 段階（選択 → 再クリック）にする。
-                            // 1 クリックで起動すると、プロンプト入力中に一覧へフォーカスを
-                            // 移すだけのクリックが書きかけのプロンプトでセッションを起動して
-                            // しまう（送ったメッセージは取り消せない）。
-                            // 判定はクリックで選択を動かす前に取る（動かした後では
-                            // 常に dir_idx == idx になり 2 段階が崩れる）
-                            let reclick = state.click_activates(idx);
-                            state.select(idx);
-                            state.focus = NewFocus::Browser;
-                            if reclick {
-                                if state.selected_is_launch() {
-                                    launch = true;
-                                } else {
-                                    state.descend(); // 選択済みを再クリック = 潜る
-                                }
-                            }
-                        } else {
-                            state.focus = NewFocus::Browser;
-                        }
-                    }
-                }
-                MouseEventKind::ScrollUp => {
-                    state.focus = NewFocus::Browser;
-                    state.select_prev();
-                }
-                MouseEventKind::ScrollDown => {
-                    state.focus = NewFocus::Browser;
-                    state.select_next();
-                }
-                _ => {}
-            }
-            if launch {
+            let action = state.handle_mouse(pane, mouse);
+            if action == Some(crate::ui::new_view::NewAction::Launch) {
                 start_new_session(app)?;
             }
             return Ok(false);
@@ -1856,7 +1778,7 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
             return Ok(false);
         }
         // 右ペイン: イベントを claude へ転送（ホイールも claude 自身がスクロール処理する）
-        forward_mouse(app, mouse)?;
+        forward_mouse(app, mouse);
     }
     Ok(false)
 }
@@ -1870,20 +1792,27 @@ fn session_open(app: &mut App, id: &SessionId) -> bool {
         .any(|w| &w.session_id == id && w.alive())
 }
 
+/// メニューを開く唯一の口。開いた瞬間の共通処理（選択の初期値）をここで揃える
+/// （種類ごとに `Popup` を組み立てると、開き方の作法が入口の数だけ増える）
+fn open_popup(app: &mut App, kind: PopupKind, anchor_y: u16) {
+    app.popup = Some(Popup {
+        kind,
+        anchor_y,
+        selected: 0,
+    });
+}
+
 /// セッション行のメニューを開く（行頭の `=` クリック / 選択行の `Enter`）。
 /// 項目の見た目に効く 2 つ（ピン留め・窓の有無）は開いた時点の写し
 fn open_session_popup(app: &mut App, id: &SessionId, anchor_y: u16) {
     let open = session_open(app, id);
-    let row = app.sessions.iter().find(|r| &r.session_id == id);
-    app.popup = Some(Popup {
-        kind: PopupKind::Session {
-            id: id.clone(),
-            pinned: row.is_some_and(|r| r.pinned),
-            open,
-        },
-        anchor_y,
-        selected: 0,
-    });
+    let row = app.row(id);
+    let kind = PopupKind::Session {
+        id: id.clone(),
+        pinned: row.is_some_and(|r| r.pinned),
+        open,
+    };
+    open_popup(app, kind, anchor_y);
 }
 
 /// モーダル表示中のキー操作（Esc = 全閉 / ↑↓ = 選択 / Enter = 実行）
@@ -1928,7 +1857,12 @@ fn handle_popup_click(app: &mut App, col: u16, row: u16) {
     {
         return;
     }
-    activate_popup(app, (row - rect.y - 1) as usize);
+    // 枠内に入りきらないメニューは描画がスクロールしている（[`crate::ui::popup_scroll`]）
+    // ので、クリックの行 → 項目 index も同じずらしを通す
+    let visible = rect.height.saturating_sub(2) as usize;
+    let total = popup.kind.entries(app.grouping).len();
+    let offset = crate::ui::popup_scroll(popup.selected, total, visible);
+    activate_popup(app, offset + (row - rect.y - 1) as usize);
 }
 
 /// 選択項目の実行（Enter / クリック共通）。実行できない項目・範囲外の index は無視する
@@ -1936,49 +1870,50 @@ fn activate_popup(app: &mut App, index: usize) {
     let Some(popup) = app.popup.as_ref() else {
         return;
     };
-    let entries = popup.kind.entries(app.grouping);
-    if !entries.get(index).is_some_and(|(_, enabled)| *enabled) {
+    let mut entries = popup.kind.entries(app.grouping);
+    if index >= entries.len() {
         return;
     }
-    let Some(action) = popup.kind.action(index) else {
+    let entry = entries.swap_remove(index);
+    if !entry.enabled {
         return;
-    };
+    }
     app.popup = None;
-    run_popup_action(app, action);
+    run_popup_action(app, entry.action);
 }
 
 /// メニュー項目の実行。**副作用はここだけ**に集め、「どの項目が何を意味するか」の
 /// 判定は [`PopupKind::action`]（純関数）に置く
 fn run_popup_action(app: &mut App, action: PopupAction) {
     match action {
-        // 開いたら打ち先はそのセッションなので、行クリックと同じくフォーカスを端末へ移す
+        // 開けたら打ち先はそのセッションなので、行クリックと同じくフォーカスを端末へ移す
+        // （失敗時は移さない ＝ 打鍵が別セッションへ流れない）
         PopupAction::OpenSession(id) => {
-            open_session(app, &id);
-            app.set_focus(Focus::Terminal);
+            if open_session(app, &id) {
+                app.set_focus(Focus::Terminal);
+            }
         }
         PopupAction::TogglePin(id) => edit_row(app, &id, |row| row.pinned = !row.pinned),
         PopupAction::MarkRead(id) => mark_read(app, &id),
         PopupAction::Stop(id) => menu_stop(app, &id),
         PopupAction::Close(id) => menu_close(app, &id),
-        PopupAction::SetGrouping(next) => {
-            if app.grouping != next {
-                toggle_grouping(app);
-            }
-        }
+        PopupAction::SetGrouping(next) => set_grouping(app, next),
         // 空プロンプトで起動する（登録は dispatch_session が行う）
         PopupAction::NewSessionIn(cwd) => dispatch_session(app, cwd, String::new()),
         PopupAction::RemoveProject(cwd) => remove_project(app, &cwd),
     }
 }
 
-/// グルーピング切替（入口は ⊞ group 行のメニューだけ）。選択は ~/.ccdesk/config.json に永続化
-/// （撮影用の供給元は保存しない ＝ 開発者の設定を踏まない）
-fn toggle_grouping(app: &mut App) {
-    app.grouping = match app.grouping {
-        Grouping::State => Grouping::Directory,
-        Grouping::Directory => Grouping::State,
-    };
-    app.source.save_window(WindowItem::Grouping(app.grouping));
+/// グルーピングの選択（入口は ⊞ group 行のメニューだけ）。選択は
+/// ~/.ccdesk/config.json に永続化（撮影用の供給元は保存しない ＝ 開発者の設定を
+/// 踏まない）。**選ばれた値を代入する**（反転ではない ＝ 3 つ目の grouping を
+/// 足してもメニューの項目がそのまま答えになる）。同じ値なら保存も走らせない
+fn set_grouping(app: &mut App, next: Grouping) {
+    if app.grouping == next {
+        return;
+    }
+    app.grouping = next;
+    app.source.save_window(WindowItem::Grouping(next));
 }
 
 /// メニュー: stop（セッションのプロセスを終わらせる）。
@@ -1988,9 +1923,6 @@ fn toggle_grouping(app: &mut App) {
 /// 表示が Stopped になるのはその結果で、記録によるものではない（だから
 /// `stop` でも `/clear` でも `/resume` でも同じ表示になる）
 fn menu_stop(app: &mut App, id: &SessionId) {
-    if id.is_empty() {
-        return;
-    }
     close_window_of(app, id);
 }
 
@@ -2015,27 +1947,38 @@ pub(crate) fn kill_sessions_on_exit(app: &mut App) {
 /// 一覧から外したいだけの操作で会話の記録まで消してはいけない）。
 /// 動いていれば先にプロセスを終わらせる（窓の無い行になってプロセスだけが残らない）
 fn menu_close(app: &mut App, id: &SessionId) {
-    if id.is_empty() {
-        return;
-    }
     close_window_of(app, id);
     let before = app.sessions.len();
     app.sessions.retain(|row| &row.session_id != id);
     if app.sessions.len() != before {
         save_sessions(app);
     }
-    // 消した行の名前を編集中だったら畳む（行が無いのに入力欄だけ残らない）
+}
+
+/// hook 注入ファイルのパス（実体は [`crate::hooks::inject_settings`]）。
+/// **書けなかったことを黙らせない**: hooks 無しで起動したセッションは状態報告が
+/// 縮退する（入力待ち・完了が導出できなくなる）ので、下部バーへ 1 行出す。
+/// セッション自体は hooks 無しで起動を続ける（起動を止めるほどの失敗ではない）
+fn hook_settings(app: &mut App) -> Option<std::path::PathBuf> {
+    let settings = crate::hooks::inject_settings();
+    if settings.is_none() {
+        set_notice(
+            app,
+            "could not write the hook settings; session states may not update (see ccdesk logs)"
+                .to_string(),
+        );
+    }
+    settings
 }
 
 /// 指定セッションのウィンドウを閉じる（＝ 子プロセスを終わらせる）。
 /// 窓が開いていなければ何もしない
 fn close_window_of(app: &mut App, id: &SessionId) {
-    if let Some(i) = app.windows.iter().position(|w| &w.session_id == id) {
-        if let Some(window) = app.windows.get_mut(i) {
-            let _ = window.child.kill();
-        }
-        remove_window(app, i);
-    }
+    let Some(i) = app.window_index(id) else {
+        return;
+    };
+    let _ = app.windows[i].child.kill();
+    remove_window(app, i);
 }
 
 /// ウィンドウを一覧から外す（active 添字も詰める）。
@@ -2050,7 +1993,9 @@ fn remove_window(app: &mut App, idx: usize) {
     if app.active >= idx && app.active > 0 {
         app.active -= 1;
     }
-    if app.windows.is_empty() || was_active {
+    // 右ペインが既に New 画面なら奪わない: 表示されていたのは死んだ窓ではなく
+    // New 画面で、作り直すと**入力途中のプロンプトが無警告で消える**
+    if (app.windows.is_empty() || was_active) && !matches!(app.right_view, RightView::New(_)) {
         app.open_new_view();
     }
 }
@@ -2108,8 +2053,7 @@ fn start_ccdesk_update(app: &mut App) {
     {
         let mut state = app
             .ccdesk_update
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_recover();
         // 実行中の多重起動と、済んだ更新の再実行を防ぐ
         if matches!(*state, SelfUpdate::Running | SelfUpdate::Done) {
             return;
@@ -2123,8 +2067,7 @@ fn start_ccdesk_update(app: &mut App) {
             Err(e) => SelfUpdate::Failed(format!("ccdesk update failed: {e}")),
         };
         *shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = outcome;
+            .lock_recover() = outcome;
     });
 }
 
@@ -2153,6 +2096,26 @@ fn start_claude_update(app: &mut App) {
         refresh.store(true, std::sync::atomic::Ordering::Relaxed);
         dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     });
+}
+
+/// 通知の寿命。**表示だけでなく当たり判定にも効く**（notice 表示中は下部バーの
+/// 使用率が出ない ＝ 使用率クリックの有無が notice の生死で決まる）ので、
+/// 失効の判断は描画ではなく run ループ（[`expire_notice`]) が持つ
+const NOTICE_TTL: Duration = Duration::from_secs(5);
+
+/// 期限を過ぎた通知を落とす（消えたら true ＝ 描き直す）。
+/// **描画の中で落とさない**: 期限切れでも描画が走らない間は `notice` が残り、
+/// 「消えたはずの通知が使用率クリックを殺し続ける」形になる
+fn expire_notice(app: &mut App) -> bool {
+    if app
+        .notice
+        .as_ref()
+        .is_some_and(|(_, at)| at.elapsed() >= NOTICE_TTL)
+    {
+        app.notice = None;
+        return true;
+    }
+    false
 }
 
 /// 下部バーに数秒表示する通知（起動失敗など、無反応に見せないため）。
@@ -2288,30 +2251,64 @@ fn relaunch<'a>(
 /// いるため（二度目に送ると同じ指示が 2 回走る）。`--session-id` を渡すので
 /// **行の identity は変わらず**、履歴が生まれたときにこの行の transcript になる。
 ///
-/// 失敗（cwd 消失等）は握りつぶさず下部バーへ通知する
-pub(crate) fn open_session(app: &mut App, id: &SessionId) {
-    // **ペインを開いた時点が既読の契機**（切替も再開も同じ ＝ ここ 1 箇所で済む）
-    mark_read(app, id);
-    if let Some(i) = app.windows.iter().position(|w| &w.session_id == id) {
-        app.show_session(i);
-        return;
+/// 失敗（cwd 消失等）は握りつぶさず下部バーへ通知する。
+/// **戻り値は「ペインがこのセッションを出したか」。** 呼び手はこれを見てから
+/// フォーカスを端末へ移す（失敗したのに移すと、打鍵が直前まで表示していた
+/// 別セッションへ流れる）
+pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
+    if let Some(i) = app.window_index(id) {
+        if app.windows[i].alive() {
+            // **ペインを開いた時点が既読の契機**（切替も再開も同じ）
+            mark_read(app, id);
+            app.show_session(i);
+            return true;
+        }
+        // 直前に死んだ窓（生死スキャンがまだ拾っていない）は開かない:
+        // 固まった死画面が出て、次のスキャンで意図せず New 画面へ飛ばされる。
+        // 外して下の起こし直しへ落とす（メニューの stop 判定 `session_open` と
+        // 同じく、生きた窓だけを「開いている」と数える）
+        let _ = app.windows[i].child.kill();
+        remove_window(app, i);
     }
-    let Some(row) = app.sessions.iter().find(|r| &r.session_id == id) else {
-        return; // 再読み込みで消えた行（クリックと削除の競合）は何もしない
+    // **別のインスタンス（または ccdesk の外）で動いているセッションを
+    // `claude -r` で二重に起こさない**: 同じ会話を 2 プロセスが同時に更新する。
+    // 判定材料は `agents --json`（生きている前景セッションだけが載る）。
+    // 観測は 2 秒周期なので、止めた直後の自分のセッションが最大 2 秒ほど
+    // 残って見えることがある（その間の open は 1 度空振りするだけで、壊れない）
+    if app
+        .agents
+        .iter()
+        .any(|a| a.is_interactive() && a.session_id == id.as_str())
+    {
+        set_notice(
+            app,
+            format!("session {id} is already running in another window"),
+        );
+        return false;
+    }
+    let Some(row) = app.row(id) else {
+        return false; // 再読み込みで消えた行（クリックと削除の競合）は何もしない
     };
     let (launch, cwd) = relaunch(&app.titles, row);
     let cwd = cwd.into_owned();
-    let settings = crate::hooks::inject_settings();
+    let settings = hook_settings(app);
     let (rows, cols) = app.pane_size();
     match Session::spawn(id, &cwd, rows, cols, launch, settings.as_deref()) {
         Ok(window) => {
+            // 既読は**起こせてから**付ける（起こせなかった行の未読 ● を、
+            // 内容を見ていないのに消さない）
+            mark_read(app, id);
             app.windows.push(window);
             app.show_session(app.windows.len() - 1);
             // 再開は transcript の読み直しに時間がかかりうる。子が端末を掴むまでの
             // 打鍵は捨てる（[`drop_input_while_starting`]）
             app.input_gate = Some(std::time::Instant::now());
+            true
         }
-        Err(e) => set_notice(app, format!("failed to resume session {id}: {e}")),
+        Err(e) => {
+            set_notice(app, format!("failed to resume session {id}: {e}"));
+            false
+        }
     }
 }
 
@@ -2320,6 +2317,7 @@ mod tests {
     use super::*;
 
     use crate::source::{persist_projects, WindowState};
+    use crate::ui::MIN_SIDEBAR;
 
     const TERM: (u16, u16) = (120, 40);
 
@@ -2345,7 +2343,15 @@ mod tests {
     fn labels(kind: &PopupKind, grouping: Grouping) -> Vec<String> {
         kind.entries(grouping)
             .into_iter()
-            .map(|(label, _)| label)
+            .map(|entry| entry.label)
+            .collect()
+    }
+
+    /// (表示名, 実行可能か) の一覧（項目表の見た目を比べるテスト用）
+    fn entry_pairs(kind: &PopupKind, grouping: Grouping) -> Vec<(String, bool)> {
+        kind.entries(grouping)
+            .into_iter()
+            .map(|entry| (entry.label, entry.enabled))
             .collect()
     }
 
@@ -2369,24 +2375,10 @@ mod tests {
     }
 
     /// 使用率が出ている App と、取り直しが呼ばれた回数の記録
+    /// （fixture は型の持ち主 = usage 側の 1 つを使う）
     fn usage_app() -> (App, Arc<std::sync::atomic::AtomicUsize>) {
         let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let usage = Usage::Ready(crate::usage::UsageInfo {
-            five: Some(crate::usage::UsageWindow {
-                pct: 18.0,
-                resets_at: Some(now + 3600),
-            }),
-            seven: Some(crate::usage::UsageWindow {
-                pct: 55.0,
-                resets_at: Some(now + 4 * 86400),
-            }),
-            models: Vec::new(),
-            fetched_at: now,
-        });
+        let usage = crate::usage::sample_ready(Vec::new());
         let mut app = test_app(34, TERM);
         app.source = Arc::new(TestSource::for_usage(usage.clone(), Arc::clone(&refreshes)));
         app.usage = usage;
@@ -2478,7 +2470,7 @@ mod tests {
     #[test]
     fn session_menu_disables_stop_only_when_no_window_is_open() {
         assert_eq!(
-            session("s1", true).entries(Grouping::State),
+            entry_pairs(&session("s1", true), Grouping::State),
             [
                 ("open".to_string(), true),
                 ("pin".to_string(), true),
@@ -2491,7 +2483,7 @@ mod tests {
             session("s1", false)
                 .entries(Grouping::State)
                 .into_iter()
-                .map(|(_, enabled)| enabled)
+                .map(|entry| entry.enabled)
                 .collect::<Vec<_>>(),
             [true, true, true, false, true],
             "stop must be the only entry disabled when there is no window"
@@ -2526,13 +2518,14 @@ mod tests {
     #[test]
     fn session_menu_maps_each_row_index_to_its_action() {
         let kind = session("abc123", true);
+        let g = Grouping::State;
         let id = || SessionId::new("abc123");
-        assert_eq!(kind.action(0), Some(PopupAction::OpenSession(id())));
-        assert_eq!(kind.action(1), Some(PopupAction::TogglePin(id())));
-        assert_eq!(kind.action(2), Some(PopupAction::MarkRead(id())));
-        assert_eq!(kind.action(3), Some(PopupAction::Stop(id())));
-        assert_eq!(kind.action(4), Some(PopupAction::Close(id())));
-        assert_eq!(kind.action(5), None, "an index past the last entry must do nothing");
+        assert_eq!(kind.action(g, 0), Some(PopupAction::OpenSession(id())));
+        assert_eq!(kind.action(g, 1), Some(PopupAction::TogglePin(id())));
+        assert_eq!(kind.action(g, 2), Some(PopupAction::MarkRead(id())));
+        assert_eq!(kind.action(g, 3), Some(PopupAction::Stop(id())));
+        assert_eq!(kind.action(g, 4), Some(PopupAction::Close(id())));
+        assert_eq!(kind.action(g, 5), None, "an index past the last entry must do nothing");
     }
 
     /// grouping メニューは現在の選択に ● を付け、各行はその grouping を指す
@@ -2547,14 +2540,14 @@ mod tests {
             ["  state", "● directory"]
         );
         assert_eq!(
-            PopupKind::Group.action(0),
+            PopupKind::Group.action(Grouping::State, 0),
             Some(PopupAction::SetGrouping(Grouping::State))
         );
         assert_eq!(
-            PopupKind::Group.action(1),
+            PopupKind::Group.action(Grouping::State, 1),
             Some(PopupAction::SetGrouping(Grouping::Directory))
         );
-        assert_eq!(PopupKind::Group.action(2), None);
+        assert_eq!(PopupKind::Group.action(Grouping::State, 2), None);
     }
 
     /// セッション行の**行末** `=` クリックでメニューが開く（二次操作の入口）。
@@ -2628,14 +2621,14 @@ mod tests {
             ["new session", "remove project"]
         );
         assert_eq!(
-            kind.action(0),
+            kind.action(Grouping::State, 0),
             Some(PopupAction::NewSessionIn("C:\\dev\\shop-app".to_string()))
         );
         assert_eq!(
-            kind.action(1),
+            kind.action(Grouping::State, 1),
             Some(PopupAction::RemoveProject("C:\\dev\\shop-app".to_string()))
         );
-        assert_eq!(kind.action(2), None);
+        assert_eq!(kind.action(Grouping::State, 2), None);
     }
 
     /// Esc は開いているメニューを閉じる（階層を持たないので戻り先も無い）。
@@ -2679,7 +2672,7 @@ mod tests {
         let stop = kind
             .entries(app.grouping)
             .iter()
-            .position(|(label, _)| label == "stop")
+            .position(|entry| entry.label == "stop")
             .expect("the stop entry is gone");
         open(&mut app, kind, 3);
         for _ in 0..stop {
@@ -2716,27 +2709,6 @@ mod tests {
                 "a border click at ({col},{row}) must not run an entry"
             );
         }
-    }
-
-    /// **幅の下限は「短い項目しか無いメニューが痩せない」ための床**で、
-    /// grouping 切替（最長 `  directory` = 11 桁）がそれに当たる。
-    /// セッションのメニューは項目が増えて床を越えたので、最長項目から決まる
-    #[test]
-    fn menu_width_is_the_longest_entry_but_never_below_the_floor() {
-        use unicode_width::UnicodeWidthStr;
-        assert_eq!(PopupKind::Group.width(Grouping::State), POPUP_MIN_WIDTH);
-        assert_eq!(PopupKind::Group.width(Grouping::Directory), POPUP_MIN_WIDTH);
-        let kind = session("s1", true);
-        let widest = labels(&kind, Grouping::State)
-            .iter()
-            .map(|label| label.width())
-            .max()
-            .unwrap() as u16;
-        assert_eq!(kind.width(Grouping::State), widest + POPUP_CHROME);
-        assert!(
-            kind.width(Grouping::State) > POPUP_MIN_WIDTH,
-            "the floor must not clip the longest entry"
-        );
     }
 
     /// 内容から幅を決めるので、狭いサイドバーでは右ペインに被る。
@@ -3174,8 +3146,7 @@ mod tests {
     fn state_name(app: &App) -> &'static str {
         match &*app
             .ccdesk_update
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
         {
             SelfUpdate::Idle => "Idle",
             SelfUpdate::Running => "Running",
@@ -3338,20 +3309,20 @@ mod tests {
                 projects: match &self.projects {
                     ProjectsBackend::Absent => Vec::new(),
                     ProjectsBackend::MemoryDisk { disk, .. } => disk
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .lock_recover()
                         .clone(),
                 },
             }
         }
 
-        // 記録するのは「次に開く画面」だけ（他の項目は実ファイルへも書かない）
+        // 記録するのは「次に開く画面」だけ（他の項目は実ファイルへも書かない）。
+        // None（new session 画面）の保存表記は live 側の持ち物なので、
+        // ここでは Option の形をそのまま記録する
         fn save_window(&self, item: WindowItem<'_>) {
             if let WindowItem::LastView(view) = item {
                 self.views
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(view.to_string());
+                    .lock_recover()
+                    .push(view.map(|id| id.to_string()).unwrap_or_default());
             }
         }
 
@@ -3360,11 +3331,9 @@ mod tests {
                 ProjectsBackend::Absent => next.to_vec(),
                 ProjectsBackend::MemoryDisk { disk, baseline } => {
                     let mut disk = disk
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        .lock_recover();
                     let mut baseline = baseline
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        .lock_recover();
                     persist_projects(&mut baseline, next, |merge| {
                         *disk = merge(disk.clone());
                         true // メモリ上のディスクは書き込みに失敗しない
@@ -3565,17 +3534,21 @@ mod tests {
             (false, false, IDLE_REDRAW * 10),
         ] {
             assert!(
-                should_draw(false, force, pty_dirty, since_draw),
+                should_draw(false, force, pty_dirty, since_draw, IDLE_REDRAW),
                 "nothing asked for a redraw: force={force} dirty={pty_dirty}"
             );
             assert!(
-                !should_draw(true, force, pty_dirty, since_draw),
+                !should_draw(true, force, pty_dirty, since_draw, IDLE_REDRAW),
                 "a frame was grabbed while the child was mid-redraw: \
                  force={force} dirty={pty_dirty}"
             );
         }
         // 何も起きていない周は描かない（無条件 60fps にしない）
-        assert!(!should_draw(false, false, false, fresh));
+        assert!(!should_draw(false, false, false, fresh, IDLE_REDRAW));
+        // スピナーが回っている間だけ短い周期でも描く（回っていなければ 1 秒粒度）
+        let between = SPINNER_REDRAW + Duration::from_millis(50);
+        assert!(should_draw(false, false, false, between, SPINNER_REDRAW));
+        assert!(!should_draw(false, false, false, between, IDLE_REDRAW));
     }
 
     /// **一覧とアカウント行は 1 つの輪。** 下端の先がアカウント行で、その先は
@@ -3648,8 +3621,7 @@ mod tests {
             let mut app = test_app(34, TERM);
             app.ccdesk_latest = Some("v9.9.9".to_string());
             *app.ccdesk_update
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+                .lock_recover() = state;
             start_ccdesk_update(&mut app);
             assert_eq!(
                 state_name(&app),
@@ -3666,6 +3638,30 @@ mod tests {
             updated_at,
             ..SessionRow::new(SessionId::new(id), cwd, updated_at)
         }
+    }
+
+    /// **別インスタンス（や ccdesk の外）で動いているセッションを `claude -r` で
+    /// 二重に起こさない。** `agents --json` に interactive で載っている ＝
+    /// どこかで生きて動いている ＝ 二重に開くと同じ会話を 2 プロセスが同時更新する
+    #[test]
+    fn opening_a_session_running_elsewhere_does_not_double_resume() {
+        let mut app = test_app(34, TERM);
+        app.sessions = vec![session_row("s", "C:\\dev\\api", 1)];
+        app.agents = vec![AgentInfo {
+            session_id: "s".to_string(),
+            kind: "interactive".to_string(),
+            status: "busy".to_string(),
+            pid: Some(4242),
+        }];
+        assert!(
+            !open_session(&mut app, &SessionId::new("s")),
+            "reported the pane as opened"
+        );
+        assert!(
+            app.windows.is_empty(),
+            "spawned a second claude for a session that is already running"
+        );
+        assert!(app.notice.is_some(), "the user was not told why nothing opened");
     }
 
     fn project(cwd: &str, has_sessions: bool) -> PopupKind {
@@ -3696,7 +3692,8 @@ mod tests {
         assert_eq!(cwd, row.cwd, "a fresh start must use the row's own cwd");
         // 1 ターン終わって transcript ができたら再開になる
         titles.write_transcript(&row, "{\"type\":\"user\"}\n");
-        titles.refresh(&mut row);
+        let mut budget = u64::MAX;
+        titles.refresh(&mut row, &mut budget);
         let (launch, cwd) = relaunch(&titles, &row);
         assert!(
             matches!(launch, Launch::Resume),
@@ -3969,14 +3966,14 @@ mod tests {
     #[test]
     fn project_menu_disables_remove_while_sessions_remain() {
         assert_eq!(
-            project("C:\\dev\\api", false).entries(Grouping::Directory),
+            entry_pairs(&project("C:\\dev\\api", false), Grouping::Directory),
             [
                 ("new session".to_string(), true),
                 ("remove project".to_string(), true),
             ]
         );
         assert_eq!(
-            project("C:\\dev\\api", true).entries(Grouping::Directory),
+            entry_pairs(&project("C:\\dev\\api", true), Grouping::Directory),
             [
                 ("new session".to_string(), true),
                 ("remove project".to_string(), false),
@@ -4058,10 +4055,12 @@ mod tests {
         assert_eq!(app.projects, ["C:\\dev\\api", "C:\\dev\\web"]);
     }
 
-    /// 上限を超えたら古い側から落とす（登録が自動なので放っておくと際限なく積まれる）
+    /// 上限を超えたら古い側から落とす（登録が自動なので放っておくと際限なく積まれる）。
+    /// **上限の適用は保存の正本（`merge_projects`）だけ**なので、保存を通る
+    /// 供給元で検査する（`register_project` 自身は上限を知らない）
     #[test]
     fn registering_beyond_the_limit_drops_the_oldest() {
-        let mut app = test_app(34, TERM);
+        let mut app = app_with_disk(&[], &[]);
         for i in 0..PROJECTS_LIMIT + 1 {
             register_project(&mut app, &format!("C:\\dev\\p{i}"));
         }
@@ -4083,7 +4082,7 @@ mod tests {
     /// （登録が消え、最後のセッションを消した時点で見出し＝入口まで消える）
     #[test]
     fn reusing_a_folder_keeps_it_when_the_limit_evicts() {
-        let mut app = test_app(34, TERM);
+        let mut app = app_with_disk(&[], &[]);
         for i in 0..PROJECTS_LIMIT {
             register_project(&mut app, &format!("C:\\dev\\p{i}"));
         }
@@ -4789,13 +4788,10 @@ mod tests {
     #[test]
     fn closing_a_row_leaves_its_transcript_on_disk() {
         let id = "8a1c0f52-0b3e-4a6d-9f11-2c7d5e8b0a34";
-        // 記録のファイル名は session_id（`claude --session-id` へ渡した UUID そのもの）
-        let dir = std::env::temp_dir().join(format!(
-            "ccdesk-transcript-{}-{id}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let transcript = dir.join(format!("{id}.jsonl"));
+        // 記録のファイル名は session_id（`claude --session-id` へ渡した UUID そのもの）。
+        // 置き場は共通のテスト用一時ディレクトリ（実ユーザーのファイルは触らない）
+        let dir = crate::testutil::TempDir::new("transcript", "closing_a_row");
+        let transcript = dir.join(&format!("{id}.jsonl"));
         std::fs::write(&transcript, "{}").unwrap();
 
         let mut app = app_with_row(id);
@@ -4803,7 +4799,6 @@ mod tests {
 
         assert!(app.sessions.is_empty(), "the row is still in the list");
         assert!(transcript.exists(), "closing the row removed its transcript too");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **`Enter` はメニューを持つ行ではその行のメニュー。** セッション行も同じで、
@@ -4836,19 +4831,28 @@ mod tests {
         }
     }
 
-    /// **セッションのメニューの `open` で本当にセッションが開く。** キーボードから
-    /// セッションを開く導線はこれ 1 本なので、項目が並んでいるだけでなく
-    /// 行クリックと同じ結果（[`open_session`] を通って既読になり、打ち先が端末へ移る）
-    /// になることを見る。
+    /// **セッションのメニューの `open` が行クリックと同じ [`open_session`] を通る。**
+    /// キーボードからセッションを開く導線はこれ 1 本なので、先頭項目であることと、
+    /// open_session の判断（ここでは already-running ガード）が効くことを見る。
     ///
-    /// 行の cwd に**存在しないフォルダ**を置いてあるのは、この単体テストで本物の
-    /// `claude -r` を起こさないため（起動は cwd の解決で失敗して終わる）
+    /// **本物の `claude -r` は起こさない**: 行を「別インスタンスで稼働中」にして
+    /// ガードで止める。spawn の成否は環境（claude の有無・portable-pty の cwd
+    /// フォールバック）で変わるので、spawn に到達する形はこの単体テストでは扱えない。
+    /// 開けなかったのだから、未読は残りフォーカスも移らない
+    /// （成功時に既読になる順序は open_session 自身が持つ）
     #[test]
-    fn the_session_menu_open_entry_opens_the_session() {
+    fn the_session_menu_open_entry_routes_through_open_session() {
         let mut app = test_app(34, TERM);
         app.sessions = vec![session_row("s", "C:\\ccdesk-test-no-such-folder", 1)];
         // claude が行を開いた後に何か言った ＝ 未読
         app.hook_states = HookStates::from_entries([("s", "done", 2)]);
+        // 別インスタンスで稼働中 ＝ open_session のガードが決定的に止める
+        app.agents = vec![AgentInfo {
+            session_id: "s".to_string(),
+            kind: "interactive".to_string(),
+            status: "busy".to_string(),
+            pid: Some(4242),
+        }];
         app.sidebar_rows = vec![SidebarRow::Action(RowAction::Open(SessionId::new("s")))];
         app.sidebar_header_rows = 1;
         app.selection = SidebarPos::Row(0);
@@ -4865,19 +4869,24 @@ mod tests {
             .kind
             .entries(app.grouping)
             .iter()
-            .position(|(label, _)| label == "open")
+            .position(|entry| entry.label == "open")
             .expect("the menu has no open entry");
         assert_eq!(index, 0, "open must be the first entry");
 
         activate_popup(&mut app, index);
         assert!(app.popup.is_none(), "the menu stayed open after open ran");
-        // 開いた行は既読になり（[`mark_read`] ＝ open_session の唯一の入口）、
-        // 打鍵の宛先はそのセッションになる
+        // open_session のガードに到達した証拠 ＝ already-running の通知
         assert!(
-            !app.hook_states.unread(only_row(&app)),
-            "open did not mark the row as read"
+            app.notice.as_ref().is_some_and(|(msg, _)| msg.contains("already running")),
+            "the menu entry did not reach open_session: {:?}",
+            app.notice
         );
-        assert_eq!(app.focus, Focus::Terminal, "open did not move the keys to the pane");
+        // 開けなかったので、内容を見ていない行の未読は残り、打ち先も移らない
+        assert!(
+            app.hook_states.unread(only_row(&app)),
+            "a session that did not open was marked as read"
+        );
+        assert_ne!(app.focus, Focus::Terminal, "keys moved to a pane that did not open");
     }
 
     /// **`←` `→` はサイドバーから撤去した。** 「開く」と「メニュー」の 2 つを持つのは

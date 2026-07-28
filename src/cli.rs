@@ -71,6 +71,29 @@ pub(crate) fn update_self() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 診断項目 1 つの結果。**ok/FAIL/warn の綴り・桁揃え・exit code への反映は
+/// [`Check::report`] 1 箇所**（項目を足すときに `failed = true` を書き忘れて
+/// exit 0 のまま通る、という形を作らない）
+enum Check {
+    Ok(String),
+    /// ccdesk は動くが伝えるべきことがある（exit code には効かない）
+    Warn(String),
+    Fail(String),
+}
+
+impl Check {
+    fn report(self, failed: &mut bool) {
+        match self {
+            Self::Ok(msg) => println!("ok    {msg}"),
+            Self::Warn(msg) => println!("warn  {msg}"),
+            Self::Fail(msg) => {
+                println!("FAIL  {msg}");
+                *failed = true;
+            }
+        }
+    }
+}
+
 /// 環境診断。各項目を ok / FAIL / warn の 1 行で英語出力し、FAIL があれば exit 1。
 /// TUI を起動しないので raw mode には入らず、色照会もここで直接行う
 pub(crate) fn run_doctor() -> anyhow::Result<()> {
@@ -81,153 +104,127 @@ pub(crate) fn run_doctor() -> anyhow::Result<()> {
     // （`ccdesk update` の出力もこの 2 つを案内している）
     update::cleanup_old_exe();
 
-    // claude CLI が PATH にあるか（バージョン文字列も表示）
-    match std::process::Command::new("claude")
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            let ver = String::from_utf8_lossy(&o.stdout);
-            println!("ok    claude CLI on PATH: {}", ver.trim());
-        }
-        Ok(o) => {
-            println!("FAIL  claude CLI: `claude --version` exited with {}", o.status);
-            failed = true;
-        }
-        Err(e) => {
-            println!("FAIL  claude CLI not found on PATH ({e})");
-            failed = true;
-        }
-    }
-
-    // `claude agents --json --all` が JSON 配列を返すか
-    match std::process::Command::new("claude")
-        .args(["agents", "--json", "--all"])
-        .stdin(std::process::Stdio::null())
-        .output()
-    {
-        Ok(o) => match serde_json::from_slice::<serde_json::Value>(&o.stdout) {
-            Ok(serde_json::Value::Array(items)) => {
-                println!("ok    claude agents --json: {} session(s)", items.len());
-            }
-            Ok(_) => {
-                println!("FAIL  claude agents --json: expected a JSON array");
-                failed = true;
-            }
-            Err(e) => {
-                println!("FAIL  claude agents --json: invalid JSON ({e})");
-                failed = true;
-            }
-        },
-        Err(e) => {
-            println!("FAIL  claude agents --json: failed to run ({e})");
-            failed = true;
-        }
-    }
-
-    // サイドバー下部に出るアカウント行。表示が実際どうなるかをここで確認できる
-    // （未ログインは FAIL ではない = ccdesk 自体は動く。ログインを促すだけ）
-    match fetch_account() {
-        AccountStatus::LoggedIn(label) => println!("ok    claude account: {label}"),
-        AccountStatus::LoggedOut => {
-            println!("warn  claude account: not logged in (run /login in a claude session)");
-        }
-        AccountStatus::Unknown => {
-            println!("warn  claude account: could not determine (`claude auth status --json`)");
-        }
-    }
-
-    // 使用率の取得（**opt-in を切っていても実際に 1 回叩く** ＝ 入れる前に
-    // 何が返るか確かめられる。取得は課金ゼロ・枠を消費しない。[`crate::usage`]）。
-    //
-    // **これが無いと「opt-in したのに出ない」人へ渡せる情報が無い。** 以前の方式は
-    // 開発者の環境でだけ通る 1 本を踏んでいて、他人の環境で無言に空になっていた。
-    // 環境差でしか壊れないものは、他人自身が 1 コマンドで確かめられる必要がある
-    {
-        let opt_in = if ccdesk::load_setting("usage_display").as_deref() == Some("on") {
-            "on"
-        } else {
-            "off"
-        };
-        match crate::usage::diagnose() {
-            Ok(crate::usage::Usage::Ready(info)) => {
-                let show = |label: &str, w: Option<&crate::usage::UsageWindow>| {
-                    w.map_or_else(
-                        || format!("{label} -"),
-                        |w| format!("{label} {}%", w.pct.round() as u32),
-                    )
-                };
-                let mut parts = vec![show("5h", info.five.as_ref()), show("7d", info.seven.as_ref())];
-                parts.extend(
-                    info.models
-                        .iter()
-                        .map(|(name, w)| format!("{name} {}%", w.pct.round() as u32)),
-                );
-                println!("ok    usage ({opt_in}): {}", parts.join(" · "));
-            }
-            // 枠の概念が無いアカウント（API キー・Bedrock・Vertex 等）。
-            // ccdesk は動くので FAIL ではない。**恒久的に取れないことを言う**
-            Ok(crate::usage::Usage::Unavailable) => {
-                println!(
-                    "warn  usage ({opt_in}): this account has no rate-limit windows \
-                     (subscription plans only); the gauge stays hidden"
-                );
-            }
-            Ok(_) => {
-                println!(
-                    "warn  usage ({opt_in}): claude answered but no window could be read \
-                     (its shape may have changed)"
-                );
-            }
-            Err(e) => println!("warn  usage ({opt_in}): {e}"),
-        }
-    }
-
-    // ~/.ccdesk/ が書き込み可能か（試し書きして消す）
-    match ccdesk::ccdesk_dir() {
-        Some(dir) => {
-            let probe = dir.join(".doctor-write-test");
-            match std::fs::write(&probe, b"ok") {
-                Ok(()) => {
-                    let _ = std::fs::remove_file(&probe);
-                    println!("ok    ~/.ccdesk writable: {}", dir.display());
-                }
-                Err(e) => {
-                    println!("FAIL  ~/.ccdesk not writable: {} ({e})", dir.display());
-                    failed = true;
-                }
-            }
-        }
-        None => {
-            println!("FAIL  ~/.ccdesk: could not resolve path (USERPROFILE unset?)");
-            failed = true;
-        }
-    }
-
-    // ターミナルの色照会（OSC 10/11）。取れれば fg/bg を hex 表示、失敗なら warn
-    // （パイプ実行など実端末でない場合は失敗して当然。テーマ転送は dark にフォールバック）
-    {
-        use terminal_colorsaurus::{color_palette, QueryOptions};
-        let hex = |c: terminal_colorsaurus::Color| {
-            format!("#{:02x}{:02x}{:02x}", (c.r >> 8) as u8, (c.g >> 8) as u8, (c.b >> 8) as u8)
-        };
-        match color_palette(QueryOptions::default()) {
-            Ok(p) => println!(
-                "ok    terminal color query: fg {} bg {}",
-                hex(p.foreground),
-                hex(p.background)
-            ),
-            Err(e) => println!(
-                "warn  terminal color query failed ({e}); theme forwarding falls back to dark"
-            ),
-        }
-    }
+    check_claude_cli().report(&mut failed);
+    check_agents().report(&mut failed);
+    check_account().report(&mut failed);
+    check_usage().report(&mut failed);
+    check_ccdesk_dir().report(&mut failed);
+    check_terminal_colors().report(&mut failed);
 
     if failed {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// claude CLI が PATH にあるか（バージョン文字列も表示）。
+/// 取得の作法は本番（`poll::fetch_version`）と同じ `poll::out`
+fn check_claude_cli() -> Check {
+    match crate::poll::out("claude", &["--version"]) {
+        Some(ver) if !ver.trim().is_empty() => {
+            Check::Ok(format!("claude CLI on PATH: {}", ver.trim()))
+        }
+        Some(_) => Check::Fail("claude CLI: `claude --version` answered nothing".to_string()),
+        None => Check::Fail("claude CLI not found on PATH".to_string()),
+    }
+}
+
+/// `claude agents --json --all` が読めるか。**本番のポーラーと同じ
+/// [`crate::poll::fetch_agents`]** を通す（別経路だと poll 側だけ引数や解釈を
+/// 変えたときに doctor が嘘の ok を出す）
+fn check_agents() -> Check {
+    match crate::poll::fetch_agents() {
+        Some(items) => Check::Ok(format!("claude agents --json: {} session(s)", items.len())),
+        None => Check::Fail(
+            "claude agents --json: failed to run or did not return a JSON array".to_string(),
+        ),
+    }
+}
+
+/// サイドバー下部に出るアカウント行。表示が実際どうなるかをここで確認できる
+/// （未ログインは FAIL ではない = ccdesk 自体は動く。ログインを促すだけ）
+fn check_account() -> Check {
+    match fetch_account() {
+        AccountStatus::LoggedIn(label) => Check::Ok(format!("claude account: {label}")),
+        AccountStatus::LoggedOut => Check::Warn(
+            "claude account: not logged in (run /login in a claude session)".to_string(),
+        ),
+        AccountStatus::Unknown => Check::Warn(
+            "claude account: could not determine (`claude auth status --json`)".to_string(),
+        ),
+    }
+}
+
+/// 使用率の取得（**opt-in を切っていても実際に 1 回叩く** ＝ 入れる前に
+/// 何が返るか確かめられる。取得は課金ゼロ・枠を消費しない。[`crate::usage`]）。
+///
+/// **これが無いと「opt-in したのに出ない」人へ渡せる情報が無い。** 以前の方式は
+/// 開発者の環境でだけ通る 1 本を踏んでいて、他人の環境で無言に空になっていた。
+/// 環境差でしか壊れないものは、他人自身が 1 コマンドで確かめられる必要がある
+fn check_usage() -> Check {
+    let opt_in = if ccdesk::load_setting("usage_display").as_deref() == Some("on") {
+        "on"
+    } else {
+        "off"
+    };
+    match crate::usage::diagnose() {
+        Ok(crate::usage::Usage::Ready(info)) => {
+            // 枠のラベルと並びは画面と同じ配り口（`UsageInfo::windows`）
+            let parts: Vec<String> = info
+                .windows()
+                .map(|(label, w)| format!("{label} {}%", w.pct.round() as u32))
+                .collect();
+            Check::Ok(format!("usage ({opt_in}): {}", parts.join(" · ")))
+        }
+        // 枠の概念が無いアカウント（API キー・Bedrock・Vertex 等）。
+        // ccdesk は動くので FAIL ではない。**恒久的に取れないことを言う**
+        Ok(crate::usage::Usage::Unavailable) => Check::Warn(format!(
+            "usage ({opt_in}): this account has no rate-limit windows \
+             (subscription plans only); the gauge stays hidden"
+        )),
+        Ok(_) => Check::Warn(format!(
+            "usage ({opt_in}): claude answered but no window could be read \
+             (its shape may have changed)"
+        )),
+        Err(e) => Check::Warn(format!("usage ({opt_in}): {e}")),
+    }
+}
+
+/// ~/.ccdesk/ が書き込み可能か（試し書きして消す）
+fn check_ccdesk_dir() -> Check {
+    let Some(dir) = ccdesk::ccdesk_dir() else {
+        return Check::Fail("~/.ccdesk: could not resolve path (USERPROFILE unset?)".to_string());
+    };
+    let probe = dir.join(".doctor-write-test");
+    match std::fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            Check::Ok(format!("~/.ccdesk writable: {}", dir.display()))
+        }
+        Err(e) => Check::Fail(format!("~/.ccdesk not writable: {} ({e})", dir.display())),
+    }
+}
+
+/// ターミナルの色照会（OSC 10/11）。取れれば fg/bg を hex 表示、失敗なら warn
+/// （パイプ実行など実端末でない場合は失敗して当然。テーマ転送は dark にフォールバック）。
+/// 照会は TUI 起動と同じ 1 実装（theme 側）を通る ＝ doctor の ok が本番と同じ経路の答えになる
+fn check_terminal_colors() -> Check {
+    let hex = |c: [u16; 3]| {
+        format!(
+            "#{:02x}{:02x}{:02x}",
+            (c[0] >> 8) as u8,
+            (c[1] >> 8) as u8,
+            (c[2] >> 8) as u8
+        )
+    };
+    match crate::theme::query_host_colors() {
+        (Some(fg), Some(bg)) => {
+            Check::Ok(format!("terminal color query: fg {} bg {}", hex(fg), hex(bg)))
+        }
+        _ => Check::Warn(
+            "terminal color query failed; theme forwarding falls back to dark".to_string(),
+        ),
+    }
 }
 
 /// ~/.ccdesk/error.log のパスを表示し、末尾 50 行を出力する。

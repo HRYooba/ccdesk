@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use ccdesk::{lock_path_for, write_json_atomically, Lock, LOCK_STALE};
+use ccdesk::{lock_path_for, write_json_atomically, Lock, LockExt, LOCK_STALE};
 
 /// 保管ファイルのトップレベルキー（`{"sessions": [ … ]}`）
 const SESSIONS_KEY: &str = "sessions";
@@ -204,8 +204,12 @@ pub(crate) struct SessionStore {
     ///
     /// **ストアが持つ**のは、基準を進めてよい瞬間（＝ 書けたことが確認できた瞬間）が
     /// ロックの内側にしか無いため。呼び出し側に持たせると「書けたか」と「基準」が
-    /// 別の場所に分かれ、片方だけ進んだ状態を作れてしまう
-    baseline: Mutex<Vec<SessionRow>>,
+    /// 別の場所に分かれ、片方だけ進んだ状態を作れてしまう。
+    ///
+    /// **持つのは ID だけ。** マージが基準に問うのは「この行を知っていたか」だけ
+    /// なので（[`merge_sessions`]）、行の中身まで複製して持つ理由が無い
+    /// （2 秒周期の読みのたびに全行のディープコピーが走っていた）
+    baseline: Mutex<std::collections::HashSet<SessionId>>,
 }
 
 impl SessionStore {
@@ -214,7 +218,7 @@ impl SessionStore {
             store,
             lock_wait: STORE_LOCK_WAIT,
             lock_stale: LOCK_STALE,
-            baseline: Mutex::new(Vec::new()),
+            baseline: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -236,7 +240,7 @@ impl SessionStore {
     /// **読んだ内容が以降の書き込みでマージする基準になる**（[`merge_sessions`]）
     pub(crate) fn list(&self) -> Vec<SessionRow> {
         let rows = read_rows(&self.store);
-        *self.baseline() = rows.clone();
+        *self.baseline() = ids_of(&rows);
         rows
     }
 
@@ -263,37 +267,27 @@ impl SessionStore {
         if write_json_atomically(&self.store, &document).is_err() {
             return next.to_vec();
         }
-        *baseline = merged.clone();
+        *baseline = ids_of(&merged);
         merged
     }
 
-    fn baseline(&self) -> std::sync::MutexGuard<'_, Vec<SessionRow>> {
-        self.baseline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// 起動時の掃除: [`write_json_atomically`] が rename する前にプロセスが死ぬと、
-    /// その `.tmp` は誰にも消されずに残る。
-    ///
-    /// **どう回収するかは [`ccdesk::reap_leftover_tmp`]**（tmp の名前を決める側と
-    /// 同じ場所）。ここが持つのは対象の指定だけ
-    pub(crate) fn cleanup_leftover_tmp(&self) {
-        ccdesk::reap_leftover_tmp(&self.store);
+    fn baseline(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<SessionId>> {
+        self.baseline.lock_recover()
     }
 }
 
-/// 保管ファイルの行一覧（無い・壊れている・書き換え途中はすべて空）。
+/// マージの基準に持つ ID 集合（[`SessionStore::baseline`]）
+fn ids_of(rows: &[SessionRow]) -> std::collections::HashSet<SessionId> {
+    rows.iter().map(|row| row.session_id.clone()).collect()
+}
+
+/// 保管ファイルの行一覧（無い・壊れている・書き換え途中はすべて空 ＝
+/// 読みの寛容さは [`ccdesk::read_json`] の契約）。
 /// identity を持たない行は捨てる（[`SessionRow::from_json`]）
 fn read_rows(path: &Path) -> Vec<SessionRow> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return Vec::new();
-    };
-    value
-        .get(SESSIONS_KEY)
+    ccdesk::read_json(path)
+        .as_ref()
+        .and_then(|value| value.get(SESSIONS_KEY))
         .and_then(Value::as_array)
         .map(|rows| rows.iter().filter_map(SessionRow::from_json).collect())
         .unwrap_or_default()
@@ -331,7 +325,7 @@ fn read_rows(path: &Path) -> Vec<SessionRow> {
 /// 同じ性質）。削除をもう一度押せば済む頻度の問題として割り切っている
 fn merge_sessions(
     disk: &[SessionRow],
-    baseline: &[SessionRow],
+    baseline: &std::collections::HashSet<SessionId>,
     next: &[SessionRow],
 ) -> Vec<SessionRow> {
     let mut merged: Vec<SessionRow> = next.to_vec();
@@ -344,7 +338,7 @@ fn merge_sessions(
             Some(mine) if row.updated_at > mine.updated_at => *mine = row.clone(),
             Some(_) => {}
             // baseline に居る ＝ このインスタンスが削除した行なので足さない
-            None if baseline.iter().any(|b| b.session_id == row.session_id) => {}
+            None if baseline.contains(&row.session_id) => {}
             None => merged.push(row.clone()),
         }
     }
@@ -354,27 +348,18 @@ fn merge_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
     // 取り残し tmp の判定と保持期間は lib 側（tmp 名を決める場所）が持つ
     use ccdesk::{is_leftover_tmp, TMP_KEEP};
 
-    /// テスト専用の保管先。**実ユーザーの `~/.ccdesk` を絶対に触らない**ための境界。
-    /// 名前はテスト名 + pid + 連番で一意にする（並列実行・別チェックアウトの
-    /// 同時実行と衝突させない）。Drop で丸ごと消すので、アサート失敗で
-    /// パニックしても残らない
-    struct TempStore(PathBuf);
+    /// テスト専用の保管先。**実ユーザーの `~/.ccdesk` を絶対に触らない**ための境界
+    /// （安全な置き場の実装は [`crate::testutil::TempDir`] 1 つ。
+    /// ここが持つのは保管ファイルの名前だけ）
+    struct TempStore(crate::testutil::TempDir);
 
     impl TempStore {
         fn new(test: &str) -> Self {
-            static SEQ: AtomicUsize = AtomicUsize::new(0);
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "ccdesk-sessions-{test}-{}-{seq}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
-            Self(root)
+            Self(crate::testutil::TempDir::new("sessions", test))
         }
 
         fn path(&self) -> PathBuf {
@@ -390,12 +375,6 @@ mod tests {
             let mut store = self.store();
             store.lock_wait = Duration::from_millis(50);
             store
-        }
-    }
-
-    impl Drop for TempStore {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -425,7 +404,7 @@ mod tests {
         let disk = [row("a", "C:\\dev\\disk", 2)];
         let next = [row("a", "C:\\dev\\local", 1)];
         assert_eq!(
-            merge_sessions(&disk, &[], &next).len(),
+            merge_sessions(&disk, &ids_of(&[]), &next).len(),
             1,
             "same-ID row split into two"
         );
@@ -439,7 +418,7 @@ mod tests {
         let disk = [row("shared", "C:\\dev\\shared", 1), row("from-b", "C:\\dev\\b", 2)];
         let next = [row("shared", "C:\\dev\\shared", 1), row("from-a", "C:\\dev\\a", 3)];
         assert_eq!(
-            ids(&merge_sessions(&disk, &baseline, &next)),
+            ids(&merge_sessions(&disk, &ids_of(&baseline), &next)),
             ["shared", "from-a", "from-b"],
             "another instance's session is missing from the list"
         );
@@ -450,8 +429,8 @@ mod tests {
     #[test]
     fn merging_is_a_no_op_for_a_single_instance() {
         let next = [row("a", "C:\\dev\\a", 1), row("b", "C:\\dev\\b", 2)];
-        assert_eq!(merge_sessions(&next, &next, &next), next);
-        assert_eq!(merge_sessions(&[], &next, &next), next);
+        assert_eq!(merge_sessions(&next, &ids_of(&next), &next), next);
+        assert_eq!(merge_sessions(&[], &ids_of(&next), &next), next);
     }
 
     /// **両方が知っている行は後に触った側が勝つ。** 他インスタンスが状態を
@@ -461,12 +440,12 @@ mod tests {
         let baseline = [row("s", "C:\\dev\\before", 1)];
         let disk = [row("s", "C:\\dev\\changed-by-b", 5)];
         let next = [row("s", "C:\\dev\\before", 1)];
-        let merged = merge_sessions(&disk, &baseline, &next);
+        let merged = merge_sessions(&disk, &ids_of(&baseline), &next);
         assert_eq!(merged[0].cwd, "C:\\dev\\changed-by-b", "clobbered another instance's update");
 
         // こちらの方が新しければこちらが残る（自分の操作が保存の往復で巻き戻らない）
         let next = [row("s", "C:\\dev\\changed-by-a", 9)];
-        let merged = merge_sessions(&disk, &baseline, &next);
+        let merged = merge_sessions(&disk, &ids_of(&baseline), &next);
         assert_eq!(merged[0].cwd, "C:\\dev\\changed-by-a", "own change got rolled back");
     }
 
@@ -480,7 +459,7 @@ mod tests {
         let disk = [row("keep", "C:\\dev\\keep", 1), row("dropped", "C:\\dev\\drop", 9)];
         let next = [row("keep", "C:\\dev\\keep", 1)];
         assert_eq!(
-            ids(&merge_sessions(&disk, &baseline, &next)),
+            ids(&merge_sessions(&disk, &ids_of(&baseline), &next)),
             ["keep"],
             "deleted row came back (even though the disk side is newer)"
         );
@@ -669,7 +648,7 @@ mod tests {
         temp.store().store(&[row("a", "C:\\dev\\a", 1)]);
 
         // tmp 名はインスタンスごとに一意なので、名前を組み立てずに走査で見る
-        let leftovers: Vec<_> = std::fs::read_dir(&temp.0)
+        let leftovers: Vec<_> = std::fs::read_dir(temp.0.path())
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
@@ -705,7 +684,9 @@ mod tests {
             .unwrap();
         drop(handle);
 
-        temp.store().cleanup_leftover_tmp();
+        // 回収の実体は lib 側の 1 実装（起動列は `reap_startup_leftovers` が
+        // 同じ関数を通る）
+        ccdesk::reap_leftover_tmp(&temp.path());
 
         assert!(!old.exists(), "did not reclaim the old tmp");
         assert!(fresh.exists(), "removed a tmp that might still be in progress");

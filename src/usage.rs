@@ -15,6 +15,8 @@
 //! 消えるだけで、ccdesk の他の機能は影響を受けない。
 
 use std::sync::{Arc, Mutex};
+
+use ccdesk::LockExt;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -90,6 +92,38 @@ impl UsageInfo {
     pub(crate) fn is_stale(&self, now: u64) -> bool {
         now.saturating_sub(self.fetched_at) > STALE_AFTER_SECS
     }
+
+    /// 枠を「ラベル, 枠」の並びで配る（5h → 7d → モデル別）。
+    /// **枠のラベルの綴りと並びはここ 1 箇所**: 下部バー（ui）と `ccdesk doctor` が
+    /// 同じ答えを読む（doctor は「画面でどう出るか」を確かめる入口なので、
+    /// 表記が別実装だと目的を果たさない）
+    pub(crate) fn windows(&self) -> impl Iterator<Item = (&str, &UsageWindow)> {
+        self.five
+            .iter()
+            .map(|w| ("5h", w))
+            .chain(self.seven.iter().map(|w| ("7d", w)))
+            .chain(self.models.iter().map(|(name, w)| (name.as_str(), w)))
+    }
+}
+
+/// テスト用の Ready 値（5h 18% → 1 時間後 / 7d 55% → 4 日後 / fetched_at = 今）。
+/// **fixture は型の持ち主のそばに 1 つ**: [`UsageInfo`] にフィールドを足したら
+/// ここを直せば、使う側（ui のクリック判定・app の描画）のテストが全部追随する
+#[cfg(test)]
+pub(crate) fn sample_ready(models: Vec<(String, UsageWindow)>) -> Usage {
+    let now = ccdesk::now_secs();
+    Usage::Ready(UsageInfo {
+        five: Some(UsageWindow {
+            pct: 18.0,
+            resets_at: Some(now + 3600),
+        }),
+        seven: Some(UsageWindow {
+            pct: 55.0,
+            resets_at: Some(now + 4 * 86400),
+        }),
+        models,
+        fetched_at: now,
+    })
 }
 
 /// 使用率について ccdesk が言えること。
@@ -163,7 +197,7 @@ pub(crate) fn spawn_poller(
             fetching.store(false, std::sync::atomic::Ordering::Relaxed);
             let fetched_at = std::time::Instant::now();
 
-            let mut guard = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = slot.lock_recover();
             // 取得に失敗しても、一度取れた値は捨てない（1 回の失敗で使用率行が
             // 消えるのを防ぐ）。古さは `fetched_at` に出るので嘘にはならない
             let keep_previous =
@@ -195,8 +229,14 @@ pub(crate) fn spawn_poller(
                     return; // 送り手が居なくなった（TUI 終了）
                 };
                 match trigger {
-                    // ユーザーが押した ＝ 間引かない
+                    // ユーザーが押した ＝ 間引かない（アカウントを切り替えたときに
+                    // Unavailable から戻ってこられる唯一の経路でもある）
                     Trigger::Manual => break,
+                    // **枠の概念が無いアカウントではターン完了を無視する。** 恒久的に
+                    // 取れないのに、ターンのたびに claude を起こし続ける意味が無い
+                    // （README の「stop polling entirely (click still re-checks)」が
+                    // この挙動の正本）
+                    Trigger::TurnFinished if permanent => continue,
                     // ターン完了は連発するので、直前の取得から間を置く。
                     // 間引いた分は待ち直すだけ（取得は次の合図か保険の周期で起きる）
                     Trigger::TurnFinished if fetched_at.elapsed() >= EVENT_MIN_INTERVAL => {
@@ -293,7 +333,7 @@ fn probe() -> Result<Value, ProbeError> {
 /// 1 回取得する（取得スレッド用。落ちた段は表示に出さないので潰す）
 fn fetch() -> Usage {
     match probe() {
-        Ok(v) => parse_response(&v, ccdesk::now_ms() / 1000),
+        Ok(v) => parse_response(&v, ccdesk::now_secs()),
         Err(_) => Usage::Failed,
     }
 }
@@ -301,7 +341,7 @@ fn fetch() -> Usage {
 /// `ccdesk doctor` 用。**取得経路をユーザー自身が 1 コマンドで確かめられる**ように、
 /// 落ちた段をそのまま返す（開発者の環境では再現しない不具合をユーザー側で切り分けるため）
 pub(crate) fn diagnose() -> Result<Usage, ProbeError> {
-    probe().map(|v| parse_response(&v, ccdesk::now_ms() / 1000))
+    probe().map(|v| parse_response(&v, ccdesk::now_secs()))
 }
 
 /// `control_response` 1 個から [`Usage`] を組む。**プロセスを起こさずに検査できる**

@@ -90,6 +90,17 @@ const PID_KEY: &str = "pid";
 /// 消さないと 1 セッション 1 項目で永久に積もる
 const KEEP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// 未来の記録を受け入れる猶予。
+///
+/// 時計が巻き戻る（NTP 補正）と、巻き戻し前に書かれた記録の `at` が「未来」になる。
+/// そのまま読むと再起動後の `launched_at` より新しい ＝ **前回の実行の state が
+/// 今の実行のものとして誤帰属され**（稼働中の行が Stopped 表示に固まる）、
+/// [`KEEP`] の掃除でも経過 0 扱いで永久に落ちない。未来の記録は読みの時点で捨てる。
+///
+/// 猶予の幅は、同一マシン内の書き手同士のわずかな前後（読み手が `now` を取った後に
+/// 別の hook が書く）を誤って捨てないためのもの
+const FUTURE_SKEW: Duration = Duration::from_secs(60);
+
 /// 保管の read-modify-write を直列化するロックの待ち時間。
 ///
 /// **セッションを待たせないことが最優先**なので、保管ロック（2 秒）より短い:
@@ -293,10 +304,10 @@ fn record(path: &Path, session_id: &SessionId, state: &str, now: u64, pid: Optio
     let Ok(_guard) = Lock::acquire(&lock_path_for(path), LOCK_WAIT, LOCK_STALE) else {
         return;
     };
-    let mut entries = read_entries(path);
+    let mut entries = read_entries(path, now);
     entries.retain(|_, entry| now.saturating_sub(entry.at) < KEEP.as_millis() as u64);
     entries.insert(
-        session_id.to_string(),
+        session_id.clone(),
         Entry {
             state: state.to_string(),
             at: now,
@@ -306,7 +317,7 @@ fn record(path: &Path, session_id: &SessionId, state: &str, now: u64, pid: Optio
     let document = json!({
         STATES_KEY: entries
             .iter()
-            .map(|(id, entry)| (id.clone(), json!({
+            .map(|(id, entry)| (id.to_string(), json!({
                 STATE_KEY: entry.state,
                 AT_KEY: entry.at,
                 PID_KEY: entry.pid,
@@ -317,17 +328,19 @@ fn record(path: &Path, session_id: &SessionId, state: &str, now: u64, pid: Optio
 }
 
 /// 保管ファイルの項目（`session_id` → [`Entry`]）。
-/// **無い・壊れている・書き換え途中はすべて空**（起動も turn も止めない）
-fn read_entries(path: &Path) -> BTreeMap<String, Entry> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return BTreeMap::new();
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+/// **無い・壊れている・書き換え途中はすべて空**（起動も turn も止めない）。
+///
+/// キーは最初から [`SessionId`] で組む（読み手がもう一度 B-tree を組み直さない）。
+/// `now` より未来（[`FUTURE_SKEW`] を超える）の記録はここで捨てる ＝
+/// 時計の巻き戻しで残った前回実行の記録が、読み・書きのどちらの経路にも乗らない
+fn read_entries(path: &Path, now: u64) -> BTreeMap<SessionId, Entry> {
+    let Some(value) = ccdesk::read_json(path) else {
         return BTreeMap::new();
     };
     let Some(states) = value.get(STATES_KEY).and_then(Value::as_object) else {
         return BTreeMap::new();
     };
+    let horizon = now.saturating_add(FUTURE_SKEW.as_millis() as u64);
     states
         .iter()
         .filter_map(|(id, entry)| {
@@ -340,9 +353,9 @@ fn read_entries(path: &Path) -> BTreeMap<String, Entry> {
                 .get(PID_KEY)
                 .and_then(Value::as_u64)
                 .and_then(|pid| u32::try_from(pid).ok());
-            (!id.is_empty() && !state.is_empty()).then(|| {
+            (!id.is_empty() && !state.is_empty() && at <= horizon).then(|| {
                 (
-                    id.clone(),
+                    SessionId::new(id.clone()),
                     Entry {
                         state: state.to_string(),
                         at,
@@ -364,28 +377,14 @@ pub(crate) fn read_states() -> HookStates {
 }
 
 fn states_at(path: &Path) -> HookStates {
-    HookStates(
-        read_entries(path)
-            .into_iter()
-            .map(|(id, entry)| (SessionId::new(id), entry))
-            .collect(),
-    )
+    HookStates(read_entries(path, now_ms()))
 }
 
 /// 保管ファイルの見え方（長さ・更新時刻）。**中身を読まずに「変わったか」だけを
 /// 見る口**で、run ループがこれを毎周見て変化した周だけ読み直す
 /// （hook が来た瞬間に一覧へ反映するための合図。ファイルを開かないので安い）
 pub(crate) fn states_stamp() -> Option<(u64, std::time::SystemTime)> {
-    let meta = std::fs::metadata(ccdesk::hook_states_path()?).ok()?;
-    Some((meta.len(), meta.modified().ok()?))
-}
-
-/// 起動時の掃除: rename の前に死んだ hook プロセスが残した `.tmp` を回収する
-/// （どう回収するかは [`ccdesk::reap_leftover_tmp`]。ここが持つのは対象の指定だけ）
-pub(crate) fn cleanup_leftover_tmp() {
-    if let Some(path) = ccdesk::hook_states_path() {
-        ccdesk::reap_leftover_tmp(&path);
-    }
+    ccdesk::file_stamp(&ccdesk::hook_states_path()?)
 }
 
 /// 子の claude へ `--settings` で渡す注入ファイルを書き、そのパスを返す。
@@ -402,11 +401,35 @@ pub(crate) fn cleanup_leftover_tmp() {
 /// スカラーのキーは併存せず上書きになるので、**hook 以外は載せない**
 /// （[`settings_document`] のテストがそれを固定する）
 pub(crate) fn inject_settings() -> Option<PathBuf> {
+    // 内容は exe パスにしか依存せず、走っているプロセスの `current_exe()` は
+    // 自己更新でも変わらない ＝ **1 プロセス 1 回書けば足りる**。
+    // 失敗はキャッシュしない（次のセッション起動で再試行する）
+    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    if let Some(path) = PATH.get() {
+        return Some(path.clone());
+    }
+    let path = write_inject_settings()?;
+    let _ = PATH.set(path.clone());
+    Some(path)
+}
+
+/// 注入ファイルの実書き込み。
+///
+/// **書き方は lib の 1 実装（tmp → rename）。** 素の `fs::write`（truncate →
+/// write）だと、複数インスタンスの同時起動で、書いている最中の空/部分 JSON を
+/// 別インスタンスが起こした claude が `--settings` として読み、そのセッションの
+/// state hook が黙って消える。
+/// 失敗も黙らない: hooks 無しで起動すると行の状態が縮退するので、ログに 1 行残す
+/// （呼び手は None を受けて下部バーにも出す。[`crate::app`]）
+fn write_inject_settings() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = ccdesk::ccdesk_dir()?;
     let exe_fwd = exe.to_string_lossy().replace('\\', "/");
     let path = dir.join("inject-settings.json");
-    std::fs::write(&path, settings_document(&exe_fwd).to_string()).ok()?;
+    if let Err(e) = write_json_atomically(&path, &settings_document(&exe_fwd)) {
+        ccdesk::log_error(&format!("could not write the hook settings: {e}"));
+        return None;
+    }
     Some(path)
 }
 
@@ -448,32 +471,18 @@ fn settings_document(exe_fwd: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// テスト専用の保管先。**実ユーザーの `~/.ccdesk` を絶対に触らない**ための境界
-    /// （[`crate::sessions::tests`] の `TempStore` と同じ規律）
-    struct TempStore(PathBuf);
+    /// （安全な置き場の実装は [`crate::testutil::TempDir`] 1 つ）
+    struct TempStore(crate::testutil::TempDir);
 
     impl TempStore {
         fn new(test: &str) -> Self {
-            static SEQ: AtomicUsize = AtomicUsize::new(0);
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "ccdesk-hooks-{test}-{}-{seq}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
-            Self(root)
+            Self(crate::testutil::TempDir::new("hooks", test))
         }
 
         fn path(&self) -> PathBuf {
             self.0.join("hook-states.json")
-        }
-    }
-
-    impl Drop for TempStore {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -798,6 +807,39 @@ mod tests {
         assert_eq!(stored(&states, &id("now")).as_deref(), Some("blocked"));
     }
 
+    /// **未来の記録は読まない。** 時計が巻き戻る（NTP 補正）と巻き戻し前の記録の
+    /// `at` が未来になり、再起動後の `launched_at` より新しい ＝ **前回実行の
+    /// state が今の実行に誤帰属される**（稼働中の行が Stopped 表示に固まる）。
+    /// [`KEEP`] の掃除も経過 0 扱いで落とせないので、読みの時点で捨てる
+    /// （書き直しも同じ読みを通るので、次の記録でファイルからも消える）
+    #[test]
+    fn records_from_a_future_clock_are_ignored_and_swept() {
+        let temp = TempStore::new("records_from_a_future_clock_are_ignored_and_swept");
+        let skew = FUTURE_SKEW.as_millis() as u64;
+        record(&temp.path(), &id("future"), "stopped", 1_000_000, None);
+
+        // 時計が 1_000 まで巻き戻った世界では、その記録は見えない
+        assert_eq!(
+            read_entries(&temp.path(), 1_000).get(&id("future")),
+            None,
+            "a record from a rolled-back clock's future is still being served"
+        );
+        // 猶予の内側（書き手同士のわずかな前後）は捨てない
+        assert!(
+            read_entries(&temp.path(), 1_000_000 - skew).contains_key(&id("future")),
+            "a record within the skew allowance was dropped"
+        );
+
+        // 巻き戻った時計で次の記録が載ると、未来の記録はファイルからも落ちる
+        record(&temp.path(), &id("s"), "working", 1_000, None);
+        assert_eq!(
+            stored(&states_at(&temp.path()), &id("future")),
+            None,
+            "the future record survived the next write"
+        );
+        assert_eq!(stored(&states_at(&temp.path()), &id("s")).as_deref(), Some("working"));
+    }
+
     /// 壊れた / 想定外の形でも読みは失敗しない（＝ TUI の周期処理が止まらない）。
     /// **state を持たない項目だけは捨てる**（読んでも何も答えられない）
     #[test]
@@ -848,7 +890,7 @@ mod tests {
     fn writes_land_atomically_without_leaving_a_tmp_or_a_lock() {
         let temp = TempStore::new("writes_land_atomically_without_leaving_a_tmp_or_a_lock");
         record(&temp.path(), &id("s"), "working", 1_000, None);
-        let leftovers: Vec<_> = std::fs::read_dir(&temp.0)
+        let leftovers: Vec<_> = std::fs::read_dir(temp.0.path())
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
