@@ -210,7 +210,7 @@ fn main() -> anyhow::Result<()> {
     // 前回開いていた画面を復元: セッションを見ていたなら `claude -r` で再開、
     // それ以外は new session 画面
     match window.last_view.map(sessions::SessionId::new) {
-        Some(id) if app.sessions.iter().any(|row| row.session_id == id) => {
+        Some(id) if app.row(&id).is_some() => {
             open_session(&mut app, &id);
             if app.windows.is_empty() {
                 app.open_new_view(); // 再開に失敗したときのフォールバック

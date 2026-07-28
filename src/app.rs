@@ -589,6 +589,23 @@ impl App {
     fn showing(&self, id: &SessionId) -> bool {
         self.shown_session() == Some(id)
     }
+
+    /// 一覧の行を ID で引く。**「消えた行は何もしない」の判断ごと 1 箇所に置く**
+    /// （読み直し・他インスタンスの削除とクリックは競合しうるので、
+    /// 引き当てが空振りする経路はどの呼び手にもある）
+    pub(crate) fn row(&self, id: &SessionId) -> Option<&SessionRow> {
+        self.sessions.iter().find(|row| &row.session_id == id)
+    }
+
+    /// [`Self::row`] の可変版
+    fn row_mut(&mut self, id: &SessionId) -> Option<&mut SessionRow> {
+        self.sessions.iter_mut().find(|row| &row.session_id == id)
+    }
+
+    /// その行の窓の添字（開いていなければ None）
+    fn window_index(&self, id: &SessionId) -> Option<usize> {
+        self.windows.iter().position(|w| &w.session_id == id)
+    }
 }
 
 /// now - d の Instant（アンダーフローしない）。「次の周期処理を即発火させる」ための
@@ -1292,12 +1309,10 @@ fn follow_session_switches(app: &mut App) {
 /// **名前は行が持たない**ので、作った行の表示名は次の描画で transcript から導かれる
 fn adopt_switched_session(app: &mut App, previous: &SessionId, next: &SessionId, shown: bool) {
     let cwd = app
-        .sessions
-        .iter()
-        .find(|row| &row.session_id == previous)
+        .row(previous)
         .map(|row| row.cwd.clone())
         .unwrap_or_default();
-    if !app.sessions.iter().any(|row| &row.session_id == next) {
+    if app.row(next).is_none() {
         app.sessions.push(SessionRow::new(next.clone(), cwd, now_ms()));
         save_sessions(app);
     }
@@ -1307,12 +1322,13 @@ fn adopt_switched_session(app: &mut App, previous: &SessionId, next: &SessionId,
     // 呼ばれるのは張り替わった周期だけなので、書き込みも張り替え 1 回につき 1 度
     if shown {
         app.source.save_window(WindowItem::LastView(next.as_str()));
+        // **離れた行へは何も書かない。** 窓が新しいセッションへ移った時点でその行を
+        // 動かしているものは無くなり、次の描画でそのまま Stopped になる
+        // （書き戻していた頃は、hook が持つ新しい記録より古い `stopped` が行に残った）。
+        // 既読にするのは**ペインに出ている窓**の張り替えだけ: 裏へ回した窓の
+        // `/resume` が遅れて反映された周で、見てもいない行の未読 ● を消さない
+        mark_read(app, next);
     }
-    // **離れた行へは何も書かない。** 窓が新しいセッションへ移った時点でその行を
-    // 動かしているものは無くなり、次の描画でそのまま Stopped になる
-    // （書き戻していた頃は、hook が持つ新しい記録より古い `stopped` が行に残った）。
-    // 開いている窓の行は既読（今まさに見ている会話）
-    mark_read(app, next);
 }
 
 /// hook が書いた state を読み直す。**行へは何も写さない**（写していた頃は
@@ -1372,15 +1388,16 @@ pub(crate) fn refresh_transcripts(app: &mut App) {
 /// 既に読み終えている行なら書き込みもしない（周期処理が毎周保管を書かない）
 fn mark_read(app: &mut App, id: &SessionId) {
     let now = now_ms();
-    let Some(index) = app.sessions.iter().position(|r| &r.session_id == id) else {
+    let Some(row) = app.row(id) else {
         return;
     };
-    let row = &app.sessions[index];
     // 時計が巻き戻っても既読を巻き戻さない。既読の行は書かない
     if row.last_opened_at >= now || !app.hook_states.unread(row) {
         return;
     }
-    app.sessions[index].last_opened_at = now;
+    if let Some(row) = app.row_mut(id) {
+        row.last_opened_at = now;
+    }
     save_sessions(app);
 }
 
@@ -1397,7 +1414,7 @@ fn mark_read(app: &mut App, id: &SessionId) {
 /// `●` は点かないし消えない ＝ 「自分の操作で未読が生えない」は保証ではなく構造
 fn edit_row(app: &mut App, id: &SessionId, edit: impl FnOnce(&mut SessionRow)) {
     let changed = {
-        let Some(row) = app.sessions.iter_mut().find(|r| &r.session_id == id) else {
+        let Some(row) = app.row_mut(id) else {
             return;
         };
         let before = row.clone();
@@ -1758,8 +1775,11 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                     open_project_popup(app, cwd, mouse.row);
                 }
                 Some(RowAction::Open(id)) => {
-                    open_session(app, &id);
-                    app.set_focus(Focus::Terminal);
+                    // 開けたときだけフォーカスを端末へ（失敗時に移すと打鍵が
+                    // 直前まで表示していた別セッションへ流れる）
+                    if open_session(app, &id) {
+                        app.set_focus(Focus::Terminal);
+                    }
                 }
                 // 更新行はその場で実行するだけ（右ペインを切り替えない）
                 Some(RowAction::UpdateCcdesk) => start_ccdesk_update(app),
@@ -1870,7 +1890,7 @@ fn session_open(app: &mut App, id: &SessionId) -> bool {
 /// 項目の見た目に効く 2 つ（ピン留め・窓の有無）は開いた時点の写し
 fn open_session_popup(app: &mut App, id: &SessionId, anchor_y: u16) {
     let open = session_open(app, id);
-    let row = app.sessions.iter().find(|r| &r.session_id == id);
+    let row = app.row(id);
     app.popup = Some(Popup {
         kind: PopupKind::Session {
             id: id.clone(),
@@ -1947,10 +1967,12 @@ fn activate_popup(app: &mut App, index: usize) {
 /// 判定は [`PopupKind::action`]（純関数）に置く
 fn run_popup_action(app: &mut App, action: PopupAction) {
     match action {
-        // 開いたら打ち先はそのセッションなので、行クリックと同じくフォーカスを端末へ移す
+        // 開けたら打ち先はそのセッションなので、行クリックと同じくフォーカスを端末へ移す
+        // （失敗時は移さない ＝ 打鍵が別セッションへ流れない）
         PopupAction::OpenSession(id) => {
-            open_session(app, &id);
-            app.set_focus(Focus::Terminal);
+            if open_session(app, &id) {
+                app.set_focus(Focus::Terminal);
+            }
         }
         PopupAction::TogglePin(id) => edit_row(app, &id, |row| row.pinned = !row.pinned),
         PopupAction::MarkRead(id) => mark_read(app, &id),
@@ -1984,9 +2006,6 @@ fn toggle_grouping(app: &mut App) {
 /// 表示が Stopped になるのはその結果で、記録によるものではない（だから
 /// `stop` でも `/clear` でも `/resume` でも同じ表示になる）
 fn menu_stop(app: &mut App, id: &SessionId) {
-    if id.is_empty() {
-        return;
-    }
     close_window_of(app, id);
 }
 
@@ -2011,27 +2030,22 @@ pub(crate) fn kill_sessions_on_exit(app: &mut App) {
 /// 一覧から外したいだけの操作で会話の記録まで消してはいけない）。
 /// 動いていれば先にプロセスを終わらせる（窓の無い行になってプロセスだけが残らない）
 fn menu_close(app: &mut App, id: &SessionId) {
-    if id.is_empty() {
-        return;
-    }
     close_window_of(app, id);
     let before = app.sessions.len();
     app.sessions.retain(|row| &row.session_id != id);
     if app.sessions.len() != before {
         save_sessions(app);
     }
-    // 消した行の名前を編集中だったら畳む（行が無いのに入力欄だけ残らない）
 }
 
 /// 指定セッションのウィンドウを閉じる（＝ 子プロセスを終わらせる）。
 /// 窓が開いていなければ何もしない
 fn close_window_of(app: &mut App, id: &SessionId) {
-    if let Some(i) = app.windows.iter().position(|w| &w.session_id == id) {
-        if let Some(window) = app.windows.get_mut(i) {
-            let _ = window.child.kill();
-        }
-        remove_window(app, i);
-    }
+    let Some(i) = app.window_index(id) else {
+        return;
+    };
+    let _ = app.windows[i].child.kill();
+    remove_window(app, i);
 }
 
 /// ウィンドウを一覧から外す（active 添字も詰める）。
@@ -2046,7 +2060,9 @@ fn remove_window(app: &mut App, idx: usize) {
     if app.active >= idx && app.active > 0 {
         app.active -= 1;
     }
-    if app.windows.is_empty() || was_active {
+    // 右ペインが既に New 画面なら奪わない: 表示されていたのは死んだ窓ではなく
+    // New 画面で、作り直すと**入力途中のプロンプトが無警告で消える**
+    if (app.windows.is_empty() || was_active) && !matches!(app.right_view, RightView::New(_)) {
         app.open_new_view();
     }
 }
@@ -2282,16 +2298,27 @@ fn relaunch<'a>(
 /// いるため（二度目に送ると同じ指示が 2 回走る）。`--session-id` を渡すので
 /// **行の identity は変わらず**、履歴が生まれたときにこの行の transcript になる。
 ///
-/// 失敗（cwd 消失等）は握りつぶさず下部バーへ通知する
-pub(crate) fn open_session(app: &mut App, id: &SessionId) {
-    // **ペインを開いた時点が既読の契機**（切替も再開も同じ ＝ ここ 1 箇所で済む）
-    mark_read(app, id);
-    if let Some(i) = app.windows.iter().position(|w| &w.session_id == id) {
-        app.show_session(i);
-        return;
+/// 失敗（cwd 消失等）は握りつぶさず下部バーへ通知する。
+/// **戻り値は「ペインがこのセッションを出したか」。** 呼び手はこれを見てから
+/// フォーカスを端末へ移す（失敗したのに移すと、打鍵が直前まで表示していた
+/// 別セッションへ流れる）
+pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
+    if let Some(i) = app.window_index(id) {
+        if app.windows[i].alive() {
+            // **ペインを開いた時点が既読の契機**（切替も再開も同じ）
+            mark_read(app, id);
+            app.show_session(i);
+            return true;
+        }
+        // 直前に死んだ窓（生死スキャンがまだ拾っていない）は開かない:
+        // 固まった死画面が出て、次のスキャンで意図せず New 画面へ飛ばされる。
+        // 外して下の起こし直しへ落とす（メニューの stop 判定 `session_open` と
+        // 同じく、生きた窓だけを「開いている」と数える）
+        let _ = app.windows[i].child.kill();
+        remove_window(app, i);
     }
-    let Some(row) = app.sessions.iter().find(|r| &r.session_id == id) else {
-        return; // 再読み込みで消えた行（クリックと削除の競合）は何もしない
+    let Some(row) = app.row(id) else {
+        return false; // 再読み込みで消えた行（クリックと削除の競合）は何もしない
     };
     let (launch, cwd) = relaunch(&app.titles, row);
     let cwd = cwd.into_owned();
@@ -2299,13 +2326,20 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) {
     let (rows, cols) = app.pane_size();
     match Session::spawn(id, &cwd, rows, cols, launch, settings.as_deref()) {
         Ok(window) => {
+            // 既読は**起こせてから**付ける（起こせなかった行の未読 ● を、
+            // 内容を見ていないのに消さない）
+            mark_read(app, id);
             app.windows.push(window);
             app.show_session(app.windows.len() - 1);
             // 再開は transcript の読み直しに時間がかかりうる。子が端末を掴むまでの
             // 打鍵は捨てる（[`drop_input_while_starting`]）
             app.input_gate = Some(std::time::Instant::now());
+            true
         }
-        Err(e) => set_notice(app, format!("failed to resume session {id}: {e}")),
+        Err(e) => {
+            set_notice(app, format!("failed to resume session {id}: {e}"));
+            false
+        }
     }
 }
 
