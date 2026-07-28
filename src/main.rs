@@ -22,6 +22,8 @@ mod poll;
 mod session;
 mod sessions;
 mod source;
+#[cfg(test)]
+mod testutil;
 mod theme;
 mod title;
 mod ui;

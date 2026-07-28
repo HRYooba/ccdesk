@@ -348,27 +348,18 @@ fn merge_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
     // 取り残し tmp の判定と保持期間は lib 側（tmp 名を決める場所）が持つ
     use ccdesk::{is_leftover_tmp, TMP_KEEP};
 
-    /// テスト専用の保管先。**実ユーザーの `~/.ccdesk` を絶対に触らない**ための境界。
-    /// 名前はテスト名 + pid + 連番で一意にする（並列実行・別チェックアウトの
-    /// 同時実行と衝突させない）。Drop で丸ごと消すので、アサート失敗で
-    /// パニックしても残らない
-    struct TempStore(PathBuf);
+    /// テスト専用の保管先。**実ユーザーの `~/.ccdesk` を絶対に触らない**ための境界
+    /// （安全な置き場の実装は [`crate::testutil::TempDir`] 1 つ。
+    /// ここが持つのは保管ファイルの名前だけ）
+    struct TempStore(crate::testutil::TempDir);
 
     impl TempStore {
         fn new(test: &str) -> Self {
-            static SEQ: AtomicUsize = AtomicUsize::new(0);
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "ccdesk-sessions-{test}-{}-{seq}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
-            Self(root)
+            Self(crate::testutil::TempDir::new("sessions", test))
         }
 
         fn path(&self) -> PathBuf {
@@ -384,12 +375,6 @@ mod tests {
             let mut store = self.store();
             store.lock_wait = Duration::from_millis(50);
             store
-        }
-    }
-
-    impl Drop for TempStore {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -663,7 +648,7 @@ mod tests {
         temp.store().store(&[row("a", "C:\\dev\\a", 1)]);
 
         // tmp 名はインスタンスごとに一意なので、名前を組み立てずに走査で見る
-        let leftovers: Vec<_> = std::fs::read_dir(&temp.0)
+        let leftovers: Vec<_> = std::fs::read_dir(temp.0.path())
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())

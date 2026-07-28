@@ -4788,13 +4788,10 @@ mod tests {
     #[test]
     fn closing_a_row_leaves_its_transcript_on_disk() {
         let id = "8a1c0f52-0b3e-4a6d-9f11-2c7d5e8b0a34";
-        // 記録のファイル名は session_id（`claude --session-id` へ渡した UUID そのもの）
-        let dir = std::env::temp_dir().join(format!(
-            "ccdesk-transcript-{}-{id}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let transcript = dir.join(format!("{id}.jsonl"));
+        // 記録のファイル名は session_id（`claude --session-id` へ渡した UUID そのもの）。
+        // 置き場は共通のテスト用一時ディレクトリ（実ユーザーのファイルは触らない）
+        let dir = crate::testutil::TempDir::new("transcript", "closing_a_row");
+        let transcript = dir.join(&format!("{id}.jsonl"));
         std::fs::write(&transcript, "{}").unwrap();
 
         let mut app = app_with_row(id);
@@ -4802,7 +4799,6 @@ mod tests {
 
         assert!(app.sessions.is_empty(), "the row is still in the list");
         assert!(transcript.exists(), "closing the row removed its transcript too");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **`Enter` はメニューを持つ行ではその行のメニュー。** セッション行も同じで、

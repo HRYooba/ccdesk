@@ -500,26 +500,13 @@ mod tests {
         assert!(!is_plausible_tag(&"v1.0.0".repeat(20)));
     }
 
-    /// スコープを抜けるときにディレクトリごと消す作業場。
-    /// アサート失敗でパニックしても Drop は走るので一時ファイルを残さない
-    struct Workspace(std::path::PathBuf);
-
-    impl Drop for Workspace {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// スコープを抜けるときにディレクトリごと消す作業場
+    /// （安全な置き場の実装は [`crate::testutil::TempDir`] 1 つ）
+    struct Workspace(crate::testutil::TempDir);
 
     impl Workspace {
-        /// 並列実行・別チェックアウトと衝突しないようテスト名とプロセス ID で一意にする
         fn new(test_name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "ccdesk-test-{test_name}-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
+            Self(crate::testutil::TempDir::new("update", test_name))
         }
 
         fn write(&self, name: &str, body: &str) -> std::path::PathBuf {

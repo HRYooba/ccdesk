@@ -875,11 +875,8 @@ pub(crate) fn draw_new_view(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// pos が矩形の内側にあるか（幅・高さ 0 の矩形は「内側なし」なので常に false）
-    fn contains(rect: Rect, pos: Position) -> bool {
-        pos.x >= rect.x && pos.x < rect.right() && pos.y >= rect.y && pos.y < rect.bottom()
-    }
+    // 矩形の内包判定（幅 0 の扱いを含む）は ui 側の 1 実装を使う
+    use crate::ui::tests::contains;
 
     const FOCUSES: [NewFocus; 3] = [NewFocus::Prompt, NewFocus::Path, NewFocus::Browser];
 
@@ -973,39 +970,21 @@ mod tests {
         }
     }
 
-    /// テスト用の一時ディレクトリ。drop で必ず再帰削除するので、
-    /// アサーション失敗（= panic）で抜けても後片付けが漏れない
-    struct TempDir(std::path::PathBuf);
+    /// テスト用の一時ディレクトリ（安全な置き場の実装は
+    /// [`crate::testutil::TempDir`] 1 つ。ここが持つのは sub_a / sub_b の準備だけ）
+    struct TempDir(crate::testutil::TempDir);
 
     impl TempDir {
-        /// sub_a / sub_b を持つ一時ディレクトリを作る。
-        /// パスはプロセス ID + 連番で一意にする: プロセス ID で別チェックアウトとの
-        /// 並行実行を、連番で同一プロセス内の並行テストスレッド同士を分ける
-        /// （tag の手書き重複に一意性を賭けない）
+        /// sub_a / sub_b を持つ一時ディレクトリを作る
         fn new(tag: &str) -> Self {
-            static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "ccdesk-new-view-{}-{tag}-{seq}",
-                std::process::id()
-            ));
-            // ディレクトリ作成より先にガードを組み立てる。作成中に panic しても
-            // ガードが所有しているので Drop で作りかけのディレクトリを片付けられる
-            let guard = Self(root);
-            let _ = std::fs::remove_dir_all(guard.path());
-            std::fs::create_dir_all(guard.path().join("sub_a")).unwrap();
-            std::fs::create_dir_all(guard.path().join("sub_b")).unwrap();
-            guard
+            let dir = crate::testutil::TempDir::new("new-view", tag);
+            std::fs::create_dir_all(dir.join("sub_a")).unwrap();
+            std::fs::create_dir_all(dir.join("sub_b")).unwrap();
+            Self(dir)
         }
 
         fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            self.0.path()
         }
     }
 

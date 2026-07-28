@@ -538,30 +538,16 @@ pub(crate) mod tests {
     /// **実ユーザーの transcript を絶対に触らない**ための境界で、Drop で丸ごと消す。
     /// [`crate::app`] のテスト（起こし直し方の判断）も同じ道具を使う ＝
     /// transcript を作る手順を 2 通り持たない
-    pub(crate) struct TempProjects(PathBuf);
+    pub(crate) struct TempProjects(crate::testutil::TempDir);
 
     impl TempProjects {
         pub(crate) fn new(test: &str) -> Self {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static SEQ: AtomicUsize = AtomicUsize::new(0);
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "ccdesk-projects-{test}-{}-{seq}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&root).expect("mkdir failed");
-            Self(root)
+            Self(crate::testutil::TempDir::new("projects", test))
         }
 
         /// その置き場を見る [`Titles`]
         pub(crate) fn titles(&self) -> Titles {
-            Titles::with_projects(self.0.clone())
-        }
-    }
-
-    impl Drop for TempProjects {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            Titles::with_projects(self.0.path().to_path_buf())
         }
     }
 
@@ -574,26 +560,22 @@ pub(crate) mod tests {
     /// に在った（セッションが `EnterWorktree` で移った）。
     /// **[`crate::git`] のテストも同じ fixture を使う**（git のレイアウト解釈を
     /// 直すとき、追随すべき fixture が 2 つあると片方だけ古い形のまま通る）
-    pub(crate) struct TempRepo(PathBuf);
+    pub(crate) struct TempRepo(crate::testutil::TempDir);
 
     impl TempRepo {
         pub(crate) fn new(test: &str) -> Self {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static SEQ: AtomicUsize = AtomicUsize::new(0);
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir()
-                .join(format!("ccdesk-repo-{test}-{}-{seq}", std::process::id()));
-            std::fs::create_dir_all(root.join(".git")).expect("mkdir failed");
-            Self(root)
+            let dir = crate::testutil::TempDir::new("repo", test);
+            std::fs::create_dir_all(dir.join(".git")).expect("mkdir failed");
+            Self(dir)
         }
 
         /// 主ツリーのパス（git 側のテストが一覧と突き合わせる）
         pub(crate) fn root(&self) -> &Path {
-            &self.0
+            self.0.path()
         }
 
         fn cwd(&self) -> String {
-            self.0.display().to_string()
+            self.root().display().to_string()
         }
 
         pub(crate) fn add_worktree(&self, name: &str) -> String {
@@ -620,11 +602,6 @@ pub(crate) mod tests {
         }
     }
 
-    impl Drop for TempRepo {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     /// テスト用の行（cwd は transcript のディレクトリ名を決める材料）
     fn row(id: &str) -> SessionRow {
@@ -781,7 +758,7 @@ pub(crate) mod tests {
         titles.write_transcript(&row, &body);
         let path = temp
             .0
-            .join(project_dir_name(&row.cwd))
+            .join(&project_dir_name(&row.cwd))
             .join(transcript_file_name(row.session_id.as_str()));
 
         assert_eq!(titles.title_now(&mut row), "a name");

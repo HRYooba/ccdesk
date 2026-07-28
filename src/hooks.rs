@@ -471,32 +471,18 @@ fn settings_document(exe_fwd: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// テスト専用の保管先。**実ユーザーの `~/.ccdesk` を絶対に触らない**ための境界
-    /// （[`crate::sessions::tests`] の `TempStore` と同じ規律）
-    struct TempStore(PathBuf);
+    /// （安全な置き場の実装は [`crate::testutil::TempDir`] 1 つ）
+    struct TempStore(crate::testutil::TempDir);
 
     impl TempStore {
         fn new(test: &str) -> Self {
-            static SEQ: AtomicUsize = AtomicUsize::new(0);
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "ccdesk-hooks-{test}-{}-{seq}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
-            Self(root)
+            Self(crate::testutil::TempDir::new("hooks", test))
         }
 
         fn path(&self) -> PathBuf {
             self.0.join("hook-states.json")
-        }
-    }
-
-    impl Drop for TempStore {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -904,7 +890,7 @@ mod tests {
     fn writes_land_atomically_without_leaving_a_tmp_or_a_lock() {
         let temp = TempStore::new("writes_land_atomically_without_leaving_a_tmp_or_a_lock");
         record(&temp.path(), &id("s"), "working", 1_000, None);
-        let leftovers: Vec<_> = std::fs::read_dir(&temp.0)
+        let leftovers: Vec<_> = std::fs::read_dir(temp.0.path())
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())

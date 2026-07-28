@@ -1619,7 +1619,7 @@ fn terminal_cursor_pos(pane: Rect, inner: Rect, crow: u16, ccol: u16) -> Positio
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::poll::{STOPPED, WAITING, WORKING};
 
@@ -1851,8 +1851,9 @@ mod tests {
         assert!(text.contains("5h") && text.contains("7d"), "{text}");
     }
 
-    /// pos が矩形の内側にあるか（幅・高さ 0 の矩形は「内側なし」なので常に false）
-    fn contains(rect: Rect, pos: Position) -> bool {
+    /// pos が矩形の内側にあるか（幅・高さ 0 の矩形は「内側なし」なので常に false ＝
+    /// `Rect::contains` を使わない理由）。new_view のテストも同じ 1 実装を使う
+    pub(crate) fn contains(rect: Rect, pos: Position) -> bool {
         pos.x >= rect.x && pos.x < rect.right() && pos.y >= rect.y && pos.y < rect.bottom()
     }
 
