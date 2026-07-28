@@ -13,7 +13,7 @@ use tui_term::widget::PseudoTerminal;
 use ccdesk::{dir_key, LockExt};
 
 use crate::app::{
-    selected_enter, sidebar_cols, App, Focus, Popup, RightView, RowAction,
+    selected_enter, sidebar_cols, App, Focus, Popup, PopupKind, RightView, RowAction,
     SelfUpdate, SidebarPos, SidebarRow,
 };
 use crate::poll::{
@@ -871,7 +871,7 @@ fn account_row(status: &AccountStatus) -> (String, Style) {
 pub(crate) fn popup_rect(app: &App, popup: &Popup) -> Rect {
     let entries = popup.kind.entries(app.grouping);
     let (term_w, term_h) = (app.term_size.0.max(1), app.term_size.1.max(1));
-    let width = popup.kind.width(app.grouping).min(term_w);
+    let width = popup_width(&popup.kind, app.grouping).min(term_w);
     let height = entries.len().saturating_add(2).min(term_h as usize) as u16;
     // 記号の右端に矩形の右端を合わせる。収まらなければサイドバー内の x=1 まで
     // 左へ寄せ、それでも広ければ右ペインへ食い込ませる（端末の外へは出さない）
@@ -881,6 +881,42 @@ pub(crate) fn popup_rect(app: &App, popup: &Popup) -> Rect {
     let x = mark_right.saturating_add(1).saturating_sub(width).clamp(min_x, max_x);
     let y = popup.anchor_y.saturating_add(1).min(term_h - height);
     Rect::new(x, y, width, height)
+}
+
+/// メニュー枠が食う桁数: 左右の枠線 2 + 項目行の先頭空白 1
+/// （[`draw_popup`] が `" {label}"` を出す）。**枠と空白を出す側と同じファイル**で
+/// 数える: 別の場所に置くと、描画に印や桁を足したときにこの数だけが古くなり、
+/// メニューの右端が黙って 1 桁切れる
+const POPUP_CHROME: u16 = 3;
+/// メニュー幅の下限。短い項目だけのメニュー（grouping 切替）が細く痩せて
+/// 押しにくくならないようにするための床で、**広げる側の判断ではない**
+/// （項目が長ければ [`popup_width`] がそちらを採る）
+const POPUP_MIN_WIDTH: u16 = 14;
+
+/// メニュー幅。**項目の表示幅から決める**ので、動的な項目でも切れない。
+/// 種類ごとに固定値を置くと項目を足した時点で嘘になる。端末へ収める責任は
+/// [`popup_rect`] 側
+fn popup_width(kind: &PopupKind, grouping: Grouping) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+    let widest = kind
+        .entries(grouping)
+        .iter()
+        .map(|entry| entry.label.width().min(u16::MAX as usize) as u16)
+        .max()
+        .unwrap_or(0);
+    widest.saturating_add(POPUP_CHROME).max(POPUP_MIN_WIDTH)
+}
+
+/// 枠内に入りきらないメニューの表示開始位置。**選択が常に見える**よう選択へ
+/// 追従する（描画とクリック判定が同じ計算を共有する）。
+/// 追従しない頃は、極端に低い端末で**描かれていない項目を Enter で実行できた**
+pub(crate) fn popup_scroll(selected: usize, total: usize, visible: usize) -> usize {
+    if visible == 0 {
+        return 0;
+    }
+    selected
+        .saturating_sub(visible - 1)
+        .min(total.saturating_sub(visible))
 }
 
 fn fmt_age(secs: u64) -> String {
@@ -1448,23 +1484,29 @@ fn draw_popup(frame: &mut Frame, app: &App) {
     let Some(popup) = &app.popup else { return };
     let entries = popup.kind.entries(app.grouping);
     let area = popup_rect(app, popup);
+    // 枠内に入りきらないときは選択が見える範囲だけを描く（クリック判定も
+    // 同じ [`popup_scroll`] を通るので、見えている項目と押せる項目が一致する）
+    let visible = area.height.saturating_sub(2) as usize;
+    let offset = popup_scroll(popup.selected, entries.len(), visible);
     frame.render_widget(ratatui::widgets::Clear, area);
     let lines: Vec<ListItem> = entries
         .iter()
         .enumerate()
-        .map(|(i, (label, enabled))| {
-            let mut style = if *enabled {
+        .skip(offset)
+        .take(visible)
+        .map(|(i, entry)| {
+            let mut style = if entry.enabled {
                 Style::default()
             } else {
                 Style::default().fg(ui().dim)
             };
             if i == popup.selected {
                 style = style.bg(ui().hl_bg);
-                if *enabled {
+                if entry.enabled {
                     style = style.fg(ui().emph);
                 }
             }
-            ListItem::new(Line::from(format!(" {label}")).style(style))
+            ListItem::new(Line::from(format!(" {}", entry.label)).style(style))
         })
         .collect();
     frame.render_widget(
@@ -1565,6 +1607,48 @@ fn terminal_cursor_pos(pane: Rect, inner: Rect, crow: u16, ccol: u16) -> Positio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **幅の下限は「短い項目しか無いメニューが痩せない」ための床**で、
+    /// grouping 切替（最長 `  directory` = 11 桁）がそれに当たる。
+    /// セッションのメニューは項目が増えて床を越えたので、最長項目から決まる
+    #[test]
+    fn menu_width_is_the_longest_entry_but_never_below_the_floor() {
+        use unicode_width::UnicodeWidthStr;
+        assert_eq!(popup_width(&PopupKind::Group, Grouping::State), POPUP_MIN_WIDTH);
+        assert_eq!(popup_width(&PopupKind::Group, Grouping::Directory), POPUP_MIN_WIDTH);
+        let kind = PopupKind::Session {
+            id: SessionId::new("s1"),
+            pinned: false,
+            open: true,
+        };
+        let widest = kind
+            .entries(Grouping::State)
+            .iter()
+            .map(|entry| entry.label.width())
+            .max()
+            .unwrap() as u16;
+        assert_eq!(popup_width(&kind, Grouping::State), widest + POPUP_CHROME);
+        assert!(
+            popup_width(&kind, Grouping::State) > POPUP_MIN_WIDTH,
+            "the floor must not clip the longest entry"
+        );
+    }
+
+    /// **枠内に入りきらないメニューは選択が常に見える範囲を描く**（描画と
+    /// クリック判定が同じ計算を共有する）。追従しない頃は、極端に低い端末で
+    /// 描かれていない項目を Enter で実行できた
+    #[test]
+    fn the_popup_scroll_keeps_the_selection_visible() {
+        // 5 項目・4 行しか描けない: 先頭 4 つの間はスクロールしない
+        assert_eq!(popup_scroll(0, 5, 4), 0);
+        assert_eq!(popup_scroll(3, 5, 4), 0);
+        // 最後の項目を選ぶと 1 行ずれて見える
+        assert_eq!(popup_scroll(4, 5, 4), 1);
+        // 全部描けるならずらさない
+        assert_eq!(popup_scroll(4, 5, 5), 0);
+        // 高さ 0（枠しか無い）でも落ちない
+        assert_eq!(popup_scroll(4, 5, 0), 0);
+    }
 
     /// 使用率行を 1 本の文字列にして中身を見る（描画の検査用）
     fn usage_text(usage: &Usage, max_width: u16) -> String {

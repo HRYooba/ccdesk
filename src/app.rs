@@ -157,17 +157,10 @@ pub(crate) enum SelfUpdate {
     Failed(String),
 }
 
-/// メニュー枠が食う桁数: 左右の枠線 2 + 項目行の先頭空白 1（描画が `" {label}"` を出す）
-const POPUP_CHROME: u16 = 3;
-/// メニュー幅の下限。短い項目だけのメニュー（grouping 切替）が細く痩せて
-/// 押しにくくならないようにするための床で、**広げる側の判断ではない**
-/// （項目が長ければ [`PopupKind::width`] がそちらを採る）
-const POPUP_MIN_WIDTH: u16 = 14;
-
-/// モーダルの種類。**メニューの中身（項目・幅・項目の意味）はこの型が答える**。
+/// モーダルの種類。**メニューの中身（項目・項目の意味）はこの型が答える**。
 /// [`Popup`] は「どこに開いたか・どれを選んでいるか」だけを持つので、
-/// 種類を足すときの変更は [`PopupKind::entries`] と [`PopupKind::action`] の
-/// 2 つの match に閉じる（幅は項目から導くので触らない）
+/// 種類を足すときの変更は [`PopupKind::entries`] の 1 つの match に閉じる
+/// （幅は項目から導くので触らない。枠の桁は描く側 ＝ `ui::popup_rect` が持つ）
 #[derive(Debug, PartialEq)]
 pub(crate) enum PopupKind {
     /// セッション 1 行への二次操作。**`pinned` / `open` は開いた時点の写し**
@@ -212,10 +205,19 @@ enum PopupAction {
     RemoveProject(String),
 }
 
+/// メニューの項目 1 つ。**表示（label / enabled）と動作（action）を 1 つの表で持つ**:
+/// 以前は表示の match と動作の match が index で暗黙に対応しており、項目を
+/// 1 つ挿入すると対応がずれ「押した項目と違う動作が走る」形が作れた。
+/// 描画・幅計算・実行のすべてがこの 1 つの表を読む
+pub(crate) struct PopupEntry {
+    pub(crate) label: String,
+    pub(crate) enabled: bool,
+    action: PopupAction,
+}
+
 impl PopupKind {
-    /// (表示名, 実行可能か)。並びは [`PopupKind::action`] の index 解釈と対になるので、
-    /// 項目を足すときは両方を同じ順で直す
-    pub(crate) fn entries(&self, grouping: Grouping) -> Vec<(String, bool)> {
+    /// メニューの項目表（並び順 = 表示順）
+    pub(crate) fn entries(&self, grouping: Grouping) -> Vec<PopupEntry> {
         match self {
             // 二次操作はここに集約する（ショートカットキーを併設しない ＝
             // 入口を 2 つ持たない）。
@@ -240,68 +242,59 @@ impl PopupKind {
             // **アーカイブは持たない**: `close` は行を忘れるだけで
             // `~/.claude/projects/**/*.jsonl` を消さないので、アーカイブとの差は
             // 「戻す導線があるか」だけになる ＝ 節を 1 つ増やす価値が無い
-            PopupKind::Session { pinned, open, .. } => vec![
-                ("open".to_string(), true),
-                (if *pinned { "unpin" } else { "pin" }.to_string(), true),
-                ("mark as read".to_string(), true),
-                ("stop".to_string(), *open),
-                ("close".to_string(), true),
-            ],
-            PopupKind::Group => {
-                let mark = |g: Grouping| if grouping == g { "● " } else { "  " };
+            PopupKind::Session { id, pinned, open } => {
+                let entry = |label: &str, enabled: bool, action: PopupAction| PopupEntry {
+                    label: label.to_string(),
+                    enabled,
+                    action,
+                };
                 vec![
-                    (format!("{}state", mark(Grouping::State)), true),
-                    (format!("{}directory", mark(Grouping::Directory)), true),
+                    entry("open", true, PopupAction::OpenSession(id.clone())),
+                    entry(
+                        if *pinned { "unpin" } else { "pin" },
+                        true,
+                        PopupAction::TogglePin(id.clone()),
+                    ),
+                    entry("mark as read", true, PopupAction::MarkRead(id.clone())),
+                    entry("stop", *open, PopupAction::Stop(id.clone())),
+                    entry("close", true, PopupAction::Close(id.clone())),
                 ]
             }
+            // 項目は [`Grouping::ORDER`] から導く（variant を足すとここも自動で増える ＝
+            // メニューだけ古い 2 分岐のまま、という形を作れない）
+            PopupKind::Group => Grouping::ORDER
+                .into_iter()
+                .map(|g| PopupEntry {
+                    label: format!("{}{}", if grouping == g { "● " } else { "  " }, g.as_str()),
+                    enabled: true,
+                    action: PopupAction::SetGrouping(g),
+                })
+                .collect(),
             // **セッションが残っているフォルダは登録解除させない。** 見出しの一覧は
             // 「登録リスト ∪ セッションの cwd」なので、登録を外してもセッション由来で
             // 見出しは出続ける。押せるのに表示が変わらないのは嘘なので、
             // stop と同じ仕組み（実行可能フラグ）で落とす
-            PopupKind::Project { has_sessions, .. } => vec![
-                ("new session".to_string(), true),
-                ("remove project".to_string(), !has_sessions),
+            PopupKind::Project { cwd, has_sessions } => vec![
+                PopupEntry {
+                    label: "new session".to_string(),
+                    enabled: true,
+                    action: PopupAction::NewSessionIn(cwd.clone()),
+                },
+                PopupEntry {
+                    label: "remove project".to_string(),
+                    enabled: !has_sessions,
+                    action: PopupAction::RemoveProject(cwd.clone()),
+                },
             ],
         }
     }
 
-    /// メニュー幅。**項目の表示幅から決める**ので、アカウント表示名や email のような
-    /// 動的な項目でも切れない。種類ごとに固定値を置くと項目を足した時点で嘘になるため、
-    /// 幅の知識はここ 1 箇所だけに持たせる。端末へ収める責任は `popup_rect` 側
-    pub(crate) fn width(&self, grouping: Grouping) -> u16 {
-        use unicode_width::UnicodeWidthStr;
-        let widest = self
-            .entries(grouping)
-            .iter()
-            .map(|(label, _)| label.width().min(u16::MAX as usize) as u16)
-            .max()
-            .unwrap_or(0);
-        widest.saturating_add(POPUP_CHROME).max(POPUP_MIN_WIDTH)
-    }
-
-    /// 選択 index の項目が意味する動作（範囲外・意味を持たない index は None）。
-    /// 動的な項目は index で対象（アカウント）を引く
-    fn action(&self, index: usize) -> Option<PopupAction> {
-        match self {
-            PopupKind::Session { id, .. } => match index {
-                0 => Some(PopupAction::OpenSession(id.clone())),
-                1 => Some(PopupAction::TogglePin(id.clone())),
-                2 => Some(PopupAction::MarkRead(id.clone())),
-                3 => Some(PopupAction::Stop(id.clone())),
-                4 => Some(PopupAction::Close(id.clone())),
-                _ => None,
-            },
-            PopupKind::Group => match index {
-                0 => Some(PopupAction::SetGrouping(Grouping::State)),
-                1 => Some(PopupAction::SetGrouping(Grouping::Directory)),
-                _ => None,
-            },
-            PopupKind::Project { cwd, .. } => match index {
-                0 => Some(PopupAction::NewSessionIn(cwd.clone())),
-                1 => Some(PopupAction::RemoveProject(cwd.clone())),
-                _ => None,
-            },
-        }
+    /// 選択 index の項目が意味する動作（範囲外は None）。**表（[`Self::entries`]）から
+    /// 引く**ので、表示と動作が index でずれることは構造的に無い
+    #[cfg(test)]
+    fn action(&self, grouping: Grouping, index: usize) -> Option<PopupAction> {
+        let mut entries = self.entries(grouping);
+        (index < entries.len()).then(|| entries.swap_remove(index).action)
     }
 }
 
@@ -1085,39 +1078,45 @@ pub(crate) fn selected_enter(app: &App) -> Option<Enter> {
 /// なので、方向で区別すると他の行では嘘の案内になる。セッションを開く導線は
 /// メニューの `open`（[`PopupKind::Session`] の先頭項目）へ寄せた。
 ///
-/// 何をするかの判断は [`selected_enter`] が持ち、ここは実行だけ
+/// **実行表はクリックと同じ [`run_row_action`]**。違うのはセッション行だけ
+/// （Enter = メニュー / クリック = 開く）で、その 1 つの差だけをここに書く。
+/// 位置はクリックで開くときと同じ [`selected_row_y`]（開き方で場所が変わらない）
 fn run_enter(app: &mut App) {
-    match selected_enter(app) {
-        Some(Enter::Menu) => open_row_menu(app),
-        Some(Enter::NewSession) => {
-            app.open_new_view();
-            app.set_focus(Focus::Terminal);
-        }
-        Some(Enter::UpdateCcdesk) => start_ccdesk_update(app),
-        Some(Enter::UpdateClaude) => start_claude_update(app),
-        None => {}
-    }
-}
-
-/// 選択行のメニューを開く（[`Enter::Menu`] の実行）。
-/// **位置はクリックで開くときと同じ [`selected_row_y`]**（開き方で場所が変わらない）
-fn open_row_menu(app: &mut App) {
     let anchor_y = selected_row_y(app);
     let SidebarPos::Row(row) = app.selection else {
         return; // メニューを持たない位置（アカウント行）
     };
-    match app.sidebar_rows.get(row).and_then(SidebarRow::action).cloned() {
-        Some(RowAction::Open(id)) => open_session_popup(app, &id, anchor_y),
-        Some(RowAction::Project(cwd)) => open_project_popup(app, cwd, anchor_y),
-        Some(RowAction::ToggleGroup) => {
-            app.popup = Some(Popup {
-                kind: PopupKind::Group,
-                anchor_y,
-                selected: 0,
-            })
+    let Some(action) = app.sidebar_rows.get(row).and_then(SidebarRow::action).cloned() else {
+        return;
+    };
+    match action {
+        RowAction::Open(id) => open_session_popup(app, &id, anchor_y),
+        other => run_row_action(app, other, anchor_y),
+    }
+}
+
+/// 行の動作の実行表。**キーボード（Enter）とクリックが同じ 1 つの表を通る**ので、
+/// [`RowAction`] を足したときに「クリックでは効くのに Enter では無反応」の形が
+/// 作れない（match は網羅なのでコンパイラが両経路ぶんを一度に要求する）。
+/// セッション行（Open）だけは入口ごとに意味が違うので、呼び手が先に分岐する
+fn run_row_action(app: &mut App, action: RowAction, anchor_y: u16) {
+    match action {
+        RowAction::New => {
+            app.open_new_view();
+            app.set_focus(Focus::Terminal);
         }
-        // メニューを持たない行と、行の無い位置
-        Some(RowAction::New | RowAction::UpdateCcdesk | RowAction::UpdateClaude) | None => {}
+        RowAction::ToggleGroup => open_popup(app, PopupKind::Group, anchor_y),
+        // 見出し行はメニューを開くだけ。**フォーカスは移さない**（メニューがキーを受ける）
+        RowAction::Project(cwd) => open_project_popup(app, cwd, anchor_y),
+        // 更新行はその場で実行するだけ（右ペインを切り替えない）
+        RowAction::UpdateCcdesk => start_ccdesk_update(app),
+        RowAction::UpdateClaude => start_claude_update(app),
+        // セッション行は呼び手が経路を選ぶ（クリック = 開く / Enter = メニュー）
+        RowAction::Open(id) => {
+            if open_session(app, &id) {
+                app.set_focus(Focus::Terminal);
+            }
+        }
     }
 }
 
@@ -1531,11 +1530,7 @@ fn project_has_sessions(app: &App, cwd: &str) -> bool {
 /// `has_sessions` は開いた時点の写しにする（[`PopupKind::Project`] 参照）
 fn open_project_popup(app: &mut App, cwd: String, anchor_y: u16) {
     let has_sessions = project_has_sessions(app, &cwd);
-    app.popup = Some(Popup {
-        kind: PopupKind::Project { cwd, has_sessions },
-        anchor_y,
-        selected: 0,
-    });
+    open_popup(app, PopupKind::Project { cwd, has_sessions }, anchor_y);
 }
 
 /// キーボード選択位置の画面 y。**式そのものは描画側が持つ**（一覧の行は [`row_y`]、
@@ -1765,35 +1760,11 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                     open_session_popup(app, &id.clone(), mouse.row);
                     return Ok(false);
                 }
-            // セッション行・new session クリックは右ペインへフォーカスを移す
-            match action {
-                Some(RowAction::New) => {
-                    app.open_new_view();
-                    app.set_focus(Focus::Terminal);
-                }
-                Some(RowAction::ToggleGroup) => {
-                    app.popup = Some(Popup {
-                        kind: PopupKind::Group,
-                        anchor_y: mouse.row,
-                        selected: 0,
-                    });
-                }
-                // 見出し行クリックはメニューを開くだけ。**フォーカスは移さない**
-                // （メニューがキーを受ける。セッション行クリックとは動作が違う）
-                Some(RowAction::Project(cwd)) => {
-                    open_project_popup(app, cwd, mouse.row);
-                }
-                Some(RowAction::Open(id)) => {
-                    // 開けたときだけフォーカスを端末へ（失敗時に移すと打鍵が
-                    // 直前まで表示していた別セッションへ流れる）
-                    if open_session(app, &id) {
-                        app.set_focus(Focus::Terminal);
-                    }
-                }
-                // 更新行はその場で実行するだけ（右ペインを切り替えない）
-                Some(RowAction::UpdateCcdesk) => start_ccdesk_update(app),
-                Some(RowAction::UpdateClaude) => start_claude_update(app),
-                None => {}
+            // 実行表はキーボードの Enter と同じ [`run_row_action`]。
+            // セッション行のクリックは「開く」（Enter はメニュー）で、開けたとき
+            // だけフォーカスを端末へ移す判断も表の側にある
+            if let Some(action) = action {
+                run_row_action(app, action, mouse.row);
             }
         }
     } else {
@@ -1895,20 +1866,27 @@ fn session_open(app: &mut App, id: &SessionId) -> bool {
         .any(|w| &w.session_id == id && w.alive())
 }
 
+/// メニューを開く唯一の口。開いた瞬間の共通処理（選択の初期値）をここで揃える
+/// （種類ごとに `Popup` を組み立てると、開き方の作法が入口の数だけ増える）
+fn open_popup(app: &mut App, kind: PopupKind, anchor_y: u16) {
+    app.popup = Some(Popup {
+        kind,
+        anchor_y,
+        selected: 0,
+    });
+}
+
 /// セッション行のメニューを開く（行頭の `=` クリック / 選択行の `Enter`）。
 /// 項目の見た目に効く 2 つ（ピン留め・窓の有無）は開いた時点の写し
 fn open_session_popup(app: &mut App, id: &SessionId, anchor_y: u16) {
     let open = session_open(app, id);
     let row = app.row(id);
-    app.popup = Some(Popup {
-        kind: PopupKind::Session {
-            id: id.clone(),
-            pinned: row.is_some_and(|r| r.pinned),
-            open,
-        },
-        anchor_y,
-        selected: 0,
-    });
+    let kind = PopupKind::Session {
+        id: id.clone(),
+        pinned: row.is_some_and(|r| r.pinned),
+        open,
+    };
+    open_popup(app, kind, anchor_y);
 }
 
 /// モーダル表示中のキー操作（Esc = 全閉 / ↑↓ = 選択 / Enter = 実行）
@@ -1953,7 +1931,12 @@ fn handle_popup_click(app: &mut App, col: u16, row: u16) {
     {
         return;
     }
-    activate_popup(app, (row - rect.y - 1) as usize);
+    // 枠内に入りきらないメニューは描画がスクロールしている（[`crate::ui::popup_scroll`]）
+    // ので、クリックの行 → 項目 index も同じずらしを通す
+    let visible = rect.height.saturating_sub(2) as usize;
+    let total = popup.kind.entries(app.grouping).len();
+    let offset = crate::ui::popup_scroll(popup.selected, total, visible);
+    activate_popup(app, offset + (row - rect.y - 1) as usize);
 }
 
 /// 選択項目の実行（Enter / クリック共通）。実行できない項目・範囲外の index は無視する
@@ -1961,15 +1944,16 @@ fn activate_popup(app: &mut App, index: usize) {
     let Some(popup) = app.popup.as_ref() else {
         return;
     };
-    let entries = popup.kind.entries(app.grouping);
-    if !entries.get(index).is_some_and(|(_, enabled)| *enabled) {
+    let mut entries = popup.kind.entries(app.grouping);
+    if index >= entries.len() {
         return;
     }
-    let Some(action) = popup.kind.action(index) else {
+    let entry = entries.swap_remove(index);
+    if !entry.enabled {
         return;
-    };
+    }
     app.popup = None;
-    run_popup_action(app, action);
+    run_popup_action(app, entry.action);
 }
 
 /// メニュー項目の実行。**副作用はここだけ**に集め、「どの項目が何を意味するか」の
@@ -1987,25 +1971,23 @@ fn run_popup_action(app: &mut App, action: PopupAction) {
         PopupAction::MarkRead(id) => mark_read(app, &id),
         PopupAction::Stop(id) => menu_stop(app, &id),
         PopupAction::Close(id) => menu_close(app, &id),
-        PopupAction::SetGrouping(next) => {
-            if app.grouping != next {
-                toggle_grouping(app);
-            }
-        }
+        PopupAction::SetGrouping(next) => set_grouping(app, next),
         // 空プロンプトで起動する（登録は dispatch_session が行う）
         PopupAction::NewSessionIn(cwd) => dispatch_session(app, cwd, String::new()),
         PopupAction::RemoveProject(cwd) => remove_project(app, &cwd),
     }
 }
 
-/// グルーピング切替（入口は ⊞ group 行のメニューだけ）。選択は ~/.ccdesk/config.json に永続化
-/// （撮影用の供給元は保存しない ＝ 開発者の設定を踏まない）
-fn toggle_grouping(app: &mut App) {
-    app.grouping = match app.grouping {
-        Grouping::State => Grouping::Directory,
-        Grouping::Directory => Grouping::State,
-    };
-    app.source.save_window(WindowItem::Grouping(app.grouping));
+/// グルーピングの選択（入口は ⊞ group 行のメニューだけ）。選択は
+/// ~/.ccdesk/config.json に永続化（撮影用の供給元は保存しない ＝ 開発者の設定を
+/// 踏まない）。**選ばれた値を代入する**（反転ではない ＝ 3 つ目の grouping を
+/// 足してもメニューの項目がそのまま答えになる）。同じ値なら保存も走らせない
+fn set_grouping(app: &mut App, next: Grouping) {
+    if app.grouping == next {
+        return;
+    }
+    app.grouping = next;
+    app.source.save_window(WindowItem::Grouping(next));
 }
 
 /// メニュー: stop（セッションのプロセスを終わらせる）。
@@ -2398,7 +2380,15 @@ mod tests {
     fn labels(kind: &PopupKind, grouping: Grouping) -> Vec<String> {
         kind.entries(grouping)
             .into_iter()
-            .map(|(label, _)| label)
+            .map(|entry| entry.label)
+            .collect()
+    }
+
+    /// (表示名, 実行可能か) の一覧（項目表の見た目を比べるテスト用）
+    fn entry_pairs(kind: &PopupKind, grouping: Grouping) -> Vec<(String, bool)> {
+        kind.entries(grouping)
+            .into_iter()
+            .map(|entry| (entry.label, entry.enabled))
             .collect()
     }
 
@@ -2531,7 +2521,7 @@ mod tests {
     #[test]
     fn session_menu_disables_stop_only_when_no_window_is_open() {
         assert_eq!(
-            session("s1", true).entries(Grouping::State),
+            entry_pairs(&session("s1", true), Grouping::State),
             [
                 ("open".to_string(), true),
                 ("pin".to_string(), true),
@@ -2544,7 +2534,7 @@ mod tests {
             session("s1", false)
                 .entries(Grouping::State)
                 .into_iter()
-                .map(|(_, enabled)| enabled)
+                .map(|entry| entry.enabled)
                 .collect::<Vec<_>>(),
             [true, true, true, false, true],
             "stop must be the only entry disabled when there is no window"
@@ -2579,13 +2569,14 @@ mod tests {
     #[test]
     fn session_menu_maps_each_row_index_to_its_action() {
         let kind = session("abc123", true);
+        let g = Grouping::State;
         let id = || SessionId::new("abc123");
-        assert_eq!(kind.action(0), Some(PopupAction::OpenSession(id())));
-        assert_eq!(kind.action(1), Some(PopupAction::TogglePin(id())));
-        assert_eq!(kind.action(2), Some(PopupAction::MarkRead(id())));
-        assert_eq!(kind.action(3), Some(PopupAction::Stop(id())));
-        assert_eq!(kind.action(4), Some(PopupAction::Close(id())));
-        assert_eq!(kind.action(5), None, "an index past the last entry must do nothing");
+        assert_eq!(kind.action(g, 0), Some(PopupAction::OpenSession(id())));
+        assert_eq!(kind.action(g, 1), Some(PopupAction::TogglePin(id())));
+        assert_eq!(kind.action(g, 2), Some(PopupAction::MarkRead(id())));
+        assert_eq!(kind.action(g, 3), Some(PopupAction::Stop(id())));
+        assert_eq!(kind.action(g, 4), Some(PopupAction::Close(id())));
+        assert_eq!(kind.action(g, 5), None, "an index past the last entry must do nothing");
     }
 
     /// grouping メニューは現在の選択に ● を付け、各行はその grouping を指す
@@ -2600,14 +2591,14 @@ mod tests {
             ["  state", "● directory"]
         );
         assert_eq!(
-            PopupKind::Group.action(0),
+            PopupKind::Group.action(Grouping::State, 0),
             Some(PopupAction::SetGrouping(Grouping::State))
         );
         assert_eq!(
-            PopupKind::Group.action(1),
+            PopupKind::Group.action(Grouping::State, 1),
             Some(PopupAction::SetGrouping(Grouping::Directory))
         );
-        assert_eq!(PopupKind::Group.action(2), None);
+        assert_eq!(PopupKind::Group.action(Grouping::State, 2), None);
     }
 
     /// セッション行の**行末** `=` クリックでメニューが開く（二次操作の入口）。
@@ -2681,14 +2672,14 @@ mod tests {
             ["new session", "remove project"]
         );
         assert_eq!(
-            kind.action(0),
+            kind.action(Grouping::State, 0),
             Some(PopupAction::NewSessionIn("C:\\dev\\shop-app".to_string()))
         );
         assert_eq!(
-            kind.action(1),
+            kind.action(Grouping::State, 1),
             Some(PopupAction::RemoveProject("C:\\dev\\shop-app".to_string()))
         );
-        assert_eq!(kind.action(2), None);
+        assert_eq!(kind.action(Grouping::State, 2), None);
     }
 
     /// Esc は開いているメニューを閉じる（階層を持たないので戻り先も無い）。
@@ -2732,7 +2723,7 @@ mod tests {
         let stop = kind
             .entries(app.grouping)
             .iter()
-            .position(|(label, _)| label == "stop")
+            .position(|entry| entry.label == "stop")
             .expect("the stop entry is gone");
         open(&mut app, kind, 3);
         for _ in 0..stop {
@@ -2769,27 +2760,6 @@ mod tests {
                 "a border click at ({col},{row}) must not run an entry"
             );
         }
-    }
-
-    /// **幅の下限は「短い項目しか無いメニューが痩せない」ための床**で、
-    /// grouping 切替（最長 `  directory` = 11 桁）がそれに当たる。
-    /// セッションのメニューは項目が増えて床を越えたので、最長項目から決まる
-    #[test]
-    fn menu_width_is_the_longest_entry_but_never_below_the_floor() {
-        use unicode_width::UnicodeWidthStr;
-        assert_eq!(PopupKind::Group.width(Grouping::State), POPUP_MIN_WIDTH);
-        assert_eq!(PopupKind::Group.width(Grouping::Directory), POPUP_MIN_WIDTH);
-        let kind = session("s1", true);
-        let widest = labels(&kind, Grouping::State)
-            .iter()
-            .map(|label| label.width())
-            .max()
-            .unwrap() as u16;
-        assert_eq!(kind.width(Grouping::State), widest + POPUP_CHROME);
-        assert!(
-            kind.width(Grouping::State) > POPUP_MIN_WIDTH,
-            "the floor must not clip the longest entry"
-        );
     }
 
     /// 内容から幅を決めるので、狭いサイドバーでは右ペインに被る。
@@ -4018,14 +3988,14 @@ mod tests {
     #[test]
     fn project_menu_disables_remove_while_sessions_remain() {
         assert_eq!(
-            project("C:\\dev\\api", false).entries(Grouping::Directory),
+            entry_pairs(&project("C:\\dev\\api", false), Grouping::Directory),
             [
                 ("new session".to_string(), true),
                 ("remove project".to_string(), true),
             ]
         );
         assert_eq!(
-            project("C:\\dev\\api", true).entries(Grouping::Directory),
+            entry_pairs(&project("C:\\dev\\api", true), Grouping::Directory),
             [
                 ("new session".to_string(), true),
                 ("remove project".to_string(), false),
@@ -4916,7 +4886,7 @@ mod tests {
             .kind
             .entries(app.grouping)
             .iter()
-            .position(|(label, _)| label == "open")
+            .position(|entry| entry.label == "open")
             .expect("the menu has no open entry");
         assert_eq!(index, 0, "open must be the first entry");
 
