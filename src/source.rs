@@ -45,15 +45,17 @@ const DEFAULT_SIDEBAR_WIDTH: u16 = 34;
 /// セッション名が全部切れた画像になっていた）。
 ///
 /// 内側（枠の中）に収めたいものは 2 つ。桁数は文字数ではなくセルの表示幅で数える
-/// （状態のグリフや区切りの記号は 1 文字が 1 桁とは限らない）:
+/// （区切りの記号は 1 文字が 1 桁とは限らない）:
 ///
-/// 1. セッション行 `= ␣ <グリフ> ␣ <名前>␣␣<状態>`。前置きが 4 桁で、
-///    [`demo_rows`] の最長は "add dark mode toggle"(20) + "Completed"(9)
+/// 1. セッション行 `<行頭><名前><menu>`。前後の固定桁は [`crate::ui::HEAD_COLS`] +
+///    [`crate::ui::MENU_COLS`]（手でこの桁数を数え直さない。テストもそちらを読む）で、
+///    [`demo_rows`] の最長は "add dark mode toggle"(20)
 /// 2. 集計行 `1 waiting · 2 working · 2 completed · 1 stopped` ＝ 47 桁。
 ///    語の途中で切れると画像が壊れて見えるので、こちらが実際の下限になる
 ///
 /// List は枠の内側（幅 - 2）で切るので 47 + 2 = 49 桁。右ペインを削らないよう
-/// これ以上は広げない。行末の要約・経過時間は元々溢れる前提（切っても意味が残る）。
+/// これ以上は広げない。状態はドットの色で語るので行に文字は乗らない
+/// （行末の要約・経過時間はもう出ない）。
 /// **実データではこの幅を要求しない**（集計行は 0 件の項目を出さないので、
 /// 4 種すべてが揃っている撮影データが最も長い）。
 /// 根拠は `demo_sidebar_width_fits_the_sidebar_rows` が固定する
@@ -1041,8 +1043,10 @@ mod tests {
         const DEMO_HEADER: &str = "1 waiting · 2 working · 2 completed · 1 stopped";
 
         let inner = usize::from(DEMO_SIDEBAR_WIDTH - 2);
-        // 名前より前の固定部分 `= ␣ <グリフ> ␣`。グリフ（✻ / ✽ / ∙）はどれも 1 桁
-        let prefix = "= ∙ ".width();
+        // 行が名前の前後で固定して食う桁。**正本は `crate::ui` の定数**（ここで
+        // 手で数え直さない ＝ 行頭・行末の桁を変えたらこの予算も自動でずれる）。
+        // 状態は文字では乗らない（ドットの色で語る）ので、名前の他に足す桁は無い
+        let fixed_cols = crate::ui::HEAD_COLS + crate::ui::MENU_COLS;
         let mut widest = DEMO_HEADER.width();
         let mut counts = std::collections::BTreeMap::<&str, usize>::new();
         for (_, title, state) in demo_rows() {
@@ -1051,13 +1055,12 @@ mod tests {
                 Some(state) => classify(state, true),
                 None => classify(crate::poll::STOPPED, false),
             };
-            *counts.entry(view.label()).or_default() += 1;
-            let need = prefix + title.width() + 2 + view.label().width();
+            *counts.entry(view.title()).or_default() += 1;
+            let need = fixed_cols + title.width();
             assert!(
                 need <= inner,
-                "{:?} + {:?} needs {need} cols (inner is {inner} cols)",
-                title,
-                view.label()
+                "{:?} needs {need} cols (inner is {inner} cols)",
+                title
             );
             widest = widest.max(need);
         }

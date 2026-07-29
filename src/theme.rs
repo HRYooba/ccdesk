@@ -26,6 +26,15 @@ pub(crate) struct UiTheme {
     pub(crate) emph: Color,  // 強調テキスト（背景の明暗で White / Black を自動選択）
     pub(crate) dim: Color,   // 淡色テキスト（fg と bg の中間 45%。どのテーマでも読める距離を保証）
     pub(crate) hl_bg: Color, // 選択・ホバーの帯（bg を fg 側へ 10% 寄せた色）
+    /// サイドバーの点滅（Working のドット）の谷側。**`dim`（45%）よりさらに bg 側
+    /// （80%）へ寄せる**のが要点で、谷を `dim` と同じ色にすると Stopped の色を
+    /// 借りてしまい、明滅が「どの状態か」を語る色チャンネルと衝突する。
+    ///
+    /// **色相を保ったまま暗くする（同じ色のまま明度だけ落とす）は選べない**: 状態色は
+    /// ANSI の名前付き色（`Color::LightRed` 等）で、実際の RGB は端末のカラーパレット
+    /// 依存 ＝ ccdesk 側は知らない。起動時に照会できるのは端末の fg/bg 2 色だけ
+    /// （[`query_host_colors`]）なので、合成できる中間色もこの 2 色の間に限られる
+    pub(crate) faint: Color,
 }
 
 static UI: std::sync::OnceLock<UiTheme> = std::sync::OnceLock::new();
@@ -52,6 +61,7 @@ pub(crate) fn ui() -> &'static UiTheme {
             emph: if lum > 0.5 { Color::Black } else { Color::White },
             dim: mix(fg, bg, 0.45),
             hl_bg: mix(bg, fg, 0.10),
+            faint: mix(fg, bg, 0.8),
         }
     })
 }

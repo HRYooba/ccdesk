@@ -90,8 +90,7 @@ impl std::fmt::Display for SessionId {
 /// 「保存値」と「正本」の 2 本立てになってズレても気づけない。実害はどちらでも
 /// 同じ形で出た:
 ///
-/// - 表示名: 保存値が `new session` のまま固定される・名前が変わるたびに
-///   `updated_at` が動いて経過時間が 0s へ戻る（正本は transcript ＝
+/// - 表示名: 保存値が `new session` のまま固定される（正本は transcript ＝
 ///   [`crate::title::Titles::of`] が描画のたびに導く）
 /// - state: ccdesk が異常終了すると保存値が最後の観測のまま固まり、
 ///   死んでいる行が `Needs input` を出し続ける。逆に窓を閉じた行へ保存値を
@@ -103,9 +102,10 @@ impl std::fmt::Display for SessionId {
 ///
 /// **`updated_at` と `last_opened_at` は別の問いに答える**（同じ材料を見ない）:
 ///
-/// - `updated_at` ＝ **この保管の中身が最後に変わった時刻**。[`merge_sessions`] の
-///   後勝ち判定と、行の経過時間（`· 23s`）の下限に使う。ユーザーの操作
-///   （ピン留め等）で進む
+/// - `updated_at` ＝ **この保管の中身が最後に変わった時刻**。使うのは
+///   [`merge_sessions`] の後勝ち判定だけ。ユーザーの操作（ピン留め等）で進むが、
+///   姿を変えない操作（`mark as read` 等）では進めない ＝ 他インスタンスの
+///   本当の変更を後勝ち判定で踏み潰さないため
 /// - `last_opened_at` ＝ **最後にその行を開いた時刻**。未読の判定に使うが、
 ///   相手は `updated_at` ではなく **hook の `at`**（[`crate::hooks::HookStates::unread`]）＝
 ///   「claude が何か言ったのが最後に開いた後か」。だから ccdesk を起動し直しても、

@@ -626,6 +626,24 @@ impl Group {
         }
     }
 
+    /// この状態の色。**行のドット・集計・節が同じこの 1 箇所を読む**ので、
+    /// 状態を増やしたときに色の対応を書き忘れる場所が増えない
+    /// （以前は `StateView.color` が別に持っていて、`group` と食い違う値を
+    /// 作れてしまっていた）
+    pub(crate) fn color(self) -> Color {
+        match self {
+            Self::Waiting => C_ATTENTION,
+            Self::Working => C_WORKING,
+            Self::Completed => C_OK,
+            Self::Stopped => ui().dim,
+        }
+    }
+
+    /// ドットが明滅するか。**動いている状態だけ**（`Group::Working` と同義）
+    pub(crate) fn blinks(self) -> bool {
+        self == Self::Working
+    }
+
     /// 表示順（節の並びと集計の並び）。**[`Ord`] と同じ順を 1 箇所で配る**ので、
     /// 節を足したときに並びの書き漏らしが起きない
     pub(crate) const ORDER: [Self; 4] = [
@@ -634,26 +652,6 @@ impl Group {
         Self::Completed,
         Self::Stopped,
     ];
-}
-
-/// 状態 → 表示（節・色・スピナー）の単一マッピング。
-/// draw 内に同じ分岐を複製しない（集計と行表示のずれを防ぐ）。
-///
-/// **ラベルは持たない**（`group.title()` が答える）。持たせていた頃は
-/// 「ラベルは Done だが節は Completed」のような食い違いを作れた
-#[derive(Clone, Copy)]
-pub(crate) struct StateView {
-    pub(crate) group: Group,
-    pub(crate) color: Color,
-    pub(crate) spinning: bool, // Working スピナーの対象
-    pub(crate) alive: bool,    // プロセス生存（アイコン形状 ✻/∙）
-}
-
-impl StateView {
-    /// 行に出す文字列（＝ 節の見出しと同じ語）
-    pub(crate) fn label(&self) -> &'static str {
-        self.group.title()
-    }
 }
 
 /// **実行が終わった**ことを表す state 値。書く側（hook の `SessionEnd` ＝
@@ -692,21 +690,15 @@ pub(crate) const COMPLETED: &str = "completed";
 /// **未知の値は state として扱わない。** 生きているなら Working（まだ何も
 /// 報告していないセッションは動いている可能性が高い）、死んでいるなら Stopped。
 /// 以前は死んだ行に `Idle` という 5 番目の語を出していた
-pub(crate) fn classify(live_state: &str, alive: bool) -> StateView {
-    let view = |group: Group, color: Color, spinning: bool| StateView {
-        group,
-        color,
-        spinning,
-        alive,
-    };
+pub(crate) fn classify(live_state: &str, alive: bool) -> Group {
     match live_state {
-        COMPLETED => view(Group::Completed, C_OK, false),
-        STOPPED => view(Group::Stopped, ui().dim, false),
-        WAITING => view(Group::Waiting, C_ATTENTION, false),
+        COMPLETED => Group::Completed,
+        STOPPED => Group::Stopped,
+        WAITING => Group::Waiting,
         // `working` と未知の値をまとめて扱う（どちらも「動いているらしい」）
-        _ if alive => view(Group::Working, C_WORKING, true),
+        _ if alive => Group::Working,
         // プロセスが居ない ＝ 動いていないので、report された state に関わらず Stopped
-        _ => view(Group::Stopped, ui().dim, false),
+        _ => Group::Stopped,
     }
 }
 
@@ -742,9 +734,10 @@ pub(crate) struct Run<'a> {
 ///   異常終了しても次の起動で正しくなる）
 /// - `stop` / `/clear` / `/resume` の**どれで止まっても同じ表示**（止まる ＝
 ///   その行を動かす実行が無くなる、の 1 通りしかない）
-/// - **`Stopped` なのに `✻`（生存形）という矛盾が作れない**: `stopped` は
+/// - **`Stopped` の行が Working の色・明滅を帯びるという矛盾が作れない**: `stopped` は
 ///   「実行が終わった」の言い換えなので、hook がそう言った実行は実行として扱わない
-///   ＝ Stopped は必ず生死フラグが降りた状態でしか作られない
+///   ＝ Stopped は必ず `classify(STOPPED, _)` の 1 分岐だけを通って `Group::Stopped` を
+///   返し、色（[`Group::color`]）も明滅（[`Group::blinks`]）もその 1 つの値から導く
 ///
 /// 実行があるときの中身は **hook が主、`agents --json` が従**:
 /// hook は turn 単位で届くので
@@ -767,7 +760,7 @@ pub(crate) struct Run<'a> {
 /// 逆向き（busy でない観測で `working` を waiting へ落とす）もしない:
 /// 「動いていない」は idle_prompt の誤検知と同じ轍で、ターンを終えた行が
 /// 時間経過で入力待ちへ落ちる
-pub(crate) fn row_state(run: Option<Run<'_>>) -> StateView {
+pub(crate) fn row_state(run: Option<Run<'_>>) -> Group {
     let Some(run) = run.filter(|run| run.hook.map(|(state, _)| state) != Some(STOPPED)) else {
         return classify(STOPPED, false);
     };

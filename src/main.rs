@@ -214,7 +214,7 @@ fn main() -> anyhow::Result<()> {
         projects: window.projects,
         popup: None,
         focus: Focus::Terminal,
-        spinner_active: false,
+        animating: false,
         source,
     };
     // バックグラウンド取得の起動。**起動列の重い処理（埋め戻し・transcript の
