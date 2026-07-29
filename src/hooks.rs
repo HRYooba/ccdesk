@@ -14,9 +14,8 @@
 //! 保管（`sessions.json`）と hook が食い違い、しかもどちらが新しいかが行ごとに
 //! 逆になっていた（[`crate::sessions::SessionRow`]）。
 //!
-//! ここが答えるのは 3 つ。どれも**行に保存せず、そのつど引く**:
-//! 状態（[`HookStates::get`]）・未読（[`HookStates::unread`]）・
-//! 行が今の姿になった時刻（[`HookStates::changed_at`]）。
+//! ここが答えるのは 2 つ。どちらも**行に保存せず、そのつど引く**:
+//! 状態（[`HookStates::get`]）・未読（[`HookStates::unread`]）。
 //!
 //! **注入する settings はここが 1 箇所で組む**（[`inject_settings`]）。載るのは hook だけ。
 //!
@@ -189,12 +188,6 @@ impl HookStates {
         (entry.at >= launched?).then_some((entry.state.as_str(), entry.at))
     }
 
-    /// その行について **hook が最後に何か書いた時刻**（記録が無ければ None）。
-    /// 窓の有無は見ない ＝ 動いていない行についても「最後に動いたのはいつか」を答える
-    fn last_at(&self, id: &SessionId) -> Option<u64> {
-        self.0.get(id).map(|entry| entry.at)
-    }
-
     /// 前回の写しと比べて、**新しくターンを終えた行があるか**。
     ///
     /// 使用率はターンが終わった瞬間に動くので、これが取得の合図になる
@@ -227,17 +220,6 @@ impl HookStates {
             .get(&row.session_id)
             .and_then(|entry| entry.activity_at)
             .is_some_and(|at| at > row.last_opened_at)
-    }
-
-    /// その行が**今の姿になった時刻**（行に出る経過時間 `· 23s` の起点）。
-    ///
-    /// **未読とは別の材料を見る**: 姿は「claude が言った状態」と「保管の中身」の
-    /// 両方で変わるので、新しい方を採る。未読（[`Self::unread`]）が hook だけを
-    /// 見るのは、答える問いが「claude が何か言ったか」だから
-    pub(crate) fn changed_at(&self, row: &SessionRow) -> u64 {
-        self.last_at(&row.session_id)
-            .unwrap_or(0)
-            .max(row.updated_at)
     }
 
     /// **その claude プロセスが今動かしているセッション。** hook はどのイベントでも
@@ -879,21 +861,6 @@ mod tests {
         )
         .unwrap();
         assert!(!states_at(&temp.path()).unread(&row), "a legacy entry created an unread mark");
-    }
-
-    /// **経過時間の起点は未読とは別の材料。** 行の姿は「claude が言った状態」と
-    /// 「保管の中身」の両方で変わるので、新しい方を採る（未読は hook だけを見る）
-    #[test]
-    fn the_age_of_a_row_starts_at_whichever_moved_last() {
-        let row = |updated_at| SessionRow {
-            updated_at,
-            ..SessionRow::new(id("s"), "C:\\dev\\app", 0)
-        };
-        let states = HookStates::from_entries([("s", "done", 2_000)]);
-        assert_eq!(states.changed_at(&row(1_000)), 2_000, "the hook did not move the age");
-        assert_eq!(states.changed_at(&row(3_000)), 3_000, "an edit to the row did not move the age");
-        // hook を持たない行は保管の時刻だけ（起動しただけの行も 0 にならない）
-        assert_eq!(HookStates::default().changed_at(&row(1_000)), 1_000);
     }
 
     /// **pid は claude が hook の子へ渡す環境変数から読む**（実測: v2.1.220 の

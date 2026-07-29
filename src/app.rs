@@ -29,11 +29,11 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const LIVE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// イベント待ちの上限（＝ 何も起きないときの周回間隔）
 const POLL_IDLE: Duration = Duration::from_millis(33);
-/// スピナーが回っている間の描き直し間隔（点滅周期 400ms の半周期 ＝
+/// 何かが動いている間の描き直し間隔（ドットの点滅周期 400ms の半周期 ＝
 /// これより短くしても見た目は変わらず、フレームが増えるだけ）
-const SPINNER_REDRAW: Duration = Duration::from_millis(200);
-/// 何も動いていないときの描き直す間隔。動くものは経過時間表示（`· 23s`）だけで、
-/// その粒度は 1 秒なので、これより短い周期は**前フレームと同一の出力**を組み直すだけ
+const ANIMATION_REDRAW: Duration = Duration::from_millis(200);
+/// 何も動いていないときの描き直す間隔。残るのは通知の期限切れ等の低頻度な変化
+/// だけなので、これより短い周期は**前フレームと同一の出力**を組み直すだけ
 const IDLE_REDRAW: Duration = Duration::from_secs(1);
 /// 描画を見送っている間のイベント待ちの上限。子が静まったことに早く気づくため
 /// 短くする（見送りは [`crate::session::REDRAW_HOLD_MAX`] で打ち切られるので、
@@ -434,9 +434,15 @@ pub(crate) struct App {
     pub(crate) projects: Vec<String>,
     pub(crate) popup: Option<Popup>,
     pub(crate) focus: Focus,
-    // 直前のフレームでスピナー（Working の点滅）が出ていたか。
-    // run ループがアイドル時の描き直し間隔を選ぶ材料（描画が毎フレーム更新する）
-    pub(crate) spinner_active: bool,
+    /// 直前のフレームで速い描き直しが要る何かが動いていたか。
+    /// run ループがアイドル時の描き直し間隔を選ぶ材料（描画が毎フレーム更新する）。
+    ///
+    /// **材料は 2 つ束ねている**: 行のドットの明滅（[`crate::poll::Group::blinks`]）と、
+    /// 使用率の取得中スピナー（[`Self::usage_fetching`]。回るのは本物のブライユ点字
+    /// アニメ ＝ [`crate::ui::usage_spinner_frame`]）。どちらも「今フレームを
+    /// 速く描き直す必要があるか」という同じ問いに答えるので、
+    /// 名前を「spinner」に寄せず両方を指せる名前にしてある
+    pub(crate) animating: bool,
 }
 
 /// テストの土台になる中立な `App`。各テストは関心のあるフィールドだけを
@@ -513,7 +519,7 @@ impl Default for App {
             popup: None,
             // サイドバー側にしておく（set_focus が PTY へ通知を出さない）
             focus: Focus::Sidebar,
-            spinner_active: false,
+            animating: false,
         }
     }
 }
@@ -740,15 +746,15 @@ fn send_to_active(app: &mut App, bytes: &[u8]) {
 }
 
 /// この周に描くか。**再描画は「PTY に新出力」「UI イベント」「無変化でも
-/// [`IDLE_REDRAW`] 周期（スピナー・経過時間）」のときだけ**（無条件 60fps は
-/// claude 画面全体の再構築が毎フレーム走り重い）。
+/// [`IDLE_REDRAW`] 周期（ドットの点滅・通知の期限切れ等）」のときだけ**
+/// （無条件 60fps は claude 画面全体の再構築が毎フレーム走り重い）。
 ///
 /// `holding` は**すべてに優先する**: 子が画面を作り替えている最中に掴んだ
 /// フレームはカーソルが中間位置で確定し、IME の変換窓がそこへ飛ぶ
 /// （判断は [`crate::session::Session::holds_frame`]、上限も向こうが持つので
 /// ここが false を返し続けることはない）
-/// `idle_after` は無変化でも描き直す間隔（スピナーが回っている間だけ短くする ＝
-/// [`SPINNER_REDRAW`] / [`IDLE_REDRAW`]）
+/// `idle_after` は無変化でも描き直す間隔（何か動いている間だけ短くする ＝
+/// [`ANIMATION_REDRAW`] / [`IDLE_REDRAW`]）
 fn should_draw(holding: bool, force: bool, pty_dirty: bool, since_draw: Duration, idle_after: Duration) -> bool {
     !holding && (force || pty_dirty || since_draw > idle_after)
 }
@@ -904,10 +910,11 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             .windows
             .iter()
             .any(|w| w.dirty.load(std::sync::atomic::Ordering::Relaxed));
-        // スピナー（Working の点滅）が出ている間だけ短い周期で描き直す。
-        // 出ていなければ動くのは経過時間（1 秒粒度）だけなので、それに合わせる
-        let idle_after = if app.spinner_active {
-            SPINNER_REDRAW
+        // 何か動いている（ドットの点滅・使用率取得中スピナー）間だけ短い周期で
+        // 描き直す。出ていない間は通知の期限切れ等の低頻度な変化しか無いので、
+        // 1 秒粒度で足りる
+        let idle_after = if app.animating {
+            ANIMATION_REDRAW
         } else {
             IDLE_REDRAW
         };
@@ -1469,9 +1476,10 @@ fn mark_read(app: &mut App, id: &SessionId) {
 ///
 /// `updated_at` を進めるのはマージの後勝ち判定に要るから
 /// （[`crate::sessions`] の `merge_sessions`）。**進めるのは行の中身が実際に
-/// 変わったときだけ**: `updated_at` は行に出る経過時間の材料でもあるので
-/// （[`crate::hooks::HookStates::changed_at`]）、何も変えない操作で進めると
-/// **行に何も起きていないのに経過時間が 0s へ戻る**。
+/// 変わったときだけ**: 何も変えない操作（`mark as read` 等）で進めてしまうと、
+/// 他インスタンスが先に書いた本当の変更（ピン留め等）より `updated_at` だけが
+/// 新しくなり、後勝ち判定でこちらの（中身は古いままの）写しが勝って
+/// 相手の変更を踏み潰す。
 ///
 /// **未読には触らない。** 未読の材料は hook の `at` だけなので、行を書き換えても
 /// `●` は点かないし消えない ＝ 「自分の操作で未読が生えない」は保証ではなく構造
@@ -3687,9 +3695,9 @@ mod tests {
         }
         // 何も起きていない周は描かない（無条件 60fps にしない）
         assert!(!should_draw(false, false, false, fresh, IDLE_REDRAW));
-        // スピナーが回っている間だけ短い周期でも描く（回っていなければ 1 秒粒度）
-        let between = SPINNER_REDRAW + Duration::from_millis(50);
-        assert!(should_draw(false, false, false, between, SPINNER_REDRAW));
+        // 何か動いている間だけ短い周期でも描く（動いていなければ 1 秒粒度）
+        let between = ANIMATION_REDRAW + Duration::from_millis(50);
+        assert!(should_draw(false, false, false, between, ANIMATION_REDRAW));
         assert!(!should_draw(false, false, false, between, IDLE_REDRAW));
     }
 
@@ -4918,12 +4926,13 @@ mod tests {
 
     /// **何も変えない操作は `updated_at` を動かさない。**
     ///
-    /// `updated_at` は行に出る経過時間の材料でもあるので
-    /// （[`crate::hooks::HookStates::changed_at`]）、中身が変わっていないのに進めると
-    /// **行に何も起きていないのに `· 0s` へ戻る**。`mark as read` は姿を変えないので
-    /// 進めず、ピン留めは変えるので進む
+    /// 進めてしまうと、他インスタンスが先に書いた本当の変更（ピン留め等）より
+    /// こちらの写しの `updated_at` だけが新しくなり、マージの後勝ち判定
+    /// （[`crate::sessions`] の `merge_sessions`）でこちらの古い中身が勝って
+    /// 相手の変更を踏み潰す。`mark as read` は姿を変えないので進めず、
+    /// ピン留めは変えるので進む
     #[test]
-    fn an_edit_that_changes_nothing_leaves_the_age_alone() {
+    fn an_edit_that_changes_nothing_leaves_updated_at_alone() {
         let mut app = app_with_row("s");
         let id = SessionId::new("s");
         app.sessions[0].last_opened_at = 1_000;
@@ -4932,7 +4941,7 @@ mod tests {
 
         // 未読の行への `mark as read`: 既読にはなるが行の姿は変わっていない
         run_popup_action(&mut app, PopupAction::MarkRead(id.clone()));
-        assert_eq!(only_row(&app).updated_at, 2_000, "mark as read reset the age");
+        assert_eq!(only_row(&app).updated_at, 2_000, "mark as read advanced updated_at");
         assert!(
             !app.hook_states.unread(only_row(&app)),
             "mark as read did not clear unread"
@@ -4940,11 +4949,11 @@ mod tests {
 
         // もう一度押しても何も動かない
         run_popup_action(&mut app, PopupAction::MarkRead(id.clone()));
-        assert_eq!(only_row(&app).updated_at, 2_000, "a second mark as read reset the age");
+        assert_eq!(only_row(&app).updated_at, 2_000, "a second mark as read advanced updated_at");
 
         // 中身が変わる操作は進める（マージの後勝ち判定の材料なので必ず進む）
         run_popup_action(&mut app, PopupAction::TogglePin(id));
-        assert!(only_row(&app).updated_at > 2_000, "a real change did not advance the age");
+        assert!(only_row(&app).updated_at > 2_000, "a real change did not advance updated_at");
     }
 
     /// **`stop` は窓を閉じるだけで、行へは何も書かない**（行は消えず `open` で
