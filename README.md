@@ -107,9 +107,12 @@ move — so nothing runs while you are idle. **Click it to refresh right away** 
 the rings spin while that fetch is in flight. A slow 15-minute poll backs that up,
 because two things no event can report: the 5-hour window resetting on a timer,
 and usage from outside ccdesk (another terminal, claude.ai, another device).
-Bursts of finished turns collapse into one fetch, and accounts with no rate-limit
-windows stop polling entirely (a click still re-checks, in case you signed in
-elsewhere).
+Bursts of finished turns collapse into one fetch. If a fetch ever succeeded and a
+later one can't reach your rate limits (you signed out, for instance), ccdesk
+keeps showing the last numbers and keeps polling, so signing back in brings the
+gauge back on its own. Only an account with no rate-limit concept at all (API
+key, Bedrock, Vertex) — one that has never once returned numbers — stops polling
+entirely; a click still re-checks it, in case you switched accounts.
 
 ccdesk gets the numbers by running the official `claude` CLI headless for a
 moment and sending one `get_usage` request over the Agent SDK control channel.
@@ -126,9 +129,9 @@ thread never starts.
 `ccdesk doctor` reports what the probe returns on your machine, and runs even
 with the setting off so you can look before turning it on. A failed fetch shows
 as `usage —` rather than a silent blank; a reading old enough that the backup
-poll must have missed (20 minutes) is dimmed; an account with no rate-limit
-windows at all (API key, Bedrock, Vertex)
-hides the gauge instead of warning forever.
+poll must have missed (20 minutes) is dimmed; an account that has never once
+had rate-limit windows (API key, Bedrock, Vertex) hides the gauge instead of
+warning forever.
 
 ## License
 

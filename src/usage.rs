@@ -143,7 +143,12 @@ pub(crate) enum Usage {
     Unknown,
     /// 枠の概念が無いアカウント（`rate_limits_available: false`）。
     /// API キー利用者など**恒久的に取れない**ので、行ごと出さない
-    /// （直せないものを警告し続けない。理由は `ccdesk doctor` が言う）
+    /// （直せないものを警告し続けない。理由は `ccdesk doctor` が言う）。
+    ///
+    /// ただし**一度でも `Ready` を見た後の `Unavailable` は恒久だと信じない**
+    /// （ログアウトも同じ形で返るため、区別が付かない）。[`arbitrate`] が
+    /// その場合は前の `Ready` を保ったまま扱うので、この variant に落ちるのは
+    /// 「起動してから一度も枠が取れていない」ときだけになる
     Unavailable,
     /// 取得に失敗した（claude が起きない・応答が読めない・形が変わった）。
     /// **黙って消さず、取れていないことを出す**
@@ -170,6 +175,29 @@ impl UsageRefresh {
     /// 連発するので [`EVENT_MIN_INTERVAL`] で間引く
     pub(crate) fn note_turn_finished(&self) {
         let _ = self.0.send(Trigger::TurnFinished);
+    }
+}
+
+/// 今の値と新しい観測から、次に持つべき値を裁定する。**プロセスを起こさずに
+/// 検査できる**よう [`spawn_poller`] のスレッドから切り出してある。
+///
+/// 取得に失敗した（`Failed`）ときだけでなく、**枠の概念が無いアカウント
+/// （`Unavailable`）でも**、直前が `Ready` なら前の値を保つ。ログアウトした
+/// 状態で取得すると `Unavailable` と同じ形（`rate_limits_available: false`）
+/// で返るため、一度でも枠が取れたことがあるアカウントでの `Unavailable` は
+/// 「恒久的に枠が無い」ではなく「一時的に取れない」と見なす。これにより
+/// 再ログイン後、次の周期取得か次のターン完了で自動的に表示が復帰する
+/// （`guard` が `Ready` のままなので、周期取得も止まらない）。
+///
+/// 一度も `Ready` になっていない `Unavailable`（本当に枠が無いアカウント）は
+/// そのまま `Unavailable` を返す
+fn arbitrate(current: &Usage, next: Usage) -> Usage {
+    let keep_previous = matches!(next, Usage::Failed | Usage::Unavailable)
+        && matches!(current, Usage::Ready(_));
+    if keep_previous {
+        current.clone()
+    } else {
+        next
     }
 }
 
@@ -211,18 +239,16 @@ pub(crate) fn spawn_poller(
             let fetched_at = std::time::Instant::now();
 
             let mut guard = slot.lock_recover();
-            // 取得に失敗しても、一度取れた値は捨てない（1 回の失敗で使用率行が
-            // 消えるのを防ぐ）。古さは `fetched_at` に出るので嘘にはならない
-            let keep_previous =
-                matches!(next, Usage::Failed) && matches!(*guard, Usage::Ready(_));
-            if !keep_previous {
-                *guard = next;
-            }
+            let updated = arbitrate(&guard, next);
+            *guard = updated;
             // 値が据え置きでも描き直させる（古さの dim は時間で変わる）
             dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-            // **枠の概念が無いアカウントでは周期取得をやめる。** 恒久的に取れないので
-            // 保険の周期で claude を起こす意味が無い。要求だけは受け続ける
-            // （アカウントを切り替えたときに戻ってこられる経路を残す）
+            // **一度も Ready を見ていない Unavailable でだけ周期取得をやめる。**
+            // 枠の概念が無いアカウント（API キー等）は恒久的に取れないので、保険の
+            // 周期で claude を起こす意味が無い。要求だけは受け続ける（アカウントを
+            // 切り替えたときに戻ってこられる経路を残す）。一度 Ready を見た後の
+            // Unavailable は [`arbitrate`] が前の Ready のまま保つので、ここには来ない
+            // （ログアウトしても周期取得が止まらず、再ログインで自動的に復帰する）
             let permanent = matches!(*guard, Usage::Unavailable);
             drop(guard);
 
@@ -243,15 +269,17 @@ pub(crate) fn spawn_poller(
                     return; // 送り手が居なくなった（TUI 終了）
                 };
                 match trigger {
-                    // ユーザーが押した ＝ 間引かない（アカウントを切り替えたときに
-                    // Unavailable から戻ってこられる唯一の経路でもある）
+                    // ユーザーが押した ＝ 間引かない（一度も Ready になっていない
+                    // Unavailable では、これが再挑戦できる唯一の経路になる。
+                    // 一度 Ready を見たアカウントは周期取得と TurnFinished でも
+                    // 自動的に戻る ＝ この経路が要るのは never-Ready のときだけ）
                     Trigger::Manual => {
                         manual = true;
                         break;
                     }
-                    // **枠の概念が無いアカウントではターン完了を無視する。** 恒久的に
-                    // 取れないのに、ターンのたびに claude を起こし続ける意味が無い
-                    // （README の「stop polling entirely (click still re-checks)」が
+                    // **一度も Ready になっていない Unavailable ではターン完了を
+                    // 無視する。** 恒久的に取れないのに、ターンのたびに claude を
+                    // 起こし続ける意味が無い（README の「stop polling entirely」が
                     // この挙動の正本）
                     Trigger::TurnFinished if permanent => continue,
                     // ターン完了は連発するので、直前の取得から間を置く。
@@ -572,5 +600,54 @@ mod tests {
         assert_eq!(parse_timestamp("2026-07-27T17:30:00+00:00"), Some(1_785_173_400));
         assert_eq!(parse_timestamp("Jul 28, 2:30am"), None);
         assert_eq!(parse_timestamp(""), None);
+    }
+
+    /// ログアウトして `rate_limits_available: false` が返っても、一度 Ready を
+    /// 見ていれば表示は消えない（固着の再現テスト）
+    #[test]
+    fn ready_then_unavailable_keeps_the_ready_value() {
+        let ready = sample_ready(Vec::new());
+        assert_eq!(arbitrate(&ready, Usage::Unavailable), ready);
+    }
+
+    /// 既存挙動の固定: 取得が 1 回失敗しても前の Ready は捨てない
+    #[test]
+    fn ready_then_failed_keeps_the_ready_value() {
+        let ready = sample_ready(Vec::new());
+        assert_eq!(arbitrate(&ready, Usage::Failed), ready);
+    }
+
+    /// 起動してから一度も枠が取れていないアカウントの Unavailable は、
+    /// 恒久的に取れないアカウントとしてそのまま扱う
+    #[test]
+    fn never_ready_unavailable_stays_unavailable() {
+        assert_eq!(
+            arbitrate(&Usage::Unknown, Usage::Unavailable),
+            Usage::Unavailable
+        );
+    }
+
+    /// 新しい取得が成功すれば、古い Ready を素直に置き換える
+    #[test]
+    fn ready_then_ready_replaces_with_the_new_value() {
+        let old = sample_ready(Vec::new());
+        let new = sample_ready(vec![(
+            "Fable".to_string(),
+            UsageWindow {
+                pct: 42.0,
+                resets_at: None,
+            },
+        )]);
+        assert_eq!(arbitrate(&old, new.clone()), new);
+    }
+
+    /// Failed（Ready を経ていない）の後の Unavailable も、保持する前の値が
+    /// Ready ではないのでそのまま Unavailable になる
+    #[test]
+    fn failed_then_unavailable_becomes_unavailable() {
+        assert_eq!(
+            arbitrate(&Usage::Failed, Usage::Unavailable),
+            Usage::Unavailable
+        );
     }
 }
