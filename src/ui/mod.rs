@@ -1183,8 +1183,17 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             .or_else(|| {
                 // 別インスタンスで動いている行を Stopped と描かない（Stopped の行は
                 // open で `claude -r` を起こすので、嘘の Stopped は二重再開の入口になる）。
-                // hook の記録は起動時刻で新旧を判断できない（他人の窓）ので使わない
-                (!status.is_empty()).then_some(Run {
+                // hook の記録は起動時刻で新旧を判断できない（他人の窓）ので使わない。
+                //
+                // **ただし、ccdesk 自身がこの行を止めた直後は例外。** `agents --json`
+                // の観測は最大 2 秒古く、今 kill したばかりの自分のセッションがまだ
+                // 載っていることがある。観測時刻（[`App::agents_observed_at`]）が
+                // 停止時刻（[`App::stopped_at`]）より新しくなるまでは、この救済を
+                // 「他インスタンスの実行」として採らない ＝ Stopped のまま描く
+                // （採ってしまうと、次のポーリングで残像が消えるまでの一瞬だけ
+                // Waiting 等を経由してから Stopped になる）
+                let stopped_at = app.stopped_at.get(&row.session_id).copied().unwrap_or(0);
+                (!status.is_empty() && app.agents_observed_at > stopped_at).then_some(Run {
                     hook: None,
                     status,
                     status_at: app.agents_observed_at,
@@ -2229,6 +2238,67 @@ pub(crate) mod tests {
             // 形はプロセスの生死（窓が無いので停止形）
             assert!(line.contains('∙'), "a stopped row is drawn with a live glyph: {line:?}");
             assert!(!line.contains('✻'), "{line:?}");
+        }
+    }
+
+    /// **ccdesk が今止めたセッションの残像は、次の観測が届くまで実行として拾わない。**
+    ///
+    /// stop 直後は `agents --json` の観測が最大 2 秒古く、kill したばかりの
+    /// 自分のセッションがまだ busy 等で載っている。ここを「別インスタンスの実行」
+    /// （run の 3 つ目の分岐）と誤認すると、Stopped になるはずの行が一瞬 Waiting
+    /// 等を経由してから Stopped になってしまう（今回のバグ）。観測時刻が
+    /// 停止時刻より新しくなるまでは Stopped のまま描く
+    #[test]
+    fn a_row_ccdesk_just_stopped_ignores_a_stale_agents_observation() {
+        let mut app = App {
+            term_size: (140, 40),
+            sidebar_width: 60,
+            sessions: vec![named_session("dead-beef", "C:\\dev\\api", "just-stopped")],
+            titles: fixed_titles(),
+            // 「今 kill した」の記録。観測が同時刻以下の間は救済させない
+            stopped_at: [(crate::sessions::SessionId::new("dead-beef"), 5_000)].into(),
+            agents_observed_at: 5_000,
+            agents: vec![crate::poll::AgentInfo {
+                session_id: "dead-beef".to_string(),
+                kind: crate::claude_format::AGENT_KIND_INTERACTIVE.to_string(),
+                status: "busy".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for line in session_lines(&mut app) {
+            assert!(
+                line.contains("Stopped"),
+                "a just-stopped row believed a stale agents observation: {line:?}"
+            );
+        }
+    }
+
+    /// 対で固定する: 停止時刻より**新しい**観測に載っていれば、それは自分の残像
+    /// ではなく本当に別インスタンス（または ccdesk の外）で動いている実行 ＝
+    /// 別インスタンス救済はこれまで通り働く
+    #[test]
+    fn a_newer_agents_observation_still_rescues_another_instance() {
+        let mut app = App {
+            term_size: (140, 40),
+            sidebar_width: 60,
+            sessions: vec![named_session("dead-beef", "C:\\dev\\api", "elsewhere")],
+            titles: fixed_titles(),
+            stopped_at: [(crate::sessions::SessionId::new("dead-beef"), 5_000)].into(),
+            agents_observed_at: 5_001, // 停止より後の観測 ＝ 本当に動いている
+            agents: vec![crate::poll::AgentInfo {
+                session_id: "dead-beef".to_string(),
+                kind: crate::claude_format::AGENT_KIND_INTERACTIVE.to_string(),
+                status: "busy".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for line in session_lines(&mut app) {
+            assert!(
+                !line.contains("Stopped"),
+                "the rescue for another instance stopped working: {line:?}"
+            );
         }
     }
 

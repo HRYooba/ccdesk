@@ -166,6 +166,7 @@ fn main() -> anyhow::Result<()> {
         agents_observed_at: 0,
         agents_shared: Arc::new(Mutex::new(Vec::new())),
         agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stopped_at: std::collections::HashMap::new(),
         sessions,
         hook_states,
         fixed_states,
