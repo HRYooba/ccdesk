@@ -326,6 +326,18 @@ pub(crate) struct App {
     pub(crate) agents_observed_at: u64,
     pub(crate) agents_shared: Arc<Mutex<Vec<AgentInfo>>>,
     pub(crate) agents_dirty: Arc<std::sync::atomic::AtomicBool>,
+    /// ccdesk がその窓を閉じた時刻（ms）。**「自分が今止めたセッション」だけを覚える**。
+    ///
+    /// `agents --json` の観測は最大 [`LIVE_SCAN_INTERVAL`] 分古いことがあるので、
+    /// kill した直後は「たった今殺した自分の前景セッション」がまだ busy 等として
+    /// 載っている。この残像を[`crate::ui`]の別インスタンス救済（窓が無い行を
+    /// 他インスタンスの実行として拾う分岐）が実行と誤認すると、Stopped になるはずの
+    /// 行が一瞬 Waiting 等を経由してしまう。ここに刻んだ時刻より観測が新しくなる
+    /// （＝ 次のポーリングで残像が消える）までは、その行を救済の対象にしない。
+    ///
+    /// 行に保存しない（`sessions.json` は触らない）。窓を再び開いた
+    /// （[`App::window_index`] が Some を返すようになった）ら消す ＝ 無限に溜めない
+    pub(crate) stopped_at: std::collections::HashMap<SessionId, u64>,
     /// サイドバーに並ぶ行。**正本は `~/.ccdesk/sessions.json`**（供給元が読み書きする）
     pub(crate) sessions: Vec<SessionRow>,
     /// hook（`--settings` で注入した公式 hook）が書いた state の写し。
@@ -456,6 +468,7 @@ impl Default for App {
             agents_observed_at: 0,
             agents_shared: Arc::new(Mutex::new(Vec::new())),
             agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stopped_at: std::collections::HashMap::new(),
             sessions: Vec::new(),
             hook_states: HookStates::default(),
             fixed_states: std::collections::HashMap::new(),
@@ -1994,6 +2007,9 @@ fn menu_close(app: &mut App, id: &SessionId) {
     if app.sessions.len() != before {
         save_sessions(app);
     }
+    // 行ごと消えるので、close_window_of が刻んだ記録も一緒に捨てる
+    // （行が無い session_id を持ち続けても引く先が無く、溜まるだけ）
+    app.stopped_at.remove(id);
 }
 
 /// hook 注入ファイルのパス（実体は [`crate::hooks::inject_settings`]）。
@@ -2013,12 +2029,17 @@ fn hook_settings(app: &mut App) -> Option<std::path::PathBuf> {
 }
 
 /// 指定セッションのウィンドウを閉じる（＝ 子プロセスを終わらせる）。
-/// 窓が開いていなければ何もしない
+/// 窓が開いていなければ何もしない。
+///
+/// **`stop` / `close` / PTY 書き込み失敗の後始末、この関数を通る窓閉じ全てが
+/// ここへ収束する**ので、[`App::stopped_at`] を刻む場所もここ 1 箇所に一本化する
+/// （散らばると「刻み忘れた経路」だけ古い観測を実行と誤認する不具合が再発する）
 fn close_window_of(app: &mut App, id: &SessionId) {
     let Some(i) = app.window_index(id) else {
         return;
     };
     let _ = app.windows[i].child.kill();
+    app.stopped_at.insert(id.clone(), now_ms());
     remove_window(app, i);
 }
 
@@ -2355,6 +2376,9 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
             // 既読は**起こせてから**付ける（起こせなかった行の未読 ● を、
             // 内容を見ていないのに消さない）
             mark_read(app, id);
+            // この行を動かす窓がまた居る ＝ 「自分が止めた」の記録は役目を終えた
+            // （消さないと止めた行の数だけ溜まる）
+            app.stopped_at.remove(id);
             app.windows.push(window);
             app.show_session(app.windows.len() - 1);
             // 再開は transcript の読み直しに時間がかかりうる。子が端末を掴むまでの
