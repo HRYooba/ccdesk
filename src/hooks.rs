@@ -50,23 +50,14 @@ use crate::sessions::{SessionId, SessionRow};
 /// 拾うのは**ユーザーが動くまで進まない**通知だけ。`auth_success` / `agent_completed` /
 /// `elicitation_complete` は完了・情報通知なので拾わない（完了は `Stop` が答える）。
 ///
+/// **入力待ちの解除（`elicitation_response` 等）も拾わない。** 解除は
+/// 「waiting より新しい busy 観測」の裁定（[`crate::poll::row_state`]）が担う:
+/// 解除を表すイベントは全操作には存在しない（許可プロンプトの許可には無い）ので、
+/// イベントを列挙しても状態機械は閉じない。解除の口を 2 系統持たない。
+///
 /// 縮退: matcher が効かない版では `Notification` が一度も発火しない ＝ 入力待ちは
 /// `agents --json` の `status` 経由だけになる。**`done` が壊れるより取り逃すほうが軽い**
 const ATTENTION_MATCHER: &str = "permission_prompt|elicitation_dialog|agent_needs_input";
-
-/// 入力待ちの**解除**を知らせる `Notification` の matcher。`elicitation_response` は
-/// ユーザーがダイアログに回答を送った瞬間に発火する ＝ [`ATTENTION_MATCHER`] で
-/// waiting に入った行を working へ戻す対のイベント。これが無いと、回答後も
-/// ターン終了（`Stop`）まで Waiting のまま固まる（状態機械が非対称になる）。
-///
-/// `elicitation_complete`（submit / dismiss の両方で発火）は**入れない**:
-/// 同じ回答から hook プロセスが 2 本走ると、遅れた `working` が `Stop → completed` の
-/// 後に保存され、終わったターンが Working に戻る競合の面が広がる。dismiss で
-/// Waiting が残るのは従来と同じ挙動 ＝ 悪化ではない。
-///
-/// 回答→`Stop` の間には必ず claude の応答生成（API 往復）が挟まるので、
-/// `working` と `completed` の保存が入れ違う余地は実用上小さい
-const RESUME_MATCHER: &str = "elicitation_response";
 
 /// 注入する hook 1 件。**`--settings` の生成（[`inject_settings`]）と受け口
 /// （[`run_hook`]）が同じ表を読む**ので、片方だけ増えた状態にならない。
@@ -85,20 +76,18 @@ struct HookEvent {
     activity: bool,
 }
 
-/// 注入する hook の表。同じイベント名を複数載せてよい（matcher で発火を分ける。
-/// `Notification` は waiting に入る通知と working へ戻す通知の 2 枚）。
+/// 注入する hook の表。同じイベント名を複数載せてよい（matcher で発火を分ける形を
+/// 注入・受け口とも受け付ける）。
 ///
 /// **turn 単位のイベントだけを載せる。** hook は毎回 ccdesk を 1 プロセス起こすので、
 /// `PreToolUse` / `PostToolUse` のような道具ごとに飛ぶイベントを足すと、Windows の
 /// プロセス起動コストがそのままセッションの遅さになる。
-const HOOK_EVENTS: [HookEvent; 6] = [
+const HOOK_EVENTS: [HookEvent; 5] = [
     // 起動直後・再開直後はまだプロンプトを受けていない ＝ 入力待ち。
     // ユーザー自身の操作なので未読にはしない
     HookEvent { event: "SessionStart", matcher: None, state: WAITING, activity: false },
     HookEvent { event: "UserPromptSubmit", matcher: None, state: WORKING, activity: false },
     HookEvent { event: "Notification", matcher: Some(ATTENTION_MATCHER), state: WAITING, activity: true },
-    // 回答はユーザー自身の操作 ＝ 状態は動くが未読は作らない
-    HookEvent { event: "Notification", matcher: Some(RESUME_MATCHER), state: WORKING, activity: false },
     HookEvent { event: "Stop", matcher: None, state: COMPLETED, activity: true },
     // プロセスの終了は「claude が何か言った」ではない
     HookEvent { event: "SessionEnd", matcher: None, state: STOPPED, activity: false },
@@ -702,19 +691,19 @@ mod tests {
         }
     }
 
-    /// **working へ戻す `Notification` は回答の通知だけを拾う。**
-    /// `elicitation_complete` を足すと同じ回答から hook プロセスが 2 本走り、
-    /// 遅れた `working` が `Stop → completed` を上書きする競合の面が広がる。
-    /// waiting 系と重なると同じ発火が両方の state を書いて後勝ちが運任せになる
+    /// **入力待ちの解除（`elicitation_response` 等）を hook で拾わない。**
+    /// 解除は「waiting より新しい busy 観測」の裁定（[`crate::poll::row_state`]）が
+    /// 担う。イベントでも拾うと、解除の口が 2 系統になり
+    /// （遅れた `working` が `Stop → completed` を上書きする競合も増える）、
+    /// しかもイベントが存在しない操作（許可プロンプトの許可）には効かない
     #[test]
-    fn the_resume_notification_picks_up_only_the_dialog_response() {
-        assert_eq!(RESUME_MATCHER, "elicitation_response");
-        for kind in RESUME_MATCHER.split('|') {
-            assert!(
-                !ATTENTION_MATCHER.split('|').any(|attention| attention == kind),
-                "{kind} is in both matchers"
-            );
-        }
+    fn no_hook_resumes_a_waiting_row() {
+        assert!(
+            !HOOK_EVENTS
+                .iter()
+                .any(|row| row.event == "Notification" && row.state == WORKING),
+            "a resume notification is registered; the arbitration in row_state owns that"
+        );
     }
 
     /// **道具ごとに飛ぶイベントは登録しない**（hook は毎回 ccdesk を 1 プロセス
@@ -815,11 +804,10 @@ mod tests {
         assert!(!states.unread(&pinned), "an edit to the row created an unread mark");
     }
 
-    /// **ダイアログへの回答は状態を working へ戻すが、未読は作らない。**
+    /// **ユーザー操作起点の working（`UserPromptSubmit`）は状態を動かすが、未読は作らない。**
     ///
-    /// 回答（`elicitation_response`）はユーザー自身の操作なので、これで未読が
-    /// 生えると「claude が何か言った」印の意味が壊れる。activity を持たない記録は
-    /// 前回の `activity_at` を引き継ぐだけ
+    /// ユーザー自身の操作で未読が生えると「claude が何か言った」印の意味が壊れる。
+    /// activity を持たない記録は前回の `activity_at` を引き継ぐだけ
     #[test]
     fn an_answered_dialog_resumes_working_without_creating_unread() {
         let temp = TempStore::new("an_answered_dialog_resumes_working_without_creating_unread");
