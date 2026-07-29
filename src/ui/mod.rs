@@ -1167,12 +1167,16 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             .map(|(_, w)| Run {
                 hook: app.hook_states.get(&row.session_id, Some(w.launched_at)),
                 status,
+                status_at: app.agents_observed_at,
                 busy: w.busy,
             })
             .or_else(|| {
                 app.fixed_states.get(&row.session_id).map(|state| Run {
-                    hook: Some(state.as_str()),
+                    // 撮影用の固定 state は時刻を持たない（status も空なので
+                    // 裁定則（[`crate::poll::row_state`]）は起き得ない）
+                    hook: Some((state.as_str(), 0)),
                     status: "",
+                    status_at: 0,
                     busy: false,
                 })
             })
@@ -1183,6 +1187,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 (!status.is_empty()).then_some(Run {
                     hook: None,
                     status,
+                    status_at: app.agents_observed_at,
                     busy: false,
                 })
             });
@@ -2143,18 +2148,46 @@ pub(crate) mod tests {
     #[test]
     fn a_live_row_prefers_the_hook_state_over_the_live_status() {
         let label = |hook, status, busy| {
-            row_state(Some(Run { hook, status, busy })).label()
+            row_state(Some(Run { hook, status, status_at: 0, busy })).label()
         };
         // hook が居れば status も出力ヒューリスティックも見ない
-        assert_eq!(label(Some(crate::poll::COMPLETED), "busy", true), "Completed");
-        assert_eq!(label(Some(WORKING), "idle", false), "Working");
-        assert_eq!(label(Some(WAITING), "busy", false), "Waiting");
+        assert_eq!(label(Some((crate::poll::COMPLETED, 0)), "busy", true), "Completed");
+        assert_eq!(label(Some((WORKING, 0)), "idle", false), "Working");
+        assert_eq!(label(Some((WAITING, 0)), "busy", false), "Waiting");
         // hook が一度も来ていない行は status から導く
         assert_eq!(label(None, "busy", false), "Working");
         assert_eq!(label(None, "idle", false), "Waiting");
         // status も無い間は出力の変化から推す
         assert_eq!(label(None, "", true), "Working");
         assert_eq!(label(None, "", false), "Waiting");
+    }
+
+    /// **hook の `waiting` だけは、より新しい `busy` 観測に負ける（裁定則）。**
+    ///
+    /// `waiting` は「ユーザーが動くまで進まない」という主張なので、その後に
+    /// 観測された「動いている」は反証になる。許可プロンプトの許可のように
+    /// 「解除された」を知らせる hook イベントが存在しない操作があり、
+    /// イベントの列挙では状態機械が閉じない ＝ この 1 本が安全網になる
+    #[test]
+    fn a_newer_busy_observation_overrules_a_waiting_hook() {
+        let view = |hook, status, status_at| {
+            row_state(Some(Run { hook, status, status_at, busy: false }))
+        };
+        // waiting(at=1000) より新しい busy 観測 → Working（スピナーも回る）
+        let promoted = view(Some((WAITING, 1_000)), "busy", 2_000);
+        assert_eq!(promoted.label(), "Working");
+        assert!(promoted.spinning, "the promoted row does not spin");
+        // 古い busy 観測は前の状態の名残 ＝ waiting のまま（同時刻も採らない）
+        assert_eq!(view(Some((WAITING, 1_000)), "busy", 999).label(), "Waiting");
+        assert_eq!(view(Some((WAITING, 1_000)), "busy", 1_000).label(), "Waiting");
+        // 新しい観測でも「動いていない」は waiting を覆さない（入力待ちの表示を守る）
+        assert_eq!(view(Some((WAITING, 1_000)), "idle", 2_000).label(), "Waiting");
+        assert_eq!(view(Some((WAITING, 1_000)), "waiting", 2_000).label(), "Waiting");
+        assert_eq!(view(Some((WAITING, 1_000)), "", 2_000).label(), "Waiting");
+        // waiting 以外は覆さない（busy は「このターンの続き」と「次のターン」を
+        // 区別できないので、completed を覆すと Done の意味が壊れる）
+        assert_eq!(view(Some((crate::poll::COMPLETED, 1_000)), "busy", 2_000).label(), "Completed");
+        assert_eq!(view(Some((WORKING, 1_000)), "idle", 2_000).label(), "Working");
     }
 
     /// **動かしているものが無い行は、hook が何を言っていても Stopped。**
@@ -2208,15 +2241,19 @@ pub(crate) mod tests {
     #[test]
     fn a_stopped_hook_ends_the_run_instead_of_labelling_a_live_one() {
         let view = row_state(Some(Run {
-            hook: Some(STOPPED),
+            hook: Some((STOPPED, 0)),
             status: "idle",
+            status_at: 0,
             busy: false,
         }));
         assert_eq!(view.label(), "Stopped", "a fresh stopped was thrown away");
         assert!(!view.alive, "the shape says the process is alive on a stopped row");
         assert!(!view.spinning);
         // 他の state はそのまま生きている実行として出る（形は生存形）
-        assert!(row_state(Some(Run { hook: Some("done"), status: "", busy: false })).alive);
+        assert!(
+            row_state(Some(Run { hook: Some(("done", 0)), status: "", status_at: 0, busy: false }))
+                .alive
+        );
     }
 
     /// 更新の有無で行構成が変わらない（固定ヘッダー行数もマーカー桁の位置も動かない）。
