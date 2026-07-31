@@ -11,7 +11,7 @@
 //! demo 実装が何も起こさないので、ネットワーク・プロセス起動・ファイル読みは
 //! 呼び出し側の `if !demo` ではなく構造として止まる。
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 
 use ccdesk::{same_dir, save_setting, save_state, update_state_list, LockExt};
@@ -116,6 +116,11 @@ pub(crate) enum WindowItem<'a> {
 pub(crate) struct PollSinks {
     pub(crate) agents: Arc<Mutex<Vec<AgentInfo>>>,
     pub(crate) agents_dirty: Arc<AtomicBool>,
+    /// `fetch_agents()` を**呼ぶ直前**にポーラーが刻む時刻（ms）。**取り込み側
+    /// （run ループ）はここを読むだけで、自分では `now_ms()` を刻まない**:
+    /// `agents --json` は 1 回 ~900ms かかるので、取り込み時刻（swap の瞬間）を
+    /// 刻むと「取得を始める前のスナップショットに、取得が終わった後の時刻」が付いてしまう
+    pub(crate) agents_fetch_started: Arc<AtomicU64>,
     pub(crate) footer: Arc<Mutex<FooterInfo>>,
     pub(crate) footer_dirty: Arc<AtomicBool>,
     pub(crate) footer_refresh: Arc<AtomicBool>,
@@ -520,7 +525,7 @@ impl DataSource for LiveSource {
     }
 
     fn spawn_pollers(&self, sinks: PollSinks) {
-        spawn_agents_poller(sinks.agents, sinks.agents_dirty);
+        spawn_agents_poller(sinks.agents, sinks.agents_dirty, sinks.agents_fetch_started);
         // 版行 2 本（claude / ccdesk）の更新チェックは**同じポーラーの同じゲート**で
         // 回す（周期を分けると片方だけ別の規則へ流れる。[`VersionSinks`]）
         spawn_footer_poller(

@@ -49,14 +49,33 @@ use crate::sessions::{SessionId, SessionRow};
 /// 拾うのは**ユーザーが動くまで進まない**通知だけ。`auth_success` / `agent_completed` /
 /// `elicitation_complete` は完了・情報通知なので拾わない（完了は `Stop` が答える）。
 ///
+/// **`worker_permission_prompt` と `elicitation_url_dialog` も拾う。** どちらも
+/// claude が実際に撃つ通知種別だが、**claude 自身の文書化された matcher 一覧には
+/// 載っていない**（バイナリ内の文字列で存在を確認済み）。`worker_permission_prompt` は
+/// チームのワーカーが許可を求めたとき（`${agent_id} needs permission for ${tool_name}` 等）
+/// に飛ぶ。matcher は**完全一致**なので `permission_prompt` では拾えず、
+/// 別の値として並べる必要がある。
+///
 /// **入力待ちの解除（`elicitation_response` 等）も拾わない。** 解除は
 /// 「waiting より新しい busy 観測」の裁定（[`crate::poll::row_state`]）が担う:
 /// 解除を表すイベントは全操作には存在しない（許可プロンプトの許可には無い）ので、
 /// イベントを列挙しても状態機械は閉じない。解除の口を 2 系統持たない。
 ///
-/// 縮退: matcher が効かない版では `Notification` が一度も発火しない ＝ 入力待ちは
-/// `agents --json` の `status` 経由だけになる。**`done` が壊れるより取り逃すほうが軽い**
-const ATTENTION_MATCHER: &str = "permission_prompt|elicitation_dialog|agent_needs_input";
+/// **縮退**: matcher が効かない版、またはここに載っていない通知種別では
+/// `Notification` が一度も発火しない。それでも「情報なし」にはならない ＝
+/// 直前の hook（`UserPromptSubmit` 等）が書いた `working` が残り、行は赤・明滅の
+/// まま止まる（**取り逃すのは軽くない**。以前はここを「経過時間表示が古びるだけ」の
+/// つもりで軽視していたが、経過時間表示は既に廃止済みで、実際の害はこちらの方だった）。
+/// この赤固着は [`crate::poll::row_state`] の逆向き裁定則（より新しい非 `busy`
+/// 観測で `working` から降りる）が受け皿になる ＝ ここで取りこぼしても
+/// 次のポーリングで自己修復する
+///
+/// **`Elicitation` hook は今回入れない。** MCP の入力要求に反応する専用 hook が
+/// 実在する（バイナリ内に確認済み）が、`PermissionRequest` と同種の decision hook
+/// （空 stdout / exit 0 が無害か、6 秒ゲートが無いか等）の安全性検証をしていない。
+/// 同種の口として存在することだけ書き残す
+const ATTENTION_MATCHER: &str =
+    "permission_prompt|elicitation_dialog|agent_needs_input|worker_permission_prompt|elicitation_url_dialog";
 
 /// 注入する hook 1 件。**`--settings` の生成（[`inject_settings`]）と受け口
 /// （[`run_hook`]）が同じ表を読む**ので、片方だけ増えた状態にならない。
@@ -78,16 +97,55 @@ struct HookEvent {
 /// 注入する hook の表。同じイベント名を複数載せてよい（matcher で発火を分ける形を
 /// 注入・受け口とも受け付ける）。
 ///
-/// **turn 単位のイベントだけを載せる。** hook は毎回 ccdesk を 1 プロセス起こすので、
+/// **原則は turn 単位のイベントだけを載せる。** hook は毎回 ccdesk を 1 プロセス起こすので、
 /// `PreToolUse` / `PostToolUse` のような道具ごとに飛ぶイベントを足すと、Windows の
 /// プロセス起動コストがそのままセッションの遅さになる。
-const HOOK_EVENTS: [HookEvent; 5] = [
+///
+/// **`PermissionRequest` はこの原則の例外**（`only_turn_level_events_are_injected` は
+/// これを禁止リストに入れていない）。道具ごとに飛ぶように見えるが、実測では
+/// 発火の上限は「ユーザーが手で許可に答える回数」であって道具の呼び出し回数ではない
+/// （Bash を 3 回連発しても `PreToolUse` は 3 回・`PermissionRequest` は自動承認された
+/// ものを除いた 1 回だけ）。turn より頻繁になり得るのは事実だが、頻度の実体は
+/// 「ユーザーへの割り込み」であって「道具の呼び出し」ではないので、この原則が
+/// 避けたい害（turn の何倍もプロセスを起こす）には当たらない
+const HOOK_EVENTS: [HookEvent; 7] = [
     // 起動直後・再開直後はまだプロンプトを受けていない ＝ 入力待ち。
     // ユーザー自身の操作なので未読にはしない
     HookEvent { event: "SessionStart", matcher: None, state: WAITING, activity: false },
     HookEvent { event: "UserPromptSubmit", matcher: None, state: WORKING, activity: false },
     HookEvent { event: "Notification", matcher: Some(ATTENTION_MATCHER), state: WAITING, activity: true },
+    // 道具の許可ダイアログが実際に表示されるときだけ飛ぶ（公式カタログ:
+    // "Run before permission prompt"）。`Notification` の 2 つの matcher
+    // （`permission_prompt` / `worker_permission_prompt`）と役割が重なるが、
+    // こちらは黄（waiting）の表示が確定するまでの遅れが無い（`Notification` は
+    // 6 秒ゲートの後にしか来ない版がある）。**matcher は None（全ツール）**:
+    // 道具ごとに絞る意味が無い（どの道具の許可でも待っているのはユーザー）
+    //
+    // **未検証のリスク**: `crate::poll::row_state` の裁定則（hook の `waiting` は
+    // より新しい `busy` 観測に負ける）と噛み合うかは実測できていない。
+    // 許可ダイアログの表示中も `claude agents --json` の `status` が `busy` を
+    // 返し続けるなら、この hook が書いた waiting が次のポーリング（最大 2 秒後）で
+    // 覆り、黄がまた赤へ戻ってしまう。ダイアログ中に `status` を握って
+    // 意図的に安全なプロンプト・許可待ちを再現する手段が無く（この環境の
+    // permission mode は自動承認が広く効いていて、実際にダイアログを止められなかった）
+    // 確認できなかった。**傍証**: claude の生存セッション一覧の項目は
+    // `status`（`busy`/`shell`/`idle`/`waiting` の 4 値）とは別に `waitingFor`
+    // という専用フィールドを持つ（バイナリの文字列で確認済み）。「待っている」を
+    // 表す状態と、それを説明する専用フィールドがわざわざ両方あるのは、
+    // 許可待ちのような「ユーザーの決定待ち」を `busy` と区別して表すためだと
+    // 考えるのが自然で、既存コードの doc（`waiting` ＝ 確認待ち）とも整合するが、
+    // **実測による裏取りではない**。次に触る人はここを疑ってよい
+    HookEvent { event: "PermissionRequest", matcher: None, state: WAITING, activity: true },
     HookEvent { event: "Stop", matcher: None, state: COMPLETED, activity: true },
+    // Stop の代わりに、API エラー（rate limit・認証失敗・max_output_tokens 等）で
+    // ターンが終わったときだけ飛ぶ（claude の公式カタログに文書化: "Fires instead of
+    // Stop when an API error ended the turn"）。**state は Stop と同じ completed**:
+    // `Group::Completed` の定義は「ターンが終わった」であって「成功した」ではないので、
+    // エラーで終わったターンもここに収まる。別の Group を新設するのは、成否の区別を
+    // 導入するための Group 全体の設計変更になり、この 1 件のためには釣り合わない。
+    // activity も Stop と同じ true: max_output_tokens（出力が長くて打ち切られた）が
+    // 含まれるのが効く経路で、ユーザーが見るべき出来事という点は Stop と変わらない
+    HookEvent { event: "StopFailure", matcher: None, state: COMPLETED, activity: true },
     // プロセスの終了は「claude が何か言った」ではない
     HookEvent { event: "SessionEnd", matcher: None, state: STOPPED, activity: false },
 ];
@@ -497,6 +555,21 @@ fn write_inject_settings() -> Option<PathBuf> {
     Some(path)
 }
 
+/// 注入する hook 1 本あたりのタイムアウト（秒）。claude 側の既定は 600 秒だが、
+/// ccdesk の hook は実測 170〜190ms（JSON を tmp → rename で 1 回書くだけ）なので、
+/// 5 秒あれば固まった場合との区別に十分な余裕がある。
+///
+/// **万一 ccdesk の hook が固まると、`PermissionRequest` は表示前に待つ経路がある**
+/// （サブエージェント生成コンテキストの `awaitAutomatedChecksBeforeDialog`）ので、
+/// 既定の 600 秒のままだと許可ダイアログ自体が最大 600 秒出てこない。
+/// タイムアウトを明示するのはこの経路への保険。
+///
+/// **全 hook に一律で出す**: イベントごとに待って良い長さを変える理由が無い
+/// （どのイベントも同じ 1 プロセス起動＋ JSON 書き込みだけ）ので、`HookEvent` に
+/// フィールドを足して行ごとに持たせるより、注入する側でまとめて出す方が
+/// 構造が増えない
+const HOOK_TIMEOUT_SECS: u64 = 5;
+
 /// 注入ファイルの中身（[`inject_settings`] の判断だけを取り出したもの。
 /// ファイルを書かずに検査できる）
 fn settings_document(exe_fwd: &str) -> Value {
@@ -518,6 +591,7 @@ fn settings_document(exe_fwd: &str) -> Value {
                 // state まで運ぶ（受け口は (event, state) の組で表を引く。
                 // 同名イベントの 2 枚をイベント名だけでは区別できない）
                 "command": format!("\"{exe_fwd}\" hook {} {}", row.event, row.state),
+                "timeout": HOOK_TIMEOUT_SECS,
             }]),
         );
         if let Value::Array(groups) = hooks
@@ -604,6 +678,61 @@ mod tests {
         assert_eq!(resolve("Notification", Some(STOPPED)), None, "accepted a pair not in the table");
     }
 
+    /// **`StopFailure` は Stop の代わりに、API エラーでターンが終わったときだけ飛ぶ。**
+    /// state は Stop と同じ `completed`（`Group::Completed` の定義は「ターンが終わった」
+    /// であって「成功した」ではないので、エラーで終わったターンもここに収まる）。
+    /// activity も Stop と同じ true（max_output_tokens 等、ユーザーが見るべき出来事
+    /// という点は変わらない）。旧形式（[`LEGACY_HOOK_STATES`]）には無い ＝
+    /// この hook を知らない旧セッションが呼ぶことは無いので、後方互換の組は要らない
+    #[test]
+    fn stop_failure_is_treated_like_stop() {
+        assert_eq!(resolve("StopFailure", Some(COMPLETED)), Some((COMPLETED, true)));
+        assert!(
+            !LEGACY_HOOK_STATES.iter().any(|(event, _)| *event == "StopFailure"),
+            "StopFailure does not need a legacy form (it is a new hook)"
+        );
+    }
+
+    /// **`PermissionRequest` は道具ごとに飛びうるが、turn 単位の原則の例外として
+    /// 意図的に登録してある。** `only_turn_level_events_are_injected` がこれを
+    /// 禁止リストに入れていないのは見落としではなく、[`HOOK_EVENTS`] の doc が言う
+    /// 判断（頻度の実体は「ユーザーへの割り込み」であって「道具の呼び出し」ではない）
+    /// をこのテストでも固定しておく。matcher は None（全ツール共通）、
+    /// 旧形式（[`LEGACY_HOOK_STATES`]）には無い（新しい hook なので旧セッションが
+    /// 呼ぶことは無い）
+    #[test]
+    fn permission_request_is_registered_as_a_deliberate_exception() {
+        let row = HOOK_EVENTS
+            .iter()
+            .find(|row| row.event == "PermissionRequest")
+            .expect("PermissionRequest is not registered");
+        assert_eq!(row.matcher, None, "PermissionRequest should not filter by tool");
+        assert_eq!(row.state, WAITING);
+        assert!(row.activity, "a permission wait is something the user should see");
+        assert!(
+            !LEGACY_HOOK_STATES.iter().any(|(event, _)| *event == "PermissionRequest"),
+            "PermissionRequest does not need a legacy form (it is a new hook)"
+        );
+    }
+
+    /// **注入する全 hook のコマンドに、同じタイムアウトが一律で載る。**
+    /// イベントごとに待って良い長さを変える理由が無いので、`HookEvent` に
+    /// フィールドを足さず [`settings_document`] 側でまとめて出す設計を固定する
+    #[test]
+    fn every_injected_command_carries_the_same_timeout() {
+        let document = settings_document("C:/bin/ccdesk.exe");
+        let hooks = document.get("hooks").and_then(Value::as_object).unwrap();
+        for (event, groups) in hooks {
+            for group in groups.as_array().unwrap() {
+                assert_eq!(
+                    group["hooks"][0]["timeout"].as_u64(),
+                    Some(HOOK_TIMEOUT_SECS),
+                    "{event} does not carry the shared hook timeout"
+                );
+            }
+        }
+    }
+
     /// **state 引数の無い旧形式は、専用の表で解決する。** [`HOOK_EVENTS`] の並び順で
     /// 解決すると、並べ替えが旧 settings の意味を黙って変える。
     /// 旧形式の組はすべて注入表にも存在する（勝手な状態を作らない）
@@ -658,7 +787,14 @@ mod tests {
     #[test]
     fn the_notification_hook_ignores_the_idle_reminder() {
         let kinds: Vec<&str> = ATTENTION_MATCHER.split('|').collect();
-        for wanted in ["permission_prompt", "elicitation_dialog", "agent_needs_input"] {
+        for wanted in [
+            "permission_prompt",
+            "elicitation_dialog",
+            "agent_needs_input",
+            // 公式の matcher 一覧には無いが実在する（バイナリの文字列で確認済み）
+            "worker_permission_prompt",
+            "elicitation_url_dialog",
+        ] {
             assert!(kinds.contains(&wanted), "{wanted} is not picked up");
         }
         // 催促と完了・情報通知は拾わない（完了は Stop が答える）
@@ -671,6 +807,19 @@ mod tests {
         ] {
             assert!(!kinds.contains(&unwanted), "{unwanted} must not be picked up");
         }
+    }
+
+    /// **matcher は完全一致で、前方一致では拾えない。**
+    /// `permission_prompt` を登録しただけでは `worker_permission_prompt` は
+    /// 拾えない ＝ チームのワーカーが許可を求める通知を別途登録する必要があった
+    /// 理由そのもの
+    #[test]
+    fn the_worker_permission_prompt_needs_its_own_entry_because_matchers_are_exact() {
+        let kinds: Vec<&str> = ATTENTION_MATCHER.split('|').collect();
+        assert!(
+            kinds.contains(&"permission_prompt") && kinds.contains(&"worker_permission_prompt"),
+            "both matchers should be listed as separate, exact entries"
+        );
     }
 
     /// **入力待ちの解除（`elicitation_response` 等）を hook で拾わない。**
@@ -689,7 +838,12 @@ mod tests {
     }
 
     /// **道具ごとに飛ぶイベントは登録しない**（hook は毎回 ccdesk を 1 プロセス
-    /// 起こすので、turn より細かい粒度を足すとセッションが目に見えて遅くなる）
+    /// 起こすので、turn より細かい粒度を足すとセッションが目に見えて遅くなる）。
+    ///
+    /// **`PermissionRequest` をここで禁止していないのは見落としではない。**
+    /// 見た目は道具ごとのイベントだが、意図的な例外として登録してある
+    /// （[`HOOK_EVENTS`] の doc、および `permission_request_is_registered_as_a_deliberate_exception`
+    /// を参照）
     #[test]
     fn only_turn_level_events_are_injected() {
         for event in ["PreToolUse", "PostToolUse", "PreCompact", "SubagentStop"] {

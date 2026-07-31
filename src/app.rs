@@ -320,13 +320,25 @@ pub(crate) struct App {
     pub(crate) active: usize,
     // claude agents --json のライブ状態（正規 IF。バックグラウンドスレッドが更新）
     pub(crate) agents: Vec<AgentInfo>,
-    /// [`Self::agents`] を取り込んだ時刻（ms）。**status の観測時刻**として
+    /// [`Self::agents`] の**取得を始めた時刻**（ms）。**status の観測時刻**として
     /// hook の記録時刻と新旧を比べる材料（[`crate::poll::row_state`] の裁定則）。
-    /// 取り込みと同じ 1 箇所（run ループの swap）でだけ刻む ＝ 中身とずれない
+    ///
+    /// **取り込みの瞬間（run ループの swap）を刻まない。** `agents --json` は
+    /// 1 回 ~900ms かかる（[`crate::poll::spawn_agents_poller`]）ので、取得完了後の
+    /// 時刻を付けると「取得を始める前のスナップショットに、取得完了後の時刻」が付く
+    /// ＝ 実際より最大 900ms 新しい観測を信じてしまう（kill 直前の busy 残像に
+    /// kill より後の時刻が付いて `stopped_at` のガードを素通りする・許可プロンプト
+    /// より前の busy が waiting hook を覆す、の 2 つの実バグを引いた）。
+    /// ここへ取り込むのは [`Self::agents_fetch_started`]（ポーラーが `fetch_agents()`
+    /// を呼ぶ直前に刻んだ値）で、run ループ自身は時計を読まない
     pub(crate) agents_observed_at: u64,
     pub(crate) agents_shared: Arc<Mutex<Vec<AgentInfo>>>,
     pub(crate) agents_dirty: Arc<std::sync::atomic::AtomicBool>,
+    /// [`Self::agents_observed_at`] の取得元。ポーラーが書き、run ループは
+    /// swap のたびにここを読むだけ（詳細は [`crate::source::PollSinks::agents_fetch_started`]）
+    pub(crate) agents_fetch_started: Arc<std::sync::atomic::AtomicU64>,
     /// ccdesk がその窓を閉じた時刻（ms）。**「自分が今止めたセッション」だけを覚える**。
+    /// 刻む場所は [`remove_window`] 1 箇所（窓を外す経路が増えても刻み忘れが起きない）。
     ///
     /// `agents --json` の観測は最大 [`LIVE_SCAN_INTERVAL`] 分古いことがあるので、
     /// kill した直後は「たった今殺した自分の前景セッション」がまだ busy 等として
@@ -341,7 +353,7 @@ pub(crate) struct App {
     /// サイドバーに並ぶ行。**正本は `~/.ccdesk/sessions.json`**（供給元が読み書きする）
     pub(crate) sessions: Vec<SessionRow>,
     /// hook（`--settings` で注入した公式 hook）が書いた state の写し。
-    /// **行の state・未読・経過時間はどれもここから導く**（行に保存しない）。
+    /// **行の state・未読はどれもここから導く**（行に保存しない）。
     /// hook が一度も来ていない行だけ `agents --json` の `status` へ落ちる
     /// （[`crate::hooks`]）
     pub(crate) hook_states: HookStates,
@@ -474,6 +486,7 @@ impl Default for App {
             agents_observed_at: 0,
             agents_shared: Arc::new(Mutex::new(Vec::new())),
             agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            agents_fetch_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             stopped_at: std::collections::HashMap::new(),
             sessions: Vec::new(),
             hook_states: HookStates::default(),
@@ -560,6 +573,7 @@ impl App {
         PollSinks {
             agents: self.agents_shared.clone(),
             agents_dirty: self.agents_dirty.clone(),
+            agents_fetch_started: self.agents_fetch_started.clone(),
             footer: self.footer_shared.clone(),
             footer_dirty: self.footer_dirty.clone(),
             footer_refresh: self.footer_refresh.clone(),
@@ -891,9 +905,12 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 .agents_shared
                 .lock_recover()
                 .clone();
-            // 観測時刻は取り込みの瞬間（取得完了 → swap の遅れは 1 フレーム未満で、
-            // 2 秒周期の裁定には効かない）
-            app.agents_observed_at = ccdesk::now_ms();
+            // 観測時刻は**取得を始めた時刻**（ポーラーが `fetch_agents()` の直前に
+            // 刻んだ値）を読むだけ。ここで `now_ms()` を刻むと、~900ms かかる取得の
+            // 分だけ実際より新しい時刻が付いてしまう（[`App::agents_observed_at`] 参照）
+            app.agents_observed_at = app
+                .agents_fetch_started
+                .load(std::sync::atomic::Ordering::Relaxed);
             force_draw = true;
         }
         // claude が画面を作り替えている最中は掴まない（[`Session::holds_frame`]）。
@@ -1453,8 +1470,16 @@ pub(crate) fn refresh_transcripts(app: &mut App) {
 /// ペインを開いた（開き方は問わない）・`mark as read`・ペインに出ている行へ
 /// hook が届いた（[`adopt_hook_states`]）。
 ///
-/// 進めるのは `last_opened_at` だけで **`updated_at` は触らない**: 既読にしても
-/// 行の姿は変わらないので、経過時間（`· 23s`）が 0s へ戻ってはいけない。
+/// 進めるのは `last_opened_at` だけで **`updated_at` は触らない**: 既読は
+/// 行の中身（cwd・transcript・ピン留め）を 1 つも変えないので、ここで
+/// `updated_at` を進めると [`edit_row`] の doc が言う踏み潰しをこちらが起こす
+/// （中身は古いままの写しが後勝ち判定に勝ち、他インスタンスが直前に書いた
+/// ピン留め等が消える）。
+///
+/// **では既読はどうやって他インスタンスへ伝わるか**: `last_opened_at` は
+/// [`crate::sessions`] の `merge_sessions` が**行の後勝ちとは別軸で**大きい方を
+/// 採る。既読は「行の内容」ではなく「このユーザーがどこまで見たか」なので、
+/// 内容の新旧とは別に合流させるのが正しい。
 /// 既に読み終えている行なら書き込みもしない（周期処理が毎周保管を書かない）
 fn mark_read(app: &mut App, id: &SessionId) {
     let now = now_ms();
@@ -1475,11 +1500,15 @@ fn mark_read(app: &mut App, id: &SessionId) {
 /// 行が無ければ何もしない（メニューを開いたまま他インスタンスが消した場合）。
 ///
 /// `updated_at` を進めるのはマージの後勝ち判定に要るから
-/// （[`crate::sessions`] の `merge_sessions`）。**進めるのは行の中身が実際に
-/// 変わったときだけ**: 何も変えない操作（`mark as read` 等）で進めてしまうと、
+/// （[`crate::sessions`] の `merge_sessions`）。**進めるのは before/after を比べて
+/// 行の中身が実際に変わったときだけ**: 変わっていないのに進めてしまうと、
 /// 他インスタンスが先に書いた本当の変更（ピン留め等）より `updated_at` だけが
 /// 新しくなり、後勝ち判定でこちらの（中身は古いままの）写しが勝って
 /// 相手の変更を踏み潰す。
+///
+/// **`mark as read` はここを通らない別経路**（[`mark_read`]）。あちらは
+/// `updated_at` を進めない ＝ ここで言う踏み潰しを起こさないための別扱いで、
+/// 既読は `merge_sessions` が別軸（`last_opened_at` の大きい方）で合流させる。
 ///
 /// **未読には触らない。** 未読の材料は hook の `at` だけなので、行を書き換えても
 /// `●` は点かないし消えない ＝ 「自分の操作で未読が生えない」は保証ではなく構造
@@ -2040,23 +2069,33 @@ fn hook_settings(app: &mut App) -> Option<std::path::PathBuf> {
 /// 窓が開いていなければ何もしない。
 ///
 /// **`stop` / `close` / PTY 書き込み失敗の後始末、この関数を通る窓閉じ全てが
-/// ここへ収束する**ので、[`App::stopped_at`] を刻む場所もここ 1 箇所に一本化する
-/// （散らばると「刻み忘れた経路」だけ古い観測を実行と誤認する不具合が再発する）
+/// [`remove_window`] へ収束する**ので、[`App::stopped_at`] を刻む場所は
+/// そちら 1 箇所に一本化してある（ここでは刻まない）
 fn close_window_of(app: &mut App, id: &SessionId) {
     let Some(i) = app.window_index(id) else {
         return;
     };
     let _ = app.windows[i].child.kill();
-    app.stopped_at.insert(id.clone(), now_ms());
     remove_window(app, i);
 }
 
 /// ウィンドウを一覧から外す（active 添字も詰める）。
-/// 表示するウィンドウが無くなったら右ペインは New 画面へ
+/// 表示するウィンドウが無くなったら右ペインは New 画面へ。
+///
+/// **`App::stopped_at` を刻む場所はここ 1 箇所。** 窓を外す経路は 3 つある
+/// （[`close_window_of`] 経由の `stop`/`close`/PTY 書き込み失敗、生死スキャンが
+/// 拾う自然死、[`open_session`] が起こし直す前に片付ける「死んでいるがまだ
+/// スキャンが拾っていない窓」）が、**行を動かす窓が無くなったという事実は
+/// 3 つとも同じ**なので、刻む理由も同じ。以前はこの関数を経由しない自然死の
+/// 経路（生死スキャン）だけ刻み忘れており、`/exit` や外部からの kill の直後に
+/// 最大 [`LIVE_SCAN_INTERVAL`] 秒ぶん古い `agents --json` の観測が素通りして、
+/// 行が数秒 Working/Waiting に見えてから Stopped になっていた（実機で観測されたバグ）。
+/// ここへ一本化したことで、経路を増やしても刻み忘れが起きない
 fn remove_window(app: &mut App, idx: usize) {
     if idx >= app.windows.len() {
         return;
     }
+    app.stopped_at.insert(app.windows[idx].session_id.clone(), now_ms());
     let was_active = idx == app.active;
     app.windows.remove(idx);
     app.hovered = None;
@@ -4835,8 +4874,10 @@ mod tests {
         mark_read(&mut app, &SessionId::new("s"));
         let row = row_of(&app, "s");
         assert!(!app.hook_states.unread(row), "still unread after being opened");
-        // 既読にしても行の姿は変わらない ＝ 経過時間が 0s へ戻らない
-        assert_eq!(row.updated_at, 1, "marking as read reset the age");
+        // 既読は `updated_at` を進めない ＝ 行の内容の後勝ち判定には乗らない
+        // （乗せると、既読にしただけで他インスタンスの本当の変更を踏み潰しうる。
+        // `crate::sessions` の `merge_sessions` が `last_opened_at` を別軸で合流させる）
+        assert_eq!(row.updated_at, 1, "marking as read advanced updated_at");
 
         mark_read(&mut app, &SessionId::new("gone-row"));
         assert_eq!(app.sessions.len(), 1, "an unknown row changed the list");
@@ -4929,8 +4970,9 @@ mod tests {
     /// 進めてしまうと、他インスタンスが先に書いた本当の変更（ピン留め等）より
     /// こちらの写しの `updated_at` だけが新しくなり、マージの後勝ち判定
     /// （[`crate::sessions`] の `merge_sessions`）でこちらの古い中身が勝って
-    /// 相手の変更を踏み潰す。`mark as read` は姿を変えないので進めず、
-    /// ピン留めは変えるので進む
+    /// 相手の変更を踏み潰す。`mark as read` は行の内容を 1 つも変えない
+    /// （既読は `last_opened_at` を通じて別軸で合流する。[`mark_read`]）ので
+    /// 何度押しても進めず、ピン留めは中身を変えるので進む
     #[test]
     fn an_edit_that_changes_nothing_leaves_updated_at_alone() {
         let mut app = app_with_row("s");
@@ -4939,7 +4981,7 @@ mod tests {
         app.sessions[0].updated_at = 2_000;
         app.hook_states = HookStates::from_entries([("s", "done", 2_000)]);
 
-        // 未読の行への `mark as read`: 既読にはなるが行の姿は変わっていない
+        // 未読の行への `mark as read`: 既読にはなるが行の内容は変わっていない
         run_popup_action(&mut app, PopupAction::MarkRead(id.clone()));
         assert_eq!(only_row(&app).updated_at, 2_000, "mark as read advanced updated_at");
         assert!(

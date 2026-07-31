@@ -83,16 +83,37 @@ pub(crate) fn fetch_agents() -> Option<Vec<AgentInfo>> {
     Some(parsed)
 }
 
+/// 取得 1 回ぶん。**`fetch_started` を実際に取得する前に刻む**のが要点で、
+/// 取得後（完了後）に刻むと 900ms 前のスナップショットに取得完了時刻が
+/// 付いてしまい、取り込み側（run ループ）の新旧裁定が実際より新しい観測だと
+/// 錯覚する（[`crate::source::PollSinks::agents_fetch_started`] のコメント参照）。
+///
+/// **取得そのものを引数で受ける**（`fetch_agents` を直接呼ばない）。
+/// スレッドを起こさず、かつ**取得に時間がかかる場合を模して**この順序を
+/// テストできるようにするため（`fetch` に時間のかかる関数を渡し、刻んだ時刻が
+/// 開始側に寄っていることを見る。実装を `fetch_agents` に固定すると、
+/// 呼び出し前後どちらで刻んでも「速すぎて差が測れない」テストになってしまう）
+fn poll_agents_once(
+    shared: &Mutex<Vec<AgentInfo>>,
+    dirty: &std::sync::atomic::AtomicBool,
+    fetch_started: &std::sync::atomic::AtomicU64,
+    fetch: impl FnOnce() -> Option<Vec<AgentInfo>>,
+) {
+    fetch_started.store(ccdesk::now_ms(), std::sync::atomic::Ordering::Relaxed);
+    if let Some(parsed) = fetch() {
+        *shared.lock_recover() = parsed;
+        dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// agents --json は 1 回 ~900ms かかるためバックグラウンドスレッドで回す
 pub(crate) fn spawn_agents_poller(
     shared: Arc<Mutex<Vec<AgentInfo>>>,
     dirty: Arc<std::sync::atomic::AtomicBool>,
+    fetch_started: Arc<std::sync::atomic::AtomicU64>,
 ) {
     std::thread::spawn(move || loop {
-        if let Some(parsed) = fetch_agents() {
-            *shared.lock_recover() = parsed;
-            dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+        poll_agents_once(&shared, &dirty, &fetch_started, fetch_agents);
         std::thread::sleep(Duration::from_secs(2));
     });
 }
@@ -745,21 +766,40 @@ pub(crate) struct Run<'a> {
 /// （ccdesk が起こしていないセッション・注入が効かなかった場合）だけ `status` へ落ち、
 /// `status` も無い間は出力の変化から推す。
 ///
-/// # 例外 ＝ waiting の裁定則
+/// # 例外 ＝ 裁定則（hook と `status` が食い違うときの決着）
 ///
-/// **hook の `waiting` だけは、より新しい `busy` 観測に負ける。**
+/// **hook の `waiting` は、より新しい `busy` 観測に負ける。**
 /// `waiting` は「ユーザーが動くまで claude は進まない」という主張なので、
 /// その後に観測された「動いている」はその主張の反証になる（許可プロンプトの
 /// 許可のように**「解除された」を知らせる hook イベントが存在しない**操作が
 /// あり、イベントの列挙では状態機械が閉じない。裁定則は原因が何であれ
 /// 最大ポーリング 1 周期の遅れで自己修復する）。
 ///
-/// waiting 以外は status で覆さない: `busy` は「このターンの続き」と「次のターン」を
-/// 区別できないので、`completed` を覆すと Done の意味が壊れる（次のターンが
-/// 始まれば `UserPromptSubmit` hook が即 `working` を書くので、覆す必要も無い）。
-/// 逆向き（busy でない観測で `working` を waiting へ落とす）もしない:
-/// 「動いていない」は idle_prompt の誤検知と同じ轍で、ターンを終えた行が
-/// 時間経過で入力待ちへ落ちる
+/// **逆向き、hook の `working` も、より新しい非 `busy` 観測に負ける。**
+/// claude は **Esc 中断のとき `Stop` hook を撃たない**（実データで確認済み:
+/// 中断ターンの 91%（113/124）で `Stop` 未発火。`hook-states.json` に `working` の
+/// まま固着した行が実際に見つかった）。「ターンが終わった」を知らせるイベントが
+/// 来ない以上 `working` は自己修復できず、次のターンを完走するか窓を閉じるまで
+/// 赤・明滅のまま固着する。
+///
+/// **以前はこの逆向きを避けていた。** 当時の懸念は「`idle_prompt`（60 秒放置の
+/// 催促。`crate::hooks` の `ATTENTION_MATCHER` が今も避けている問題と同じ）のような
+/// **時間経過だけの誤検知**で、ターンを終えた行が入力待ちへ落ちる」というものだった。
+/// **今回はその失敗の型に当たらないと判断した**: 材料が違う。`idle_prompt` は
+/// 「何もしていない時間が経った」というタイマー起点の通知で claude の実際の状態を
+/// 見ていないが、`agents --json` の `status` は **claude 自身がポーリングのたびに
+/// 都度上書きする現在値**で、経過時間は見ない。
+///
+/// **ちらつきリスクは実測して確認した**: `claude agents --json --all` を実際の
+/// セッションに対して繰り返し叩き、ツール実行中・その前後の思考中を通じて
+/// `status` が `busy` のまま安定していること（連続ポーリングで 1 ターンの間
+/// 一度も `busy` から離れなかった）を確かめた。ゆえに「より新しい非 `busy` 観測」は
+/// 高い信頼度で「そのターンが実際に終わった（中断された）」を意味する。
+///
+/// `waiting`・`working` 以外（`completed` 等）は status で覆さない: `busy` は
+/// 「このターンの続き」と「次のターン」を区別できないので、`completed` を覆すと
+/// Done の意味が壊れる（次のターンが始まれば `UserPromptSubmit` hook が即
+/// `working` を書くので、覆す必要も無い）
 pub(crate) fn row_state(run: Option<Run<'_>>) -> Group {
     let Some(run) = run.filter(|run| run.hook.map(|(state, _)| state) != Some(STOPPED)) else {
         return classify(STOPPED, false);
@@ -767,6 +807,13 @@ pub(crate) fn row_state(run: Option<Run<'_>>) -> Group {
     match run.hook {
         Some((WAITING, at)) if run.status == STATUS_BUSY && run.status_at > at => {
             classify(WORKING, true)
+        }
+        // status が空は「まだ観測していない」（`Run::status` の doc）であって
+        // 「busy でないと確認できた」ではないので、`is_empty()` で明示的に除く
+        Some((WORKING, at))
+            if !run.status.is_empty() && run.status != STATUS_BUSY && run.status_at > at =>
+        {
+            classify(WAITING, true)
         }
         Some((state, _)) => classify(state, true),
         None if run.status.is_empty() && run.busy => classify(WORKING, true),
@@ -778,6 +825,45 @@ pub(crate) fn row_state(run: Option<Run<'_>>) -> Group {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **観測時刻は取得完了ではなく取得開始で刻む。**
+    ///
+    /// `agents --json` は 1 回 ~900ms かかる。以前は取り込み側（run ループ）が
+    /// 取得完了後に `now_ms()` を刻んでいたため、取得を始める前のスナップショットに
+    /// 取得完了後の時刻が付いていた（kill 直前の busy 残像に kill より後の時刻が
+    /// 付いて `stopped_at` のガードを素通りする・許可プロンプトより前の busy 観測が
+    /// `waiting` hook を覆す、の 2 つの実バグを引いた）。
+    ///
+    /// **取得に時間がかかる状況を模して**証明する: `fetch` に `sleep` を挟んだ
+    /// 偽の取得を渡し、刻まれた時刻が sleep の**前**（開始）に寄っていて、
+    /// sleep の**後**（完了）には寄っていないことを見る。本物の `fetch_agents` を
+    /// 直接呼ぶ形だと、`claude` の有無や応答速度で所要時間が環境依存になり、
+    /// 前後どちらで刻んでも差が測れない（測れてもその環境でしか通らない）
+    /// テストになってしまうため、ここでは所要時間を固定して確実に測る
+    #[test]
+    fn poll_agents_once_stamps_the_start_time_before_fetching_not_after() {
+        let shared = Mutex::new(Vec::new());
+        let dirty = std::sync::atomic::AtomicBool::new(false);
+        let fetch_started = std::sync::atomic::AtomicU64::new(0);
+        let before = ccdesk::now_ms();
+        poll_agents_once(&shared, &dirty, &fetch_started, || {
+            std::thread::sleep(Duration::from_millis(200));
+            None
+        });
+        let after = ccdesk::now_ms();
+        let stamped = fetch_started.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after - before >= 200,
+            "test precondition broke: the fake fetch did not actually take time"
+        );
+        // 刻まれた時刻は sleep の前（開始）側の狭い窓に収まる。sleep の後
+        // （完了）に刻んでいれば `after` の近くに寄ってしまうはず
+        assert!(
+            stamped < after - 100,
+            "the start time ({stamped}) is stamped near completion ({after}), not near the start \
+             ({before}); fetch_started must be stored before the fetch runs, not after"
+        );
+    }
 
     /// PERSONAL の email（プロフィール照合のテストで使う）
     const EMAIL: &str = "taro@example.com";
