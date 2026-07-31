@@ -65,10 +65,10 @@ pub(crate) const UNTITLED: &str = "new session";
 ///
 /// **これは全候補に効く上限ではない**（[`Span`]）。まれにしか書かれない候補は
 /// この外に出るので、初回だけ先頭から読む
-const TAIL_BYTES: u64 = 64 * 1024;
+pub(crate) const TAIL_BYTES: u64 = 64 * 1024;
 
 /// 候補が transcript の**どこに現れるか**。走査の範囲はこの性質から機械的に決まる
-/// （[`Titles::refresh`]）ので、候補と範囲の対応表を別に持たない。
+/// （[`Titles::refresh_all`]）ので、候補と範囲の対応表を別に持たない。
 ///
 /// **この区別を落とすと実害が出る**: `custom-title` を末尾 64 KiB だけで探していた
 /// 頃は、長い会話の早い段階でリネームした記録が範囲の外に出て拾えず、
@@ -101,14 +101,29 @@ fn rare_missing(found: &Found) -> bool {
         .any(|(i, (_, span))| *span == Span::Rare && found[i].is_none())
 }
 
-/// [`Titles::refresh`] が 1 周期（一覧の読み直し 1 回）に読んでよいバイト数。
+/// 1 周期（一覧の読み直し 1 回）に読んでよいバイト数。**全行で分け合う。**
 ///
 /// **初回の先頭側スキャン（[`Span::Rare`] ＝ リネーム記録の探索）を数周期に
 /// 分けるための予算。** 予算なしで全量を読んでいた頃は、最初の描画の前に
 /// 全セッションの transcript（数百 MB になり得る）を UI スレッドで読み切り、
-/// 起動が数秒〜数十秒固まった。末尾（[`TAIL_BYTES`]）は予算内で必ず読むので、
-/// 追記型の候補（ai-title / last-prompt）による名前は最初の周期から出る
+/// 起動が数秒〜数十秒固まった。
+///
+/// **これは実際の読み取り量の上限。** 末尾窓・追記ぶん・先頭側の読み残しの
+/// どれも、読む前に残高で切る（読んでから引くと上限にならない）。
+///
+/// **配り方は [`Titles::refresh_all`] が持つ**（呼び手ではない）。予算が
+/// 有限である以上、足りなくなったときに何を先に捨てるかが表示に出るので、
+/// その順序は行をまたいだ判断になる。理由と段の表はあちらの doc
 pub(crate) const SCAN_BUDGET: u64 = 4 * 1024 * 1024;
+
+/// **末尾窓 1 つぶんは必ず 1 周期の予算に収まる。** 割ると走査が 2 つとも止まる:
+/// [`Titles::first_scan`] はどの周期でも窓を読めず名前が永久に出ないし、
+/// [`Titles::append_scan`] は「行が長い」と「予算が細い」を区別できる大きさに
+/// 届かず追記を 1 バイトも進められない
+const _: () = assert!(
+    SCAN_BUDGET >= TAIL_BYTES,
+    "a tail window must fit in one cycle's budget"
+);
 
 /// 表示名として使える 1 行へ整える。改行・連続空白は 1 つの空白へ畳み、
 /// [`TITLE_MAX_CHARS`] 文字で切る。
@@ -145,24 +160,45 @@ pub(crate) fn title_text(raw: &str) -> String {
     out
 }
 
-/// ファイルの `from` バイト目から終わりまでを文字列で読む
-/// （壊れたバイトは lossy で受ける ＝ 途中から読んでも失敗しない）
-fn read_from(path: &Path, from: u64) -> Option<String> {
+/// ファイルの `from` バイト目から `len` バイトだけを**生バイトで**読む
+/// （足りなければ None ＝ 縮んだ・読めない）。
+///
+/// **文字列にして返さない。** 読んだ範囲は必ず文字の途中から始まる（塊の境界は
+/// バイト位置で決まる）ので、`String::from_utf8_lossy` を通すと壊れたバイトが
+/// U+FFFD（3 バイト）に膨らみ、**文字列上の位置が生ファイルのバイト位置と
+/// ずれる**。そのずれを `scanned` や `head_pending` に足していたのが実害で、
+/// 実データでは末尾窓の境界が多バイト文字を割ったセッションの `scanned` が
+/// ファイル長を 4 バイト超え、`meta.len() < scanned` が毎周期成立して
+/// **走査が毎回まるごとやり直しになっていた**。
+/// 位置は生バイトで数え、lossy 変換は走査するスライスにだけ掛ける
+/// （[`scan_bytes`]）
+fn read_range(path: &Path, from: u64, len: u64) -> Option<Vec<u8>> {
     let mut file = std::fs::File::open(path).ok()?;
     file.seek(SeekFrom::Start(from)).ok()?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    let mut buf = vec![0u8; usize::try_from(len).ok()?];
+    file.read_exact(&mut buf).ok()?;
+    Some(buf)
 }
 
-/// ファイルの `from` バイト目から `len` バイトだけを文字列で読む
-/// （先頭側スキャンの塊読み用。lossy の理由は [`read_from`] と同じ）
-fn read_range(path: &Path, from: u64, len: u64) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
-    file.seek(SeekFrom::Start(from)).ok()?;
-    let mut buf = vec![0u8; len as usize];
-    file.read_exact(&mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
+/// 最初の改行の**次**の位置（改行が無ければ末尾）。塊の先頭が行の途中のとき、
+/// その半端な行を落とす量
+fn after_first_newline(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(bytes.len(), |at| at + 1)
+}
+
+/// 最後の改行の**次**の位置（改行が無ければ 0）＝ 行が完結している範囲の終わり。
+/// 書きかけの最終行はここから外れるので、次に読むときもう一度読める
+fn end_of_complete_lines(bytes: &[u8]) -> usize {
+    bytes.iter().rposition(|&b| b == b'\n').map_or(0, |at| at + 1)
+}
+
+/// バイト列を走査して候補を拾う。**位置の計算は生バイトで済ませ、ここで初めて
+/// 文字列にする**（壊れたバイトは lossy で受ける ＝ 途中から読んでも失敗しない）
+fn scan_bytes(bytes: &[u8], spans: &[Span], found: &mut Found) {
+    scan_into(&String::from_utf8_lossy(bytes), spans, found);
 }
 
 /// 範囲 `text` を走査して候補を拾う。`spans` に載る性質の候補だけを見るので、
@@ -213,6 +249,19 @@ fn pick(found: &Found) -> Option<&String> {
 /// すべての候補をすべての範囲で探す（走査を範囲で分けない場合の指定）
 const EVERY_SPAN: [Span; 2] = [Span::Rare, Span::Appended];
 
+/// 1 周期でその行に要る読み取りの種類。**予算が足りないときに何を先に捨てるかは
+/// これで決まる**（順序と根拠は [`Titles::refresh_all`] の表）。
+///
+/// 先頭側の読み残しはここに載せない: あれは行の状態
+/// （[`Scan::head_pending`]）から分かるので、[`Titles::plan`] が決める必要が無い
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stage {
+    /// まだ一度も走査していない ＝ **その行の名前がまだ無い**
+    First,
+    /// 走査済みの行の追記ぶん ＝ 名前は既に出ていて、新しくなるだけ
+    Append,
+}
+
 /// 1 本の transcript について「どこまで読んだか」と「そこまでで見つかった候補」。
 ///
 /// **これはキャッシュであって状態ではない。** 捨てて作り直しても同じ答えになる
@@ -223,8 +272,13 @@ const EVERY_SPAN: [Span; 2] = [Span::Rare, Span::Appended];
 struct Scan {
     /// 最後に読んだときのファイルの見え方（長さ・更新時刻）。None ＝ 未走査
     stamp: Option<Stamp>,
-    /// 走査済みの末尾位置。**必ず行の切れ目**なので、次はここから読めば
-    /// 行の途中から始まらない（書きかけの最終行は次回もう一度読む）
+    /// 走査済みの末尾位置。**原則として行の切れ目**なので、次はここから読めば
+    /// 行の途中から始まらない（書きかけの最終行は次回もう一度読む）。
+    ///
+    /// **例外は 1 つだけ**: [`TAIL_BYTES`] 読んでも改行が 1 つも無い ＝ 予算では
+    /// 追えない長さの 1 行に当たったとき、その行を諦めて塊の分だけ進める
+    /// （[`Titles::append_scan`]）。そこだけは行の途中を指し、頭の欠けた行は
+    /// JSON として捨てられる
     scanned: u64,
     /// そこまでで見つかった候補
     found: Found,
@@ -276,7 +330,7 @@ impl Titles {
 
     /// **行の表示名。** 純粋な引き当てで、拾えていなければ [`UNTITLED`]。
     ///
-    /// 材料を用意するのは [`Self::refresh`]（一覧の読み直しと同じ周期）で、
+    /// 材料を用意するのは [`Self::refresh_all`]（一覧の読み直しと同じ周期）で、
     /// ここは引き当てるだけ ＝ 描画のたびにファイルを読まない
     pub(crate) fn of(&self, row: &SessionRow) -> String {
         if let Some(name) = self.fixed.get(&row.session_id) {
@@ -289,24 +343,71 @@ impl Titles {
             .unwrap_or_else(|| UNTITLED.to_string())
     }
 
-    /// 行の transcript を解決し、増えたぶんを走査する（一覧の読み直しと同じ周期）。
+    /// **全行を 1 周期ぶん読み直す。** 戻り値は「どれかの行の `transcript` の記録を
+    /// 書き換えたか」（呼び手が保存の要否に使う）。
     ///
     /// **行を書き換えるのは `transcript` だけ**（解決した場所の記録）。表示名も
     /// `updated_at` も触らない ＝ **名前が変わってもマージの後勝ち判定は動かない**
     /// （[`crate::sessions::merge_sessions`]。行の経過時間表示は既に廃止済みで、
     /// 今 `updated_at` が答えるのはこれだけ）。
-    /// **戻り値は「transcript の記録を書き換えたか」**（呼び手が保存の要否に使う）。
     ///
-    /// 読む範囲の決め方は 3 段:
+    /// # 読む順が「どの行に名前が付くか」を決める
     ///
-    /// - **初回**は末尾 [`TAIL_BYTES`] だけを全候補で走査する ＝ 追記型の候補
-    ///   （ai-title / last-prompt）による名前は最初の周期から出る
-    /// - 先頭側は [`Span::Rare`]（リネーム記録）の探索として読み残し
-    ///   （`head_pending`）、**予算の範囲で数周期に分けて**消化する
-    ///   （[`Self::drain_head`]。予算の理由は [`SCAN_BUDGET`]）
-    /// - **2 回目以降**は増えたぶんだけを全候補で走査する。transcript は追記しか
-    ///   されないので、これで全量を読んだのと同じ答えが保たれる
-    pub(crate) fn refresh(&mut self, row: &mut SessionRow, budget: &mut u64) -> bool {
+    /// 予算（[`SCAN_BUDGET`]）は全行で分け合うので、足りなくなったときに
+    /// **何を先に捨てるか**が表示に出る。段は 3 つで、上ほど失うものが大きい:
+    ///
+    /// | 段 | 読むもの | その周期に落ちたとき失うもの |
+    /// |:--|:--|:--|
+    /// | 1 | まだ走査していない行の末尾窓 | **その行の名前そのもの**（[`UNTITLED`] のまま） |
+    /// | 2 | 走査済みの行の追記ぶん | 名前の新しさ（古い名前は出ている） |
+    /// | 3 | 先頭側の読み残し | リネーム記録（下位の候補へ落ちるだけ） |
+    ///
+    /// **段をまたいで順に配るのが要点で、行ごとに 1〜3 を回してはいけない。**
+    /// 段 3 はリネーム記録が無ければファイルを舐め切るまで止まらないので、
+    /// 行ごとに回すと前の行の段 3 が後ろの行の段 1 を飢えさせる。実データ
+    /// 6 行 12.9 MB で、最後の行に名前が付くのが起動の約 4 秒後になっていた。
+    ///
+    /// **段の順序をここに閉じ込めてあるのは、呼び手に順序を守らせないため。**
+    /// 段を公開メソッドに割って呼び手が並べる形にすると、段 3 を呼び忘れても
+    /// 名前は出てしまう（下位の候補で埋まる）＝ リネームだけが静かに拾えなくなる
+    pub(crate) fn refresh_all(&mut self, rows: &mut [SessionRow], budget: &mut u64) -> bool {
+        let mut changed = false;
+        // 解決と stat は行あたりここで 1 回だけ（段ごとに回すと段の数だけ増える）
+        let mut plans = Vec::with_capacity(rows.len());
+        for row in rows.iter_mut() {
+            let (plan, moved) = self.plan(row);
+            changed |= moved;
+            plans.push(plan);
+        }
+        for stage in [Stage::First, Stage::Append] {
+            let planned_here =
+                |plan: &&Option<(Stage, Stamp)>| matches!(plan, Some((s, _)) if *s == stage);
+            let mut left = plans.iter().filter(planned_here).count() as u64;
+            for (row, plan) in rows.iter().zip(&plans) {
+                let Some((planned, stamp)) = *plan else {
+                    continue;
+                };
+                if planned != stage {
+                    continue;
+                }
+                let mut allot = Self::allowance(stage, *budget, left);
+                let offered = allot;
+                self.run(&row.session_id, planned, stamp, &mut allot);
+                *budget -= offered - allot;
+                left -= 1;
+            }
+        }
+        for row in rows.iter() {
+            if let Some(scan) = self.seen.get_mut(&row.session_id) {
+                Self::drain_head(scan, budget);
+            }
+        }
+        changed
+    }
+
+    /// その行の transcript を解決し、**この周期に要る読み取りを決める**（読まない）。
+    /// 戻り値の bool は「行の `transcript` 記録を書き換えたか」
+    fn plan(&mut self, row: &mut SessionRow) -> (Option<(Stage, Stamp)>, bool) {
         let (path, resolved_changed) = self.resolve(row);
         // 解決できない・消えた ＝ 読む対象が無い。**拾った値も一緒に落とす**
         // （残すと、消えたファイルから拾った名前が行に出続ける ＝ キャッシュが
@@ -319,7 +420,7 @@ impl Titles {
             })
         else {
             self.seen.remove(&row.session_id);
-            return resolved_changed;
+            return (None, resolved_changed);
         };
         let stamp = (meta.len(), meta.modified().ok());
         let scan = self.seen.entry(row.session_id.clone()).or_default();
@@ -331,46 +432,123 @@ impl Titles {
                 ..Scan::default()
             };
         }
-        if scan.stamp.is_none() {
-            // 初回: まず末尾だけを読む（予算が尽きていれば次の周期に回す）
-            if *budget > 0 {
-                Self::first_scan(scan, meta.len(), stamp, budget);
-            }
-        } else if scan.stamp != Some(stamp) {
-            // 追記ぶんの読み直し（常に行の切れ目 = scanned から始まる）
-            if let Some(text) = read_from(&scan.path, scan.scanned) {
-                *budget = budget.saturating_sub(text.len() as u64);
-                // 走査するのは行が完結している範囲まで（書きかけの最終行は次回に回す）
-                let complete = text.rfind('\n').map_or(0, |at| at + 1);
-                scan_into(&text[..complete], &EVERY_SPAN, &mut scan.found);
-                scan.stamp = Some(stamp);
-                scan.scanned += complete as u64;
-            }
-        }
-        Self::drain_head(scan, budget);
-        resolved_changed
+        let stage = match scan.stamp {
+            None => Some(Stage::First),
+            Some(seen) if seen != stamp => Some(Stage::Append),
+            Some(_) => None, // 前回から見え方が変わっていない ＝ 読むものが無い
+        };
+        (stage.map(|stage| (stage, stamp)), resolved_changed)
     }
 
-    /// 初回の走査: 末尾 [`TAIL_BYTES`] を全候補で読み、先頭側を読み残しとして記録する
-    fn first_scan(scan: &mut Scan, len: u64, stamp: Stamp, budget: &mut u64) {
-        let from = len.saturating_sub(TAIL_BYTES);
-        let Some(mut text) = read_from(&scan.path, from) else {
+    /// その段でこの 1 行に許す読み取り量（`left` ＝ その段に残っている行数）。
+    ///
+    /// **段によって分け方が違うのは、読み取りが分割できるかどうかが違うから**:
+    ///
+    /// - 段 1（末尾窓）は**分けない**。窓は丸ごと読むか読まないかで、等分すると
+    ///   どの行も窓に届かず**全部の行が名前を失う**。先着順で構わないのは、
+    ///   読めた行はその周期で走査済みになり次の周期には段 1 から抜けるため
+    ///   ＝ 行数ぶんの周期で必ず全部に行き渡る
+    /// - 段 2（追記）は**等分する**。分割して読めるので、先頭の行が抱えた
+    ///   backlog に周期を丸ごと取られると後ろの行と段 3 が進まない。
+    ///   下限を [`TAIL_BYTES`] に置くのは、それより細かく割ると
+    ///   [`Self::append_scan`] が行の切れ目に届かず読み直しが空回りするため
+    ///
+    /// **下限があるぶん、等分しきれる行数には上限がある**（`SCAN_BUDGET /
+    /// TAIL_BYTES` ＝ 64 行）。それを超える行が**毎周期ずっと**追記され続けると、
+    /// 並びの後ろの行は追記を読めない ＝ 名前は残るが古いまま止まる。
+    /// 段 1 と違って自然には解消しない（順序が固定なので同じ行が後ろに居続ける）。
+    /// 直すならラウンドロビンの状態を持つことになるので、64 セッションが同時に
+    /// 出力し続ける状況が実際に起きてから入れる
+    ///
+    /// **残高で頭打ちするのもここ**（呼び手と分け合わない ＝ 「この行が読んでよい量」
+    /// の答えが 1 箇所に収まる）
+    fn allowance(stage: Stage, budget: u64, left: u64) -> u64 {
+        match stage {
+            Stage::First => budget,
+            Stage::Append => budget.div_ceil(left.max(1)).max(TAIL_BYTES).min(budget),
+        }
+    }
+
+    /// [`Self::plan`] が決めた読み取りを実行する
+    fn run(&mut self, id: &SessionId, stage: Stage, stamp: Stamp, budget: &mut u64) {
+        let Some(scan) = self.seen.get_mut(id) else {
             return;
         };
-        *budget = budget.saturating_sub(text.len() as u64);
-        let mut start = from;
-        // 行の途中から読んだときだけ、壊れた先頭行を落とす（その行は先頭側の
-        // 読み残しに含まれるので、取りこぼしにはならない）
-        if from > 0 {
-            let at = text.find('\n').map_or(text.len(), |at| at + 1);
-            text = text.split_off(at);
-            start += at as u64;
+        match stage {
+            Stage::First => Self::first_scan(scan, stamp, budget),
+            Stage::Append => Self::append_scan(scan, stamp, budget),
         }
-        let complete = text.rfind('\n').map_or(0, |at| at + 1);
-        scan_into(&text[..complete], &EVERY_SPAN, &mut scan.found);
+    }
+
+    /// 初回の走査: 末尾 [`TAIL_BYTES`] を全候補で読み、先頭側を読み残しとして記録する。
+    ///
+    /// **末尾窓は分割して読まない**（予算が窓ぶんに満たない周期は何もせず次へ回す）。
+    /// 先頭側の消化（[`Self::drain_head`]）が探すのは [`Span::Rare`] だけなので、
+    /// 窓を半端に読むと追記型の候補（ai-title / last-prompt）が読み残し側へ落ちて
+    /// **どの段も拾わない** ＝ その行の名前が永久に出ない。
+    /// 窓が予算より大きくなることは無い（[`SCAN_BUDGET`] の直下で固定してある）
+    fn first_scan(scan: &mut Scan, stamp: Stamp, budget: &mut u64) {
+        let len = stamp.0;
+        let from = len.saturating_sub(TAIL_BYTES);
+        let want = len - from;
+        if *budget < want {
+            return; // 次の周期へ（窓は必ず丸ごと読む）
+        }
+        let Some(bytes) = read_range(&scan.path, from, want) else {
+            return;
+        };
+        *budget = budget.saturating_sub(want);
+        // 行の途中から読んだときだけ、半端な先頭行を落とす（その行は先頭側の
+        // 読み残しに含まれるので、取りこぼしにはならない）
+        let skip = if from > 0 { after_first_newline(&bytes) } else { 0 };
+        let complete = end_of_complete_lines(&bytes[skip..]);
+        scan_bytes(&bytes[skip..skip + complete], &EVERY_SPAN, &mut scan.found);
+        let start = from + skip as u64;
         scan.stamp = Some(stamp);
         scan.scanned = start + complete as u64;
         scan.head_pending = (start > 0).then_some(0..start);
+    }
+
+    /// 追記ぶんの走査（常に行の切れ目 ＝ `scanned` から始まる）。
+    ///
+    /// **残り予算で切る。** EOF まで届かなかった周期は `stamp` を据え置くので、
+    /// 次の周期が同じ続きから読む ＝ 読み残しが消えない。据え置かずに
+    /// EOF まで読み切っていた頃は、予算がいくら残っていようと 1 行の追記が
+    /// 数十 MB あればそのぶん丸ごと UI スレッドで読んでいた。
+    ///
+    /// **細切れには読まない。** 塊が行の切れ目に届かなかったとき、それが
+    /// 「予算では追えない長さの 1 行」なのか「残り予算が細かっただけ」なのかは、
+    /// **塊の大きさでしか区別できない**。区別が付かない大きさ（[`TAIL_BYTES`] 未満）
+    /// なら読まずに次の周期へ回す。区別せずに塊を飛ばしていた頃は、周期の終わりに
+    /// 当たった**ごく普通の長さの行**が候補を持っていると二度と拾えなかった
+    /// （次の周期は行の途中から読み始め、頭の欠けた行は JSON として捨てられる）
+    fn append_scan(scan: &mut Scan, stamp: Stamp, budget: &mut u64) {
+        let delta = stamp.0.saturating_sub(scan.scanned);
+        if delta == 0 {
+            scan.stamp = Some(stamp); // 中身は増えていない（更新時刻だけ動いた）
+            return;
+        }
+        let take = (*budget).min(delta);
+        if take < delta && take < TAIL_BYTES {
+            return; // 次の周期へ（予算切れ take == 0 もここに入る）
+        }
+        let Some(bytes) = read_range(&scan.path, scan.scanned, take) else {
+            return;
+        };
+        *budget = budget.saturating_sub(take);
+        // 走査するのは行が完結している範囲まで（書きかけの最終行は次回に回す）
+        let complete = end_of_complete_lines(&bytes);
+        scan_bytes(&bytes[..complete], &EVERY_SPAN, &mut scan.found);
+        if take < delta {
+            // まだ EOF に届いていない。**[`TAIL_BYTES`] 読んで改行が 1 つも無い ＝
+            // 予算では追えない長さの 1 行**なので、その行は諦めて先へ進む
+            // （進めないと同じ塊を毎周期読み直して永久に止まる。
+            // [`Self::drain_head`] と同じ判断）
+            scan.scanned += if complete > 0 { complete as u64 } else { take };
+        } else {
+            scan.scanned += complete as u64;
+            scan.stamp = Some(stamp);
+        }
     }
 
     /// 先頭側の読み残し（[`Span::Rare`] の探索）を、予算の範囲で**末尾側から
@@ -390,27 +568,30 @@ impl Titles {
             }
             let take = (*budget).min(range.end - range.start);
             let from = range.end - take;
-            let Some(text) = read_range(&scan.path, from, take) else {
-                // 読めない（消えた・置き換わった）。次の周期の解決やり直しに任せる
-                scan.head_pending = None;
+            let Some(bytes) = read_range(&scan.path, from, take) else {
+                // **範囲は捨てずに次の周期へ回す。** 一時的に読めなかっただけの
+                // ことがある（Windows では別プロセスのロックで普通に起きる）。
+                // 捨てると、ファイルが在って見え方も変わらない限りどの段も
+                // 読み直さない ＝ リネーム記録が永久に拾えなくなる。
+                // ファイルごと消えた場合は行の記録ごと落ちる（[`Self::plan`]）
                 return;
             };
-            *budget = budget.saturating_sub(text.len() as u64);
+            *budget = budget.saturating_sub(take);
             // 塊の先頭が行の途中なら、その行は次（さらに前）の塊が読む
             let skip = if from > range.start {
-                text.find('\n').map_or(text.len(), |at| at + 1)
+                after_first_newline(&bytes)
             } else {
                 0
             };
             let mut fresh = Found::default();
-            scan_into(&text[skip..], &[Span::Rare], &mut fresh);
+            scan_bytes(&bytes[skip..], &[Span::Rare], &mut fresh);
             for (i, (_, span)) in CANDIDATES.iter().enumerate() {
                 // 既にある値（末尾側 ＝ より新しい塊で見つけたもの）は上書きしない
                 if *span == Span::Rare && scan.found[i].is_none() {
                     scan.found[i] = fresh[i].take();
                 }
             }
-            let new_end = if skip == text.len() && from > range.start {
+            let new_end = if skip == bytes.len() && from > range.start {
                 // 塊の中に行の切れ目が無い（予算より長い 1 行）。その行の走査は
                 // 諦めて先へ進む（リネーム記録は短い行なので実害は無い）
                 from
@@ -508,18 +689,18 @@ impl Titles {
         self.write_transcript_for(row, &row.cwd.clone(), contents);
     }
 
-    /// テスト用: 解決 + 走査 + 引き当てを 1 度に通す（本番は
-    /// [`Self::refresh`] が周期で、[`Self::of`] が描画で走る）。
-    /// 予算は無制限 ＝ 1 回で読み切る（予算の分割そのものを見るテストは
-    /// 予算を明示して [`Self::refresh`] を直接呼ぶ）
+    /// テスト用: 解決 + 走査 + 引き当てを 1 行ぶん通す（本番は
+    /// [`Self::refresh_all`] が周期で、[`Self::of`] が描画で走る）。
+    /// 予算は無制限 ＝ 1 回で読み切る（予算の配り方そのものを見るテストは
+    /// 予算を明示して [`Self::refresh_all`] を呼ぶ）
     pub(crate) fn title_now(&mut self, row: &mut SessionRow) -> String {
         let mut budget = u64::MAX;
-        self.refresh(row, &mut budget);
+        self.refresh_all(std::slice::from_mut(row), &mut budget);
         self.of(row)
     }
 }
 
-/// テスト用: 文字列を丸ごと走査して表示名を選ぶ（本番の [`Titles::refresh`] は
+/// テスト用: 文字列を丸ごと走査して表示名を選ぶ（本番の [`Titles::refresh_all`] は
 /// 範囲を分けて走るので、範囲の話を抜きにした優先順の検査はこれを使う）
 #[cfg(test)]
 fn pick_title(text: &str) -> Option<String> {
@@ -739,8 +920,7 @@ pub(crate) mod tests {
         // 探索の材料（作業ツリーの台帳）を消しても、記録が生きているので影響しない
         repo.remove_worktree("fix+two");
         assert!(row.transcript.as_ref().unwrap().is_file(), "the premise broke");
-        let mut budget = u64::MAX;
-        titles.refresh(&mut row, &mut budget);
+        titles.title_now(&mut row);
         assert_eq!(titles.of(&row), "resolved once", "resolved again despite a live record");
         assert!(row.transcript.is_some());
     }
@@ -967,7 +1147,7 @@ pub(crate) mod tests {
 
         // 1 周期目: 予算が末尾ぶんしか無い ＝ 先頭のリネームまで届かない
         let mut budget = TAIL_BYTES;
-        titles.refresh(&mut row, &mut budget);
+        titles.refresh_all(std::slice::from_mut(&mut row), &mut budget);
         assert_eq!(titles.of(&row), UNTITLED, "found the rename without reading the head");
 
         // 2 周期目以降: 読み残しが予算の範囲で消化され、答えが揃う
@@ -976,9 +1156,296 @@ pub(crate) mod tests {
                 break;
             }
             let mut budget = TAIL_BYTES;
-            titles.refresh(&mut row, &mut budget);
+            titles.refresh_all(std::slice::from_mut(&mut row), &mut budget);
         }
         assert_eq!(titles.of(&row), "named at the top", "the head scan never finished");
+    }
+
+    /// **末尾窓の境界が多バイト文字を割っても、覚える位置が生ファイルとずれない。**
+    ///
+    /// 位置を lossy 変換後の文字列で数えていた頃は、割れたバイトが U+FFFD
+    /// （3 バイト）へ膨らんだぶんだけ `scanned` が実ファイル長を追い越した。
+    /// すると次の周期の「縮んだ？」判定（`meta.len() < scanned`）が毎回成立し、
+    /// **その行の走査が 2 秒ごとにまるごとやり直しになり続ける**。
+    /// 実データでも 6 本中 1 本で起きていた（4 バイト超過）
+    #[test]
+    fn a_tail_window_that_splits_a_multibyte_character_keeps_its_offsets_honest() {
+        let temp = TempProjects::new("a_tail_window_that_splits_a_multibyte_character");
+        let mut titles = temp.titles();
+        let mut row = row("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        // 日本語ではなく全角ラテン（3 バイト文字であることだけが要る。
+        // tests/no_japanese_in_code.rs の検査対象を避ける）
+        let wide = "\u{ff21}".repeat(300);
+        // 末尾窓を必ず超える量にする（TAIL_BYTES を動かしても前提が崩れない）
+        let filler = format!("{}\n", line("noise", "text", &wide));
+        let body = filler.repeat(TAIL_BYTES as usize / filler.len() + 8);
+        // 末尾窓の境界が文字の途中に落ちる長さを探す（末尾に詰め物を足して長さを動かす。
+        // 先頭に足すと本文ごと同じだけずれて境界の当たる位置が変わらない）
+        let head = line("custom-title", "customTitle", "named at the top");
+        let split = (0..8).find_map(|pad| {
+            let text = format!("{head}\n{body}{}\n", "x".repeat(pad));
+            let bytes = text.as_bytes();
+            let at = bytes.len() - TAIL_BYTES as usize;
+            // UTF-8 の継続バイト（0b10xxxxxx）＝ 文字の途中
+            ((bytes[at] & 0xC0) == 0x80).then_some(text)
+        });
+        let text = split.expect("no padding made the tail window split a character");
+        titles.write_transcript(&row, &text);
+        let len = text.len() as u64;
+        assert!(len > TAIL_BYTES, "the premise broke - the file fits in the tail window");
+
+        let mut budget = SCAN_BUDGET;
+        titles.refresh_all(std::slice::from_mut(&mut row), &mut budget);
+        assert_eq!(titles.of(&row), "named at the top");
+        let scanned = titles.seen[&row.session_id].scanned;
+        assert!(scanned <= len, "remembered {scanned} bytes of a {len} byte file");
+
+        // 見え方が変わっていない 2 周期目は 1 バイトも読まない
+        // （やり直しが起きていれば、ここで予算が減る）
+        let mut budget = SCAN_BUDGET;
+        titles.refresh_all(std::slice::from_mut(&mut row), &mut budget);
+        assert_eq!(budget, SCAN_BUDGET, "the scan started over on an unchanged file");
+        assert_eq!(titles.of(&row), "named at the top");
+    }
+
+    /// **先頭側の読み取りが失敗しても、未走査の範囲は捨てない。**
+    ///
+    /// 捨てていた頃は、ファイルが在って見え方も変わらない限りどの段も読み直さない
+    /// ので、**そのセッションのリネーム記録が二度と拾えなくなった**
+    /// （コメントは「次の周期の解決やり直しに任せる」と言っていたが、解決は
+    /// 記録が生きている間は走らない）
+    #[test]
+    fn a_failed_head_read_keeps_the_range_for_the_next_cycle() {
+        let temp = TempProjects::new("a_failed_head_read_keeps_the_range");
+        // 実在するが範囲に足りないファイル ＝ 読み取りが必ず失敗する
+        let path = temp.0.join("short.jsonl");
+        std::fs::write(&path, "{}\n").expect("write failed");
+        let mut scan = Scan {
+            path,
+            head_pending: Some(0..10_000),
+            ..Scan::default()
+        };
+
+        let mut budget = 10_000;
+        Titles::drain_head(&mut scan, &mut budget);
+
+        assert_eq!(
+            scan.head_pending,
+            Some(0..10_000),
+            "the unread range was thrown away on a read that may succeed next time"
+        );
+        assert_eq!(budget, 10_000, "budget was spent on a read that failed");
+    }
+
+    /// **1 周期に読む量は予算を超えない。**
+    ///
+    /// 追記ぶんを EOF まで読み切っていた頃は、予算がいくら残っていようと
+    /// 追記の大きさぶん UI スレッドで読んでいた（スリープ復帰や長時間の放置で、
+    /// 1 周期の追記が数十 MB になることがある）。
+    /// **読み切れなかった続きは失わない**（次の周期が同じ位置から読む）
+    #[test]
+    fn one_cycle_never_reads_more_than_its_budget() {
+        let temp = TempProjects::new("one_cycle_never_reads_more_than_its_budget");
+        let mut titles = temp.titles();
+        let mut row = row("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+        let start = format!("{}\n", line("last-prompt", "lastPrompt", "the first prompt"));
+        titles.write_transcript(&row, &start);
+        assert_eq!(titles.title_now(&mut row), "the first prompt");
+
+        // 予算よりずっと大きい追記（末尾に答えがある）
+        let filler = format!("{}\n", line("noise", "text", &"x".repeat(1_000))).repeat(600);
+        let appended = format!("{start}{filler}{}\n", line("ai-title", "aiTitle", "the new name"));
+        titles.write_transcript(&row, &appended);
+        // 1 周期の予算は末尾窓以上にする（下回ると追記は 1 バイトも進まない。
+        // 本番は SCAN_BUDGET >= TAIL_BYTES が const assert で保証する）
+        let budget_per_cycle = TAIL_BYTES + 20_000;
+        assert!(
+            (appended.len() - start.len()) as u64 > budget_per_cycle * 3,
+            "the premise broke - the append fits in a few cycles' budget"
+        );
+
+        let mut budget = budget_per_cycle;
+        titles.refresh_all(std::slice::from_mut(&mut row), &mut budget);
+        assert_eq!(
+            titles.of(&row),
+            "the first prompt",
+            "read past the budget and reached the end of the append in one cycle"
+        );
+
+        // 続きは次の周期以降で消化され、最後には答えが揃う
+        for _ in 0..64 {
+            if titles.of(&row) == "the new name" {
+                break;
+            }
+            let mut budget = budget_per_cycle;
+            titles.refresh_all(std::slice::from_mut(&mut row), &mut budget);
+        }
+        assert_eq!(titles.of(&row), "the new name", "the append was never finished");
+        assert_eq!(
+            titles.seen[&row.session_id].scanned,
+            appended.len() as u64,
+            "the append was not read to the end"
+        );
+    }
+
+    /// **行の切れ目に届かなかった塊を、行が長いと決めつけて捨てない。**
+    ///
+    /// 読む量は残り予算で切るので、周期の終わりでは**ごく普通の長さの行**でも
+    /// 塊に改行が入らない。そこで塊ごと飛ばしていた頃は、その行が候補
+    /// （長いプロンプトの `last-prompt` など）だと**二度と拾えなかった**:
+    /// 次の周期は行の途中から読み始め、頭の欠けた行は JSON として捨てられる
+    #[test]
+    fn a_chunk_too_small_to_reach_a_line_break_is_not_thrown_away() {
+        let temp = TempProjects::new("a_chunk_too_small_to_reach_a_line_break");
+        let mut titles = temp.titles();
+        let mut row = row("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+        let start = format!("{}\n", line("last-prompt", "lastPrompt", "the first prompt"));
+        titles.write_transcript(&row, &start);
+        assert_eq!(titles.title_now(&mut row), "the first prompt");
+
+        // 追記は「候補を持つ 1 行」だけ。普通に読めば拾えるが、行の途中で
+        // 切った塊を捨てると頭が欠けて拾えなくなる
+        let long_name = "z".repeat(10_000);
+        let appended = format!("{start}{}\n", line("ai-title", "aiTitle", &long_name));
+        titles.write_transcript(&row, &appended);
+        let thin = 3_000u64;
+        assert!(
+            thin < (appended.len() - start.len()) as u64 && thin < TAIL_BYTES,
+            "the premise broke - the thin budget does not cut the line in half"
+        );
+
+        // 残り予算が細い周期を挟んでも、答えは変わらない
+        let mut budget = thin;
+        titles.refresh_all(std::slice::from_mut(&mut row), &mut budget);
+        for _ in 0..8 {
+            let mut budget = SCAN_BUDGET;
+            titles.refresh_all(std::slice::from_mut(&mut row), &mut budget);
+        }
+        assert_eq!(
+            titles.of(&row),
+            title_text(&long_name),
+            "the appended line was thrown away because a thin cycle could not reach its line break"
+        );
+    }
+
+    /// **名前がまだ無い行を、名前が古くなるだけの行より先に読む。**
+    ///
+    /// 予算は全行で分け合うので、読む順が「どの行に名前が付くか」を決める。
+    /// 走査済みの行の追記を先に配ると、まだ一度も読んでいない行が
+    /// [`UNTITLED`] のまま置き去りになる（失うものの大きさが違う）
+    #[test]
+    fn a_row_with_no_name_yet_is_read_before_rows_that_only_go_stale() {
+        let temp = TempProjects::new("a_row_with_no_name_yet_is_read_first");
+        let mut titles = temp.titles();
+        let mut busy = row("cccccccc-cccc-4ccc-8ccc-cccccccccccc");
+        let start = format!("{}\n", line("ai-title", "aiTitle", "the busy one"));
+        titles.write_transcript(&busy, &start);
+        assert_eq!(titles.title_now(&mut busy), "the busy one");
+
+        // 走査済みの行に予算を食い切る量の追記
+        let filler = format!("{}\n", line("noise", "text", &"x".repeat(1_000))).repeat(300);
+        titles.write_transcript(&busy, &format!("{start}{filler}"));
+        // まだ一度も走査していない小さな行
+        let mut fresh = row("dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+        titles.write_transcript(&fresh, &format!("{}\n", line("ai-title", "aiTitle", "the new one")));
+
+        // 追記ぶんには足りず、未走査の行の末尾窓には足りる予算。
+        // **並びは busy が先**（順に配ると fresh に届かない）
+        let mut budget = 50_000;
+        let mut rows = [busy, fresh];
+        titles.refresh_all(&mut rows, &mut budget);
+
+        assert_eq!(
+            titles.of(&rows[1]),
+            "the new one",
+            "the append of an already-named row starved the row that had no name at all"
+        );
+        busy = rows[0].clone();
+        fresh = rows[1].clone();
+        assert_eq!(titles.of(&busy), "the busy one", "the named row lost its name");
+        assert!(titles.of(&fresh) != UNTITLED);
+    }
+
+    /// **予算では追えない長さの 1 行は、諦めて先へ進む。**
+    ///
+    /// 諦めないと同じ塊を毎周期読み直して、その行から先が永久に進まない
+    /// （[`Scan::scanned`] が行の途中を指す唯一の場合）。捨てるのはその 1 行だけで、
+    /// 後ろの行は普通に拾える
+    #[test]
+    fn a_line_longer_than_the_tail_window_is_skipped_instead_of_stalling() {
+        let temp = TempProjects::new("a_line_longer_than_the_tail_window_is_skipped");
+        let mut titles = temp.titles();
+        let mut row = row("ffffffff-ffff-4fff-8fff-ffffffffffff");
+        let start = format!("{}\n", line("last-prompt", "lastPrompt", "the first prompt"));
+        titles.write_transcript(&row, &start);
+        assert_eq!(titles.title_now(&mut row), "the first prompt");
+
+        // 末尾窓より長い 1 行（この行は捨てられる）＋ その後ろの普通の行
+        let huge = "z".repeat(TAIL_BYTES as usize * 2);
+        let appended = format!(
+            "{start}{}\n{}\n",
+            line("ai-title", "aiTitle", &huge),
+            line("ai-title", "aiTitle", "the line after the huge one")
+        );
+        titles.write_transcript(&row, &appended);
+
+        // 予算を末尾窓ぶんずつ配る ＝ 巨大な行は毎周期「改行なし」に当たる
+        for _ in 0..32 {
+            if titles.of(&row) == "the line after the huge one" {
+                break;
+            }
+            let mut budget = TAIL_BYTES;
+            titles.refresh_all(std::slice::from_mut(&mut row), &mut budget);
+        }
+        assert_eq!(
+            titles.of(&row),
+            "the line after the huge one",
+            "the scan stalled on a line it could never fit in one cycle"
+        );
+    }
+
+    /// **backlog を抱えた 1 行が、周期を丸ごと取らない。**
+    ///
+    /// 段 2（追記）は分割して読めるので、行ごとに上限を配る。先着順のままだと、
+    /// スリープ復帰などで先頭の行に数十 MB たまっているあいだ、後ろの行の名前も
+    /// 段 3（リネーム記録の探索）も進まなかった
+    #[test]
+    fn a_row_with_a_backlog_does_not_take_the_whole_cycle() {
+        let temp = TempProjects::new("a_row_with_a_backlog_does_not_take_the_whole_cycle");
+        let mut titles = temp.titles();
+        let mut rows = [
+            row("11111111-2222-4333-8444-555555555555"),
+            row("66666666-7777-4888-8999-aaaaaaaaaaaa"),
+        ];
+        let start = |name: &str| format!("{}\n", line("ai-title", "aiTitle", name));
+        for (row, name) in rows.iter_mut().zip(["the backlogged one", "the quiet one"]) {
+            titles.write_transcript(row, &start(name));
+            assert_eq!(titles.title_now(row), name);
+        }
+
+        // 先頭の行に予算より大きい backlog、後ろの行には小さな追記
+        let filler = format!("{}\n", line("noise", "text", &"x".repeat(1_000))).repeat(300);
+        titles.write_transcript(
+            &rows[0].clone(),
+            &format!("{}{filler}", start("the backlogged one")),
+        );
+        titles.write_transcript(
+            &rows[1].clone(),
+            &format!("{}{}\n", start("the quiet one"), line("ai-title", "aiTitle", "caught up")),
+        );
+        let mut budget = 150_000u64;
+        assert!(
+            filler.len() as u64 > budget,
+            "the premise broke - the backlog fits in one cycle"
+        );
+
+        titles.refresh_all(&mut rows, &mut budget);
+
+        assert_eq!(
+            titles.of(&rows[1]),
+            "caught up",
+            "the backlogged row took the whole cycle and the quiet row never got read"
+        );
     }
 
     /// 撮影用の固定表は transcript を 1 つも読まずに名前を返す
