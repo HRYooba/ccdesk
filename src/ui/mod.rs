@@ -36,11 +36,12 @@ use crate::usage::{Usage, UsageInfo, UsageWindow};
 ///
 /// | チャンネル | 表すもの | 値 |
 /// |:--|:--|:--|
-/// | 塗り | 未読（見ていない間にその行が動いた） | [`DOT_FILLED`] ＝ 未読 / [`DOT_HOLLOW`] ＝ 既読 |
+/// | 形の大きさ | 止まっているか | 丸（[`DOT_FILLED`]/[`DOT_HOLLOW`]）/ 一回り小さい丸（[`DOT_STOPPED_FILLED`]/[`DOT_STOPPED_HOLLOW`]）＝ Stopped |
+/// | 塗り | 未読（見ていない間にその行が動いた） | 塗り ＝ 未読 / 中空 ＝ 既読（大小のどちらでも保たれる） |
 /// | 色 | 状態（[`crate::poll::Group`]） | Waiting/Working/Completed/Stopped の 4 色 |
-/// | 明滅 | Working だけ | 400ms 周期で状態色 ↔ [`crate::theme::UiTheme::faint`] を往復 |
+/// | 明滅 | Working だけ | 400ms 周期で状態色 ↔ [`crate::theme::UiTheme::dim`]（淡色テキストと同じ色）を往復 |
 ///
-/// 3 つを同じ 1 桁へ載せるのは、行を縦に流し読みするときに「未読か」「どの状態か」
+/// 4 つを同じ 1 桁へ載せるのは、行を縦に流し読みするときに「未読か」「どの状態か」
 /// 「動いているか」を 1 箇所で拾えるようにするため（別々の桁に分けると視線が散る）。
 /// **状態アイコン（かつての `✻`/`✽`/`∙`）と行末の `<状態> · <経過>` テキストは廃止した**:
 /// 状態は色とドットで語るので、文字での重複表現は持たない。
@@ -48,9 +49,14 @@ use crate::usage::{Usage, UsageInfo, UsageWindow};
 /// **ピン留めはここに印を持たない**: pin した行は [`PINNED_TITLE`] の節へ移るので、
 /// 節に入っていること自体が表示になる（同じ知識を印と並びの 2 箇所に持たない）。
 ///
-/// **記号は East Asian Width が Ambiguous でないものを選ぶ**（[`MENU_MARK`] の判断と
-/// 同じ理由: 幅が端末次第で 1 桁にも 2 桁にもなる記号を桁の前提に乗せない）。
-/// 幅 1 桁であることはテストが固定する。
+/// **幅 1 桁であることはテストが固定する**（`the_row_head_marks_are_one_column_wide`）。
+/// 測るのは `unicode-width` の既定 ＝ East Asian Ambiguous を 1 桁と数える側で、
+/// ratatui の桁計算もこれと同じものを使うので、描画と予算の答えは必ず一致する。
+///
+/// **ドットの丸（`●○•`）は Ambiguous を承知で使っている**（`width_cjk` は 2 を返す）。
+/// 同じ意味を持つ Ambiguous でない丸が Unicode に無いため、代わりが無い。
+/// CJK ロケールで Ambiguous を 2 桁に描く端末では行がずれる ＝ 既知の制約。
+/// 選べる場面（[`MENU_MARK`] のように ASCII で足りるところ）では Ambiguous を避ける。
 ///
 /// 1 桁目: **その行が今ペインに出ているか**（`❯` U+276F ＝ ペインが指している行）
 const OPEN_MARK: &str = "❯";
@@ -58,6 +64,26 @@ const CLOSED_MARK: &str = " ";
 /// ドットの塗り（未読チャンネル）。色と明滅は [`session_row_line`] が別に決める
 const DOT_FILLED: &str = "●";
 const DOT_HOLLOW: &str = "○";
+/// 止まった行（[`Group::Stopped`]）のドット。**同じ丸のまま一回り小さい**ので、
+/// 塗り（未読）はそのまま読めて「もう動かない行」だけが引っ込んで見える。
+///
+/// **形で分けるのが要る理由**: Stopped の色は [`crate::theme::UiTheme::dim`] で、
+/// Working の明滅の谷と同じ色になる（[`session_row_line`]）。色だけに任せると
+/// 「谷にいる Working」と「Stopped」が見分けられないので、そこは形が引き受ける。
+/// 副産物として、モノクロ端末や色覚差でも Stopped だけは判別できる
+const DOT_STOPPED_FILLED: &str = "•";
+const DOT_STOPPED_HOLLOW: &str = "◦";
+
+/// ドットのグリフ。**形の種類が「止まっているか」、塗りが「未読か」**を表す
+/// （色は [`Group::color`]、明滅は [`Group::blinks`] が別に決める ＝ 4 つの
+/// チャンネルがどれも他の値を書き換えない）
+fn dot_glyph(group: Group, unread: bool) -> &'static str {
+    if group == Group::Stopped {
+        mark(unread, DOT_STOPPED_FILLED, DOT_STOPPED_HOLLOW)
+    } else {
+        mark(unread, DOT_FILLED, DOT_HOLLOW)
+    }
+}
 
 /// ピン留めした行を集める節の見出し。**グルーピング（state / directory）に
 /// 関係なく同じ位置（一覧の先頭）に出る**ので、pin の効き方が
@@ -792,7 +818,7 @@ struct RowData {
     label: String,
     /// 今ペインに出ている行（[`Look::open`] の材料）
     is_active_window: bool,
-    /// 未読（[`crate::sessions::SessionRow::unread`]）＝ ドットの塗り（[`DOT_FILLED`]）
+    /// 未読（[`crate::sessions::SessionRow::unread`]）＝ ドットの塗り（[`dot_glyph`]）
     unread: bool,
     /// ピン留め（[`PINNED_TITLE`] の節へ移す）
     pinned: bool,
@@ -806,10 +832,13 @@ struct RowData {
 /// 行だけに効く）。**時計を直接読まず引数で受ける**ので、位相を固定してテストできる
 /// （[`draw`] は 1 フレームぶんの全行に同じ位相を渡す）
 fn session_row_line(d: &RowData, look: Look, inner_width: u16, blink_lit: bool) -> Line<'static> {
-    let dot = mark(d.unread, DOT_FILLED, DOT_HOLLOW);
-    // 明滅の谷は dim ではなく faint（[`crate::theme::UiTheme::faint`]）。
-    // dim だと Stopped の色と同じになり、明滅が「状態」チャンネルと衝突する
-    let dot_color = if d.group.blinks() && !blink_lit { ui().faint } else { d.group.color() };
+    let dot = dot_glyph(d.group, d.unread);
+    // 明滅の谷は淡色テキストと同じ [`crate::theme::UiTheme::dim`]。**画面に既にある
+    // 淡さへ揃える**ので、谷の深さを決めるためだけの色を別に持たない。
+    // 代価: dim は Stopped の色でもあるため、谷の瞬間だけ Working が Stopped と
+    // 同じ色になる。塗り（未読）と「動いていること」自体は谷でも消えないので、
+    // 谷専用の色（fg と bg の中間 80%）を足してまで避ける価値は無いと判断した
+    let dot_color = if d.group.blinks() && !blink_lit { ui().dim } else { d.group.color() };
     // 行頭のペイン印 + ドット + 空白（消えている側も同じ幅を取る）
     let head = vec![
         Span::styled(
@@ -2025,9 +2054,19 @@ pub(crate) mod tests {
             CLOSED_MARK.trim().is_empty(),
             "a character is showing in the empty slot: {CLOSED_MARK:?}"
         );
-        // ドットは未読/既読のどちらも 1 桁（既読は空白ではなく ○）
+        // ドットは 4 グリフとも 1 桁（既読は空白ではなく ○、Stopped は一回り小さい丸）
         assert_eq!(DOT_FILLED.width(), 1, "{DOT_FILLED:?} is not 1 column wide");
         assert_eq!(DOT_HOLLOW.width(), 1, "{DOT_HOLLOW:?} is not 1 column wide");
+        assert_eq!(
+            DOT_STOPPED_FILLED.width(),
+            1,
+            "{DOT_STOPPED_FILLED:?} is not 1 column wide"
+        );
+        assert_eq!(
+            DOT_STOPPED_HOLLOW.width(),
+            1,
+            "{DOT_STOPPED_HOLLOW:?} is not 1 column wide"
+        );
         // 行頭 = ペイン印 1 + ドット 1 + 空白 1
         assert_eq!(
             HEAD_COLS,
@@ -2117,9 +2156,10 @@ pub(crate) mod tests {
                 .clone()
         };
         let (unread, read) = (at("fresh-row"), at("seen-row"));
-        // 印はそれぞれ決まった桁に出る（ペインに出ていないので 1 桁目は空白）
-        assert!(unread.starts_with(&format!("{CLOSED_MARK}{DOT_FILLED}")), "{unread:?}");
-        assert!(read.starts_with(&format!("{CLOSED_MARK}{DOT_HOLLOW}")), "{read:?}");
+        // 印はそれぞれ決まった桁に出る（ペインに出ていないので 1 桁目は空白）。
+        // 窓が無い行 ＝ Stopped なので丸は小さい側、塗りは未読/既読で割れる
+        assert!(unread.starts_with(&format!("{CLOSED_MARK}{DOT_STOPPED_FILLED}")), "{unread:?}");
+        assert!(read.starts_with(&format!("{CLOSED_MARK}{DOT_STOPPED_HOLLOW}")), "{read:?}");
         // 名前の開始桁は 2 本とも同じ（消えている印の桁も確保されている）
         let name_col = |line: &str, name: &str| line[..line.find(name).unwrap()].width();
         assert_eq!(name_col(&unread, "fresh-row"), HEAD_COLS);
@@ -2167,10 +2207,42 @@ pub(crate) mod tests {
         assert_eq!(view(Some((WAITING, 1_000)), "idle", 2_000).title(), "Waiting");
         assert_eq!(view(Some((WAITING, 1_000)), "waiting", 2_000).title(), "Waiting");
         assert_eq!(view(Some((WAITING, 1_000)), "", 2_000).title(), "Waiting");
-        // waiting 以外は覆さない（busy は「このターンの続き」と「次のターン」を
-        // 区別できないので、completed を覆すと Done の意味が壊れる）
+        // completed は覆さない（busy は「このターンの続き」と「次のターン」を
+        // 区別できないので、completed を覆すと Done の意味が壊れる）。
+        // working が非 busy 観測に負ける逆向きは
+        // `a_newer_non_busy_observation_overrules_a_working_hook` が固定する
         assert_eq!(view(Some((crate::poll::COMPLETED, 1_000)), "busy", 2_000).title(), "Completed");
-        assert_eq!(view(Some((WORKING, 1_000)), "idle", 2_000).title(), "Working");
+    }
+
+    /// **逆向きの裁定則: hook の `working` も、より新しい非 `busy` 観測に負ける。**
+    ///
+    /// claude は Esc 中断のとき `Stop` hook を撃たない（実データで確認済み:
+    /// 中断ターンの 91%（113/124）で `Stop` 未発火）ので、`working` は自己修復する
+    /// 手段を持たず、次のターンを完走するか窓を閉じるまで赤・明滅のまま固着していた。
+    /// 材料が `agents --json` の `status`（claude 自身がポーリングのたびに上書きする
+    /// 現在値）である点が、以前避けていた `idle_prompt`（時間経過だけの誤検知）とは
+    /// 違う、という判断の根拠は [`row_state`] の doc を参照
+    #[test]
+    fn a_newer_non_busy_observation_overrules_a_working_hook() {
+        let view = |hook, status, status_at| {
+            row_state(Some(Run { hook, status, status_at, busy: false }))
+        };
+        // working(at=1000) より新しい非 busy 観測 → Waiting（実測した 3 値すべて）
+        for status in ["idle", "waiting", "shell"] {
+            assert_eq!(
+                view(Some((WORKING, 1_000)), status, 2_000).title(),
+                "Waiting",
+                "a newer {status:?} observation did not demote a working hook"
+            );
+        }
+        // 古い（またはターン開始と同時刻の）観測は前の状態の名残 ＝ working のまま
+        assert_eq!(view(Some((WORKING, 1_000)), "idle", 999).title(), "Working");
+        assert_eq!(view(Some((WORKING, 1_000)), "idle", 1_000).title(), "Working");
+        // busy 観測はもちろん覆さない（ターンが進行中）
+        assert_eq!(view(Some((WORKING, 1_000)), "busy", 2_000).title(), "Working");
+        // status が空（一度も観測していない）は「busy でないと確認できた」ではない
+        // ので覆さない（`Run::status_at` の doc が言う「0 ＝ 裁定は起きない」と同じ理由）
+        assert_eq!(view(Some((WORKING, 1_000)), "", 2_000).title(), "Working");
     }
 
     /// **動かしているものが無い行は、hook が何を言っていても Stopped。**
@@ -2208,11 +2280,10 @@ pub(crate) mod tests {
             titles: fixed_titles(),
             ..Default::default()
         };
-        // 状態は文字ではなくドットの色で語るので、色で回帰を検査する
+        // 状態は文字ではなくドットが語るので、ドットで回帰を検査する
         for needle in ["hook-newer", "both-agree", "store-newer"] {
-            assert_eq!(
-                drawn_dot_color(&mut app, needle),
-                ui().dim,
+            assert!(
+                drawn_as_stopped(&mut app, needle),
                 "a row with no window is not drawn as Stopped: {needle}"
             );
         }
@@ -2243,10 +2314,52 @@ pub(crate) mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(
-            drawn_dot_color(&mut app, "just-stopped"),
-            ui().dim,
+        assert!(
+            drawn_as_stopped(&mut app, "just-stopped"),
             "a just-stopped row believed a stale agents observation"
+        );
+    }
+
+    /// **自然死（`/exit`・クラッシュ）の直後も、`stop` と同じ扱いになる。**
+    ///
+    /// `App::stopped_at` を刻む場所は今 [`crate::app`] の `remove_window` 1 箇所に
+    /// 一本化されている。以前はそこを経由しない自然死の掃除ループ（生死スキャンが
+    /// 拾う `!w.alive()`）だけ刻み忘れており、`stopped_at` が 0（未記録）のまま
+    /// 描かれていた。0 は「守るべき時刻が無い」なので、ガード
+    /// （`agents_observed_at > stopped_at`）が素通りし、最大 `LIVE_SCAN_INTERVAL`
+    /// 秒古い busy 観測を実行と誤認して、Stopped になるはずの行が数秒
+    /// Working/Waiting に見えていた（実機で観測されたバグ）。
+    ///
+    /// **この時刻を刻むのが `remove_window` 経由の実プロセス生死判定なので、
+    /// ここでは疑似 PTY を起こさずに「掃除された直後」の状態（窓が無く、
+    /// `stopped_at` が今の時刻を持つ）を直接組んで、そこから先の描画側の
+    /// ガードが `a_row_ccdesk_just_stopped_ignores_a_stale_agents_observation` と
+    /// 同じく正しく働くことを固定する**（`remove_window` 自体が刻むことは
+    /// `close_window_of`・生死スキャン・`open_session` の死んだ窓の片付けの
+    /// 3 箇所すべてで呼び出し元を確認済み。呼び出し元の確認は報告に書く）
+    #[test]
+    fn a_naturally_dead_row_is_stopped_despite_a_stale_agents_observation() {
+        let mut app = App {
+            term_size: (140, 40),
+            sidebar_width: 60,
+            sessions: vec![named_session("cafe-face", "C:\\dev\\api", "exited-naturally")],
+            titles: fixed_titles(),
+            // remove_window が掃除の瞬間に刻んだ想定の記録（窓は既に無い）
+            stopped_at: [(crate::sessions::SessionId::new("cafe-face"), 5_000)].into(),
+            // 生死スキャンの周期（最大 LIVE_SCAN_INTERVAL 秒）だけ古い busy 観測が
+            // まだ残っている
+            agents_observed_at: 5_000,
+            agents: vec![crate::poll::AgentInfo {
+                session_id: "cafe-face".to_string(),
+                kind: crate::claude_format::AGENT_KIND_INTERACTIVE.to_string(),
+                status: "busy".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            drawn_as_stopped(&mut app, "exited-naturally"),
+            "a naturally-dead row believed a stale agents observation"
         );
     }
 
@@ -2270,9 +2383,10 @@ pub(crate) mod tests {
             }],
             ..Default::default()
         };
-        assert_ne!(
-            drawn_dot_color(&mut app, "elsewhere"),
-            ui().dim,
+        // **色ではなく記号で見る**: 明滅の谷は Stopped と同じ色なので、色で
+        // 「Stopped ではない」を主張すると Working の行が位相しだいで落ちる
+        assert!(
+            !drawn_as_stopped(&mut app, "elsewhere"),
             "the rescue for another instance stopped working"
         );
     }
@@ -2794,19 +2908,25 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// セッション行のドット（行頭 2 桁目）の前景色を 1 フレーム描いて取り出す。
-    /// **状態は文字ではなく色で語る**ので、実データの回帰検査には
-    /// [`render_sidebar`] のテキストではなくこれで色を読む。
+    /// その行が Stopped として描かれたか（ドットの記号で見る）。
+    /// 判定は [`drawn_dot`] が返す記号だけに乗るので、明滅の位相に左右されない
+    fn drawn_as_stopped(app: &mut App, needle: &str) -> bool {
+        let (glyph, _) = drawn_dot(app, needle);
+        glyph == DOT_STOPPED_FILLED || glyph == DOT_STOPPED_HOLLOW
+    }
+
+    /// セッション行のドット（行頭 2 桁目）を 1 フレーム描いて (記号, 前景色) で取り出す。
+    /// **状態は文字ラベルではなくこのドットが語る**ので、実データの回帰検査には
+    /// [`render_sidebar`] のテキストではなくこれを読む。
     ///
-    /// **明滅する行（Working）には使えない**: 明滅は描画した瞬間の時刻から決まる
-    /// 位相なので、呼ぶたびに状態色か faint かが変わり得る（flaky）。今の呼び出し元は
-    /// すべて明滅しない行。Working 行の色や明滅を検査したいときは
-    /// `session_row_line` を直接呼んで位相を引数で固定するテスト
-    /// （`the_dot_color_matches_the_row_state` 等）を使う。
+    /// **「その行が Stopped か」は色ではなく記号で見ること**（[`drawn_as_stopped`]）:
+    /// 明滅の谷は [`ui`]`().dim` ＝ Stopped の色そのものなので、色で判定すると
+    /// Working の行が描いた瞬間の位相しだいで Stopped と同じ答えを返す。
+    /// 実際にこれで 2 回に 1 回落ちるテストが生まれた。記号は位相に依らない。
     ///
-    /// 行の index と色を**同じ 1 回の描画**から取る（2 回描くと、行を探す描画と
-    /// 色を読む描画の間で時刻が進み、上の flaky さの原因が増える）
-    fn drawn_dot_color(app: &mut App, needle: &str) -> Color {
+    /// 記号・色・行の index は**同じ 1 回の描画**から取る（2 回描くと、行を探す描画と
+    /// 読む描画の間で一覧が組み直され、別の行の桁を読み得る）
+    fn drawn_dot(app: &mut App, needle: &str) -> (String, Color) {
         let (w, h) = app.term_size;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("test terminal");
@@ -2834,7 +2954,8 @@ pub(crate) mod tests {
             .map(|(i, _)| i)
             .unwrap_or_else(|| panic!("{needle} is not on any row"));
         // 行は上枠の次から積まれ、ドットは行頭から 2 桁目（1 桁目はペイン印）
-        buffer[(2, idx as u16 + 1)].fg
+        let cell = &buffer[(2, idx as u16 + 1)];
+        (cell.symbol().to_string(), cell.fg)
     }
 
     /// **登録リストが画面に届いていることの検証（配線のテスト）。** セッションを
@@ -3034,19 +3155,18 @@ pub(crate) mod tests {
             titles: fixed_titles(),
             ..Default::default()
         };
-        // 状態は文字ではなくドットの色で語る
-        assert_eq!(
-            drawn_dot_color(&mut app, "stopped-row"),
-            ui().dim,
-            "a dead row is not drawn as Stopped"
-        );
+        // 状態は文字ではなくドットが語る（記号は Stopped の小さい丸、色は dim）
+        let (glyph, color) = drawn_dot(&mut app, "stopped-row");
+        assert_eq!(glyph, DOT_STOPPED_HOLLOW, "a dead row is not drawn as Stopped");
+        assert_eq!(color, ui().dim, "a dead row does not use the Stopped color");
         let texts = sidebar_texts(&mut app);
         let row = texts
             .iter()
             .find(|t| t.contains("stopped-row"))
             .expect("the row was not drawn");
-        // 既読なのでドットは抜き（塗りのままでは未読の入力待ちと見紛う）
-        assert!(row.starts_with(&format!("{CLOSED_MARK}{DOT_HOLLOW}")), "{row:?}");
+        // 既読なのでドットは抜き（塗りのままでは未読の入力待ちと見紛う）。
+        // 止まった行なので丸は一回り小さい側
+        assert!(row.starts_with(&format!("{CLOSED_MARK}{DOT_STOPPED_HOLLOW}")), "{row:?}");
         // 集計もその 1 本を Stopped として数える（0 件の項目は出さない）
         let counts = summary_row(&texts);
         assert_eq!(
@@ -3088,11 +3208,15 @@ pub(crate) mod tests {
         assert_eq!(border_x(&mut app), 34, "the sidebar stayed narrow after there was room again");
     }
 
-    /// 見た目を比べるためのセッション行 1 本ぶんの材料
+    /// 見た目を比べるためのセッション行 1 本ぶんの材料。
+    ///
+    /// **状態は特別扱いの無い `Waiting`**（明滅もせず、丸も小さくならない）にしてある。
+    /// ここを `Stopped` にすると、状態を上書きしないテストが黙って「止まった行だけの
+    /// 見た目」を検査することになる（状態別の見え方は各テストが自分で `group` を置く）
     fn look_fixture() -> RowData {
         RowData {
             action: RowAction::Open(SessionId::new("a")),
-            group: Group::Stopped,
+            group: Group::Waiting,
             cwd: "C:\\dev\\api".to_string(),
             label: "the-row".to_string(),
             is_active_window: false,
@@ -3186,6 +3310,37 @@ pub(crate) mod tests {
         assert_eq!(unread[1].0, DOT_FILLED, "an unread row does not show the filled dot");
     }
 
+    /// **止まった行だけ丸が一回り小さくなる。塗り（未読）はそのまま。**
+    ///
+    /// これは色の肩代わり: Stopped の色は Working の明滅の谷と同じ `dim` なので、
+    /// **色だけでは「谷にいる Working」と「Stopped」が区別できない**。形が
+    /// その区別を引き受ける。ここでは 4 通り（大小 × 塗り）が全部違う記号に
+    /// なることを見るので、片方のチャンネルがもう片方を潰したら落ちる
+    #[test]
+    fn a_stopped_row_shows_a_smaller_dot_without_losing_its_fill() {
+        let look = Look { band: false, selected: false, open: false };
+        let glyph = |group: Group, unread: bool| {
+            let mut d = look_fixture();
+            d.group = group;
+            d.unread = unread;
+            cells(&session_row_line(&d, look, DEFAULT_INNER, true))[1].0.clone()
+        };
+        assert_eq!(glyph(Group::Stopped, true), DOT_STOPPED_FILLED, "unread stopped");
+        assert_eq!(glyph(Group::Stopped, false), DOT_STOPPED_HOLLOW, "read stopped");
+        // 止まっていない状態は大きい丸のまま（Stopped だけが小さくなる）
+        for group in [Group::Waiting, Group::Working, Group::Completed] {
+            assert_eq!(glyph(group, true), DOT_FILLED, "{} shrank", group.title());
+            assert_eq!(glyph(group, false), DOT_HOLLOW, "{} shrank", group.title());
+        }
+        // 4 記号が全部別物 = 大小と塗りのどちらも相手を潰していない
+        let all = [DOT_FILLED, DOT_HOLLOW, DOT_STOPPED_FILLED, DOT_STOPPED_HOLLOW];
+        for i in 0..all.len() {
+            for j in i + 1..all.len() {
+                assert_ne!(all[i], all[j], "two dot glyphs are the same character");
+            }
+        }
+    }
+
     /// **ドットの色は状態そのもの。** 4 状態それぞれで [`crate::poll::classify`] が
     /// 決めた `Group` の色（[`Group::color`]）がそのままドットへ出る。
     /// `classify` を経由して色を取るので、対応表を手で書き写さない
@@ -3221,13 +3376,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// **Working 中のドットは 400ms の位相で状態色と faint を往復する。**
+    /// **Working 中のドットは 400ms の位相で状態色と dim を往復する。**
     ///
-    /// 谷は dim ではなく [`ui().faint`]: dim だと Stopped の色と同じになり、
-    /// 明滅が「どの状態か」を語る色チャンネルと衝突する（[`crate::theme::UiTheme::faint`]
-    /// のコメント参照）。明滅しない状態（例: Completed）は位相に関係なく自分の色のまま
+    /// 谷は淡色テキストと同じ [`ui().dim`]（谷の深さを決めるためだけの色を別に持たない）。
+    /// **谷が Stopped の色と一致するのは承知の上**なので、ここでは「谷 = dim」を
+    /// 名指しで固定して、別の淡色へ黙って差し替わらないようにする。
+    /// 明滅しない状態（例: Completed）は位相に関係なく自分の色のまま
     #[test]
-    fn a_working_dot_blinks_between_its_color_and_faint() {
+    fn a_working_dot_blinks_between_its_color_and_dim() {
         let look = Look { band: false, selected: false, open: false };
         let mut d = look_fixture();
         d.group = Group::Working;
@@ -3238,7 +3394,7 @@ pub(crate) mod tests {
             Some(Group::Working.color()),
             "the lit phase does not show the state color"
         );
-        assert_eq!(dark, Some(ui().faint), "the dark phase does not fall back to faint");
+        assert_eq!(dark, Some(ui().dim), "the dark phase does not fall back to dim");
         assert_ne!(lit, dark, "the dot does not blink");
 
         // 明滅しない状態は位相に関係なく自分の色のまま（色と明滅は同じ group から

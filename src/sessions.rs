@@ -306,8 +306,17 @@ fn read_rows(path: &Path) -> Vec<SessionRow> {
 /// - `baseline` は「ディスクはこうなっている」とこのインスタンスが最後に判断した一覧。
 ///   `next` との差が**このインスタンスの操作**なので、消した / 知らないを区別できる
 /// - **両方に居る行は `updated_at` が新しい方**を採る。行の中身（cwd・transcript・
-///   ピン留め・既読）は最後に触った側が正しく、こちらの写しが古いなら
+///   ピン留め）は最後に触った側が正しく、こちらの写しが古いなら
 ///   他インスタンスの変更を踏み潰してはいけない
+/// - **既読（`last_opened_at`）だけは行の内容の後勝ちに乗せない、別軸の値。**
+///   「このユーザーがどこまで見たか」は `updated_at` が答える「行の内容が最後に
+///   変わったのはどちらか」とは別の問いなので、勝った行を丸ごと差し替える判定に
+///   混ぜない。`last_opened_at` は各インスタンスで単調増加（[`crate::app`] の
+///   `mark_read` が巻き戻しを拒む）なので、**勝った側へもう一方の値を `max` で
+///   当てるだけで安全**に両立できる。行の内容の後勝ちに混ぜてしまうと、
+///   「既読にしただけ」で `updated_at` が進み、他インスタンスが先に書いた
+///   本当の変更（ピン留め等）ごと踏み潰す（`mark_read` が `updated_at` を
+///   進める実装だったときに実際に起きたバグ）
 /// - `baseline` に居て `next` に居ない行は**このインスタンスが削除した**ので、
 ///   ディスクに残っていても落とす（削除がこのインスタンスの以降の書き込みで復活しない）
 /// - どちらにも居ない ＝ ディスクにしか居ない行は他インスタンスが作ったセッション。
@@ -334,9 +343,15 @@ fn merge_sessions(
             .iter_mut()
             .find(|mine| mine.session_id == row.session_id)
         {
-            // 両方が知っている行 ＝ 後に触った側の内容を採る
-            Some(mine) if row.updated_at > mine.updated_at => *mine = row.clone(),
-            Some(_) => {}
+            // 両方が知っている行 ＝ 後に触った側の内容を採るが、既読（last_opened_at）
+            // だけは行の内容とは別に、両方の大きい方を当てる（単調増加なので安全。
+            // 勝った側にもう一方の既読を上書きで消させない）
+            Some(mine) if row.updated_at > mine.updated_at => {
+                let last_opened_at = mine.last_opened_at.max(row.last_opened_at);
+                *mine = row.clone();
+                mine.last_opened_at = last_opened_at;
+            }
+            Some(mine) => mine.last_opened_at = mine.last_opened_at.max(row.last_opened_at),
             // baseline に居る ＝ このインスタンスが削除した行なので足さない
             None if baseline.contains(&row.session_id) => {}
             None => merged.push(row.clone()),
@@ -447,6 +462,55 @@ mod tests {
         let next = [row("s", "C:\\dev\\changed-by-a", 9)];
         let merged = merge_sessions(&disk, &ids_of(&baseline), &next);
         assert_eq!(merged[0].cwd, "C:\\dev\\changed-by-a", "own change got rolled back");
+    }
+
+    /// **既読（`last_opened_at`）はマージの後勝ち判定とは別軸で生き残る。**
+    ///
+    /// A がこの行を開いて既読にしても、`mark_read`（[`crate::app`]）は
+    /// `updated_at` を進めない（進めると、既読にしただけで他インスタンスの
+    /// 本当の変更を踏み潰す事故になる。詳しくは `merge_sessions` の doc）。
+    /// ここでは、A の写し（`next`）が行の内容の比較で**そのまま勝つ**側でも、
+    /// A の既読（もともと `next` 側が持っている、B より新しい値）が
+    /// 巻き戻らずに残ることを固定する。
+    ///
+    /// **わざと disk 側にも（A の既読より古い）`last_opened_at` を持たせてある**:
+    /// 単に `mine.last_opened_at` へ触れず放置する実装でも一見通ってしまうテストに
+    /// しないため。もし実装が `mine.last_opened_at = row.last_opened_at` と
+    /// 無条件の上書きになっていれば（`max` を取り忘れていれば）、この disk 側の
+    /// 古い値で A の既読が巻き戻り、ここで落ちる
+    #[test]
+    fn merging_keeps_a_read_row_over_an_older_unrelated_write() {
+        let baseline = [row("s", "C:\\dev\\api", 1)];
+        // A: この行を開いて既読にした（last_opened_at だけ進む。updated_at は不動）
+        let next = [SessionRow { last_opened_at: 5_000, ..row("s", "C:\\dev\\api", 1) }];
+        // B: 内容の実変更は無く（updated_at は next と同じ＝比較で next が勝つ）、
+        // 既読にも触れていない（last_opened_at は A の既読より古いまま）
+        let disk = [SessionRow { last_opened_at: 1_000, ..row("s", "C:\\dev\\api", 1) }];
+        let merged = merge_sessions(&disk, &ids_of(&baseline), &next);
+        assert_eq!(
+            merged[0].last_opened_at, 5_000,
+            "a newer read was rolled back by an older, unrelated write"
+        );
+    }
+
+    /// **逆向き: B の本当の変更（ピン留め等）と A の既読は、両方とも生き残る。**
+    ///
+    /// これが「行の内容の後勝ちに既読を混ぜない」（案B）を選んだ理由そのもの。
+    /// 混ぜていれば（既読も `updated_at` を進めていれば）、A が既読にしただけで
+    /// B のピン留めより `updated_at` が新しくなり、行ごと勝って B の変更を
+    /// 踏み潰していた。既読を別軸にしたことで、**行の内容は本当に新しい方
+    /// （B）が勝ちつつ、既読（A）も一緒に残る**
+    #[test]
+    fn merging_keeps_both_a_newer_real_change_and_a_newer_read() {
+        let baseline = [row("s", "C:\\dev\\before", 1)];
+        // A: 内容は変えず、この行を開いて既読にしただけ（last_opened_at だけ進む）
+        let next = [SessionRow { last_opened_at: 5_000, ..row("s", "C:\\dev\\before", 1) }];
+        // B: 本当の変更（cwd で表す。ピン留め等と同種の「行の内容」の変更）を
+        // した。既読には触れていない（last_opened_at は古いまま）
+        let disk = [SessionRow { last_opened_at: 1_000, ..row("s", "C:\\dev\\changed-by-b", 9) }];
+        let merged = merge_sessions(&disk, &ids_of(&baseline), &next);
+        assert_eq!(merged[0].cwd, "C:\\dev\\changed-by-b", "B's real change was lost");
+        assert_eq!(merged[0].last_opened_at, 5_000, "A's read was lost");
     }
 
     /// **削除した行は、このインスタンスの以降の書き込みでは復活しない。** baseline に
