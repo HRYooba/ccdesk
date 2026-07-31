@@ -1452,14 +1452,12 @@ fn adopt_hook_states(app: &mut App) {
 /// その周期まで遅れる
 pub(crate) fn refresh_transcripts(app: &mut App) {
     let mut titles = std::mem::take(&mut app.titles);
-    let mut changed = false;
-    // 1 周期に読む量の上限。初回の全量読み（リネーム記録の探索）を数周期へ分け、
-    // UI スレッド ＝ 最初の描画を数百 MB の read で止めない
-    // （[`crate::title::SCAN_BUDGET`]）
+    // 1 周期に読む量の上限。UI スレッド ＝ 最初の描画を数百 MB の read で止めない。
+    // **どの行の何を先に読むかは [`Titles`] 側の判断**（予算が足りないときに
+    // 何を捨てるかは行をまたいだ順序で決まるので、ここで配ると呼び手が
+    // 順序を守る責任を負う）。段の表は [`crate::title::Titles::refresh_all`]
     let mut budget = crate::title::SCAN_BUDGET;
-    for row in &mut app.sessions {
-        changed |= titles.refresh(row, &mut budget);
-    }
+    let changed = titles.refresh_all(&mut app.sessions, &mut budget);
     app.titles = titles;
     if changed {
         save_sessions(app);
@@ -3914,8 +3912,7 @@ mod tests {
         assert_eq!(cwd, row.cwd, "a fresh start must use the row's own cwd");
         // 1 ターン終わって transcript ができたら再開になる
         titles.write_transcript(&row, "{\"type\":\"user\"}\n");
-        let mut budget = u64::MAX;
-        titles.refresh(&mut row, &mut budget);
+        titles.title_now(&mut row);
         let (launch, cwd) = relaunch(&titles, &row);
         assert!(
             matches!(launch, Launch::Resume),
@@ -3986,6 +3983,94 @@ mod tests {
             only_row(&app).updated_at,
             1_234,
             "resolving a path moved the age of the row"
+        );
+    }
+
+    /// **前の行の先頭側スキャンが、後ろの行の名前を飢えさせない。**
+    ///
+    /// 予算（[`crate::title::SCAN_BUDGET`]）は全行で分け合う。先頭側スキャンは
+    /// リネーム記録（`custom-title`）の探索で、**記録が無い transcript では
+    /// 先頭までファイルを舐め切るまで止まらない**。実データ 6 本すべてに
+    /// `custom-title` が無かったので、これは例外ではなく普通の姿。
+    ///
+    /// 行ごとに予算を食い切らせていた頃は、後ろの行が末尾走査
+    /// （＝名前が出るのに必要な唯一の読み）にすら届かず、**起動から数秒間
+    /// `new session` に見えた**（実測で 6 行目に名前が付くのは約 4 秒後）
+    #[test]
+    fn a_long_head_scan_does_not_starve_the_names_of_later_rows() {
+        let temp = crate::title::tests::TempProjects::new("a_long_head_scan_does_not_starve");
+        let mut app = app_with_row("first");
+        app.sessions.push(session_row("second", "C:\\dev\\api", 1));
+        app.titles = temp.titles();
+
+        // 1 行目: リネーム記録が無く、予算を丸ごと食う大きさ（実データの 4.3 MB 相当）
+        let filler = format!("{{\"type\":\"noise\",\"text\":\"{}\"}}\n", "x".repeat(1_000));
+        let bulk = filler.repeat(crate::title::SCAN_BUDGET as usize / filler.len() + 200);
+        let head_bytes = bulk.len() as u64;
+        app.titles.write_transcript(
+            &app.sessions[0].clone(),
+            &format!("{bulk}{{\"type\":\"ai-title\",\"aiTitle\":\"the first name\"}}\n"),
+        );
+        // 2 行目: 末尾を読めば名前が出る小さな transcript
+        app.titles.write_transcript(
+            &app.sessions[1].clone(),
+            "{\"type\":\"ai-title\",\"aiTitle\":\"the second name\"}\n",
+        );
+        assert!(
+            head_bytes > crate::title::SCAN_BUDGET,
+            "the premise broke - the first row does not exhaust the budget"
+        );
+
+        refresh_transcripts(&mut app);
+
+        assert_eq!(
+            app.titles.of(&app.sessions[1]),
+            "the second name",
+            "the head scan of the first row ate the budget the second row needed for its name"
+        );
+        assert_eq!(app.titles.of(&app.sessions[0]), "the first name");
+    }
+
+    /// **末尾窓の外にあるリネーム記録が、この関数を通しても拾える。**
+    ///
+    /// 先頭側の読み残しの消化は末尾走査とは別のパスなので、**そのパスを落としても
+    /// 名前は出てしまう**（下位の候補で埋まる）。[`crate::title`] 側の
+    /// `a_rename_before_the_tail_window_is_still_found` はテスト用ヘルパーを
+    /// 通っていて本番の配線を見ないため、ここで本番の入口ごと固定する
+    #[test]
+    fn refreshing_transcripts_also_finds_a_rename_outside_the_tail_window() {
+        let temp = crate::title::tests::TempProjects::new("refresh_finds_a_rename_outside_the_tail");
+        let mut app = app_with_row("s");
+        app.titles = temp.titles();
+
+        // 先頭にリネーム、末尾窓を越える詰め物、末尾に下位の候補
+        let filler = format!("{{\"type\":\"noise\",\"text\":\"{}\"}}\n", "x".repeat(200))
+            .repeat(1_000);
+        assert!(
+            filler.len() as u64 > crate::title::TAIL_BYTES,
+            "the premise broke - the filler fits inside the tail window"
+        );
+        // 先頭側は 1 周期の残予算で読み切れる大きさ（読み切れないなら、
+        // この検査が落ちても「段 3 が走らない」ではなく「予算が足りない」になる）
+        assert!(
+            filler.len() as u64 + crate::title::TAIL_BYTES < crate::title::SCAN_BUDGET,
+            "the premise broke - the head does not fit in one cycle's budget"
+        );
+        app.titles.write_transcript(
+            &app.sessions[0].clone(),
+            &format!(
+                "{{\"type\":\"custom-title\",\"customTitle\":\"named at the top\"}}\n\
+                 {filler}\
+                 {{\"type\":\"last-prompt\",\"lastPrompt\":\"the latest prompt\"}}\n"
+            ),
+        );
+
+        refresh_transcripts(&mut app);
+
+        assert_eq!(
+            app.titles.of(only_row(&app)),
+            "named at the top",
+            "the head scan never ran - the name fell back to the tail candidate"
         );
     }
 

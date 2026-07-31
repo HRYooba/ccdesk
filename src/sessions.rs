@@ -118,7 +118,7 @@ pub(crate) struct SessionRow {
     /// **解決済みの transcript の場所。** cwd から毎回導かない理由は、cwd が
     /// 動く値だから（セッションは走行中に git worktree へ移れる）。不変であるはずの
     /// パスを動く値から導くのが誤りだったので、解決した結果をここに記録する。
-    /// 消えていたら解決し直す（[`crate::title::Titles::refresh`]）
+    /// 消えていたら解決し直す（[`crate::title::Titles::refresh_all`]）
     pub(crate) transcript: Option<PathBuf>,
     pub(crate) pinned: bool,
     /// 最後にその行を開いた時刻（ms）。未読の判定材料
