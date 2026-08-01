@@ -300,14 +300,20 @@ New 画面のほかに、フォルダ見出しの `⋮` メニューの `new ses
 
 ## 4. 実装順序
 
-1. `backend` モジュール新設 + claude を移設（**振る舞いを変えない**。全テスト通過を確認）
-2. `Kind` / `agent_session_id` をデータモデルへ追加
-3. codex backend（起動・hook・表示名）
-4. UI（接頭辞・最小幅・New 画面の Agent 行）
-5. 使用率 2 行
-6. Esc 対策
+**進捗は git 履歴と `src/backend/` の中身が正本。** ここは順序と、各段で何を
+「終わり」とみなすかだけを書く（済/未のチェックは書かない ＝ 手で維持すると腐る）。
 
-1 は独立して安全なので、単独で出せる。
+1. `backend` モジュール新設 + claude を移設。`Kind` を `SessionRow` へ。
+   **振る舞いを変えない**（起動するのは claude だけ）
+2. hook の受け口を行 ID 基準にする（[`crate::hooks::ROW_ENV`] を読む）＋
+   `agent_session_id` を行へ
+3. codex の表示名（`session_index.jsonl`）
+4. UI（接頭辞・最小幅・版行・New 画面の Agent 行・見出しメニュー・grouping）
+5. 使用率 2 行 + アカウント行の移動
+6. Esc 対策（§2.5）
+
+1 は独立して安全なので単独で出せる。2 以降は codex の行が実際に生まれるので、
+実機確認が要る。
 
 ---
 
