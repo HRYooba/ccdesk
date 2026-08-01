@@ -106,6 +106,8 @@ pub(crate) fn run_doctor() -> anyhow::Result<()> {
 
     check_claude_cli().report(&mut failed);
     check_agents().report(&mut failed);
+    check_codex_cli().report(&mut failed);
+    check_codex_usage().report(&mut failed);
     check_account().report(&mut failed);
     check_usage().report(&mut failed);
     check_ccdesk_dir().report(&mut failed);
@@ -126,6 +128,37 @@ fn check_claude_cli() -> Check {
         }
         Some(_) => Check::Fail("claude CLI: `claude --version` answered nothing".to_string()),
         None => Check::Fail("claude CLI not found on PATH".to_string()),
+    }
+}
+
+/// codex CLI が PATH にあるか。**無いのは FAIL ではない**:
+/// ccdesk は claude だけでも動く（codex の行を作ろうとしたときに初めて困る）
+fn check_codex_cli() -> Check {
+    let program = crate::backend::Kind::Codex.backend().update_program();
+    match crate::poll::out(program, &["--version"]) {
+        Some(ver) if !ver.trim().is_empty() => {
+            Check::Ok(format!("codex CLI on PATH: {}", ver.trim()))
+        }
+        _ => Check::Warn(
+            "codex CLI not found on PATH (codex sessions cannot be started)".to_string(),
+        ),
+    }
+}
+
+/// codex の使用率が取れるか（`codex app-server` へ 1 往復）。
+/// **本番と同じ経路**を通す（別経路だと doctor が嘘の ok を出す）
+fn check_codex_usage() -> Check {
+    match crate::backend::Kind::Codex.backend().usage() {
+        crate::usage::Usage::Ready(info) => Check::Ok(format!(
+            "codex usage: {}",
+            info.windows()
+                .map(|(label, w)| format!("{label} {:.0}%", w.pct))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        )),
+        // 取れないのは codex が入っていない・未ログイン・形が変わった、のどれか。
+        // どれも ccdesk 自体は動くので Warn
+        other => Check::Warn(format!("codex usage: not available ({other:?})")),
     }
 }
 

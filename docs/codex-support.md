@@ -86,7 +86,18 @@ CLI では `[experimental]` 表記。
 呼ぶときは `initialize` → `initialized` → 本題の 3 手。応答が返るまで stdin を開いた
 まま待つ必要がある（閉じると無応答で終了する）。
 
-### 1.4 env は hook の子プロセスまで継承される
+### 1.4 Windows では `.cmd` を自前で解決する必要がある
+
+`std::process::Command::new("codex")` は `codex.cmd` を見つけない（`CreateProcess` は
+`PATHEXT` を見ない）。claude は native インストールで `claude.exe` なので露見して
+いなかったが、npm 経由で入る agent は `.cmd` のシムしか持たない。
+
+さらに npm は同じディレクトリへ **`codex`（sh のシム）と `codex.cmd` を並べて置く**ので、
+拡張子なしを先に採ると Windows が実行できない方を掴む。
+
+解決は [`ccdesk::resolve_program`] 1 箇所（PATH × PATHEXT。拡張子付きを先に見る）。
+
+### 1.5 env は hook の子プロセスまで継承される
 
 ccdesk が起動時に立てた環境変数が、codex を経由して hook のプロセスまで届く。実測:
 
@@ -294,10 +305,10 @@ New 画面のほかに、フォルダ見出しの `⋮` メニューの `new ses
 | 面 | 決定 |
 |:--|:--|
 | 行メニューの `open` | `agent_session_id` 未取得なら**無効化**（`remove project` と同じ `enabled` の仕組み）。窓は通常 5 秒以内に閉じる |
-| 右ペインのキーヒント | `all keys pass through to <agent>` ＝ 開いている窓の kind から導く（今は `claude` 固定） |
+| 右ペインのキーヒント | `all keys pass through to <agent>` ＝ 開いている窓の kind から導く |
 | 右ペインの枠タイトル | 変えない。中身の TUI が自分の素性を出している（codex は `>_ OpenAI Codex`） |
 | `ccdesk doctor` | codex のチェックを足す。ただし **codex が PATH に無いのは FAIL ではない**（ccdesk は claude だけでも動く）ので Warn 止まり |
-| 撮影用データ（`--demo`） | codex の行を混ぜる。README のスクリーンショットも撮り直す |
+| 撮影用データ（`--demo`） | codex の行を混ぜる。**README のスクリーンショットは撮り直しが要る**（撮影は実機の TUI で行う ＝ `screenshots/screenshot.ps1`） |
 
 ---
 

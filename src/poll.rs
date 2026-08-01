@@ -297,7 +297,10 @@ fn is_personal_org(org: &str, email: &str, subscription_type: Option<&str>) -> b
 /// ここで `status.success()` を要求すると未ログインが「取得失敗」に化けて
 /// 表示が固まるため、成否は各パーサの内容判定に委ねる
 pub(crate) fn out(cmd: &str, args: &[&str]) -> Option<String> {
-    let o = std::process::Command::new(cmd)
+    // **PATH の解決は自前でやる**（Windows の `Command::new` は `.cmd` を
+    // 見つけない。理由は [`ccdesk::resolve_program`]）
+    let program = ccdesk::resolve_program(cmd)?;
+    let o = std::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()

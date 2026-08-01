@@ -323,6 +323,98 @@ pub fn hook_states_path() -> Option<std::path::PathBuf> {
     Some(ccdesk_dir()?.join("hook-states.json"))
 }
 
+/// PATH 上の実行ファイルを絶対パスへ解決する。
+///
+/// **Windows で必要。** `std::process::Command::new("codex")` は `codex.cmd` を
+/// 見つけない（`CreateProcess` は `PATHEXT` を見ない）。claude は native
+/// インストールで `claude.exe` なので今まで露見しなかったが、npm 経由で入る
+/// agent（codex）は `.cmd` のシムしか持たない。
+///
+/// **見つからなければ None**（呼び手は諦める ＝ その agent の版・使用率が出ない）。
+/// PATHEXT が空・未設定のときは実行ファイルらしい既定の拡張子を使う
+pub fn resolve_program(name: &str) -> Option<std::path::PathBuf> {
+    // 既にパスの形（区切りを含む）なら PATH を探さない
+    if name.contains(['/', '\\']) {
+        let direct = std::path::PathBuf::from(name);
+        return direct.is_file().then_some(direct);
+    }
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        // **Windows は拡張子付きを先に見る。** npm は同じディレクトリへ
+        // `codex`（sh のシム）と `codex.cmd` を並べて置くので、拡張子なしを
+        // 先に採ると Windows が実行できない方を掴む（実際にそうなっていた）
+        for ext in &exts {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        // Windows で拡張子なしのファイルは実行できないので見ない
+        // （明示的に拡張子を含む名前で呼ばれたときだけ通す）
+        if (!cfg!(windows) || name.contains('.')) && dir.join(name).is_file() {
+            return Some(dir.join(name));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod resolve_program_tests {
+    use super::resolve_program;
+
+    /// パスの形で渡されたものは PATH を探さない（在れば返す・無ければ None）
+    #[test]
+    fn a_name_that_is_already_a_path_is_not_looked_up() {
+        assert_eq!(resolve_program("./no-such-thing-here"), None);
+    }
+
+    /// **Windows は同じ名前の拡張子付きを先に採る。** npm は `codex`（sh のシム）と
+    /// `codex.cmd` を同じディレクトリへ並べて置くので、拡張子なしを先に採ると
+    /// Windows が実行できない方を掴む（実際にそうなっていた）
+    #[cfg(windows)]
+    #[test]
+    fn the_extension_wins_over_the_bare_name_in_the_same_directory() {
+        let dir = std::env::temp_dir().join("ccdesk-resolve-program-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("thing"), b"#!/bin/sh
+").unwrap();
+        std::fs::write(dir.join("thing.cmd"), b"@echo off
+").unwrap();
+
+        // PATH をこのテストの間だけ差し替える（他のテストは PATH を読まない）
+        let saved = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", &dir) };
+        let found = resolve_program("thing");
+        match saved {
+            Some(path) => unsafe { std::env::set_var("PATH", path) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            found
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string()),
+            Some("thing.cmd".to_string()),
+            "picked something Windows cannot execute: {found:?}"
+        );
+    }
+}
+
 /// 現在時刻の epoch ms。**行の時刻・hook の時刻はすべてこの単位**
 /// （`SessionRow` と `hook-states.json` が同じ物差しを使う）
 pub fn now_ms() -> u64 {

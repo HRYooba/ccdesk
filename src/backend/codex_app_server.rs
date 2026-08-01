@@ -45,7 +45,8 @@ pub(crate) fn rate_limits(program: &str, now: u64) -> Option<UsageInfo> {
 /// **応答が返るまで stdin を開いたままにする**（閉じるとサーバーが即終了して
 /// 何も返さない。実測 327ms で無応答終了した）
 fn ask(program: &str) -> Option<Value> {
-    let mut child = Command::new(program)
+    // `.cmd` のシムでも起こせるように絶対パスへ解決する（[`ccdesk::resolve_program`]）
+    let mut child = Command::new(ccdesk::resolve_program(program)?)
         .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

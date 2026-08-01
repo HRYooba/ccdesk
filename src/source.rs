@@ -668,18 +668,19 @@ fn demo_sessions() -> Vec<SessionRow> {
 /// ので、撮影は [`Titles::fixed`] と [`DataSource::fixed_states`] へ渡す表として持つ。
 /// 状態が None の行は**動かしている実行が無い** ＝ Stopped
 fn demo_rows() -> Vec<(SessionRow, String, Option<State>)> {
-    let rows: [(&str, Option<State>, &str); 6] = [
-        ("fix login form validation", Some(State::Working), "C:\\dev\\shop-app"),
-        ("add dark mode toggle", Some(State::Waiting), "C:\\dev\\shop-app"),
-        ("refactor api client", Some(State::Working), "C:\\dev\\api"),
-        ("write onboarding docs", Some(State::Idle), "C:\\dev\\docs"),
-        ("optimize image pipeline", Some(State::Idle), "C:\\dev\\api"),
-        ("migrate to vite", None, "C:\\dev\\shop-app"),
+    // **agent を混ぜる**（同じフォルダに claude と codex が並ぶ形が撮れる）
+    let rows: [(&str, Option<State>, &str, Kind); 6] = [
+        ("fix login form validation", Some(State::Working), "C:\\dev\\shop-app", Kind::Claude),
+        ("add dark mode toggle", Some(State::Waiting), "C:\\dev\\shop-app", Kind::Codex),
+        ("refactor api client", Some(State::Working), "C:\\dev\\api", Kind::Claude),
+        ("write onboarding docs", Some(State::Idle), "C:\\dev\\docs", Kind::Codex),
+        ("optimize image pipeline", Some(State::Idle), "C:\\dev\\api", Kind::Claude),
+        ("migrate to vite", None, "C:\\dev\\shop-app", Kind::Codex),
     ];
     let now = ccdesk::now_ms();
     rows.iter()
         .enumerate()
-        .map(|(i, (title, state, cwd))| {
+        .map(|(i, (title, state, cwd, kind))| {
             let minutes = (i as u64 + 1) * 7;
             let updated = now.saturating_sub(minutes * 60_000);
             // 架空の UUID（実セッションの ID を出さない）
@@ -687,6 +688,10 @@ fn demo_rows() -> Vec<(SessionRow, String, Option<State>)> {
             (
                 SessionRow {
                     updated_at: updated,
+                    kind: *kind,
+                    // codex の行は agent 側の ID が無いと開けない扱いなので、撮影でも
+                    // 埋めておく（メニューが無効の見た目にならない）
+                    agent_session_id: (*kind == Kind::Codex).then(|| id.to_string()),
                     ..SessionRow::new(id, *cwd, updated)
                 },
                 (*title).to_string(),

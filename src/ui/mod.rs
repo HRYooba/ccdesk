@@ -1071,8 +1071,15 @@ fn context_hint(app: &App) -> Option<(&'static str, String)> {
         if matches!(app.right_view, RightView::New(_)) {
             return None;
         }
-        // ccdesk が取るのは予約キーだけ。残りは全部 claude が受ける
-        return Some(("terminal", "all keys pass through to claude".to_string()));
+        // ccdesk が取るのは予約キーだけ。残りは全部**その行の agent**が受ける
+        let agent = app
+            .shown_session()
+            .and_then(|id| app.row(id))
+            .map_or(Kind::default(), |row| row.kind);
+        return Some((
+            "terminal",
+            format!("all keys pass through to {}", agent.title()),
+        ));
     }
     if app.popup.is_some() {
         // メニューは開いている間すべてのキーを飲む ＝ 一覧のキーは出さない
