@@ -11,6 +11,7 @@
 //! demo 実装が何も起こさないので、ネットワーク・プロセス起動・ファイル読みは
 //! 呼び出し側の `if !demo` ではなく構造として止まる。
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 
@@ -178,9 +179,9 @@ pub(crate) trait DataSource: Send + Sync {
     /// live はポーラーが後から埋めるので既定値でよい
     fn footer(&self) -> FooterInfo;
 
-    /// 使用率（5h 枠 / 7d 枠 / モデル別週次）。**まだ答えが無いなら
-    /// [`Usage::Unknown`]**（「まだ分からない」と「取れなかった」を混ぜない）
-    fn usage(&self) -> Usage;
+    /// その agent の使用率。**まだ答えが無いなら [`Usage::Unknown`]**
+    /// （「まだ分からない」と「取れなかった」を混ぜない）
+    fn usage(&self, kind: Kind) -> Usage;
 
     /// 使用率をその場で取り直す（フッターの使用率をクリックしたとき）。
     /// **実際に取り直しを頼んだかを返す**: 呼び手はこれで取得中スピナーを
@@ -339,7 +340,7 @@ pub(crate) struct LiveSource {
     /// opt-in を要求する理由は資源ではなく、これが ccdesk で唯一「無人で Anthropic の
     /// サーバーへ出る」経路だから（判断とその根拠は [`crate::main`] にある）。
     /// **切っている人の環境では claude プロセスが 1 つも増えない**
-    usage: Option<(UsageSlot, UsageRefresh)>,
+    usage: Option<BTreeMap<Kind, (UsageSlot, UsageRefresh)>>,
     /// 「ディスク上の登録プロジェクトはこうなっている」とこのインスタンスが最後に
     /// 判断した一覧。**書き込みのマージの基準**（[`merge_projects`]）で、
     /// 起動時の読み込みと、**実際にディスクへ書いた内容**で更新する
@@ -365,11 +366,22 @@ impl LiveSource {
         ccdesk::reap_startup_leftovers();
         let sessions = SessionStore::detect();
         // **opt-in の分岐はここ 1 箇所。** off なら取得スレッドを起こさない
+        // **agent ごとに 1 本ずつ。** どれを取るかは [`Kind::ORDER`] が決めるので、
+        // agent を足しても取り漏らさない
         let usage = usage_display.then(|| {
-            let slot: UsageSlot = Arc::new(Mutex::new(Usage::default()));
-            let refresh =
-                crate::usage::spawn_poller(Arc::clone(&slot), usage_dirty, usage_fetching);
-            (slot, refresh)
+            Kind::ORDER
+                .into_iter()
+                .map(|kind| {
+                    let slot: UsageSlot = Arc::new(Mutex::new(Usage::default()));
+                    let refresh = crate::usage::spawn_poller(
+                        kind,
+                        Arc::clone(&slot),
+                        Arc::clone(&usage_dirty),
+                        Arc::clone(&usage_fetching),
+                    );
+                    (kind, (slot, refresh))
+                })
+                .collect()
         });
         Self {
             usage,
@@ -416,24 +428,31 @@ impl DataSource for LiveSource {
         FooterInfo::default() // 実値は spawn_footer_poller が書く
     }
 
-    fn usage(&self) -> Usage {
+    fn usage(&self, kind: Kind) -> Usage {
         // opt-in していなければスロットが無い ＝ 取得もしないし何も描かない
-        self.usage.as_ref().map_or(Usage::Unknown, |(slot, _)| {
-            slot.lock_recover()
-                .clone()
-        })
+        self.usage
+            .as_ref()
+            .and_then(|slots| slots.get(&kind))
+            .map_or(Usage::Unknown, |(slot, _)| slot.lock_recover().clone())
     }
 
+    /// **全 agent へ流す。** クリックは「使用率を取り直せ」という 1 つの操作で、
+    /// どの行を押したかで片方だけ取り直す形にはしない
     fn refresh_usage(&self) -> bool {
-        if let Some((_, refresh)) = &self.usage {
+        let Some(slots) = &self.usage else {
+            return false;
+        };
+        for (_, refresh) in slots.values() {
             refresh.request();
-            return true;
         }
-        false
+        !slots.is_empty()
     }
 
     fn note_turn_finished(&self) {
-        if let Some((_, refresh)) = &self.usage {
+        let Some(slots) = &self.usage else {
+            return;
+        };
+        for (_, refresh) in slots.values() {
             refresh.note_turn_finished();
         }
     }
@@ -587,7 +606,7 @@ impl DataSource for DemoSource {
         demo_footer()
     }
 
-    fn usage(&self) -> Usage {
+    fn usage(&self, _kind: Kind) -> Usage {
         Usage::Ready(demo_usage())
     }
 
@@ -750,7 +769,7 @@ mod tests {
             );
         }
 
-        let Usage::Ready(usage) = DemoSource.usage() else {
+        let Usage::Ready(usage) = DemoSource.usage(Kind::Claude) else {
             panic!("usage gauge is always present in demo data");
         };
         assert_eq!(usage.five.as_ref().map(|w| w.pct), Some(34.0));

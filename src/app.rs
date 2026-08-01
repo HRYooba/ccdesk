@@ -13,6 +13,8 @@ use crate::hooks::HookStates;
 use crate::keys::{encode_key, forward_mouse};
 use crate::poll::{AgentInfo, FooterInfo, Grouping};
 use crate::usage::Usage;
+use std::collections::BTreeMap;
+
 use crate::backend::{Inject, Kind, Launch};
 use crate::session::Session;
 use crate::sessions::{SessionId, SessionRow};
@@ -121,25 +123,16 @@ impl SidebarRow {
 pub(crate) enum SidebarPos {
     /// 一覧の行（[`App::sidebar_rows`] の index）
     Row(usize),
-    /// フッターのアカウント行。**今サインインしているアカウントを出すだけの行**で、
-    /// 選択とホバーはできるが押しても何も起きない（[`SidebarRow::Inert`] と同じ扱い。
-    /// 切り替えを持たない理由は [`crate::poll::AccountStatus`]）。
-    ///
-    /// **`SidebarRow::Inert` へは寄せられない**: あちらは `sidebar_rows` に積まれた
-    /// 行の種類で、この行はフッター（一覧の外・下端に固定）に描かれるため index を
-    /// 持たない。「押しても何も起きない」という**答え**は
-    /// [`selected_enter`] が `None` を返す 1 箇所に揃えてある
-    Account,
 }
 
 impl SidebarPos {
-    /// 一覧の行なら index。**アカウント行は一覧の外なので `None`**
-    /// （行のハイライト・行の動作の引き当て・スクロール追従はこれを見る）
+    /// 一覧の行の index（行のハイライト・行の動作の引き当て・スクロール追従が読む）。
+    ///
+    /// **`Option` のまま残してある**: 一覧の外を指す位置（かつてのアカウント行）が
+    /// また要るかもしれないので、呼び手を「必ず行がある」前提にしない
     pub(crate) fn row(self) -> Option<usize> {
-        match self {
-            Self::Row(row) => Some(row),
-            Self::Account => None,
-        }
+        let Self::Row(row) = self;
+        Some(row)
     }
 }
 
@@ -431,7 +424,7 @@ pub(crate) struct App {
     // 使用率（5h / 7d / モデル別週次）。**取るかどうかの判断は供給元**
     // （`DataSource::usage`）が持つので、ここは受け取った値だけを持つ。
     // 注入する settings には一切関係しない（[`crate::hooks::inject_settings`]）
-    pub(crate) usage: Usage,
+    pub(crate) usage: BTreeMap<Kind, Usage>,
     /// 使用率が更新されたことを取得スレッドが立てる合図（フッターと同じ作法）。
     /// **周期で読みに行かない**ので、使用率を切った環境ではこの旗が一度も立たない
     pub(crate) usage_dirty: Arc<std::sync::atomic::AtomicBool>,
@@ -531,7 +524,7 @@ impl Default for App {
             ccdesk_latest: None,
             ccdesk_latest_shared: Arc::new(Mutex::new(None)),
             ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            usage: Usage::default(),
+            usage: BTreeMap::new(),
             usage_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             usage_fetching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             usage_hovered: false,
@@ -861,7 +854,10 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             .usage_dirty
             .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            let usage = app.source.usage();
+            let usage: BTreeMap<Kind, Usage> = Kind::ORDER
+                .into_iter()
+                .map(|kind| (kind, app.source.usage(kind)))
+                .collect();
             if usage != app.usage {
                 app.usage = usage;
                 force_draw = true;
@@ -1147,10 +1143,7 @@ impl Enter {
 /// ここが `None` を返すことで表す ＝ 更新の無い版行（[`SidebarRow::Inert`]）と
 /// アカウント行（[`SidebarPos::Account`]）が同じ 1 つの答えを共有する
 pub(crate) fn selected_enter(app: &App) -> Option<Enter> {
-    let SidebarPos::Row(row) = app.selection else {
-        // アカウント行は今サインインしているアカウントを出すだけ
-        return None;
-    };
+    let SidebarPos::Row(row) = app.selection;
     match app.sidebar_rows.get(row)?.action()? {
         RowAction::New => Some(Enter::NewSession),
         RowAction::Open(_) | RowAction::Project(_) | RowAction::ToggleGroup => Some(Enter::Menu),
@@ -1170,9 +1163,7 @@ pub(crate) fn selected_enter(app: &App) -> Option<Enter> {
 /// 位置はクリックで開くときと同じ [`selected_row_y`]（開き方で場所が変わらない）
 fn run_enter(app: &mut App) {
     let anchor_y = selected_row_y(app);
-    let SidebarPos::Row(row) = app.selection else {
-        return; // メニューを持たない位置（アカウント行）
-    };
+    let SidebarPos::Row(row) = app.selection;
     let Some(action) = app.sidebar_rows.get(row).and_then(SidebarRow::action).cloned() else {
         return;
     };
@@ -1675,10 +1666,8 @@ fn open_project_popup(app: &mut App, cwd: String, anchor_y: u16) {
 /// メニューが行からずれて出るので、**キーボードもマウスもこの 1 つの計算に乗せる**。
 /// メニューの矩形はこの 1 つ下に出るので、Enter でメニューを開く位置は全部これを使う
 fn selected_row_y(app: &App) -> u16 {
-    match app.selection {
-        SidebarPos::Row(row) => row_y(row, app.sidebar_header_rows, app.sidebar_scroll),
-        SidebarPos::Account => sidebar_layout(app).account_y,
-    }
+    let SidebarPos::Row(row) = app.selection;
+    row_y(row, app.sidebar_header_rows, app.sidebar_scroll)
 }
 
 /// 指定フォルダ・プロンプトで前景セッションを 1 本起こす
@@ -1816,7 +1805,7 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
     // 当たり判定は描画と同じ導出（[`crate::ui::usage_hit`]）なので、
     // 出していないとき（notice 表示中・狭い端末・使用率を切っている）は当たらない
     let on_usage = crate::ui::usage_hit(app)
-        .is_some_and(|hit| mouse.row == hit.row && hit.columns.contains(&mouse.column));
+        .is_some_and(|hit| hit.rows.contains(&mouse.row) && hit.columns.contains(&mouse.column));
     // 乗っている間は帯で「押せる」ことを示す（一覧の行のホバーと同じ手段）
     app.usage_hovered = on_usage;
     if on_usage && let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
@@ -1847,20 +1836,6 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         }
         // アカウント行（フッター下段）はサイドバー一覧の行ではないので、
         // 一覧のヒットテスト（`row_at` はフッター帯を不感帯にする）ではなくここで受ける。
-        // **列は見ない = 行のどこを押しても当たる**（一覧の行と同じ規則）。
-        // **押しても何も起きない行**（今サインインしているアカウントを出すだけ）
-        // なので、受けるのは選択とホバーだけ ＝ 更新の無い版行と同じ扱い
-        if sl.footer_visible && mouse.row == sl.account_y {
-            // ホバーもここで決める ＝ **当たり判定はクリックと同じこの 1 分岐**
-            // （フッターを描いていない狭い端末はこの分岐に入らないのでホバーもしない）
-            app.hovered = Some(SidebarPos::Account);
-            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                app.set_focus(Focus::Sidebar);
-                // 選択もここへ移す（キーボードで降りたときと同じ位置に居る）
-                app.selection = SidebarPos::Account;
-            }
-            return Ok(false);
-        }
         // 画面 y → 行 index（列は見ないので行のどこを押しても当たる）。
         // 計算は描画側と同じ ui::row_at を共有する
         let row = row_at(
@@ -2176,33 +2151,20 @@ fn remove_window(app: &mut App, idx: usize) {
 /// （飾り ＝ [`SidebarRow::Decoration`] は飛ばす。押しても何も起きない行は止まる ＝
 /// 「触れる行」の集合はホバーと同じ [`SidebarRow::selectable`] 1 つで決まる）。
 ///
-/// **一覧とアカウント行は 1 つの輪**（マウスで押せる行はキーボードでも届く）:
-/// 一覧の末尾で `↓` → アカウント行 → もう一度 `↓` で一覧の先頭へ戻り、
-/// 一覧の先頭で `↑` はアカウント行へ回る。端で止めると「アカウント行から
-/// 一覧の先頭へ戻る」ために一覧全体を遡ることになる。
+/// **一覧は 1 つの輪**: 末尾で `↓` を押すと先頭へ、先頭で `↑` を押すと末尾へ回る。
+/// 端で止めると、先頭へ戻るために一覧全体を遡ることになる。
 ///
-/// **フッターを描いていないときは一覧の中だけで巡回する** ＝ 判断はマウスの
-/// 当たり判定と同じ [`sidebar_layout`] の `footer_visible`。
 /// 触れる行が 1 つも無ければ何も動かさない（無限に回らない）
 pub(crate) fn move_selection(app: &mut App, dir: i32) {
-    let len = app.sidebar_rows.len() as i32;
-    let account = sidebar_layout(app).footer_visible;
-    // アカウント行は「一覧の末尾の 1 つ先」に居る扱い。輪の長さはその 1 行を含む
-    let ring = len + i32::from(account);
+    let ring = app.sidebar_rows.len() as i32;
     if ring <= 0 {
         return;
     }
-    let mut at = match app.selection {
-        SidebarPos::Row(row) => row as i32,
-        SidebarPos::Account => len,
-    };
+    let SidebarPos::Row(row) = app.selection;
+    let mut at = row as i32;
     // 輪を 1 周するまで探す（触れる行が無ければ元の位置のまま戻る）
     for _ in 0..ring {
         at = (at + dir).rem_euclid(ring);
-        if at == len {
-            app.selection = SidebarPos::Account;
-            return;
-        }
         if app.sidebar_rows[at as usize].selectable() {
             app.selection = SidebarPos::Row(at as usize);
             app.sidebar_follow_sel = true; // 次の draw で選択行が見えるようスクロール
@@ -2586,7 +2548,7 @@ mod tests {
         let usage = crate::usage::sample_ready(Vec::new());
         let mut app = test_app(34, TERM);
         app.source = Arc::new(TestSource::for_usage(usage.clone(), Arc::clone(&refreshes)));
-        app.usage = usage;
+        app.usage = Kind::ORDER.into_iter().map(|k| (k, usage.clone())).collect();
         (app, refreshes)
     }
 
@@ -2597,12 +2559,16 @@ mod tests {
     fn clicking_the_usage_gauge_refetches_it() {
         let (mut app, refreshes) = usage_app();
         let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
-        assert_eq!(hit.row, TERM.1 - 1, "the gauge is on the bottom bar");
+        assert_eq!(
+            hit.rows,
+            TERM.1 - crate::ui::BOTTOM_BAR_ROWS..TERM.1,
+            "the gauge is not on the bottom bar"
+        );
 
         // 領域の左端・右端どちらを押しても当たる
         for column in [hit.columns.start, hit.columns.end - 1] {
             let before = refreshes.load(std::sync::atomic::Ordering::Relaxed);
-            handle_mouse(&mut app, &click(column, hit.row)).unwrap();
+            handle_mouse(&mut app, &click(column, hit.rows.start)).unwrap();
             assert_eq!(
                 refreshes.load(std::sync::atomic::Ordering::Relaxed),
                 before + 1,
@@ -2618,7 +2584,7 @@ mod tests {
         let (mut app, refreshes) = usage_app();
         let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
         // 領域の 1 桁左、そして同じ列の 1 行上
-        for (column, row) in [(hit.columns.start - 1, hit.row), (hit.columns.start, hit.row - 1)] {
+        for (column, row) in [(hit.columns.start - 1, hit.rows.start), (hit.columns.start, hit.rows.start - 1)] {
             handle_mouse(&mut app, &click(column, row)).unwrap();
         }
         assert_eq!(refreshes.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -2634,7 +2600,7 @@ mod tests {
 
         // 乗った ＝ 点く + 描き直す
         let prev = (app.hovered, app.usage_hovered);
-        handle_mouse(&mut app, &moved(hit.columns.start, hit.row)).unwrap();
+        handle_mouse(&mut app, &moved(hit.columns.start, hit.rows.start)).unwrap();
         assert!(app.usage_hovered, "the gauge is not marked as hovered");
         assert!(
             mouse_needs_redraw(MouseEventKind::Moved, prev, (app.hovered, app.usage_hovered)),
@@ -2643,14 +2609,14 @@ mod tests {
 
         // 乗ったまま動いた ＝ 描き直さない
         let prev = (app.hovered, app.usage_hovered);
-        handle_mouse(&mut app, &moved(hit.columns.end - 1, hit.row)).unwrap();
+        handle_mouse(&mut app, &moved(hit.columns.end - 1, hit.rows.start)).unwrap();
         assert!(
             !mouse_needs_redraw(MouseEventKind::Moved, prev, (app.hovered, app.usage_hovered)),
             "moving inside the gauge must not ask for a redraw"
         );
 
         // 外れた ＝ 消える（1 桁左はゲージの外）
-        handle_mouse(&mut app, &moved(hit.columns.start - 1, hit.row)).unwrap();
+        handle_mouse(&mut app, &moved(hit.columns.start - 1, hit.rows.start)).unwrap();
         assert!(!app.usage_hovered, "the mark stays after the mouse left");
     }
 
@@ -2662,7 +2628,7 @@ mod tests {
         // 取り直しを頼めた ＝ 回し始める
         let (mut app, _) = usage_app();
         let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
-        handle_mouse(&mut app, &click(hit.columns.start, hit.row)).unwrap();
+        handle_mouse(&mut app, &click(hit.columns.start, hit.rows.start)).unwrap();
         assert!(
             app.usage_fetching.load(std::sync::atomic::Ordering::Relaxed),
             "the spinner did not start on click"
@@ -2670,9 +2636,12 @@ mod tests {
 
         // 取得しない供給元（既定の DemoSource は取り直さない）＝ 立てない
         let mut app = test_app(34, TERM);
-        app.usage = crate::usage::sample_ready(Vec::new());
+        app.usage = Kind::ORDER
+            .into_iter()
+            .map(|k| (k, crate::usage::sample_ready(Vec::new())))
+            .collect();
         let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
-        handle_mouse(&mut app, &click(hit.columns.start, hit.row)).unwrap();
+        handle_mouse(&mut app, &click(hit.columns.start, hit.rows.start)).unwrap();
         assert!(
             !app.usage_fetching.load(std::sync::atomic::Ordering::Relaxed),
             "a spinner started that no one will stop"
@@ -2684,7 +2653,7 @@ mod tests {
     #[test]
     fn a_hidden_usage_gauge_has_no_hit_area() {
         let app = test_app(34, TERM);
-        assert!(matches!(app.usage, Usage::Unknown), "the fixture's premise broke");
+        assert!(app.usage.is_empty(), "the fixture's premise broke");
         assert!(crate::ui::usage_hit(&app).is_none());
     }
 
@@ -3150,14 +3119,12 @@ mod tests {
         (0..w).map(|x| buffer[(x, h - 1)].symbol()).collect()
     }
 
-    /// 触れる位置（一覧の実体のある行 + フッターのアカウント行）を、
-    /// **描画が積んだ行から**列挙する
+    /// 触れる位置（一覧の実体のある行）を、**描画が積んだ行から**列挙する
     fn touchable_positions(app: &mut App) -> Vec<SidebarPos> {
         drawn_bottom_bar(app); // 1 フレーム描いて行を積む
         (0..app.sidebar_rows.len())
             .filter(|row| app.sidebar_rows[*row].selectable())
             .map(SidebarPos::Row)
-            .chain(std::iter::once(SidebarPos::Account))
             .collect()
     }
 
@@ -3584,8 +3551,8 @@ mod tests {
             FooterInfo::default()
         }
 
-        fn usage(&self) -> Usage {
-            // テスト用の供給元は claude を起こさない（値は仕込まれたものを返すだけ）
+        fn usage(&self, _kind: Kind) -> Usage {
+            // テスト用の供給元は agent を起こさない（値は仕込まれたものを返すだけ）
             self.usage.clone()
         }
 
@@ -3660,48 +3627,6 @@ mod tests {
         }
     }
 
-    /// **アカウント行は押しても何も起きない。** 出しているのは「今サインインして
-    /// いるのは誰か」だけなので、行全体が当たっても起きるのは選択とホバーだけ
-    /// （メニューは開かず、幅変更ドラッグにもならない）。
-    /// 当たり判定は描画と同じ [`sidebar_layout`] の `account_y`
-    #[test]
-    fn clicking_the_account_row_only_moves_the_selection() {
-        let mut app = app_with_account_footer();
-        let sl = sidebar_layout(&app);
-        assert!(sl.footer_visible, "the footer must be visible for this test's premise");
-        // 内容の桁は x=1..=sidebar_width-2（枠の内側）。列 0 も行に当たる
-        let rightmost = app.sidebar_width - 2;
-        for col in [0, 1, 2, 5, rightmost - 1, rightmost] {
-            app.selection = SidebarPos::Row(0);
-            handle_mouse(&mut app, &click(col, sl.account_y)).unwrap();
-            assert!(app.popup.is_none(), "a menu opened at col={col}");
-            assert!(!app.dragging, "col={col} must not start a resize drag");
-            // 選択はアカウント行へ移る（キーボードで降りたときと同じ位置に居る）
-            assert_eq!(app.selection, SidebarPos::Account, "col={col}");
-            // ホバーもアカウント行を指す（一覧の行 index には化けない）
-            assert_eq!(app.hovered, Some(SidebarPos::Account), "col={col}");
-        }
-        assert_eq!(app.sidebar_width, 34, "sidebar width must not change");
-    }
-
-    /// **アカウント行を選んだ `Enter` は何も起こさない。**
-    /// 更新の無い版行（[`SidebarRow::Inert`]）と同じ答えを
-    /// [`selected_enter`] 1 箇所から得ることの固定
-    #[test]
-    fn pressing_enter_on_the_account_row_does_nothing() {
-        let mut app = app_with_account_footer();
-        app.sidebar_rows = vec![SidebarRow::Action(RowAction::New)];
-        app.sidebar_header_rows = 1;
-        app.selection = SidebarPos::Account;
-        assert_eq!(selected_enter(&app), None, "the account row claims an Enter action");
-        press(&mut app, KeyCode::Enter);
-        assert!(app.popup.is_none(), "Enter opened a menu on the account row");
-        assert!(
-            matches!(app.right_view, RightView::Sessions),
-            "Enter changed the right pane from the account row"
-        );
-        assert_eq!(app.selection, SidebarPos::Account, "Enter moved the selection");
-    }
 
     /// ホバーの行き先が両方ある `App`: フッターのアカウント行と、一覧の押せる行 1 本
     fn app_with_hoverable_rows() -> App {
@@ -3711,100 +3636,25 @@ mod tests {
         app
     }
 
-    /// **アカウント行はマウスを乗せただけでホバー対象になる。** 一覧の行 index では
-    /// 表せない位置なので、以前は「一覧の行ではない」として除外されていた。
-    /// マウスが離れれば（他の行・サイドバーの外）ホバーは外れる
-    #[test]
-    fn hovering_the_account_row_marks_it_as_hovered() {
-        let mut app = app_with_hoverable_rows();
-        let sl = sidebar_layout(&app);
-        assert!(sl.footer_visible, "the footer must be visible for this test's premise");
-
-        handle_mouse(&mut app, &moved(3, sl.account_y)).unwrap();
-        assert_eq!(app.hovered, Some(SidebarPos::Account));
-
-        // 一覧の行へ移ればそちらのホバーへ移る（アカウント行のハイライトは消える）
-        handle_mouse(&mut app, &moved(3, 1)).unwrap();
-        assert_eq!(app.hovered, Some(SidebarPos::Row(0)));
-        // サイドバーの外へ出ればホバーは無くなる
-        let outside = app.sidebar_width + 5;
-        handle_mouse(&mut app, &moved(outside, sl.account_y)).unwrap();
-        assert_eq!(app.hovered, None);
-    }
-
-    /// **ホバーとクリックはまったく同じ行に当たる。** 当たり判定を別に計算していない
-    /// ことの担保なので、片方の y だけを見るのではなく、サイドバー内の全 y について
-    /// 「ホバーがアカウント行になる y」と「クリックで選択がアカウント行へ移る y」の
-    /// 集合が一致することを見る
-    #[test]
-    fn the_hover_and_the_click_hit_the_account_row_at_the_same_rows() {
-        // 突く桁は枠の内側かつ幅変更のつかみ代の外（行のどこでも当たるので 1 つで足りる）
-        const COL: u16 = 3;
-        let sl = sidebar_layout(&app_with_hoverable_rows());
-        assert!(
-            COL < app_with_hoverable_rows().sidebar_width - 1,
-            "the probed column must be inside the sidebar"
-        );
-        let rows = TERM.1;
-        let hovered_rows: Vec<u16> = (0..rows)
-            .filter(|y| {
-                let mut app = app_with_hoverable_rows();
-                handle_mouse(&mut app, &moved(COL, *y)).unwrap();
-                app.hovered == Some(SidebarPos::Account)
-            })
-            .collect();
-        let clicked_rows: Vec<u16> = (0..rows)
-            .filter(|y| {
-                let mut app = app_with_hoverable_rows();
-                handle_mouse(&mut app, &click(COL, *y)).unwrap();
-                app.selection == SidebarPos::Account
-            })
-            .collect();
-        assert_eq!(hovered_rows, clicked_rows, "the hover and the click hit different rows");
-        // 空集合どうしの一致で通らないように、その 1 行が描画のジオメトリと同じことも見る
-        assert_eq!(
-            hovered_rows,
-            vec![sl.account_y],
-            "the account row is not where sidebar_layout says"
-        );
-    }
-
-    /// フッターが無い（狭い）端末ではアカウント行は描かれないのでホバー対象にもしない。
-    /// **描いていない行を光らせない**という選択と同じ規則
-    #[test]
-    fn a_hidden_footer_keeps_the_account_row_out_of_the_hover() {
-        let mut app = app_with_hoverable_rows();
-        app.term_size = (60, 8); // 下部バー 1 行を引くと footer_visible が落ちる高さ
-        let sl = sidebar_layout(&app);
-        assert!(!sl.footer_visible, "the footer must be hidden for this test's premise");
-        handle_mouse(&mut app, &moved(3, sl.account_y)).unwrap();
-        assert_ne!(
-            app.hovered,
-            Some(SidebarPos::Account),
-            "a row that is not drawn must not be hovered"
-        );
-    }
-
     /// マウス移動でホバー位置が変わらないなら描き直さない（FPS 対策）。
-    /// **アカウント行でも同じ**: 行の中で桁が動いただけでは再描画しない
+    /// 行の中で桁が動いただけでは再描画しない
     #[test]
     fn moving_the_mouse_inside_the_same_row_does_not_redraw() {
         let mut app = app_with_hoverable_rows();
-        let sl = sidebar_layout(&app);
-        handle_mouse(&mut app, &moved(3, sl.account_y)).unwrap();
+        handle_mouse(&mut app, &moved(3, 1)).unwrap();
         let prev = (app.hovered, app.usage_hovered);
-        handle_mouse(&mut app, &moved(10, sl.account_y)).unwrap();
+        handle_mouse(&mut app, &moved(10, 1)).unwrap();
         assert_eq!(app.hovered, prev.0, "the same row must resolve to the same hover");
         assert!(
             !mouse_needs_redraw(MouseEventKind::Moved, prev, (app.hovered, app.usage_hovered)),
-            "moving inside the account row must not ask for a redraw"
+            "moving inside a row must not ask for a redraw"
         );
         // 行が変われば描き直す
         let prev = (app.hovered, app.usage_hovered);
-        handle_mouse(&mut app, &moved(3, 1)).unwrap();
+        handle_mouse(&mut app, &moved(3, 2)).unwrap();
         assert!(
             mouse_needs_redraw(MouseEventKind::Moved, prev, (app.hovered, app.usage_hovered)),
-            "leaving the account row must ask for a redraw"
+            "leaving a row must ask for a redraw"
         );
         // 移動以外は表示を変えるので常に描き直す
         assert!(mouse_needs_redraw(
@@ -3863,45 +3713,14 @@ mod tests {
 
         press(&mut app, KeyCode::Down); // 区切り線は飛ばす
         assert_eq!(app.selection, SidebarPos::Row(2));
-        press(&mut app, KeyCode::Down);
-        assert_eq!(app.selection, SidebarPos::Account, "must reach the account row");
-        // アカウント行の先は一覧の先頭（端で止まらない）
+        // 末尾の先は一覧の先頭（端で止まらない）
         press(&mut app, KeyCode::Down);
         assert_eq!(app.selection, SidebarPos::Row(0), "must wrap around to the top of the list");
-        // 一覧の先頭で `↑` はアカウント行へ回る
+        // 先頭で `↑` は末尾へ回る
         press(&mut app, KeyCode::Up);
-        assert_eq!(app.selection, SidebarPos::Account, "must wrap around to the account row");
-        press(&mut app, KeyCode::Up);
-        assert_eq!(app.selection, SidebarPos::Row(2), "must return to the list");
+        assert_eq!(app.selection, SidebarPos::Row(2), "must wrap around to the bottom");
     }
 
-    /// フッターが無い（狭い）端末ではアカウント行は描かれないので選択対象にもしない。
-    /// **押せない位置に選択を残さない**という一覧の行と同じ規則で、
-    /// 巡回は一覧の中だけで閉じる
-    #[test]
-    fn a_hidden_footer_keeps_the_account_row_out_of_the_selection() {
-        let mut app = app_with_account_footer();
-        app.term_size = (60, 8); // 下部バー 1 行を引くと footer_visible が落ちる高さ
-        assert!(
-            !sidebar_layout(&app).footer_visible,
-            "the footer must be hidden for this test's premise"
-        );
-        app.sidebar_rows = vec![SidebarRow::Action(RowAction::New)];
-        app.sidebar_header_rows = 1;
-        app.selection = SidebarPos::Row(0);
-        for key in [KeyCode::Down, KeyCode::Up] {
-            press(&mut app, key);
-            assert_eq!(
-                app.selection,
-                SidebarPos::Row(0),
-                "{key:?} must not select a row that is not drawn"
-            );
-        }
-        // 触れる行が 2 本あれば一覧の中で巡回する（フッターへは出ない）
-        app.sidebar_rows.push(SidebarRow::Action(RowAction::ToggleGroup));
-        press(&mut app, KeyCode::Up);
-        assert_eq!(app.selection, SidebarPos::Row(1), "the list must loop on its own");
-    }
 
     /// 更新の入口のガード。**副作用（ダウンロード）が起きない経路だけを通す**:
     /// 新しい版を知らないとき / 実行中 / 再起動待ちは、押しても何も始まらない。
@@ -5334,9 +5153,7 @@ mod tests {
             SidebarRow::Action(RowAction::ToggleGroup),
         ];
         app.sidebar_header_rows = app.sidebar_rows.len();
-        let positions = (0..app.sidebar_rows.len())
-            .map(SidebarPos::Row)
-            .chain(std::iter::once(SidebarPos::Account));
+        let positions = (0..app.sidebar_rows.len()).map(SidebarPos::Row);
         for pos in positions {
             for code in [KeyCode::Left, KeyCode::Right] {
                 app.selection = pos;

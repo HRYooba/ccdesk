@@ -206,7 +206,10 @@ fn main() -> anyhow::Result<()> {
         ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // 起動時の値は供給元から 1 度受け取る（撮影用は固定値、実データは
         // まだ取れていないので Unknown ＝ 何も描かない）
-        usage: source.usage(),
+        usage: crate::backend::Kind::ORDER
+            .into_iter()
+            .map(|kind| (kind, source.usage(kind)))
+            .collect(),
         usage_dirty,
         usage_fetching,
         usage_hovered: false,

@@ -321,44 +321,92 @@ fn usage_spans(
 /// マウスが乗っている間は帯（`hl_bg`）で「押せる」ことを示す。一覧の行の
 /// ホバーと同じ手段（[`Look`]）。**帯は背景だけ ＝ 幅を変えない**ので、
 /// 乗った瞬間に当たり判定（[`usage_hit`]）が動かない
-fn usage_footer(app: &App) -> Vec<Span<'static>> {
+fn usage_footer(app: &App) -> Vec<Vec<Span<'static>>> {
     if app.notice.is_some() {
         return Vec::new();
     }
-    let mut spans = usage_line(
-        &app.usage,
-        // キーヒントを押し出さないよう、使用率に渡すのは幅の半分まで
-        app.term_size.0 / 2,
-        app.usage_fetching.load(std::sync::atomic::Ordering::Relaxed),
-    );
-    if app.usage_hovered {
-        for span in &mut spans {
-            span.style = span.style.bg(ui().hl_bg);
+    let fetching = app.usage_fetching.load(std::sync::atomic::Ordering::Relaxed);
+    // 各行は「agent 名 + アカウント + 枠」。**アカウントはここにしか出ない**
+    // （サイドバーのフッターは廃止した ＝ 同じことを 2 箇所に出さない）
+    let mut lines: Vec<Vec<Span<'static>>> = Kind::ORDER
+        .into_iter()
+        .map(|kind| {
+            let mut spans = vec![Span::styled(
+                format!(" {} ", kind.title()),
+                Style::default().fg(MUTED_FG),
+            )];
+            let (label, style) = account_cell(&app.footer.account);
+            spans.push(Span::styled(label, style));
+            spans.extend(usage_line(
+                app.usage.get(&kind).unwrap_or(&Usage::Unknown),
+                // キーヒントを押し出さないよう、使用率に渡すのは幅の半分まで
+                app.term_size.0 / 2,
+                fetching,
+            ));
+            spans
+        })
+        .collect();
+    // ブロックとして右端へ寄せるので、中は左揃えに整える
+    // （agent 名とアカウントの桁が縦に揃う ＝ 2 行が 1 つの塊に見える）
+    let widest = lines.iter().map(|l| span_width(l)).max().unwrap_or(0);
+    for line in &mut lines {
+        let pad = widest.saturating_sub(span_width(line)) as usize;
+        if pad > 0 {
+            line.push(Span::raw(" ".repeat(pad)));
+        }
+        if app.usage_hovered {
+            for span in line.iter_mut() {
+                span.style = span.style.bg(ui().hl_bg);
+            }
         }
     }
-    spans
+    lines
+}
+
+/// 使用率行の左に置くアカウント表示。**未ログインは黄のまま**
+/// （サイドバーから移しても気づきやすさを落とさない）
+fn account_cell(status: &AccountStatus) -> (String, Style) {
+    let (text, style) = account_row(status);
+    if text.is_empty() {
+        return (String::new(), style);
+    }
+    (format!("{text}  "), style)
 }
 
 /// 使用率のクリック当たり判定（右下の使用率を押すとその場で取り直す）
 pub(crate) struct UsageHit {
-    pub(crate) row: u16,
+    /// 使用率が占める行（下部バーの上端から下端まで）
+    pub(crate) rows: std::ops::Range<u16>,
     pub(crate) columns: std::ops::Range<u16>,
 }
 
 /// 使用率が今どこに描かれているか。出していないときは None ＝ 当たらない
 pub(crate) fn usage_hit(app: &App) -> Option<UsageHit> {
     let (width, height) = app.term_size;
-    if height == 0 {
+    if height < BOTTOM_BAR_ROWS {
         return None;
     }
-    let drawn = span_width(&usage_footer(app));
+    // **枠を 1 つも出していないなら当たらない。** アカウントだけの行は
+    // 押しても取り直すものが無い（使用率は opt-in。[`crate::main`]）
+    if !Kind::ORDER
+        .into_iter()
+        .any(|kind| !matches!(app.usage.get(&kind), None | Some(Usage::Unknown)))
+    {
+        return None;
+    }
+    let lines = usage_footer(app);
+    let drawn = lines.iter().map(|l| span_width(l)).max().unwrap_or(0);
     (drawn > 0).then(|| UsageHit {
-        // 下部バーは最下行（[`draw`] の縦分割と同じ）
-        row: height - 1,
+        // 下部バーは画面の末尾 [`BOTTOM_BAR_ROWS`] 行（[`draw`] の縦分割と同じ）
+        rows: height - BOTTOM_BAR_ROWS..height,
         // 右端に寄せて描くので、占めるのは末尾 `drawn` 列
         columns: width.saturating_sub(drawn)..width,
     })
 }
+
+/// 下部バーの行数。**「右ペインはどこか」（[`pane_rect`]）もここから導く**ので、
+/// 行数を増やしてもペインの高さ・PTY のサイズ・当たり判定が一斉に追随する
+pub(crate) const BOTTOM_BAR_ROWS: u16 = 2;
 
 /// 表示幅（`Span` の表示幅の合計）。**文字数ではなく表示幅**で測る:
 /// モデル名は claude が返す表示名なので、全角を含みうる
@@ -372,29 +420,27 @@ fn span_width(spans: &[Span<'_>]) -> u16 {
 
 /// サイドバーのジオメトリ（描画とクリック判定で同じ計算を共有する）
 pub(crate) struct SidebarLayout {
-    /// 一覧に使える行数（枠とフッターを除く）
+    /// 一覧に使える行数（上下の枠を除く）
     pub(crate) capacity: usize,
-    /// フッターを描くか（狭すぎる端末では描かない = クリックも受けない）
-    pub(crate) footer_visible: bool,
-    /// アカウント行の画面 y（footer_visible のときだけ有効）
-    pub(crate) account_y: u16,
 }
 
 pub(crate) fn sidebar_layout(app: &App) -> SidebarLayout {
-    // 下部バー 1 行を除いたサイドバー矩形は draw の chunks[0] と一致する
-    sidebar_layout_of(app.term_size.1.saturating_sub(1), sidebar_cols(app))
+    // 下部バーを除いたサイドバー矩形は draw の chunks[0] と一致する
+    sidebar_layout_of(
+        app.term_size.1.saturating_sub(BOTTOM_BAR_ROWS),
+        sidebar_cols(app),
+    )
 }
 
 /// [`sidebar_layout`] の本体。更新行が上部の版行に集約されたことでフッターは
 /// 「区切り線 + アカウント行」の 2 行に固定され、ジオメトリはサイドバー矩形の
 /// 大きさだけで決まる純関数になった（App を組まずにテストできる）
 fn sidebar_layout_of(height: u16, sidebar_width: u16) -> SidebarLayout {
-    let footer_visible = height >= 8 && sidebar_width > 4;
-    let footer_rows = if footer_visible { 2 } else { 0 };
+    // **フッターはもう無い。** アカウントは下部バーの使用率行の左へ移した
+    // （同じことを 2 箇所に出さない）ので、サイドバーは枠の 2 行だけを引く
+    let _ = sidebar_width;
     SidebarLayout {
-        capacity: (height as usize).saturating_sub(2 + footer_rows),
-        footer_visible,
-        account_y: height.saturating_sub(2),
+        capacity: (height as usize).saturating_sub(2),
     }
 }
 
@@ -1096,21 +1142,29 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, app: &App) {
     // 「取得が効いていない」「枠が無いアカウント」「壊れた」が全部同じ
     // 見え方（何も出ない）で、opt-in したのに出ない人へ渡せる情報が無かった
     // **当たり判定（[`usage_hit`]）と同じ導出**を通す
-    let usage_spans = usage_footer(app);
-    let usage_w = span_width(&usage_spans);
+    let usage_lines = usage_footer(app);
+    let usage_w = usage_lines.iter().map(|l| span_width(l)).max().unwrap_or(0);
     let bar = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(1), Constraint::Length(usage_w)])
         .split(area);
+    // **キーヒントは最下行の左**（今までどおり）。上の行は使用率だけが使う
+    let hint_row = Rect {
+        y: bar[0].y + bar[0].height.saturating_sub(1),
+        height: 1,
+        ..bar[0]
+    };
     // new session 画面のヒントはペイン内に出すため、下部バーには重ねない
     frame.render_widget(
         ratatui::widgets::Paragraph::new(Line::from(hint_spans))
             .style(Style::default().fg(ui().dim)),
-        bar[0],
+        hint_row,
     );
     if usage_w > 0 {
         frame.render_widget(
-            ratatui::widgets::Paragraph::new(Line::from(usage_spans)),
+            ratatui::widgets::Paragraph::new(
+                usage_lines.into_iter().map(Line::from).collect::<Vec<_>>(),
+            ),
             bar[1],
         );
     }
@@ -1125,14 +1179,14 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, app: &App) {
 pub(crate) fn pane_rect(app: &App) -> Rect {
     let (w, h) = (app.term_size.0, app.term_size.1);
     let sidebar = sidebar_cols(app).min(w);
-    Rect::new(sidebar, 0, w - sidebar, h.saturating_sub(1))
+    Rect::new(sidebar, 0, w - sidebar, h.saturating_sub(BOTTOM_BAR_ROWS))
 }
 
 pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // 最下行は横断のキーヒントバー
     let vert = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([Constraint::Min(1), Constraint::Length(BOTTOM_BAR_ROWS)])
         .split(frame.area());
     // 横の分割は pane_rect と同じ答えになる（右ペインの矩形の正本はあちら）
     let chunks = Layout::default()
@@ -1455,10 +1509,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     follow_pane(app, app.shown_session().cloned());
     // 選択が浮いたら（行構成が変わった / 狭くてフッターが消えた）先頭の
     // 触れる行へ寄せる。**実体の無い位置に選択を残さない**
-    let selection_lost = match app.selection {
-        SidebarPos::Row(row) => !app.sidebar_rows.get(row).is_some_and(SidebarRow::selectable),
-        SidebarPos::Account => !sl.footer_visible,
-    };
+    let SidebarPos::Row(selected) = app.selection;
+    let selection_lost = !app
+        .sidebar_rows
+        .get(selected)
+        .is_some_and(SidebarRow::selectable);
     if selection_lost {
         app.selection = SidebarPos::Row(
             app.sidebar_rows
@@ -1502,38 +1557,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             .border_style(border_style(app.focus == Focus::Sidebar)),
     );
     frame.render_widget(list, chunks[0]);
-
-    // ---- サイドバー下部フッター: 区切り線 / アカウント行 ----
-    // claude の更新行はここには無い（上部の版行に集約した）
-    if sl.footer_visible {
-        let fx = chunks[0].x + 1;
-        let fw = chunks[0].width - 2;
-        let account_y = sl.account_y;
-        // 区切り線（Desktop 風にフッターを本文から分ける。線の文字は separator_text が正本）
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new(
-                Line::from(separator_text(fw)).style(Style::default().fg(ui().dim)),
-            ),
-            Rect::new(fx, account_y - 1, fw, 1),
-        );
-        // アカウント行（表示名 · 組織名）。文面の判断は account_row に閉じる。
-        // **選択とホバーはできるが押しても何も起きない行**（当たり判定は
-        // handle_mouse 側が同じ `sidebar_layout` の account_y で持ち、
-        // キーボードの選択は [`SidebarPos::Account`]）
-        let (account, mut account_style) = account_row(&app.footer.account);
-        // 選択中・ホバー中は一覧の行とまったく同じ見え方にする
-        // （キーボードで降りてもマウスを乗せても「今ここ」が同じ帯で分かる）
-        account_style = Look::at(app, SidebarPos::Account, false).band(account_style);
-        // **スタイルは `Line` ではなく `Paragraph` へ載せる。** `Paragraph` は
-        // 自分のスタイルを矩形全体へ塗ってから文字を書くので、帯が一覧の行と同じ
-        // 行幅いっぱいまで伸びる。`Line` に載せると塗られるのは文字が占める桁だけで、
-        // 一覧の行（`ListItem` ＝ ratatui がリスト幅まで埋める）より短い帯になる
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new(Line::from(clip_to_width(&account, fw)))
-                .style(account_style),
-            Rect::new(fx, account_y, fw, 1),
-        );
-    }
 
     // 最下行の横断バー。**サイドバーを積んだ後に描くのが要点**で、案内は選択行の
     // 種類で変わるため、先に描くと 1 フレーム前の行の案内が出る（選択を動かした
@@ -1802,11 +1825,17 @@ pub(crate) mod tests {
     #[test]
     fn the_usage_gauge_is_banded_only_while_hovered() {
         let mut app = App {
-            usage: crate::usage::sample_ready(Vec::new()),
+            usage: Kind::ORDER
+                .into_iter()
+                .map(|k| (k, crate::usage::sample_ready(Vec::new())))
+                .collect(),
             term_size: (120, 30),
             ..Default::default()
         };
-        let plain = usage_footer(&app);
+        let spans = |app: &App| -> Vec<Span<'static>> {
+            usage_footer(app).into_iter().flatten().collect()
+        };
+        let plain = spans(&app);
         assert!(!plain.is_empty(), "the fixture's premise broke — nothing is drawn");
         assert!(
             plain.iter().all(|s| s.style.bg.is_none()),
@@ -1814,7 +1843,7 @@ pub(crate) mod tests {
         );
 
         app.usage_hovered = true;
-        let hovered = usage_footer(&app);
+        let hovered = spans(&app);
         assert!(
             hovered.iter().all(|s| s.style.bg == Some(ui().hl_bg)),
             "the hover puts no band on the gauge"
@@ -2675,68 +2704,7 @@ pub(crate) mod tests {
         assert_eq!(clip_to_width(wide, 0), "");
     }
 
-    /// **今サインインしているアカウントがフッターに出る。**
-    ///
-    /// ジオメトリだけを見る他のフッターテストと違い、ここは実際に 1 フレーム
-    /// 描いて中身を見る: 版行が上部へ移って 2 行固定になったフッターと、
-    /// アカウント行が噛み合っていることは「その行に何が出たか」でしか固定できない。
-    /// 供給元は [`DemoSource`] 既定の `App`（ファイルもネットワークも触らない）
-    #[test]
-    fn the_account_row_shows_the_signed_in_account() {
-        use crate::poll::FooterInfo;
 
-        let mut app = App {
-            term_size: (120, 30),
-            footer: FooterInfo {
-                account: AccountStatus::LoggedIn("you · Acme, Inc.".to_string()),
-                versions: Default::default(),
-            },
-            ..Default::default()
-        };
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
-        terminal
-            .draw(|frame| {
-                draw(frame, &mut app);
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let row = |y: u16| -> String {
-            (0..120).map(|x| buffer[(x, y)].symbol()).collect::<String>()
-        };
-        // 端末高さ 30 → サイドバー高さ 29（下部バー 1 行を除く）。y は画面座標
-        let sl = sidebar_layout_of(29, 34);
-
-        assert!(
-            row(sl.account_y).contains("you · Acme, Inc."),
-            "the account row has no label: {:?}",
-            row(sl.account_y)
-        );
-        assert!(
-            row(sl.account_y - 1).contains('─'),
-            "the row above the account row is not a separator: {:?}",
-            row(sl.account_y - 1)
-        );
-    }
-
-    /// フッターは「区切り線 + アカウント行」の 2 行に固定された
-    /// （claude の更新行は上部の版行へ移したので、更新の有無で高さが変わらない）
-    #[test]
-    fn sidebar_footer_is_the_separator_and_the_account_row() {
-        // 端末高さ 30 → サイドバー矩形の高さ 29（下部バー 1 行を除く）
-        let sl = sidebar_layout_of(29, 34);
-        assert!(sl.footer_visible);
-        // 内側は 27 行（上下の枠を除く）。フッター 2 行を引いた 25 行が一覧の表示窓
-        assert_eq!(sl.capacity, 25);
-        // アカウント行は内側の最終行、その 1 つ上が区切り線
-        assert_eq!(sl.account_y, 27);
-        // 表示窓は上枠の次（y = 1）から始まるので、区切り線の 1 つ上までで尽きる
-        assert_eq!(1 + sl.capacity, (sl.account_y - 1) as usize);
-        // 狭い端末ではフッターを描かない = クリックも受けない
-        for (h, w) in [(7u16, 34u16), (29, 4)] {
-            assert!(!sidebar_layout_of(h, w).footer_visible, "h={h} w={w}");
-        }
-    }
 
     /// クリック判定はヘッダー先頭の版行に当たる。行 index は列を取らない
     /// = **行のどこを押しても同じ行**（マーカーの桁だけが当たり判定ではない）。
@@ -2762,7 +2730,7 @@ pub(crate) mod tests {
         }
         // 上枠とフッター帯・下枠は不感帯
         assert_eq!(row_at(0, sl.capacity, 7, 0), usize::MAX);
-        for y in [sl.account_y - 1, sl.account_y, sl.account_y + 1] {
+        for y in [sl.capacity as u16 + 1, sl.capacity as u16 + 2] {
             assert_eq!(row_at(y, sl.capacity, 7, 0), usize::MAX, "y={y}");
         }
     }
@@ -3902,79 +3870,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// ログイン済みのアカウント行を持つ `App`
-    fn app_with_account_row() -> App {
-        use crate::poll::FooterInfo;
 
-        App {
-            term_size: (120, 30),
-            footer: FooterInfo {
-                account: AccountStatus::LoggedIn("you · Acme, Inc.".to_string()),
-                versions: Default::default(),
-            },
-            ..Default::default()
-        }
-    }
 
-    /// アカウント行の描画（文字と色）を 1 フレーム描いて取り出す。
-    /// **見た目が同じか**を突き合わせたいので、帯の色を式で持たずに実描画を比べる
-    fn drawn_account_row(app: &mut App) -> Vec<(String, Color, Color)> {
-        let (w, h) = app.term_size;
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("test terminal");
-        terminal
-            .draw(|frame| {
-                draw(frame, app);
-            })
-            .expect("draw");
-        let buffer = terminal.backend().buffer();
-        let y = sidebar_layout(app).account_y;
-        (0..w)
-            .map(|x| {
-                let cell = &buffer[(x, y)];
-                (cell.symbol().to_string(), cell.fg, cell.bg)
-            })
-            .collect()
-    }
-
-    /// **アカウント行はマウスを乗せても帯でハイライトされる。**
-    /// フッターに描かれる行なので一覧の行 index では表せず、以前はホバーから
-    /// 除外されていた（[`SidebarPos::Account`] を指せるようになったことの固定）。
-    ///
-    /// **選択とホバーは同じ帯だが同じ見た目ではない**（[`Look`]）: 帯は
-    /// 「今ここを指している」で共通、前景の強調が付くのは選択だけ。
-    /// 帯の色は書き写さず、**3 つの描画を突き合わせて**関係だけを見る
-    #[test]
-    fn the_account_row_is_highlighted_while_hovered() {
-        let bg_of = |row: &[(String, Color, Color)]| {
-            row.iter().map(|(_, _, bg)| *bg).collect::<Vec<_>>()
-        };
-        let mut app = app_with_account_row();
-        let plain = drawn_account_row(&mut app);
-
-        app.selection = SidebarPos::Account;
-        let selected = drawn_account_row(&mut app);
-        assert_ne!(plain, selected, "the premise broke — selection no longer highlights the row");
-
-        app.selection = SidebarPos::Row(0);
-        app.hovered = Some(SidebarPos::Account);
-        let hovered = drawn_account_row(&mut app);
-        assert_ne!(hovered, plain, "hovering the account row does not highlight it");
-        // 帯（背景）は選択と同じ ＝ 「今ここ」は同じ手段で示す
-        assert_eq!(bg_of(&hovered), bg_of(&selected), "hover uses a different band");
-        // 前景の強調は選択だけ ＝ 選択とホバーが見分けられる
-        assert_ne!(hovered, selected, "hover and selection are indistinguishable");
-
-        // 外れたら消える（帯が残らない）
-        app.hovered = Some(SidebarPos::Row(0));
-        assert_eq!(
-            drawn_account_row(&mut app),
-            plain,
-            "the highlight stays after the mouse left the account row"
-        );
-        app.hovered = None;
-        assert_eq!(drawn_account_row(&mut app), plain);
-    }
 
     /// 1 フレーム描いて、指定行で**帯（ハイライト背景）が乗っている桁**を返す。
     ///
@@ -3993,42 +3890,6 @@ pub(crate) mod tests {
         (0..w).filter(|x| buffer[(*x, y)].bg == ui().hl_bg).collect()
     }
 
-    /// **アカウント行の帯は一覧の行と同じ行幅いっぱいに出る。**
-    ///
-    /// アカウント行は `Paragraph` + `Rect`、一覧の行は `List` の `ListItem` で描かれる。
-    /// `Paragraph` はスタイルを `Line` に載せると**文字が占める桁だけ**が塗られるので、
-    /// リスト幅まで埋める `ListItem` より短い帯になっていた（実機のスクリーンショットで
-    /// `+ new session` は幅いっぱい・アカウント行は文字幅だけ）。
-    ///
-    /// 「同じ幅」は桁数を書き写さず、**同じ App の一覧の行と突き合わせて**見る
-    #[test]
-    fn the_account_row_band_is_as_wide_as_a_list_row() {
-        let mut app = app_with_account_row();
-        // 突き合わせる相手は `+ new session`（文字が短いので帯を埋めているかが出る）。
-        // 行 index は描画結果から引く
-        highlighted_columns(&mut app, 0);
-        let new_row = app
-            .sidebar_rows
-            .iter()
-            .position(|row| row.action() == Some(&RowAction::New))
-            .expect("the + new session row was not stacked");
-        let new_y = row_y(new_row, app.sidebar_header_rows, app.sidebar_scroll);
-        let account_y = sidebar_layout(&app).account_y;
-
-        app.selection = SidebarPos::Row(new_row);
-        let list_band = highlighted_columns(&mut app, new_y);
-        assert!(
-            list_band.len() > "+ new session".len(),
-            "the premise broke — the list row's band stops at its text: {list_band:?}"
-        );
-
-        app.selection = SidebarPos::Account;
-        assert_eq!(
-            highlighted_columns(&mut app, account_y),
-            list_band,
-            "the account row's band is not the same width as a list row's"
-        );
-    }
 
     /// **更新の無い版行も、触れれば他の行と同じ帯が出る。** 以前は動作の無い行を
     /// 区切り線と同じ扱いにしていたので、選択もホバーもハイライトも全部から漏れていた。

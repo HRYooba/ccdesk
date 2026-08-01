@@ -216,6 +216,7 @@ fn arbitrate(current: &Usage, next: Usage) -> Usage {
 /// （[`crate::poll`]）と同じ扱いで、待ちに入るのはこのスレッドだけなので TUI は
 /// 止まらない。**待ちの作法を 2 通り持たない**ためにあちらへ揃えてある
 pub(crate) fn spawn_poller(
+    kind: crate::backend::Kind,
     slot: UsageSlot,
     dirty: Arc<std::sync::atomic::AtomicBool>,
     fetching: Arc<std::sync::atomic::AtomicBool>,
@@ -234,7 +235,8 @@ pub(crate) fn spawn_poller(
                 fetching.store(true, std::sync::atomic::Ordering::Relaxed);
                 dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            let next = fetch();
+            // **取り方は agent が持つ**（[`crate::backend::Backend::usage`]）
+            let next = kind.backend().usage();
             fetching.store(false, std::sync::atomic::Ordering::Relaxed);
             let fetched_at = std::time::Instant::now();
 
@@ -376,7 +378,7 @@ fn probe() -> Result<Value, ProbeError> {
 }
 
 /// 1 回取得する（取得スレッド用。落ちた段は表示に出さないので潰す）
-fn fetch() -> Usage {
+pub(crate) fn fetch_claude() -> Usage {
     match probe() {
         Ok(v) => parse_response(&v, ccdesk::now_secs()),
         Err(_) => Usage::Failed,

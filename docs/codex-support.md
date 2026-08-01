@@ -65,6 +65,9 @@ codex の transcript にあたるファイル（rollout）は、セッション�
 `codex app-server` の JSON-RPC メソッド `account/rateLimits/read`。claude 側の
 `get_usage` と同じ性質を実測で確認した。
 
+**rollout にも `rate_limits` は載るが、そちらは最後にセッションが動いた時点の値。**
+実測で rollout の最新が 1%、この経路が 2% だった ＝ 現在値が要るならこちらを読む。
+
 | | claude | codex |
 |:--|:--|:--|
 | 経路 | ヘッドレス起動 + 制御チャンネル | `codex app-server` + JSON-RPC |

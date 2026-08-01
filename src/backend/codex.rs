@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use portable_pty::CommandBuilder;
 
-use crate::backend::{codex_index, AgentVersion, Backend, Inject, Launch};
+use crate::backend::{codex_app_server, codex_index, AgentVersion, Backend, Inject, Launch};
 use crate::hooks::{HOOK_EVENTS, HOOK_TIMEOUT_SECS, ROW_ENV};
 use crate::sessions::SessionId;
 
@@ -114,6 +114,15 @@ impl Backend for Codex {
 
     fn update_program(&self) -> &'static str {
         PROGRAM
+    }
+
+    /// app-server へ 1 往復（[`codex_app_server`]）。**rollout は読まない**
+    /// （あちらは最後にセッションが動いた時点の値で、現在値ではない）
+    fn usage(&self) -> crate::usage::Usage {
+        match codex_app_server::rate_limits(PROGRAM, ccdesk::now_secs()) {
+            Some(info) => crate::usage::Usage::Ready(info),
+            None => crate::usage::Usage::Failed,
+        }
     }
 }
 

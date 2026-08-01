@@ -96,6 +96,12 @@ impl Backend for Claude {
     fn update_program(&self) -> &'static str {
         PROGRAM
     }
+
+    /// 取得から解釈まで [`crate::usage`] が一手に持つ（claude を短命な
+    /// ヘッドレスプロセスとして起こし、SDK の制御チャンネルへ 1 往復投げる）
+    fn usage(&self) -> crate::usage::Usage {
+        crate::usage::fetch_claude()
+    }
 }
 
 #[cfg(test)]

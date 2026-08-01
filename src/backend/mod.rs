@@ -14,6 +14,7 @@
 
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod codex_app_server;
 pub(crate) mod codex_index;
 
 use portable_pty::CommandBuilder;
@@ -152,6 +153,10 @@ pub(crate) trait Backend: Send + Sync {
 
     /// 更新を走らせるコマンド（`<program> update`）。**版行の更新導線**
     fn update_program(&self) -> &'static str;
+
+    /// 使用率（枠の残り）。**取得の作法は agent ごとに違う**が、どちらも
+    /// ターンを起こさず・課金せず・記録を残さない経路を通る
+    fn usage(&self) -> crate::usage::Usage;
 }
 
 /// agent 1 つぶんの版。**「新しい版があるときだけ Some」**という形は
