@@ -15,7 +15,7 @@ use crate::app::{
     selected_enter, App, Focus, Popup, PopupKind, RightView, RowAction, SelfUpdate, SidebarPos,
     SidebarRow,
 };
-use crate::poll::{row_state, AccountStatus, Group, Grouping, Run};
+use crate::poll::{row_state, AccountStatus, State, Grouping, Run};
 use crate::sessions::SessionId;
 use crate::theme::{
     ui, usage_color, C_ATTENTION, C_FAIL, C_WORKING, FOCUS_BORDER, MUTED_FG,
@@ -38,7 +38,7 @@ use crate::usage::{Usage, UsageInfo, UsageWindow};
 /// |:--|:--|:--|
 /// | 形の大きさ | 止まっているか | 丸（[`DOT_FILLED`]/[`DOT_HOLLOW`]）/ 一回り小さい丸（[`DOT_STOPPED_FILLED`]/[`DOT_STOPPED_HOLLOW`]）＝ Stopped |
 /// | 塗り | 未読（見ていない間にその行が動いた） | 塗り ＝ 未読 / 中空 ＝ 既読（大小のどちらでも保たれる） |
-/// | 色 | 状態（[`crate::poll::Group`]） | Waiting/Working/Completed/Stopped の 4 色 |
+/// | 色 | 状態（[`crate::poll::State`]） | Waiting/Working/Completed/Stopped の 4 色 |
 /// | 明滅 | Working だけ | 400ms 周期で状態色 ↔ [`crate::theme::UiTheme::dim`]（淡色テキストと同じ色）を往復 |
 ///
 /// 4 つを同じ 1 桁へ載せるのは、行を縦に流し読みするときに「未読か」「どの状態か」
@@ -64,7 +64,7 @@ const CLOSED_MARK: &str = " ";
 /// ドットの塗り（未読チャンネル）。色と明滅は [`session_row_line`] が別に決める
 const DOT_FILLED: &str = "●";
 const DOT_HOLLOW: &str = "○";
-/// 止まった行（[`Group::Stopped`]）のドット。**同じ丸のまま一回り小さい**ので、
+/// 止まった行（[`State::Stopped`]）のドット。**同じ丸のまま一回り小さい**ので、
 /// 塗り（未読）はそのまま読めて「もう動かない行」だけが引っ込んで見える。
 ///
 /// **形で分けるのが要る理由**: Stopped の色は [`crate::theme::UiTheme::dim`] で、
@@ -75,10 +75,10 @@ const DOT_STOPPED_FILLED: &str = "•";
 const DOT_STOPPED_HOLLOW: &str = "◦";
 
 /// ドットのグリフ。**形の種類が「止まっているか」、塗りが「未読か」**を表す
-/// （色は [`Group::color`]、明滅は [`Group::blinks`] が別に決める ＝ 4 つの
+/// （色は [`State::color`]、明滅は [`State::blinks`] が別に決める ＝ 4 つの
 /// チャンネルがどれも他の値を書き換えない）
-fn dot_glyph(group: Group, unread: bool) -> &'static str {
-    if group == Group::Stopped {
+fn dot_glyph(group: State, unread: bool) -> &'static str {
+    if group == State::Stopped {
         mark(unread, DOT_STOPPED_FILLED, DOT_STOPPED_HOLLOW)
     } else {
         mark(unread, DOT_FILLED, DOT_HOLLOW)
@@ -809,11 +809,11 @@ impl Look {
 /// 決まる ＝ 窓（PTY）を起こさずに見た目を検査できる
 struct RowData {
     action: RowAction,
-    /// 状態そのもの。**ドットの色・明滅もここから導く**（[`Group::color`] /
-    /// [`Group::blinks`]）ので、`group` と食い違う色や明滅を別に持たせられない
+    /// 状態そのもの。**ドットの色・明滅もここから導く**（[`State::color`] /
+    /// [`State::blinks`]）ので、`group` と食い違う色や明滅を別に持たせられない
     /// （これを別フィールドで持っていた頃は、`look_fixture` のような手組みの
     /// `RowData` で Stopped なのに Working の色、という矛盾を作れてしまっていた）
-    group: Group,
+    group: State,
     cwd: String,
     label: String,
     /// 今ペインに出ている行（[`Look::open`] の材料）
@@ -828,7 +828,7 @@ struct RowData {
 /// 帯（選択・ホバー）と印（ペインに出ている・ドット）の重なり方も含めて
 /// [`Frame`] を用意せずに検査できる。
 ///
-/// `blink_lit` は今このフレームが明滅の「点灯」位相か（[`Group::blinks`] な
+/// `blink_lit` は今このフレームが明滅の「点灯」位相か（[`State::blinks`] な
 /// 行だけに効く）。**時計を直接読まず引数で受ける**ので、位相を固定してテストできる
 /// （[`draw`] は 1 フレームぶんの全行に同じ位相を渡す）
 fn session_row_line(d: &RowData, look: Look, inner_width: u16, blink_lit: bool) -> Line<'static> {
@@ -1135,7 +1135,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     struct WindowView {
         session_id: crate::sessions::SessionId,
         alive: bool,
-        busy: bool,
+        pty: crate::poll::PtyHint,
         /// この窓が claude を起こした時刻（hook の新旧判断の材料）
         launched_at: u64,
     }
@@ -1145,9 +1145,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         .map(|w| WindowView {
             session_id: w.session_id.clone(),
             // 生死の観測（try_wait = プロセス状態の syscall）は**窓 1 つにつき
-            // 1 フレーム 1 回**。looks_busy は出力時刻を見るだけで生死を見ない
+            // 1 フレーム 1 回**。pty_hint は出力時刻を見るだけで生死を見ない
             alive: w.alive(),
-            busy: w.looks_busy(),
+            pty: w.pty_hint(),
             launched_at: w.started_at,
         })
         .collect();
@@ -1180,16 +1180,16 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 hook: app.hook_states.get(&row.session_id, Some(w.launched_at)),
                 status,
                 status_at: app.agents_observed_at,
-                busy: w.busy,
+                pty: Some(w.pty),
             })
             .or_else(|| {
                 app.fixed_states.get(&row.session_id).map(|state| Run {
                     // 撮影用の固定 state は時刻を持たない（status も空なので
-                    // 裁定則（[`crate::poll::row_state`]）は起き得ない）
-                    hook: Some((state.as_str(), 0)),
+                    // 観測に追い越されることが起き得ない）
+                    hook: Some((*state, 0)),
                     status: "",
                     status_at: 0,
-                    busy: false,
+                    pty: None,
                 })
             })
             .or_else(|| {
@@ -1209,30 +1209,33 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                     hook: None,
                     status,
                     status_at: app.agents_observed_at,
-                    busy: false,
+                    // 他インスタンスの実行 ＝ こちらに窓が無い（材料は status）
+                    pty: None,
                 })
             });
-        let group = row_state(run);
+        // **未読は状態の材料でもある**（[`crate::poll::State::group`]）: 手が要らない行は
+        // 「まだ見ていない（Done）」と「見終わった（Idle）」に割れる
+        let unread = app.hook_states.unread(row);
         data.push(RowData {
             action: RowAction::Open(row.session_id.clone()),
-            group,
+            group: row_state(run),
             cwd: row.cwd.clone(),
             label: app.titles.of(row),
             is_active_window: window.is_some_and(|(i, _)| i == active)
                 && matches!(app.right_view, RightView::Sessions),
-            unread: app.hook_states.unread(row),
+            unread,
             pinned: row.pinned,
         });
     }
     // 集計は表示行そのものから数える（分岐の複製をしない = 行数と必ず一致）。
-    // **節と同じ [`Group::ORDER`] を回す**ので、並びと語が集計行とずれない
-    let counts: Vec<(Group, usize)> = Group::ORDER
+    // **節と同じ [`State::ORDER`] を回す**ので、並びと語が集計行とずれない
+    let counts: Vec<(State, usize)> = State::ORDER
         .iter()
         .map(|group| (*group, data.iter().filter(|d| d.group == *group).count()))
         .collect();
     // 何か動いているか（run ループがアイドル時の描き直し間隔を選ぶ材料。
     // [`crate::app::App::animating`]）。材料は 2 つ: 明滅する行（集計と同じ表示行から
-    // 導く。[`Group::blinks`]）と、使用率の取得中スピナー
+    // 導く。[`State::blinks`]）と、使用率の取得中スピナー
     app.animating = data.iter().any(|d| d.group.blinks())
         || app
             .usage_fetching
@@ -1306,7 +1309,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         Style::default().fg(ui().dim),
         SidebarRow::Action(RowAction::ToggleGroup),
     );
-    // 集計行。**語は節の見出しの小文字**（[`Group::title`] が唯一の綴り）なので、
+    // 集計行。**語は節の見出しの小文字**（[`State::title`] が唯一の綴り）なので、
     // 見出し・行ラベル・集計で別の語が出ることがない。
     //
     // **0 件の項目は出さない。** 語が 4 つになって行が長くなったので、
@@ -1362,7 +1365,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     push_section(&mut items, &mut rows, PINNED_TITLE, &pinned);
     match app.grouping {
         Grouping::State => {
-            for group in Group::ORDER {
+            for group in State::ORDER {
                 let members: Vec<&RowData> = unpinned
                     .iter()
                     .copied()
@@ -1672,7 +1675,13 @@ fn terminal_cursor_pos(pane: Rect, inner: Rect, crow: u16, ccol: u16) -> Positio
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::poll::{classify, COMPLETED, STOPPED, WAITING, WORKING};
+    use crate::poll::{PtyHint, State};
+
+    // 語彙の別名（綴りの正本は [`State::as_str`]）
+    const WORKING: State = State::Working;
+    const WAITING: State = State::Waiting;
+    const IDLE: State = State::Idle;
+    const STOPPED: State = State::Stopped;
     // Color は本番コードでは型名を直接書かない（`d.group.color()` で済む）ので、
     // テストだけで使う型としてここで読み込む
     use ratatui::style::Color;
@@ -1683,8 +1692,8 @@ pub(crate) mod tests {
     #[test]
     fn menu_width_is_the_longest_entry_but_never_below_the_floor() {
         use unicode_width::UnicodeWidthStr;
-        assert_eq!(popup_width(&PopupKind::Group, Grouping::State), POPUP_MIN_WIDTH);
-        assert_eq!(popup_width(&PopupKind::Group, Grouping::Directory), POPUP_MIN_WIDTH);
+        assert_eq!(popup_width(&PopupKind::State, Grouping::State), POPUP_MIN_WIDTH);
+        assert_eq!(popup_width(&PopupKind::State, Grouping::Directory), POPUP_MIN_WIDTH);
         let kind = PopupKind::Session {
             id: SessionId::new("s1"),
             pinned: false,
@@ -2141,8 +2150,8 @@ pub(crate) mod tests {
                 },
             ],
             hook_states: crate::hooks::HookStates::from_entries([
-                ("a", "done", 2_000),
-                ("b", "done", 2_000),
+                ("a", IDLE, 2_000),
+                ("b", IDLE, 2_000),
             ]),
             titles: fixed_titles(),
             ..Default::default()
@@ -2166,83 +2175,76 @@ pub(crate) mod tests {
         assert_eq!(name_col(&read, "seen-row"), HEAD_COLS);
     }
 
-    /// **動いている行の状態は hook が主、`agents --json` が従。**
-    /// hook は turn 単位で届くので Done を区別できるが、`status` からは出せない
+    /// **行の状態は hook（イベント）と `status`（現在値）の新しい方で決まる。**
+    ///
+    /// 2 つは同じ語彙へ揃えてある（[`crate::poll::state_of_status`]）ので、
+    /// 突き合わせに特例は要らない。ここが崩れると、食い違うたびに裁定則を
+    /// 1 本足す形へ逆戻りする
     #[test]
-    fn a_live_row_prefers_the_hook_state_over_the_live_status() {
-        let label = |hook, status, busy| {
-            row_state(Some(Run { hook, status, status_at: 0, busy })).title()
+    fn the_newer_of_the_hook_and_the_live_status_decides_the_row() {
+        let view = |hook, status, status_at| {
+            row_state(Some(Run { hook, status, status_at, pty: None })).title()
         };
-        // hook が居れば status も出力ヒューリスティックも見ない
-        assert_eq!(label(Some((crate::poll::COMPLETED, 0)), "busy", true), "Completed");
-        assert_eq!(label(Some((WORKING, 0)), "idle", false), "Working");
-        assert_eq!(label(Some((WAITING, 0)), "busy", false), "Waiting");
-        // hook が一度も来ていない行は status から導く
-        assert_eq!(label(None, "busy", false), "Working");
-        assert_eq!(label(None, "idle", false), "Waiting");
-        // status も無い間は出力の変化から推す
-        assert_eq!(label(None, "", true), "Working");
-        assert_eq!(label(None, "", false), "Waiting");
+        // 観測の方が新しい → 観測が勝つ
+        assert_eq!(view(Some((WORKING, 1_000)), "idle", 2_000), "Idle");
+        assert_eq!(view(Some((IDLE, 1_000)), "busy", 2_000), "Working");
+        assert_eq!(view(Some((State::Idle, 1_000)), "waiting", 2_000), "Waiting");
+        // hook の方が新しい（または同時刻）→ hook が勝つ
+        assert_eq!(view(Some((WORKING, 1_000)), "idle", 999), "Working");
+        assert_eq!(view(Some((WORKING, 1_000)), "idle", 1_000), "Working");
+        // 片方しか無いときはある方
+        assert_eq!(view(Some((WAITING, 1_000)), "", 2_000), "Waiting");
+        assert_eq!(view(None, "busy", 2_000), "Working");
     }
 
-    /// **hook の `waiting` だけは、より新しい `busy` 観測に負ける（裁定則）。**
+    /// **観測は、閉じるイベントが来なかった hook を必ず治す。**
     ///
-    /// `waiting` は「ユーザーが動くまで進まない」という主張なので、その後に
-    /// 観測された「動いている」は反証になる。許可プロンプトの許可のように
-    /// 「解除された」を知らせる hook イベントが存在しない操作があり、
-    /// イベントの列挙では状態機械が閉じない ＝ この 1 本が安全網になる
+    /// hook はイベントなので取りこぼすと自己修復しない。実際に閉じない組が 2 つある:
+    /// Esc 中断では `Stop` が飛ばず（実データで中断ターンの 91%（113/124）が未発火）、
+    /// 許可プロンプトの**許可には解除を知らせるイベントがそもそも存在しない**。
+    /// どちらも次の観測で解ける ＝ 遅れは最大ポーリング 1 周期に収まる
     #[test]
-    fn a_newer_busy_observation_overrules_a_waiting_hook() {
-        let view = |hook, status, status_at| {
-            row_state(Some(Run { hook, status, status_at, busy: false }))
+    fn a_status_observation_heals_a_hook_whose_closing_event_never_came() {
+        let view = |hook, status| {
+            row_state(Some(Run { hook, status, status_at: 2_000, pty: None })).title()
         };
-        // waiting(at=1000) より新しい busy 観測 → Working（スピナーも回る）
-        let promoted = view(Some((WAITING, 1_000)), "busy", 2_000);
-        assert_eq!(promoted.title(), "Working");
-        assert!(promoted.blinks(), "the promoted row does not blink");
-        // 古い busy 観測は前の状態の名残 ＝ waiting のまま（同時刻も採らない）
-        assert_eq!(view(Some((WAITING, 1_000)), "busy", 999).title(), "Waiting");
-        assert_eq!(view(Some((WAITING, 1_000)), "busy", 1_000).title(), "Waiting");
-        // 新しい観測でも「動いていない」は waiting を覆さない（入力待ちの表示を守る）
-        assert_eq!(view(Some((WAITING, 1_000)), "idle", 2_000).title(), "Waiting");
-        assert_eq!(view(Some((WAITING, 1_000)), "waiting", 2_000).title(), "Waiting");
-        assert_eq!(view(Some((WAITING, 1_000)), "", 2_000).title(), "Waiting");
-        // completed は覆さない（busy は「このターンの続き」と「次のターン」を
-        // 区別できないので、completed を覆すと Done の意味が壊れる）。
-        // working が非 busy 観測に負ける逆向きは
-        // `a_newer_non_busy_observation_overrules_a_working_hook` が固定する
-        assert_eq!(view(Some((crate::poll::COMPLETED, 1_000)), "busy", 2_000).title(), "Completed");
+        // Esc 中断: working のまま固着していた行が、次の観測で赤を降りる
+        assert_eq!(view(Some((WORKING, 1_000)), "idle"), "Idle");
+        // 許可した直後: waiting のまま固着していた行が、次の観測で動き出す
+        assert_eq!(view(Some((WAITING, 1_000)), "busy"), "Working");
+        // ダイアログが開いたままなら黄のまま（claude 自身が waiting と言う）
+        assert_eq!(view(Some((WAITING, 1_000)), "waiting"), "Waiting");
     }
 
-    /// **逆向きの裁定則: hook の `working` も、より新しい非 `busy` 観測に負ける。**
+    /// **バックグラウンド作業は「入力待ち」ではない。**
     ///
-    /// claude は Esc 中断のとき `Stop` hook を撃たない（実データで確認済み:
-    /// 中断ターンの 91%（113/124）で `Stop` 未発火）ので、`working` は自己修復する
-    /// 手段を持たず、次のターンを完走するか窓を閉じるまで赤・明滅のまま固着していた。
-    /// 材料が `agents --json` の `status`（claude 自身がポーリングのたびに上書きする
-    /// 現在値）である点が、以前避けていた `idle_prompt`（時間経過だけの誤検知）とは
-    /// 違う、という判断の根拠は [`row_state`] の doc を参照
+    /// `shell` ＝ 「アイドルだが未終了のバックグラウンド bash がある」で、
+    /// ユーザーへの要求は何も無い。`busy` 以外を一律で入力待ちへ倒していた頃は、
+    /// バックグラウンド実行中の行が黄「Needs input」を名乗って呼びつけていた。
+    /// **今は idle と同じ扱い**（独立した状態にするかは別の判断）
     #[test]
-    fn a_newer_non_busy_observation_overrules_a_working_hook() {
-        let view = |hook, status, status_at| {
-            row_state(Some(Run { hook, status, status_at, busy: false }))
+    fn background_shell_work_is_not_a_request_for_input() {
+        let view = |hook, status| {
+            row_state(Some(Run { hook, status, status_at: 2_000, pty: None })).title()
         };
-        // working(at=1000) より新しい非 busy 観測 → Waiting（実測した 3 値すべて）
-        for status in ["idle", "waiting", "shell"] {
-            assert_eq!(
-                view(Some((WORKING, 1_000)), status, 2_000).title(),
-                "Waiting",
-                "a newer {status:?} observation did not demote a working hook"
-            );
+        for status in ["idle", "shell"] {
+            assert_eq!(view(None, status), "Idle", "{status:?} asks for input");
+            assert_eq!(view(Some((WORKING, 1_000)), status), "Idle", "{status:?}");
         }
-        // 古い（またはターン開始と同時刻の）観測は前の状態の名残 ＝ working のまま
-        assert_eq!(view(Some((WORKING, 1_000)), "idle", 999).title(), "Working");
-        assert_eq!(view(Some((WORKING, 1_000)), "idle", 1_000).title(), "Working");
-        // busy 観測はもちろん覆さない（ターンが進行中）
-        assert_eq!(view(Some((WORKING, 1_000)), "busy", 2_000).title(), "Working");
-        // status が空（一度も観測していない）は「busy でないと確認できた」ではない
-        // ので覆さない（`Run::status_at` の doc が言う「0 ＝ 裁定は起きない」と同じ理由）
-        assert_eq!(view(Some((WORKING, 1_000)), "", 2_000).title(), "Working");
+        // 知らない値だけは「動いているらしい」へ倒す（呼びつけるよりは害が小さい）
+        assert_eq!(view(None, "something-new"), "Working");
+    }
+
+    /// **材料が 1 つも無い行の最後の手段は PTY の出力変化だけ。**
+    /// 出ていなければ「手が要らない」へ倒す（何も知らないことを
+    /// 「入力待ち」と名乗ってユーザーを呼びつけない）
+    #[test]
+    fn a_row_with_no_hook_and_no_status_falls_back_to_the_pty_output() {
+        let view = |pty| row_state(Some(Run { hook: None, status: "", status_at: 0, pty: Some(pty) })).title();
+        // まだ端末を掴んでいない ＝ 起動中。**「もう終わった」ではない**
+        assert_eq!(view(PtyHint::Starting), "Working");
+        assert_eq!(view(PtyHint::Writing), "Working");
+        assert_eq!(view(PtyHint::Quiet), "Idle");
     }
 
     /// **動かしているものが無い行は、hook が何を言っていても Stopped。**
@@ -2256,7 +2258,7 @@ pub(crate) mod tests {
     fn a_row_with_no_run_is_stopped_whatever_the_hooks_say() {
         let view = row_state(None);
         assert_eq!(view.title(), "Stopped");
-        assert!(view == Group::Stopped, "a stopped row is not in the last group");
+        assert!(view == State::Stopped, "a stopped row is not in the last group");
         assert!(!view.blinks());
         // かつては「Stopped なのに生存形（✻）」という矛盾を `alive` フィールドで
         // 検査していたが、状態はもう文字のアイコンで語らない（色だけ）ので、
@@ -2275,7 +2277,7 @@ pub(crate) mod tests {
             hook_states: crate::hooks::HookStates::from_entries([
                 ("8d162272", STOPPED, 1_785_118_446_410),
                 ("25bf4b8f", STOPPED, 1_785_118_379_396),
-                ("a632c052", "blocked", 1_785_118_423_198),
+                ("a632c052", WAITING, 1_785_118_423_198),
             ]),
             titles: fixed_titles(),
             ..Default::default()
@@ -2403,17 +2405,17 @@ pub(crate) mod tests {
             hook: Some((STOPPED, 0)),
             status: "idle",
             status_at: 0,
-            busy: false,
+            pty: None,
         }));
         assert_eq!(view.title(), "Stopped", "a fresh stopped was thrown away");
         assert!(!view.blinks());
         // かつては「Stopped なのにアイコンが生存形（✻）」を `alive` フィールドで
         // 検査していたが、状態はもう色だけで語るのでその矛盾自体が作れなくなった
 
-        // 他の state はそのまま生きている実行として出る（Working として扱われる）
-        assert!(
-            row_state(Some(Run { hook: Some(("done", 0)), status: "", status_at: 0, busy: false }))
-                == Group::Working
+        // 他の state はそのまま生きている実行として出る（畳まれるのは stopped だけ）
+        assert_eq!(
+            row_state(Some(Run { hook: Some((WORKING, 0)), status: "", status_at: 0, pty: None })),
+            State::Working
         );
     }
 
@@ -3113,7 +3115,7 @@ pub(crate) mod tests {
             term_size: (120, 40),
             sidebar_width: 40,
             sessions: vec![named_session("s", "C:\\dev\\api", "no-text-row")],
-            hook_states: crate::hooks::HookStates::from_entries([("s", "done", 0)]),
+            hook_states: crate::hooks::HookStates::from_entries([("s", IDLE, 0)]),
             titles: fixed_titles(),
             ..Default::default()
         };
@@ -3121,7 +3123,7 @@ pub(crate) mod tests {
             .into_iter()
             .find(|l| l.contains("no-text-row"))
             .expect("the row was not drawn");
-        for word in ["Waiting", "Working", "Completed", "Stopped"] {
+        for word in ["Waiting", "Working", "Idle", "Stopped"] {
             assert!(
                 !line.contains(word),
                 "the row still shows a status word: {line:?}"
@@ -3151,7 +3153,7 @@ pub(crate) mod tests {
                 last_opened_at: 10_000,
                 ..named_session("s", "C:\\dev\\api", "stopped-row")
             }],
-            hook_states: crate::hooks::HookStates::from_entries([("s", "blocked", 9_999)]),
+            hook_states: crate::hooks::HookStates::from_entries([("s", WAITING, 9_999)]),
             titles: fixed_titles(),
             ..Default::default()
         };
@@ -3216,7 +3218,7 @@ pub(crate) mod tests {
     fn look_fixture() -> RowData {
         RowData {
             action: RowAction::Open(SessionId::new("a")),
-            group: Group::Waiting,
+            group: State::Waiting,
             cwd: "C:\\dev\\api".to_string(),
             label: "the-row".to_string(),
             is_active_window: false,
@@ -3319,16 +3321,16 @@ pub(crate) mod tests {
     #[test]
     fn a_stopped_row_shows_a_smaller_dot_without_losing_its_fill() {
         let look = Look { band: false, selected: false, open: false };
-        let glyph = |group: Group, unread: bool| {
+        let glyph = |group: State, unread: bool| {
             let mut d = look_fixture();
             d.group = group;
             d.unread = unread;
             cells(&session_row_line(&d, look, DEFAULT_INNER, true))[1].0.clone()
         };
-        assert_eq!(glyph(Group::Stopped, true), DOT_STOPPED_FILLED, "unread stopped");
-        assert_eq!(glyph(Group::Stopped, false), DOT_STOPPED_HOLLOW, "read stopped");
+        assert_eq!(glyph(State::Stopped, true), DOT_STOPPED_FILLED, "unread stopped");
+        assert_eq!(glyph(State::Stopped, false), DOT_STOPPED_HOLLOW, "read stopped");
         // 止まっていない状態は大きい丸のまま（Stopped だけが小さくなる）
-        for group in [Group::Waiting, Group::Working, Group::Completed] {
+        for group in [State::Waiting, State::Working, State::Idle] {
             assert_eq!(glyph(group, true), DOT_FILLED, "{} shrank", group.title());
             assert_eq!(glyph(group, false), DOT_HOLLOW, "{} shrank", group.title());
         }
@@ -3342,35 +3344,36 @@ pub(crate) mod tests {
     }
 
     /// **ドットの色は状態そのもの。** 4 状態それぞれで [`crate::poll::classify`] が
-    /// 決めた `Group` の色（[`Group::color`]）がそのままドットへ出る。
-    /// `classify` を経由して色を取るので、対応表を手で書き写さない
+    /// 決めた `State` の色（[`State::color`]）がそのままドットへ出る。
+    /// [`State::group`] を経由して色を取るので、対応表を手で書き写さない
     #[test]
     fn the_dot_color_matches_the_row_state() {
         let look = Look { band: false, selected: false, open: false };
-        let dot_color = |state: &str, alive: bool| {
+        let dot_color = |state: State| {
             let mut d = look_fixture();
-            d.group = classify(state, alive);
+            d.group = state;
             cells(&session_row_line(&d, look, DEFAULT_INNER, true))[1].1.fg
         };
-        assert_eq!(dot_color(WAITING, true), Some(C_ATTENTION), "Waiting");
-        assert_eq!(dot_color(WORKING, true), Some(C_WORKING), "Working");
-        assert_eq!(dot_color(COMPLETED, true), Some(crate::theme::C_OK), "Completed");
-        assert_eq!(dot_color(STOPPED, false), Some(ui().dim), "Stopped");
+        assert_eq!(dot_color(WAITING), Some(C_ATTENTION), "Waiting");
+        assert_eq!(dot_color(WORKING), Some(C_WORKING), "Working");
+        assert_eq!(dot_color(IDLE), Some(crate::theme::C_OK), "Idle");
+        assert_eq!(dot_color(State::Idle), Some(crate::theme::C_OK), "Idle");
+        assert_eq!(dot_color(STOPPED), Some(ui().dim), "Stopped");
     }
 
     /// **4 状態の色は互いに異なる。** 新設計では色だけが状態を語るので、
     /// 2 つの状態が同じ色になると画面上で区別が付かなくなる
     #[test]
     fn the_four_group_colors_are_all_distinct() {
-        let colors: Vec<Color> = Group::ORDER.iter().map(|g| g.color()).collect();
+        let colors: Vec<Color> = State::ORDER.iter().map(|g| g.color()).collect();
         for i in 0..colors.len() {
             for j in (i + 1)..colors.len() {
                 assert_ne!(
                     colors[i],
                     colors[j],
                     "{} and {} share a color",
-                    Group::ORDER[i].title(),
-                    Group::ORDER[j].title()
+                    State::ORDER[i].title(),
+                    State::ORDER[j].title()
                 );
             }
         }
@@ -3386,12 +3389,12 @@ pub(crate) mod tests {
     fn a_working_dot_blinks_between_its_color_and_dim() {
         let look = Look { band: false, selected: false, open: false };
         let mut d = look_fixture();
-        d.group = Group::Working;
+        d.group = State::Working;
         let lit = cells(&session_row_line(&d, look, DEFAULT_INNER, true))[1].1.fg;
         let dark = cells(&session_row_line(&d, look, DEFAULT_INNER, false))[1].1.fg;
         assert_eq!(
             lit,
-            Some(Group::Working.color()),
+            Some(State::Working.color()),
             "the lit phase does not show the state color"
         );
         assert_eq!(dark, Some(ui().dim), "the dark phase does not fall back to dim");
@@ -3399,11 +3402,11 @@ pub(crate) mod tests {
 
         // 明滅しない状態は位相に関係なく自分の色のまま（色と明滅は同じ group から
         // 決まるので、「Working の色だが明滅しない」という行は型として作れない）
-        d.group = Group::Completed;
+        d.group = State::Idle;
         let steady_lit = cells(&session_row_line(&d, look, DEFAULT_INNER, true))[1].1.fg;
         let steady_dark = cells(&session_row_line(&d, look, DEFAULT_INNER, false))[1].1.fg;
         assert_eq!(steady_lit, steady_dark, "a non-blinking group changed with the phase");
-        assert_eq!(steady_lit, Some(Group::Completed.color()), "the steady color is wrong");
+        assert_eq!(steady_lit, Some(State::Idle.color()), "the steady color is wrong");
     }
 
     /// ペイン追従を見るための一覧（セッション 3 本）。**窓（PTY）は起こさない**ので、
@@ -3539,7 +3542,7 @@ pub(crate) mod tests {
             );
             // 行は元のグループの中に居る（pin を外したら戻る）
             let at = |needle: &str| texts.iter().position(|t| t.contains(needle));
-            assert!(at("chosen") > at("Completed"), "{grouping:?}: {texts:?}");
+            assert!(at("chosen") > at("Idle"), "{grouping:?}: {texts:?}");
         }
     }
 
@@ -3683,7 +3686,7 @@ pub(crate) mod tests {
         // メニュー表示中: 一覧のキーは全部このメニューが飲むので出さない
         let mut app = App {
             popup: Some(Popup {
-                kind: crate::app::PopupKind::Group,
+                kind: crate::app::PopupKind::State,
                 anchor_y: 3,
                 selected: 0,
             }),

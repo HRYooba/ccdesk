@@ -157,12 +157,41 @@ pub(crate) const CLAUDE_PID_ENV: &str = "CLAUDE_PID";
 pub(crate) const AGENT_SESSION_ID: &str = "sessionId";
 /// `"interactive"` | `"background"` 等
 pub(crate) const AGENT_KIND: &str = "kind";
-/// 前景セッションが書くライブ状態（busy|idle|waiting|shell）
+/// 前景セッションが書くライブ状態（[`AGENT_STATUS_BUSY`] 以下の 4 値）
 pub(crate) const AGENT_STATUS: &str = "status";
 /// そのセッションを動かしているプロセス（生存中のみ載る）
 pub(crate) const AGENT_PID: &str = "pid";
 /// 前景セッションを表す [`AGENT_KIND`] の値
 pub(crate) const AGENT_KIND_INTERACTIVE: &str = "interactive";
+
+// [`AGENT_STATUS`] が取る 4 値。**claude 自身が遷移のたびに上書きする現在値**で、
+// ccdesk の行の状態はこれを正本に導く（[`crate::poll::state_of_status`]）。
+//
+// claude 本体（v2.1.220）の実装から読み取った決定条件:
+//
+// 1. 開いているダイアログがあれば [`AGENT_STATUS_WAITING`]（種類を問わず必ず
+//    理由文字列が付く ＝ 既定 `"permission prompt"`）
+// 2. でなければ「応答生成中 or 委譲中」で [`AGENT_STATUS_BUSY`]、さもなくば
+//    [`AGENT_STATUS_IDLE`]
+// 3. idle かつ**未終了のバックグラウンド bash がある**ときだけ
+//    [`AGENT_STATUS_SHELL`] へ差し替わる（Monitor 系のジョブは別種別なので
+//    ここには来ない ＝ Monitor 待ちは idle のまま）
+//
+// **値が載らないセッションが実在する**（古い版・別の entrypoint で実測）。
+// 未観測との区別が付かないので、読み手は「status が無い」経路を必ず持つこと
+
+/// 応答生成中（[`crate::poll::WORKING`] へ写る）
+pub(crate) const AGENT_STATUS_BUSY: &str = "busy";
+/// ダイアログが開いていてユーザーの決定を待っている（[`crate::poll::WAITING`] へ写る）
+pub(crate) const AGENT_STATUS_WAITING: &str = "waiting";
+/// プロンプトで待機（[`crate::poll::IDLE`] へ写る）
+pub(crate) const AGENT_STATUS_IDLE: &str = "idle";
+/// idle だがバックグラウンド bash が走っている。
+///
+/// **今は [`AGENT_STATUS_IDLE`] と同じ扱い**（claude 自身が「動いていない」と
+/// 言っているものを ccdesk が赤にしない）。バックグラウンド実行を独立した状態として
+/// 出すかは別の判断で、そのときはここの写し先だけを変える
+pub(crate) const AGENT_STATUS_SHELL: &str = "shell";
 
 // ---------------------------------------------------------------------------
 // SDK 制御チャンネルの `get_usage`（**非公開**）

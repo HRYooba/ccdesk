@@ -13,6 +13,7 @@ use ccdesk::{claude_settings_channel, version_newer, LockExt};
 // [`crate::claude_format`] が持つ（外れたときに直す場所を 1 つにするため）
 use crate::claude_format::{
     AGENT_KIND, AGENT_KIND_INTERACTIVE, AGENT_PID, AGENT_SESSION_ID, AGENT_STATUS,
+    AGENT_STATUS_BUSY, AGENT_STATUS_IDLE, AGENT_STATUS_SHELL, AGENT_STATUS_WAITING,
 };
 use crate::theme::{ui, C_ATTENTION, C_OK, C_WORKING};
 
@@ -20,8 +21,8 @@ use crate::theme::{ui, C_ATTENTION, C_OK, C_WORKING};
 ///
 /// **前景移行後に読むのは前景セッションを名指しできる項目だけ。** `sessionId` が
 /// ccdesk の行（[`crate::sessions::SessionRow`]）と同じ鍵で、`status` が前景
-/// セッションの生きた状態（`~/.claude/sessions/<pid>.json` に書かれる
-/// busy|idle|waiting|shell）。bg 専用の `id`（short）・`state`・要約は読まない
+/// セッションの生きた状態（`~/.claude/sessions/<pid>.json` に書かれる現在値。
+/// 値の一覧は [`crate::claude_format`]）。bg 専用の `id`（short）・`state`・要約は読まない
 /// ＝ 非公開の内部形式に依存する経路をここで断つ
 #[derive(Clone, Default)]
 pub(crate) struct AgentInfo {
@@ -29,7 +30,8 @@ pub(crate) struct AgentInfo {
     pub(crate) session_id: String,
     /// `"interactive"` | `"background"` 等。前景セッションの行だけを突き合わせる
     pub(crate) kind: String,
-    /// 前景セッションが書くライブ状態（busy|idle|waiting|shell）
+    /// 前景セッションが書くライブ状態の生値（値の一覧と決定条件は
+    /// [`crate::claude_format`]、語彙への翻訳は [`state_of_status`]）
     pub(crate) status: String,
     /// そのセッションを動かしているプロセス（文書化: 生存中のみ pid が載る）。
     ///
@@ -612,114 +614,116 @@ impl Grouping {
     }
 }
 
-/// 行の状態。**行のラベル・節の見出し・集計の項目がこの 1 つ**で、
-/// 並びは緊急度の順（上ほどユーザーの手が要る）。
+/// **行の状態。これ 1 つが語彙の正本**で、3 つの顔を持つ:
 ///
-/// **語彙を 1 つに保つのが要点。** 以前は同じ分類を 3 通りの言葉で持っていた
-/// （行ラベル `Needs input` / `Done`、節の見出し `Needs input` / `Completed`、
-/// 集計 `awaiting input` / `completed`）ので、画面の 3 箇所で別の語が出ていた。
-/// [`Self::title`] が唯一の綴りで、集計行はそれを小文字にして使う。
+/// - **保存と CLI 引数**（[`Self::as_str`] / [`Self::parse`]）: hook は
+///   `ccdesk hook <event> <state>` として飛び、`hook-states.json` に文字列で残る
+/// - **画面**（[`Self::title`] / [`Self::color`] / [`Self::blinks`]）: 行のドット・
+///   節の見出し・集計が同じここを読む
+/// - **並び**（[`Self::ORDER`] と [`Ord`]）: 上ほどユーザーがすることがある
 ///
-/// **`Ready for review` は持たない**: 判定材料（PR 番号）は bg の state.json
+/// **表示用の型を別に持たない。** かつては `State`（hook の語彙）と `State`（節）が
+/// 別の enum で、写す関数が 1 本挟まっていた。値が 1 対 1 に対応していたので、
+/// その関数は恒等写像 ＝ **同じ知識を 2 箇所で維持していた**だけだった。
+/// 綴りの違い（保存は `working`、画面は `Working`）は同じ型の 2 つのメソッドで足りる。
+///
+/// **`Completed` は持たない。** 「ターンが終わった」は状態ではなくイベントで、
+/// 終わった後のセッションはプロンプトで待機している ＝ [`Self::Idle`]。claude 自身も
+/// `completed` にあたる status を持たない。値として分けていた頃の唯一の用途は
+/// 使用率取得の合図（[`crate::hooks::HookStates::any_row_went_idle_since`]）だったが、
+/// それは「状態の語彙」に置く理由にならなかった。
+///
+/// **`Ready for review` も持たない**: 判定材料（PR 番号）は bg の state.json
 /// （非公開の内部形式）にしか無く、前景セッションは書かない。正本を
 /// `sessions.json` 1 つにする代償として落とした
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Group {
-    /// claude がユーザーの操作を待って止まっている（許可・応答待ち・プロンプト待ち）
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum State {
+    /// claude がユーザーの決定を待って止まっている（許可・確認ダイアログ）。
+    ///
+    /// **判定規則はこれ 1 行**: 「あなたが動かないと claude が進めない」。
+    /// claude が動いておらず、あなたも待たれていないなら [`Self::Idle`]
     Waiting,
     /// claude が動いている
     Working,
-    /// ターンが終わった
-    Completed,
-    /// プロセスが終了した（行は残る）。**`Completed` と混ぜない**:
-    /// 止められたセッションを「完了」と呼ぶのは嘘になる
+    /// **この行にすることは無い。** プロンプトで待機・ターンを終えた直後・
+    /// 起動しただけ・バックグラウンド作業が走っているだけ、が全部ここに入る
+    Idle,
+    /// プロセスが終了した（行は残る）。**[`Self::Idle`] と混ぜない**: 止まっているのと
+    /// 手が空いているのは別の話で、開くときの動き（`claude -r` で起こし直すか）が違う
     Stopped,
 }
 
-impl Group {
-    /// **この 4 語が画面に出る唯一の綴り**（行ラベル・節の見出し・集計）
+impl State {
+    /// 表示順（節の並びと集計の並び）＝ [`Ord`] と同じ順。
+    /// **[`Self::parse`] もこれを舐める**ので、語を足したら綴りも並びも同時に効く
+    pub(crate) const ORDER: [Self; 4] = [Self::Waiting, Self::Working, Self::Idle, Self::Stopped];
+
+    /// 保存と CLI 引数の綴り。**[`Self::parse`] と対で、綴りを知るのはここだけ**
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Working => "working",
+            Self::Idle => "idle",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    /// 外から来た綴り（保管ファイル・hook の CLI 引数）。**知らない語は `None`**。
+    /// 呼び手は「読めなかった」を自分の文脈で decide する
+    /// （保管なら項目を捨てる、hook なら何も記録しない）
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        Self::ORDER.into_iter().find(|state| state.as_str() == text)
+    }
+
+    /// **この 4 語が画面に出る唯一の綴り**（行ラベル・節の見出し・集計）。
+    /// 集計行はこれを小文字にして使う ＝ 画面の 3 箇所で別の語が出ることが起き得ない
     pub(crate) fn title(self) -> &'static str {
         match self {
             Self::Waiting => "Waiting",
             Self::Working => "Working",
-            Self::Completed => "Completed",
+            Self::Idle => "Idle",
             Self::Stopped => "Stopped",
         }
     }
 
     /// この状態の色。**行のドット・集計・節が同じこの 1 箇所を読む**ので、
     /// 状態を増やしたときに色の対応を書き忘れる場所が増えない
-    /// （以前は `StateView.color` が別に持っていて、`group` と食い違う値を
-    /// 作れてしまっていた）
+    /// （以前は `StateView.color` が別に持っていて、食い違う値を作れてしまっていた）
     pub(crate) fn color(self) -> Color {
         match self {
             Self::Waiting => C_ATTENTION,
             Self::Working => C_WORKING,
-            Self::Completed => C_OK,
+            Self::Idle => C_OK,
             Self::Stopped => ui().dim,
         }
     }
 
-    /// ドットが明滅するか。**動いている状態だけ**（`Group::Working` と同義）
+    /// ドットが明滅するか。**動いている状態だけ**
     pub(crate) fn blinks(self) -> bool {
         self == Self::Working
     }
-
-    /// 表示順（節の並びと集計の並び）。**[`Ord`] と同じ順を 1 箇所で配る**ので、
-    /// 節を足したときに並びの書き漏らしが起きない
-    pub(crate) const ORDER: [Self; 4] = [
-        Self::Waiting,
-        Self::Working,
-        Self::Completed,
-        Self::Stopped,
-    ];
 }
 
-/// **実行が終わった**ことを表す state 値。書く側（hook の `SessionEnd` ＝
-/// [`crate::hooks`]）と、読む側（[`classify`] と行の状態の導出 ＝ [`crate::ui`]）が
-/// 同じ綴りを見るための 1 箇所。綴りを 2 通り持つと「hook が言った `stopped`」と
-/// 「表示の Stopped」が黙って別物になる
-pub(crate) const STOPPED: &str = "stopped";
-
-/// 生きている前景セッションのライブ状態（`agents --json` の `status`）を、
-/// [`classify`] が読む state 値へ写す。**呼ぶのは status が空でないときだけ**
-/// （空 ＝ まだ書かれていない・拾えていないので、判断の材料が無い）。
+/// `agents --json` の `status`（claude 自身が書く**現在値**）を [`State`] へ写す。
+/// `None` ＝ **まだ観測できていない**（空文字。値が載らないセッションも実在するので、
+/// 呼び手はこの経路を必ず持つ）。
 ///
-/// **これは従の経路**: 状態の主は
-/// hook（[`crate::hooks`]）で、ここへ落ちるのは hook が一度も来ていない行だけ
-/// （ccdesk が起こしていないセッション・注入が効かなかった場合）。
-/// hook のように「ターンが終わった」を区別できないので、出るのは Working か
-/// Waiting の 2 つ。`busy` 以外を Waiting へ倒すのは、前景セッションが `busy` で
-/// ないならユーザーの入力を待っているため（`idle` = プロンプト待ち、
-/// `waiting` = 確認待ち）
-pub(crate) fn foreground_state(status: &str) -> &'static str {
-    if status == STATUS_BUSY { WORKING } else { WAITING }
-}
-
-/// `agents --json` の `status` が「claude が動いている」を表す値。
-/// [`foreground_state`] と [`row_state`] の裁定則が同じ綴りを見る
-const STATUS_BUSY: &str = "busy";
-
-/// state 値。**書く側（hook）と読む側（[`classify`]）が同じ綴りを見る**ための 1 箇所。
-/// 語は [`Group`] の小文字（画面に出る語と内部の値を別にしない）
-pub(crate) const WAITING: &str = "waiting";
-pub(crate) const WORKING: &str = "working";
-pub(crate) const COMPLETED: &str = "completed";
-
-/// state 値（waiting|working|completed|stopped）+ 生死から表示を決める。
+/// **翻訳はここ 1 箇所**。claude 側の綴りと決定条件は [`crate::claude_format`] が持ち、
+/// ここから先は hook が書く値と同じ型になる ＝ [`row_state`] は「どちらが新しいか」
+/// だけを見ればよくなる（両者を別語彙のまま突き合わせていた頃は、食い違うたびに
+/// 特例を 1 本足す形になっていた）。
 ///
-/// **未知の値は state として扱わない。** 生きているなら Working（まだ何も
-/// 報告していないセッションは動いている可能性が高い）、死んでいるなら Stopped。
-/// 以前は死んだ行に `Idle` という 5 番目の語を出していた
-pub(crate) fn classify(live_state: &str, alive: bool) -> Group {
-    match live_state {
-        COMPLETED => Group::Completed,
-        STOPPED => Group::Stopped,
-        WAITING => Group::Waiting,
-        // `working` と未知の値をまとめて扱う（どちらも「動いているらしい」）
-        _ if alive => Group::Working,
-        // プロセスが居ない ＝ 動いていないので、report された state に関わらず Stopped
-        _ => Group::Stopped,
+/// 未知の値は Working へ倒す: 知らない状態を「入力待ち」と名乗って呼び出しを促すより、
+/// 「動いているらしい」の方が害が小さい
+pub(crate) fn state_of_status(status: &str) -> Option<State> {
+    match status {
+        "" => None,
+        AGENT_STATUS_BUSY => Some(State::Working),
+        AGENT_STATUS_WAITING => Some(State::Waiting),
+        // **shell を idle と同じに写すのは意図した判断**（理由は
+        // [`AGENT_STATUS_SHELL`]）。ここを変えるだけで独立した状態にできる
+        AGENT_STATUS_IDLE | AGENT_STATUS_SHELL => Some(State::Idle),
+        _ => Some(State::Working),
     }
 }
 
@@ -730,16 +734,34 @@ pub(crate) struct Run<'a> {
     /// その実行が hook で報告した最新の (state, 記録時刻)（一度も来ていなければ None）。
     /// 前回の実行の残骸を捨てる判断は [`crate::hooks::HookStates::get`] が
     /// 窓の起動時刻で済ませてあるので、ここへ来るのは今の実行が書いたものだけ
-    pub(crate) hook: Option<(&'a str, u64)>,
-    /// `agents --json` の `status`（hook が一度も来ていない行の従経路と、
-    /// waiting の裁定（[`row_state`]）の材料。空 ＝ ポーラーがまだ拾っていない）
+    pub(crate) hook: Option<(State, u64)>,
+    /// `agents --json` の `status` の生値（空 ＝ ポーラーがまだ拾っていない、
+    /// または値を載せないセッション）。語彙への翻訳は [`state_of_status`]
     pub(crate) status: &'a str,
-    /// `status` を観測した時刻（ms）。hook の記録時刻との新旧裁定の材料。
-    /// 0 ＝ 一度も観測していない（裁定は起きない）
+    /// `status` を観測した時刻（ms）。hook の記録時刻とどちらが新しいかを見る。
+    /// 0 ＝ 一度も観測していない
     pub(crate) status_at: u64,
-    /// PTY の出力から推した「動いているらしい」（`status` も無い間の最後の手段。
-    /// フォーカスの出入りや再描画でも動くので、**裁定の材料にはしない**）
-    pub(crate) busy: bool,
+    /// PTY の出力の様子。**hook も status も無い行だけの最後の手段**
+    /// （フォーカスの出入りや再描画でも動くので精度は低い）。
+    /// `None` ＝ この行に窓が無い（材料は必ず他にあるので、この値は読まれない）
+    pub(crate) pty: Option<PtyHint>,
+}
+
+/// 窓の PTY から見た様子。**2 値では足りない**のが要点で、「まだ 1 バイトも
+/// 出していない」と「出したがいま静か」は同じ無出力でも意味が正反対になる:
+/// 前者は起動中（＝動いている）、後者はプロンプトで待機（＝手が要らない）。
+///
+/// 1 つの真偽値で持っていた頃、材料が何も無い行はこの 2 つを区別できず、
+/// **起動中の数秒を「もう終わった」と描いていた**（`claude` の起動は認証待ちや
+/// ウイルススキャンで秒単位かかることがある。打鍵の門番が最大 10 秒待つのと同じ理由）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PtyHint {
+    /// 子がまだ端末を掴んでいない ＝ 起動の途中
+    Starting,
+    /// 直近に出力があった
+    Writing,
+    /// 出力したことはあるが、いまは静か
+    Quiet,
 }
 
 /// 1 行に出す状態を決める。**行に保存せず、そのつど導く。**
@@ -755,70 +777,57 @@ pub(crate) struct Run<'a> {
 ///   異常終了しても次の起動で正しくなる）
 /// - `stop` / `/clear` / `/resume` の**どれで止まっても同じ表示**（止まる ＝
 ///   その行を動かす実行が無くなる、の 1 通りしかない）
-/// - **`Stopped` の行が Working の色・明滅を帯びるという矛盾が作れない**: `stopped` は
-///   「実行が終わった」の言い換えなので、hook がそう言った実行は実行として扱わない
-///   ＝ Stopped は必ず `classify(STOPPED, _)` の 1 分岐だけを通って `Group::Stopped` を
-///   返し、色（[`Group::color`]）も明滅（[`Group::blinks`]）もその 1 つの値から導く
+/// - **`Stopped` の行が Working の色・明滅を帯びるという矛盾が作れない**:
+///   [`State::Stopped`] は「実行が終わった」の言い換えなので、hook がそう言った実行は
+///   実行として扱わない ＝ Stopped は必ず下の早期 return 1 本だけを通り、
+///   色（[`State::color`]）も明滅（[`State::blinks`]）もその 1 つの値から導く
 ///
-/// 実行があるときの中身は **hook が主、`agents --json` が従**:
-/// hook は turn 単位で届くので
-/// Working / Waiting / Completed を取り違えない。hook が一度も来ていない行
-/// （ccdesk が起こしていないセッション・注入が効かなかった場合）だけ `status` へ落ち、
-/// `status` も無い間は出力の変化から推す。
+/// 実行があるときの中身は **hook（イベント）と `status`（現在値）の新しい方**。
+/// 2 つは [`state_of_status`] で同じ語彙へ揃えてあるので、判断は新旧の比較だけで
+/// 足りる。どちらも無い間だけ PTY の出力変化から推す。
 ///
-/// # 例外 ＝ 裁定則（hook と `status` が食い違うときの決着）
+/// # なぜ「新しい方」の 1 本だけで足りるのか
 ///
-/// **hook の `waiting` は、より新しい `busy` 観測に負ける。**
-/// `waiting` は「ユーザーが動くまで claude は進まない」という主張なので、
-/// その後に観測された「動いている」はその主張の反証になる（許可プロンプトの
-/// 許可のように**「解除された」を知らせる hook イベントが存在しない**操作が
-/// あり、イベントの列挙では状態機械が閉じない。裁定則は原因が何であれ
-/// 最大ポーリング 1 周期の遅れで自己修復する）。
+/// hook は**イベント**（「その瞬間こうなった」）なので、取りこぼすと自己修復しない:
+/// claude は Esc 中断のとき `Stop` を撃たない（実データで中断ターンの 91%（113/124）が
+/// 未発火）し、許可プロンプトの**許可には「解除された」を知らせるイベントが存在しない**。
+/// 対して `status` は claude が遷移のたびに上書きする**現在値**なので、次の観測が
+/// 来れば必ず正しくなる。
 ///
-/// **逆向き、hook の `working` も、より新しい非 `busy` 観測に負ける。**
-/// claude は **Esc 中断のとき `Stop` hook を撃たない**（実データで確認済み:
-/// 中断ターンの 91%（113/124）で `Stop` 未発火。`hook-states.json` に `working` の
-/// まま固着した行が実際に見つかった）。「ターンが終わった」を知らせるイベントが
-/// 来ない以上 `working` は自己修復できず、次のターンを完走するか窓を閉じるまで
-/// 赤・明滅のまま固着する。
+/// **以前はこの 2 つを別々の語彙のまま突き合わせていた**（hook は
+/// `working|waiting|completed`、`status` は `busy|waiting|shell|idle`）。
+/// 突き合わせようがないので食い違うたびに特例を 1 本足すことになり、双方向 2 本
+/// （`waiting` は新しい `busy` に負ける／`working` は新しい非 `busy` に負ける）まで
+/// 増えていた。しかも `shell`（idle だがバックグラウンド bash が走っている）が
+/// 「非 `busy`」に含まれるため、**バックグラウンド実行中の行が入力待ちへ落ちる**という
+/// 副作用が付いていた。語彙を揃えると特例は 0 本になり、残るのは新旧の比較だけ。
 ///
-/// **以前はこの逆向きを避けていた。** 当時の懸念は「`idle_prompt`（60 秒放置の
-/// 催促。`crate::hooks` の `ATTENTION_MATCHER` が今も避けている問題と同じ）のような
-/// **時間経過だけの誤検知**で、ターンを終えた行が入力待ちへ落ちる」というものだった。
-/// **今回はその失敗の型に当たらないと判断した**: 材料が違う。`idle_prompt` は
-/// 「何もしていない時間が経った」というタイマー起点の通知で claude の実際の状態を
-/// 見ていないが、`agents --json` の `status` は **claude 自身がポーリングのたびに
-/// 都度上書きする現在値**で、経過時間は見ない。
-///
-/// **ちらつきリスクは実測して確認した**: `claude agents --json --all` を実際の
-/// セッションに対して繰り返し叩き、ツール実行中・その前後の思考中を通じて
-/// `status` が `busy` のまま安定していること（連続ポーリングで 1 ターンの間
-/// 一度も `busy` から離れなかった）を確かめた。ゆえに「より新しい非 `busy` 観測」は
-/// 高い信頼度で「そのターンが実際に終わった（中断された）」を意味する。
-///
-/// `waiting`・`working` 以外（`completed` 等）は status で覆さない: `busy` は
-/// 「このターンの続き」と「次のターン」を区別できないので、`completed` を覆すと
-/// Done の意味が壊れる（次のターンが始まれば `UserPromptSubmit` hook が即
-/// `working` を書くので、覆す必要も無い）
-pub(crate) fn row_state(run: Option<Run<'_>>) -> Group {
-    let Some(run) = run.filter(|run| run.hook.map(|(state, _)| state) != Some(STOPPED)) else {
-        return classify(STOPPED, false);
+/// 遅れは構造的に有界: hook は 0 遅延で入るので押した瞬間に色が変わり、hook を
+/// 取り逃しても最大ポーリング 1 周期（[`spawn_agents_poller`]）で観測が追い越す
+pub(crate) fn row_state(run: Option<Run<'_>>) -> State {
+    let Some(run) = run.filter(|run| run.hook.map(|(state, _)| state) != Some(State::Stopped))
+    else {
+        return State::Stopped;
     };
-    match run.hook {
-        Some((WAITING, at)) if run.status == STATUS_BUSY && run.status_at > at => {
-            classify(WORKING, true)
-        }
-        // status が空は「まだ観測していない」（`Run::status` の doc）であって
-        // 「busy でないと確認できた」ではないので、`is_empty()` で明示的に除く
-        Some((WORKING, at))
-            if !run.status.is_empty() && run.status != STATUS_BUSY && run.status_at > at =>
-        {
-            classify(WAITING, true)
-        }
-        Some((state, _)) => classify(state, true),
-        None if run.status.is_empty() && run.busy => classify(WORKING, true),
-        None if run.status.is_empty() => classify(WAITING, true),
-        None => classify(foreground_state(run.status), true),
+    let observed = state_of_status(run.status).map(|state| (state, run.status_at));
+    // 同時刻なら hook を採る（hook はそのセッション自身が turn の境目で書くので、
+    // 同じ ms に並んだ 2 秒周期の観測よりも出所が確か）
+    let newest = match (run.hook, observed) {
+        (Some((_, at)), Some(observed @ (_, seen))) if seen > at => Some(observed),
+        (Some(hook), _) => Some(hook),
+        (None, observed) => observed,
+    };
+    match newest {
+        Some((state, _)) => state,
+        // 材料が 1 つも無い行 ＝ **自分の窓を起こした直後**（他インスタンスの行は
+        // status を、撮影用の行は hook を必ず持つ）。だから「まだ何も出していない」は
+        // 起動中であって、終わったわけではない
+        None => match run.pty {
+            Some(PtyHint::Starting | PtyHint::Writing) => State::Working,
+            // 窓が無い行はここへ来ない（来たとしても、知らないことを「入力待ち」と
+            // 名乗ってユーザーを呼びつけるよりは静かな方が害が小さい）
+            Some(PtyHint::Quiet) | None => State::Idle,
+        },
     }
 }
 
@@ -863,6 +872,43 @@ mod tests {
             "the start time ({stamped}) is stamped near completion ({after}), not near the start \
              ({before}); fetch_started must be stored before the fetch runs, not after"
         );
+    }
+
+    /// **綴りそのものを固定する。** これは保存（`hook-states.json`）と hook の
+    /// CLI 引数のワイヤ形式で、**変えると 2 つが同時に壊れる**: 前の版が書いた
+    /// 保管が読めなくなり、更新前に起こした claude が呼ぶコマンドも通らなくなる。
+    ///
+    /// **往復（`parse(as_str())`）だけでは守れない**: [`State::parse`] は
+    /// [`State::as_str`] を舐めて実装してあるので、綴りを丸ごと変えても往復は成立する。
+    /// だからここは字面を直接置く（[`State::ORDER`] への載せ忘れは網羅の検査で落ちる）
+    #[test]
+    fn the_stored_spelling_of_every_state_is_fixed() {
+        let spelled: Vec<&str> = State::ORDER.iter().map(|state| state.as_str()).collect();
+        assert_eq!(spelled, ["waiting", "working", "idle", "stopped"]);
+        // 綴りは claude 側の値とも重なる（[`state_of_status`] が同じ語へ写す）
+        for state in State::ORDER {
+            assert_eq!(State::parse(state.as_str()), Some(state), "{state:?}");
+        }
+        // 語彙に無い綴りは受けない（呼び手が「読めなかった」を自分で decide する）
+        // `completed` は語彙から外した語（旧版の保管に残る）
+        for unknown in ["", "blocked", "done", "completed", "Working", "idle "] {
+            assert_eq!(State::parse(unknown), None, "{unknown:?}");
+        }
+    }
+
+    /// claude の `status` の写し先。**`shell` を `idle` と同じに畳むのは意図した判断**で、
+    /// ここが黄（Waiting）へ倒れていた頃はバックグラウンド実行中の行が
+    /// 「Needs input」を名乗ってユーザーを呼びつけていた
+    #[test]
+    fn a_live_status_maps_to_the_shared_vocabulary() {
+        assert_eq!(state_of_status("busy"), Some(State::Working));
+        assert_eq!(state_of_status("waiting"), Some(State::Waiting));
+        assert_eq!(state_of_status("idle"), Some(State::Idle));
+        assert_eq!(state_of_status("shell"), Some(State::Idle));
+        // 空 ＝ まだ観測していない（値を載せないセッションも実在する）
+        assert_eq!(state_of_status(""), None);
+        // 知らない値は「動いているらしい」へ倒す（呼びつけるよりは害が小さい）
+        assert_eq!(state_of_status("something-new"), Some(State::Working));
     }
 
     /// PERSONAL の email（プロフィール照合のテストで使う）

@@ -176,7 +176,7 @@ pub(crate) enum PopupKind {
         /// 窓が開いていて子プロセスが生きているか（`stop` を出せるかの判断）
         open: bool,
     },
-    Group,
+    State,
     /// プロジェクト単位の操作。`has_sessions` は開いた時点の写し（[`PopupKind::Session`] の
     /// `open` と同じ作り）で、`remove project` を出せるかの判断に使う
     Project { cwd: String, has_sessions: bool },
@@ -262,7 +262,7 @@ impl PopupKind {
             }
             // 項目は [`Grouping::ORDER`] から導く（variant を足すとここも自動で増える ＝
             // メニューだけ古い 2 分岐のまま、という形を作れない）
-            PopupKind::Group => Grouping::ORDER
+            PopupKind::State => Grouping::ORDER
                 .into_iter()
                 .map(|g| PopupEntry {
                     label: format!("{}{}", if grouping == g { "● " } else { "  " }, g.as_str()),
@@ -321,7 +321,7 @@ pub(crate) struct App {
     // claude agents --json のライブ状態（正規 IF。バックグラウンドスレッドが更新）
     pub(crate) agents: Vec<AgentInfo>,
     /// [`Self::agents`] の**取得を始めた時刻**（ms）。**status の観測時刻**として
-    /// hook の記録時刻と新旧を比べる材料（[`crate::poll::row_state`] の裁定則）。
+    /// hook の記録時刻と新旧を比べる材料（[`crate::poll::row_state`]）。
     ///
     /// **取り込みの瞬間（run ループの swap）を刻まない。** `agents --json` は
     /// 1 回 ~900ms かかる（[`crate::poll::spawn_agents_poller`]）ので、取得完了後の
@@ -360,7 +360,7 @@ pub(crate) struct App {
     /// 撮影用の固定 state（`session_id` → state）。**実データでは必ず空**で、
     /// 窓を持たない行を「動いている」ものとして描くためだけにある
     /// （[`crate::source::DataSource::fixed_states`]）
-    pub(crate) fixed_states: std::collections::HashMap<SessionId, String>,
+    pub(crate) fixed_states: std::collections::HashMap<SessionId, crate::poll::State>,
     /// 最後に見た hook 受け渡しファイルの見え方（長さ・更新時刻）。
     /// **中身ではなく「変わったか」だけを持つ**ので、run ループが毎周見ても安い。
     /// 変わった周は周期を待たずに一覧を読み直す ＝ ペイン内の `/resume` `/clear` が
@@ -449,7 +449,7 @@ pub(crate) struct App {
     /// 直前のフレームで速い描き直しが要る何かが動いていたか。
     /// run ループがアイドル時の描き直し間隔を選ぶ材料（描画が毎フレーム更新する）。
     ///
-    /// **材料は 2 つ束ねている**: 行のドットの明滅（[`crate::poll::Group::blinks`]）と、
+    /// **材料は 2 つ束ねている**: 行のドットの明滅（[`crate::poll::State::blinks`]）と、
     /// 使用率の取得中スピナー（[`Self::usage_fetching`]。回るのは本物のブライユ点字
     /// アニメ ＝ [`crate::ui::usage_spinner_frame`]）。どちらも「今フレームを
     /// 速く描き直す必要があるか」という同じ問いに答えるので、
@@ -1179,7 +1179,7 @@ fn run_row_action(app: &mut App, action: RowAction, anchor_y: u16) {
             app.open_new_view();
             app.set_focus(Focus::Terminal);
         }
-        RowAction::ToggleGroup => open_popup(app, PopupKind::Group, anchor_y),
+        RowAction::ToggleGroup => open_popup(app, PopupKind::State, anchor_y),
         // 見出し行はメニューを開くだけ。**フォーカスは移さない**（メニューがキーを受ける）
         RowAction::Project(cwd) => open_project_popup(app, cwd, anchor_y),
         // 更新行はその場で実行するだけ（右ペインを切り替えない）
@@ -1427,7 +1427,7 @@ fn adopt_hook_states(app: &mut App) {
     // **ターンが終わった行があれば使用率を取り直す。** 使用率が動くのはこの瞬間だけで、
     // 周期で叩き続けるより正確なうえ、何もしていない間は claude を 1 プロセスも
     // 起こさない（間引きは供給元の側。[`crate::usage`]）
-    if app.hook_states.any_turn_finished_since(&previous) {
+    if app.hook_states.any_row_went_idle_since(&previous) {
         app.source.note_turn_finished();
     }
     let shown: Option<SessionId> = app.shown_session().cloned();
@@ -2713,22 +2713,22 @@ mod tests {
     #[test]
     fn group_menu_marks_the_current_grouping_and_maps_each_row_to_it() {
         assert_eq!(
-            labels(&PopupKind::Group, Grouping::State),
+            labels(&PopupKind::State, Grouping::State),
             ["● state", "  directory"]
         );
         assert_eq!(
-            labels(&PopupKind::Group, Grouping::Directory),
+            labels(&PopupKind::State, Grouping::Directory),
             ["  state", "● directory"]
         );
         assert_eq!(
-            PopupKind::Group.action(Grouping::State, 0),
+            PopupKind::State.action(Grouping::State, 0),
             Some(PopupAction::SetGrouping(Grouping::State))
         );
         assert_eq!(
-            PopupKind::Group.action(Grouping::State, 1),
+            PopupKind::State.action(Grouping::State, 1),
             Some(PopupAction::SetGrouping(Grouping::Directory))
         );
-        assert_eq!(PopupKind::Group.action(Grouping::State, 2), None);
+        assert_eq!(PopupKind::State.action(Grouping::State, 2), None);
     }
 
     /// セッション行の**行末** `=` クリックでメニューが開く（二次操作の入口）。
@@ -2771,7 +2771,7 @@ mod tests {
         handle_mouse(&mut app, &click(5, 1)).unwrap();
         assert_eq!(
             app.popup.as_ref().map(|p| &p.kind),
-            Some(&PopupKind::Group),
+            Some(&PopupKind::State),
             "grouping menu must be open"
         );
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
@@ -2784,7 +2784,7 @@ mod tests {
     #[test]
     fn picking_the_current_grouping_leaves_it_unchanged() {
         let mut app = test_app(34, TERM);
-        open(&mut app, PopupKind::Group, 3);
+        open(&mut app, PopupKind::State, 3);
         activate_popup(&mut app, 0); // ● state
         assert_eq!(app.grouping, Grouping::State);
         assert!(app.popup.is_none());
@@ -2817,7 +2817,7 @@ mod tests {
     #[test]
     fn esc_and_outside_click_close_the_popup() {
         let mut app = test_app(34, TERM);
-        let menu = || PopupKind::Group;
+        let menu = || PopupKind::State;
         open(&mut app, menu(), 5);
         handle_popup_key(&mut app, KeyCode::Esc);
         assert!(app.popup.is_none(), "esc must close the menu");
@@ -2833,7 +2833,7 @@ mod tests {
     fn arrow_keys_clamp_the_selection_to_the_entry_range() {
         let mut app = test_app(34, TERM);
         // 2 項目のメニュー（state / directory）
-        open(&mut app, PopupKind::Group, 3);
+        open(&mut app, PopupKind::State, 3);
         for _ in 0..5 {
             handle_popup_key(&mut app, KeyCode::Down);
         }
@@ -2871,7 +2871,7 @@ mod tests {
     #[test]
     fn clicking_the_menu_border_does_not_run_an_item() {
         let mut app = test_app(34, TERM);
-        open(&mut app, PopupKind::Group, 3);
+        open(&mut app, PopupKind::State, 3);
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
         for (col, row) in [
             (rect.x, rect.y + 1),
@@ -2911,7 +2911,7 @@ mod tests {
     /// 幅は内容で決まるため「サイドバーより広い」「端末より広い」が起こり得る
     #[test]
     fn popup_rect_stays_inside_the_terminal_for_any_sidebar_width() {
-        let kinds = || vec![session("s1", false), PopupKind::Group, project_menu()];
+        let kinds = || vec![session("s1", false), PopupKind::State, project_menu()];
         for (term_w, term_h) in [(120u16, 40u16), (80, 24), (52, 8), (14, 5), (1, 1)] {
             for sidebar_width in [12u16, 26, 34, term_w] {
                 for anchor_y in [0u16, 1, 5, u16::MAX] {
@@ -3314,7 +3314,7 @@ mod tests {
     fn an_open_menu_swallows_clicks_aimed_at_the_version_rows() {
         let mut app = app_with_version_rows(34);
         app.selection = SidebarPos::Row(3); // `+ new session`。動いたら分かる位置に置く
-        open(&mut app, PopupKind::Group, 3);
+        open(&mut app, PopupKind::State, 3);
         let rect = popup_rect(&app, app.popup.as_ref().unwrap());
         assert!(rect.y > 2, "the menu must overlap the version row so this isn't an outside click");
         handle_mouse(&mut app, &click(5, 1)).unwrap();
@@ -3462,7 +3462,7 @@ mod tests {
         }
 
         // 窓を持たない行を動いていることにする経路は撮影用だけ（[`DemoSource`]）
-        fn fixed_states(&self) -> std::collections::HashMap<SessionId, String> {
+        fn fixed_states(&self) -> std::collections::HashMap<SessionId, crate::poll::State> {
             std::collections::HashMap::new()
         }
 
@@ -4153,7 +4153,7 @@ mod tests {
 
         // **hook が主。** 同じ pid について hook が別のセッションを知っていれば
         // そちらを採る（hook は turn の瞬間に届くので `agents --json` より新しい）
-        let hooks = HookStates::from_records([("just-cleared", "blocked", 5_000, Some(10))]);
+        let hooks = HookStates::from_records([("just-cleared", crate::poll::State::Waiting, 5_000, Some(10))]);
         assert_eq!(of(Some(10), &hooks), Some(SessionId::new("just-cleared")));
         // 窓の起動より古い hook は前回の実行のもの ＝ 従経路へ落ちる
         assert_eq!(
@@ -4161,7 +4161,7 @@ mod tests {
             Some(SessionId::new("after-resume"))
         );
         // hook しか知らない pid にも答える（`agents --json` が pid を載せない環境）
-        let only_hook = HookStates::from_records([("hook-only", "working", 1, Some(77))]);
+        let only_hook = HookStates::from_records([("hook-only", crate::poll::State::Working, 1, Some(77))]);
         assert_eq!(of(Some(77), &only_hook), Some(SessionId::new("hook-only")));
     }
 
@@ -4905,7 +4905,7 @@ mod tests {
         let mut app = App {
             sessions: rows.to_vec(),
             source: Arc::new(TestSource::for_hooks(HookStates::from_entries([(
-                "s", "blocked", 9_999,
+                "s", crate::poll::State::Waiting, 9_999,
             )]))),
             ..Default::default()
         };
@@ -4914,7 +4914,7 @@ mod tests {
         // 写しそのものは取り直されている（表示はここから導く）
         assert_eq!(
             app.hook_states.get(&SessionId::new("s"), Some(0)).map(|(state, _)| state),
-            Some("blocked")
+            Some(crate::poll::State::Waiting)
         );
     }
 
@@ -4927,13 +4927,13 @@ mod tests {
     fn a_row_is_unread_only_when_claude_spoke_after_it_was_opened() {
         let mut row = session_row("s", "C:\\dev\\api", 1_000);
         row.last_opened_at = 1_000;
-        let unread = |at| HookStates::from_entries([("s", "done", at)]).unread(&row);
+        let unread = |at| HookStates::from_entries([("s", crate::poll::State::Idle, at)]).unread(&row);
         assert!(!HookStates::default().unread(&row), "a row with no hook record is unread");
         assert!(!unread(1_000), "a hook from before the row was opened marks it unread");
         assert!(unread(1_001), "claude spoke after the row was opened but it stayed read");
 
         // 自分の操作（ピン留め）は行を書き換えるが未読の材料を動かさない
-        let hooks = HookStates::from_entries([("s", "done", 999)]);
+        let hooks = HookStates::from_entries([("s", crate::poll::State::Idle, 999)]);
         let mut app = App {
             sessions: vec![row.clone()],
             hook_states: hooks,
@@ -4953,7 +4953,7 @@ mod tests {
     #[test]
     fn opening_a_pane_marks_the_row_read() {
         let rows = [session_row("s", "C:\\dev\\api", 1)];
-        let mut app = app_with_hooks(&rows, HookStates::from_entries([("s", "done", 2)]));
+        let mut app = app_with_hooks(&rows, HookStates::from_entries([("s", crate::poll::State::Idle, 2)]));
         assert!(app.hook_states.unread(row_of(&app, "s")), "the premise (an unread row) broke");
 
         mark_read(&mut app, &SessionId::new("s"));
@@ -5028,7 +5028,7 @@ mod tests {
         let id = SessionId::new("s");
         // 未読の行（claude が何か言ったのに、まだ開いていない）
         app.sessions[0].last_opened_at = 1_000;
-        app.hook_states = HookStates::from_entries([("s", "done", 2_000)]);
+        app.hook_states = HookStates::from_entries([("s", crate::poll::State::Idle, 2_000)]);
         assert!(app.hook_states.unread(only_row(&app)), "the premise (an unread row) broke");
 
         run_popup_action(&mut app, PopupAction::TogglePin(id.clone()));
@@ -5064,7 +5064,7 @@ mod tests {
         let id = SessionId::new("s");
         app.sessions[0].last_opened_at = 1_000;
         app.sessions[0].updated_at = 2_000;
-        app.hook_states = HookStates::from_entries([("s", "done", 2_000)]);
+        app.hook_states = HookStates::from_entries([("s", crate::poll::State::Idle, 2_000)]);
 
         // 未読の行への `mark as read`: 既読にはなるが行の内容は変わっていない
         run_popup_action(&mut app, PopupAction::MarkRead(id.clone()));
@@ -5130,7 +5130,7 @@ mod tests {
             (0usize, session("s", false)),
             // 行 "s" の cwd がこのフォルダ ＝ セッションが残っている見出し
             (1, project("C:\\dev\\api", true)),
-            (2, PopupKind::Group),
+            (2, PopupKind::State),
         ] {
             app.popup = None;
             app.selection = SidebarPos::Row(row);
@@ -5159,7 +5159,7 @@ mod tests {
         let mut app = test_app(34, TERM);
         app.sessions = vec![session_row("s", "C:\\ccdesk-test-no-such-folder", 1)];
         // claude が行を開いた後に何か言った ＝ 未読
-        app.hook_states = HookStates::from_entries([("s", "done", 2)]);
+        app.hook_states = HookStates::from_entries([("s", crate::poll::State::Idle, 2)]);
         // 別インスタンスで稼働中 ＝ open_session のガードが決定的に止める
         app.agents = vec![AgentInfo {
             session_id: "s".to_string(),
