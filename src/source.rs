@@ -19,7 +19,7 @@ use ccdesk::{same_dir, save_setting, save_state, update_state_list, LockExt};
 use crate::hooks::HookStates;
 use crate::poll::{
     spawn_agents_poller, spawn_footer_poller, AccountStatus, AgentInfo, FooterInfo, Grouping,
-    VersionSinks, COMPLETED, WAITING, WORKING,
+    State, VersionSinks,
 };
 use crate::usage::{Usage, UsageInfo, UsageRefresh, UsageSlot, UsageWindow};
 use crate::sessions::{SessionId, SessionRow, SessionStore};
@@ -50,16 +50,16 @@ const DEFAULT_SIDEBAR_WIDTH: u16 = 34;
 /// 1. セッション行 `<行頭><名前><menu>`。前後の固定桁は [`crate::ui::HEAD_COLS`] +
 ///    [`crate::ui::MENU_COLS`]（手でこの桁数を数え直さない。テストもそちらを読む）で、
 ///    [`demo_rows`] の最長は "add dark mode toggle"(20)
-/// 2. 集計行 `1 waiting · 2 working · 2 completed · 1 stopped` ＝ 47 桁。
+/// 2. 集計行 `1 waiting · 2 working · 2 idle · 1 stopped` ＝ 42 桁。
 ///    語の途中で切れると画像が壊れて見えるので、こちらが実際の下限になる
 ///
-/// List は枠の内側（幅 - 2）で切るので 47 + 2 = 49 桁。右ペインを削らないよう
+/// List は枠の内側（幅 - 2）で切るので 42 + 2 = 44 桁。右ペインを削らないよう
 /// これ以上は広げない。状態はドットの色で語るので行に文字は乗らない
 /// （行末の要約・経過時間はもう出ない）。
 /// **実データではこの幅を要求しない**（集計行は 0 件の項目を出さないので、
 /// 4 種すべてが揃っている撮影データが最も長い）。
 /// 根拠は `demo_sidebar_width_fits_the_sidebar_rows` が固定する
-const DEMO_SIDEBAR_WIDTH: u16 = 49;
+const DEMO_SIDEBAR_WIDTH: u16 = 44;
 
 /// 撮影用の new session 画面の初期フォルダ（実フォルダを出さない）
 const DEMO_CWD: &str = "C:\\dev\\shop-app";
@@ -165,7 +165,7 @@ pub(crate) trait DataSource: Send + Sync {
     /// 「動いている実行」をこの表で名乗る。**実データ側は必ず空**
     /// （実データの生死を答えるのは自分の子プロセスだけ）。
     /// 名前を [`Titles::fixed`] で差し替えるのと同じ形
-    fn fixed_states(&self) -> std::collections::HashMap<SessionId, String>;
+    fn fixed_states(&self) -> std::collections::HashMap<SessionId, State>;
 
     /// hook の受け渡しファイルの見え方（長さ・更新時刻）。**中身を読まずに
     /// 「変わったか」だけを答える**口で、run ループが毎周見て、変わった周だけ
@@ -401,7 +401,7 @@ impl DataSource for LiveSource {
         crate::hooks::read_states()
     }
 
-    fn fixed_states(&self) -> std::collections::HashMap<SessionId, String> {
+    fn fixed_states(&self) -> std::collections::HashMap<SessionId, State> {
         // 実データの行が「動いている」と言えるのは自分の子プロセスが生きている
         // ときだけ ＝ ここから状態を足す経路は持たない
         std::collections::HashMap::new()
@@ -570,7 +570,7 @@ impl DataSource for DemoSource {
         HookStates::default()
     }
 
-    fn fixed_states(&self) -> std::collections::HashMap<SessionId, String> {
+    fn fixed_states(&self) -> std::collections::HashMap<SessionId, State> {
         demo_rows()
             .into_iter()
             .filter_map(|(row, _, state)| state.map(|state| (row.session_id, state)))
@@ -647,13 +647,13 @@ fn demo_sessions() -> Vec<SessionRow> {
 /// **名前も状態も行が持たない**（正本はそれぞれ transcript と「動いている実行」）
 /// ので、撮影は [`Titles::fixed`] と [`DataSource::fixed_states`] へ渡す表として持つ。
 /// 状態が None の行は**動かしている実行が無い** ＝ Stopped
-fn demo_rows() -> Vec<(SessionRow, String, Option<String>)> {
-    let rows: [(&str, Option<&str>, &str); 6] = [
-        ("fix login form validation", Some(WORKING), "C:\\dev\\shop-app"),
-        ("add dark mode toggle", Some(WAITING), "C:\\dev\\shop-app"),
-        ("refactor api client", Some(WORKING), "C:\\dev\\api"),
-        ("write onboarding docs", Some(COMPLETED), "C:\\dev\\docs"),
-        ("optimize image pipeline", Some(COMPLETED), "C:\\dev\\api"),
+fn demo_rows() -> Vec<(SessionRow, String, Option<State>)> {
+    let rows: [(&str, Option<State>, &str); 6] = [
+        ("fix login form validation", Some(State::Working), "C:\\dev\\shop-app"),
+        ("add dark mode toggle", Some(State::Waiting), "C:\\dev\\shop-app"),
+        ("refactor api client", Some(State::Working), "C:\\dev\\api"),
+        ("write onboarding docs", Some(State::Idle), "C:\\dev\\docs"),
+        ("optimize image pipeline", Some(State::Idle), "C:\\dev\\api"),
         ("migrate to vite", None, "C:\\dev\\shop-app"),
     ];
     let now = ccdesk::now_ms();
@@ -670,7 +670,7 @@ fn demo_rows() -> Vec<(SessionRow, String, Option<String>)> {
                     ..SessionRow::new(id, *cwd, updated)
                 },
                 (*title).to_string(),
-                state.map(str::to_string),
+                *state,
             )
         })
         .collect()
@@ -717,7 +717,6 @@ fn demo_usage() -> UsageInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::poll::classify;
     use ccdesk::{load_state, load_state_list};
 
     /// 撮影データは固定。実セッション・実アカウント・実使用率が混ざらないことを、
@@ -1045,7 +1044,7 @@ mod tests {
         use unicode_width::UnicodeWidthStr;
 
         // 集計ヘッダー行（ui::draw が組む文面）。demo データではこの 1 通りに定まる
-        const DEMO_HEADER: &str = "1 waiting · 2 working · 2 completed · 1 stopped";
+        const DEMO_HEADER: &str = "1 waiting · 2 working · 2 idle · 1 stopped";
 
         let inner = usize::from(DEMO_SIDEBAR_WIDTH - 2);
         // 行が名前の前後で固定して食う桁。**正本は `crate::ui` の定数**（ここで
@@ -1056,9 +1055,9 @@ mod tests {
         let mut counts = std::collections::BTreeMap::<&str, usize>::new();
         for (_, title, state) in demo_rows() {
             // 固定 state を持つ行は「動いている実行がある」扱い（[`crate::ui`] の導出と同じ）
-            let view = match &state {
-                Some(state) => classify(state, true),
-                None => classify(crate::poll::STOPPED, false),
+            let view = match state {
+                Some(state) => state,
+                None => crate::poll::State::Stopped,
             };
             *counts.entry(view.title()).or_default() += 1;
             let need = fixed_cols + title.width();
@@ -1076,7 +1075,7 @@ mod tests {
             std::collections::BTreeMap::from([
                 ("Waiting", 1),
                 ("Working", 2),
-                ("Completed", 2),
+                ("Idle", 2),
                 ("Stopped", 1),
             ])
         );

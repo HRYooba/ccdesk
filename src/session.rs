@@ -20,6 +20,7 @@ use ccdesk::{new_parser, now_ms, LockExt, Parser};
 // 継承させない環境変数の一覧は claude の非公開な形なので
 // [`crate::claude_format`] が持つ（外れたときに直す場所を 1 つにするため）
 use crate::claude_format::INHERITED_MARKERS;
+use crate::poll::PtyHint;
 use crate::sessions::SessionId;
 use crate::theme::HOST_COLORS;
 
@@ -53,6 +54,25 @@ fn hold_frame(updating: bool, since_output: Duration, since_draw: Duration) -> b
         return false;
     }
     updating || since_output < OUTPUT_QUIET
+}
+
+/// 「まだ出力が続いている」と見なす、最後の出力からの猶予
+const BUSY_QUIET: Duration = Duration::from_secs(2);
+
+/// 出力変化ヒューリスティック。**hook も `agents --json` の status も無い行の
+/// 最後の手段**（[`crate::poll::row_state`]）で、精度は低い（フォーカスの出入りや
+/// 再描画でも動く）。
+///
+/// **`started`（一度でも出力したか）が要点。** `since_output` の起点は窓を作った
+/// 時刻なので、無出力には意味の違う 2 つが混ざる: まだ端末を掴んでいない（起動中）と、
+/// 掴んだうえで静か（プロンプトで待機）。真偽値 1 つで持っていた頃はこれを混同し、
+/// **セッションを開き直すたびに根拠の無い赤が 2 秒出て**いた
+fn pty_hint(started: bool, since_output: Duration) -> PtyHint {
+    match (started, since_output < BUSY_QUIET) {
+        (false, _) => PtyHint::Starting,
+        (true, true) => PtyHint::Writing,
+        (true, false) => PtyHint::Quiet,
+    }
 }
 
 /// DEC private mode 2026（synchronized output）
@@ -447,9 +467,11 @@ impl Session {
     /// 出力変化ヒューリスティック: 直近 2 秒に出力があれば「動いているらしい」
     /// （hook も `agents --json` の status も無い行の最後の手段）。
     /// **生死は見ない**: 生死の観測（try_wait）は呼び手が別に持っていて、
-    /// ここでも呼ぶと同じ syscall が 1 フレームに 2 回走る
-    pub(crate) fn looks_busy(&self) -> bool {
-        self.last_output.lock_recover().elapsed() < Duration::from_secs(2)
+    /// ここでも呼ぶと同じ syscall が 1 フレームに 2 回走る。
+    ///
+    /// 判断そのものは [`pty_hint`]（PTY を開かずに試せる純関数）
+    pub(crate) fn pty_hint(&self) -> PtyHint {
+        pty_hint(self.started(), self.last_output.lock_recover().elapsed())
     }
 
 
@@ -475,6 +497,23 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **無出力には意味の違う 2 つが混ざる。**
+    ///
+    /// 経過時間の起点は窓を作った時刻。まだ端末を掴んでいない子は「起動中」で、
+    /// 掴んだうえで静かなら「プロンプトで待機」。真偽値 1 つで持っていた頃は
+    /// この 2 つを混同し、開き直すたびに根拠の無い赤が 2 秒出ていた
+    #[test]
+    fn an_unwritten_child_is_starting_not_finished() {
+        let fresh = Duration::from_millis(0);
+        // まだ 1 バイトも出していない ＝ 起動中（猶予を過ぎていても変わらない）
+        assert_eq!(pty_hint(false, fresh), PtyHint::Starting);
+        assert_eq!(pty_hint(false, BUSY_QUIET * 10), PtyHint::Starting);
+        // 掴んだ後は出力の勢いで割れる
+        assert_eq!(pty_hint(true, fresh), PtyHint::Writing);
+        assert_eq!(pty_hint(true, BUSY_QUIET - Duration::from_millis(1)), PtyHint::Writing);
+        assert_eq!(pty_hint(true, BUSY_QUIET), PtyHint::Quiet);
+    }
 
     /// 組み立てたコマンドラインの引数（先頭のプログラム名は落とす）
     fn argv(cmd: &CommandBuilder) -> Vec<String> {

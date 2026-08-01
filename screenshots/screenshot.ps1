@@ -1,8 +1,12 @@
-# Regenerate assets/screenshot.png from ccdesk --demo, rendered by Windows Terminal.
+# Regenerate screenshots/screenshot.png from ccdesk --demo, rendered by Windows Terminal.
+#
+# The image and the script that produces it live in the same folder on purpose: they
+# only make sense together, and splitting them across assets/ and scripts/ meant
+# neither directory said what it was for.
 #
 # Usage (from the repository root, after a release build):
 #
-#   .\scripts\screenshot.ps1 -Exe .\target\release\ccdesk.exe -Out .\assets\screenshot.png
+#   .\screenshots\screenshot.ps1 -Exe .\target\release\ccdesk.exe -Out .\screenshots\screenshot.png
 #
 # Run this whenever the sidebar or the new-session screen changes shape, so the
 # README image keeps matching the current version. Check the result before

@@ -8,7 +8,7 @@ persistent sidebar. Each pane **is** a foreground `claude` session that ccdesk o
 and the list itself lives in `~/.ccdesk/sessions.json`, so closing ccdesk ends the
 processes while the rows stay — reopen one and it resumes from its transcript.
 
-![ccdesk](assets/screenshot.png)
+![ccdesk](screenshots/screenshot.png)
 
 ## Features
 
