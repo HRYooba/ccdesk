@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use portable_pty::CommandBuilder;
 
-use crate::backend::{Backend, Inject, Launch};
+use crate::backend::{codex_index, AgentVersion, Backend, Inject, Launch};
 use crate::hooks::{HOOK_EVENTS, HOOK_TIMEOUT_SECS, ROW_ENV};
 use crate::sessions::SessionId;
 
@@ -85,6 +85,35 @@ impl Backend for Codex {
             }
         }
         cmd
+    }
+
+    /// **要る。** codex に `agents --json` 相当のライブ状態は無く、Esc 中断では
+    /// `Stop` が発火しない（[#22858](https://github.com/openai/codex/issues/22858)。
+    /// 2026-08-02 時点で OPEN）。補正しないと中断した行が Working のまま固着する。
+    ///
+    /// 誤読の危険は小さい: codex の TUI は考えている間もスピナーを描き続けるので、
+    /// 「無出力が続く」＝ ほぼ本当に止まっている
+    fn quiet_means_idle(&self) -> bool {
+        true
+    }
+
+    /// **最新版は codex 自身が書いた更新チェックの結果を読む**
+    /// （`$CODEX_HOME/version.json` の `latest_version`）。claude のように
+    /// 配布エンドポイントを自前で叩かない ＝ ネットワークへ出ない。
+    ///
+    /// 非公開の内部ファイルなので、形が変われば「更新あり」が出なくなるだけ
+    fn version(&self) -> AgentVersion {
+        // 現行版: "codex-cli 0.146.0" の末尾トークン
+        let current = crate::poll::out(PROGRAM, &["--version"])
+            .and_then(|s| s.split_whitespace().last().map(str::to_string))
+            .unwrap_or_default();
+        let latest = codex_index::latest_version()
+            .filter(|l| !current.is_empty() && ccdesk::version_newer(l, &current));
+        AgentVersion { current, latest }
+    }
+
+    fn update_program(&self) -> &'static str {
+        PROGRAM
     }
 }
 

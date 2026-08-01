@@ -36,6 +36,18 @@ fn index_path() -> Option<PathBuf> {
     Some(codex_home()?.join("session_index.jsonl"))
 }
 
+/// codex が自分で書いた更新チェックの結果（`version.json` の `latest_version`）。
+///
+/// **自前で配布エンドポイントを叩かない。** codex は起動時に自分で確認して
+/// この値を残すので、ccdesk はそれを読むだけで足りる（ネットワークへ出ない）。
+/// 非公開の内部ファイルなので、形が変われば「更新あり」が出なくなるだけ
+pub(crate) fn latest_version() -> Option<String> {
+    let path = codex_home()?.join("version.json");
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let latest = value.get("latest_version")?.as_str()?.trim();
+    (!latest.is_empty()).then(|| latest.to_string())
+}
+
 /// codex の会話名（`agent_session_id` → 名前）。
 ///
 /// **ファイルの大きさが変わったときだけ読み直す。** 索引は 1 会話 1 行の追記型で

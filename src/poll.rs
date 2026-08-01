@@ -7,7 +7,11 @@ use std::time::Duration;
 
 use ratatui::style::Color;
 
-use ccdesk::{claude_settings_channel, version_newer, LockExt};
+use std::collections::BTreeMap;
+
+use ccdesk::LockExt;
+
+use crate::backend::{AgentVersion, Kind};
 
 // `agents --json` の項目の綴りは文書化されていないので
 // [`crate::claude_format`] が持つ（外れたときに直す場所を 1 つにするため）
@@ -155,8 +159,16 @@ pub(crate) enum AccountStatus {
 #[derive(Clone, Default)]
 pub(crate) struct FooterInfo {
     pub(crate) account: AccountStatus, // ログイン状態 + 表示ラベル
-    pub(crate) current: String,        // claude の現行バージョン
-    pub(crate) latest: Option<String>, // 新しい版があるときだけ Some
+    /// agent ごとの版（[`crate::backend::Kind::ORDER`] と同じ並び）。
+    /// **kind ごとに 1 本ずつ**なので、agent を足すと版行も自動で増える
+    pub(crate) versions: BTreeMap<Kind, AgentVersion>,
+}
+
+impl FooterInfo {
+    /// その agent の版（まだ取れていなければ既定 ＝ 現行版が空）
+    pub(crate) fn version(&self, kind: Kind) -> AgentVersion {
+        self.versions.get(&kind).cloned().unwrap_or_default()
+    }
 }
 
 /// ccdesk 自身の版チェック（起動時 1 回の使い捨てスレッド）。
@@ -383,27 +395,6 @@ pub(crate) fn fetch_account() -> AccountStatus {
     AccountFetcher::default().fetch()
 }
 
-/// 現行バージョンと、それより新しい配布版があれば その版番号。
-/// 最新版は claude 本体の更新チェックと同じ公式配布エンドポイント
-/// （downloads.claude.ai/claude-code-releases/<channel> が版番号を返す。
-///  チャネルは文書化設定 autoUpdatesChannel に従う。既定 latest）
-fn fetch_version() -> (String, Option<String>) {
-    // 現行バージョン: "2.1.218 (Claude Code)" の先頭トークン
-    let current = out("claude", &["--version"])
-        .and_then(|s| s.split_whitespace().next().map(str::to_string))
-        .unwrap_or_default();
-    let channel = claude_settings_channel();
-    // ネットワークへ出る作法（タイムアウト等）は [`crate::update::http_get`] が持つ。
-    // このスレッドはアカウント取得と共用なので、応答しないネットワークで
-    // ぶら下がるとアカウント行の更新まで止まる ＝ タイムアウトが必須な理由
-    let latest = crate::update::http_get(&format!(
-        "https://downloads.claude.ai/claude-code-releases/{channel}"
-    ))
-    .map(|s| s.trim().to_string())
-    .filter(|l| l.split('.').count() >= 3 && !current.is_empty() && version_newer(l, &current));
-    (current, latest)
-}
-
 /// アカウントの周期フォールバック（秒）。認証ファイルを見られない環境や、
 /// ファイルを経由しない状態変化のための保険
 const ACCOUNT_FALLBACK_SECS: u64 = 60;
@@ -548,15 +539,20 @@ pub(crate) fn spawn_footer_poller(
             // 「起動時 1 回」のような別の規則へ流れる（実際そうなっていた）
             if refetch_due(version_age, VERSION_INTERVAL_SECS, false, forced) {
                 version_age = 0;
-                let (current, latest) = fetch_version();
-                // 取得に失敗した（current が空）ときは書かない。1 回の失敗で
-                // バージョン表記と更新ボタン行が 1 時間消えるのを防ぐ
-                if !current.is_empty() {
+                // **agent ごとに 1 本ずつ取る。** どれを取るかは
+                // [`Kind::ORDER`] が決めるので、agent を足しても取り漏らさない
+                let fetched: BTreeMap<Kind, AgentVersion> = Kind::ORDER
+                    .into_iter()
+                    .map(|kind| (kind, kind.backend().version()))
+                    // 取得に失敗した（current が空）ものは載せない。1 回の失敗で
+                    // バージョン表記と更新ボタン行が 1 時間消えるのを防ぐ
+                    .filter(|(_, v)| !v.current.is_empty())
+                    .collect();
+                if !fetched.is_empty() {
                     let mut guard = shared
                         .lock_recover();
-                    if guard.current != current || guard.latest != latest {
-                        guard.current = current;
-                        guard.latest = latest;
+                    if guard.versions != fetched {
+                        guard.versions = fetched;
                         updated = true;
                     }
                 }
@@ -748,6 +744,9 @@ pub(crate) struct Run<'a> {
     /// （フォーカスの出入りや再描画でも動くので精度は低い）。
     /// `None` ＝ この行に窓が無い（材料は必ず他にあるので、この値は読まれない）
     pub(crate) pty: Option<PtyHint>,
+    /// この行の agent が「PTY の無音 ＝ 手が空いた」を許すか
+    /// （[`crate::backend::Backend::quiet_means_idle`]）。**codex だけ true**
+    pub(crate) quiet_means_idle: bool,
 }
 
 /// 窓の PTY から見た様子。**2 値では足りない**のが要点で、「まだ 1 バイトも
@@ -821,6 +820,13 @@ pub(crate) fn row_state(run: Option<Run<'_>>) -> State {
         (None, observed) => observed,
     };
     match newest {
+        // **hook を取り逃した Working は PTY の無音で降ろす。** ライブ状態を持たない
+        // agent（codex）は、これが無いと中断した行が赤のまま固着する
+        Some((State::Working, _))
+            if run.quiet_means_idle && run.pty == Some(PtyHint::Quiet) =>
+        {
+            State::Idle
+        }
         Some((state, _)) => state,
         // 材料が 1 つも無い行 ＝ **自分の窓を起こした直後**（他インスタンスの行は
         // status を、撮影用の行は hook を必ず持つ）。だから「まだ何も出していない」は

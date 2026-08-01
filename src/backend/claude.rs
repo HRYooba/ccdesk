@@ -9,7 +9,7 @@
 
 use portable_pty::CommandBuilder;
 
-use crate::backend::{Backend, Inject, Launch};
+use crate::backend::{AgentVersion, Backend, Inject, Launch};
 use crate::claude_format::INHERITED_MARKERS;
 use crate::sessions::SessionId;
 
@@ -59,6 +59,42 @@ impl Backend for Claude {
             }
         }
         cmd
+    }
+
+    /// **要らない。** claude は `agents --json` の `status` を遷移のたびに書き直す
+    /// ので、hook を取り逃しても次の観測（2 秒周期）で必ず正しくなる。
+    /// PTY の無音まで材料にすると、考え込んで出力が止まっている間を
+    /// 「手が空いた」と誤って読む
+    fn quiet_means_idle(&self) -> bool {
+        false
+    }
+
+    /// 最新版は claude 本体の更新チェックと同じ公式配布エンドポイント
+    /// （`downloads.claude.ai/claude-code-releases/<channel>` が版番号を返す。
+    /// チャネルは文書化設定 `autoUpdatesChannel` に従う。既定 latest）
+    fn version(&self) -> AgentVersion {
+        // 現行版: "2.1.218 (Claude Code)" の先頭トークン
+        let current = crate::poll::out(PROGRAM, &["--version"])
+            .and_then(|s| s.split_whitespace().next().map(str::to_string))
+            .unwrap_or_default();
+        let channel = ccdesk::claude_settings_channel();
+        // ネットワークへ出る作法（タイムアウト等）は [`crate::update::http_get`] が持つ。
+        // このスレッドはアカウント取得と共用なので、応答しないネットワークで
+        // ぶら下がるとアカウント行の更新まで止まる ＝ タイムアウトが必須な理由
+        let latest = crate::update::http_get(&format!(
+            "https://downloads.claude.ai/claude-code-releases/{channel}"
+        ))
+        .map(|s| s.trim().to_string())
+        .filter(|l| {
+            l.split('.').count() >= 3
+                && !current.is_empty()
+                && ccdesk::version_newer(l, &current)
+        });
+        AgentVersion { current, latest }
+    }
+
+    fn update_program(&self) -> &'static str {
+        PROGRAM
     }
 }
 

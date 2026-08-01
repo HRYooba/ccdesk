@@ -133,6 +133,35 @@ pub(crate) trait Backend: Send + Sync {
         launch: Launch<'_>,
         inject: Option<&Inject>,
     ) -> CommandBuilder;
+
+    /// **hook を取り逃したとき、PTY の無音を「手が空いた」と読んでよいか。**
+    ///
+    /// hook はイベントなので取りこぼすと自己修復しない。claude にはライブ状態
+    /// （`agents --json` の `status`）があり、次の観測で必ず正しくなるので補正は
+    /// 要らない。codex にはそれが無く、実際に Esc 中断では `Stop` が発火しない
+    /// （[openai/codex#22858](https://github.com/openai/codex/issues/22858)）ので、
+    /// 補正しないと Working（赤）が固着する
+    fn quiet_means_idle(&self) -> bool;
+
+    /// この agent の現行版と、それより新しい版があればその番号。
+    ///
+    /// **取得元は agent ごとに違う**（claude は配布エンドポイントへ問い合わせ、
+    /// codex は自身が書いた更新チェックの結果を読む）。ネットワークへ出る実装が
+    /// あるので、呼ぶのは周期取得のスレッドだけ
+    fn version(&self) -> AgentVersion;
+
+    /// 更新を走らせるコマンド（`<program> update`）。**版行の更新導線**
+    fn update_program(&self) -> &'static str;
+}
+
+/// agent 1 つぶんの版。**「新しい版があるときだけ Some」**という形は
+/// claude 側から引き継いだ（読み手が「更新があるか」を latest の有無で判断する）
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub(crate) struct AgentVersion {
+    /// 現行版（取得できなければ空。空は「まだ分からない」）
+    pub(crate) current: String,
+    /// これより新しい版があるときだけ Some
+    pub(crate) latest: Option<String>,
 }
 
 #[cfg(test)]

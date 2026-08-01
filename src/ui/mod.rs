@@ -583,27 +583,29 @@ fn version_row(name: &str, version: &str, state: UpdateState, inner_width: u16) 
 /// 飾りは区切り線だけ ＝ 版行は更新の有無に関係なく選択・ホバーできる
 fn version_rows(
     ccdesk: UpdateState,
-    claude_version: &str,
-    claude: UpdateState,
+    agents: &[(Kind, String, UpdateState)],
     inner_width: u16,
 ) -> Vec<(String, Style, SidebarRow)> {
-    vec![
+    let mut rows = vec![(
+        version_row("ccdesk", env!("CARGO_PKG_VERSION"), ccdesk, inner_width),
+        ccdesk.style(),
+        ccdesk.action(RowAction::UpdateCcdesk, Some(RowAction::RestartCcdesk)),
+    )];
+    // **agent ごとに 1 行。** 1 行へ詰めると横に長くなり、更新導線も行単位で
+    // 押せなくなる（どちらの更新かを行が名乗れない）
+    rows.extend(agents.iter().map(|(kind, version, state)| {
         (
-            version_row("ccdesk", env!("CARGO_PKG_VERSION"), ccdesk, inner_width),
-            ccdesk.style(),
-            ccdesk.action(RowAction::UpdateCcdesk, Some(RowAction::RestartCcdesk)),
-        ),
-        (
-            version_row("claude", claude_version, claude, inner_width),
-            claude.style(),
-            claude.action(RowAction::UpdateClaude, None),
-        ),
-        (
-            separator_text(inner_width),
-            Style::default().fg(ui().dim),
-            SidebarRow::Decoration,
-        ),
-    ]
+            version_row(kind.title(), version, *state, inner_width),
+            state.style(),
+            state.action(RowAction::UpdateAgent(*kind), None),
+        )
+    }));
+    rows.push((
+        separator_text(inner_width),
+        Style::default().fg(ui().dim),
+        SidebarRow::Decoration,
+    ));
+    rows
 }
 
 /// directory グルーピングの見出し行。返すのは [`ProjectRow`]（表示文字列・対象フォルダ・
@@ -725,13 +727,14 @@ fn ccdesk_update_state(app: &App) -> UpdateState {
 /// `claude --version` が新しい版を返して `footer.latest` が消える ＝ 行が自然に
 /// 最新表示へ戻るため。ネイティブインストールは既定で自動更新するので、
 /// 何もしなくてもこの行が消えることもある（公式仕様）
-fn claude_update_state(app: &App) -> UpdateState {
+fn agent_update_state(app: &App, kind: Kind) -> UpdateState {
+    // **進行中は全 agent で共有する 1 本の旗**（同時に 2 つ走らせない）
     if app
         .claude_updating
         .load(std::sync::atomic::Ordering::Relaxed)
     {
         UpdateState::Running
-    } else if app.footer.latest.is_some() {
+    } else if app.footer.version(kind).latest.is_some() {
         UpdateState::Available
     } else {
         UpdateState::Current
@@ -1187,6 +1190,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         // 生きている行が主で、無ければ撮影用の固定表、それも無ければ
         // `agents --json` が拾っている前景セッション（＝ 別インスタンスや
         // ccdesk の外で動いている実行）を実行として扱う
+        // hook を取り逃したときに PTY の無音を材料にしてよいか（agent が答える）
+        let quiet_means_idle = row.kind.backend().quiet_means_idle();
         let run = window
             .filter(|(_, w)| w.alive)
             .map(|(_, w)| Run {
@@ -1194,6 +1199,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 status,
                 status_at: app.agents_observed_at,
                 pty: Some(w.pty),
+                quiet_means_idle,
             })
             .or_else(|| {
                 app.fixed_states.get(&row.session_id).map(|state| Run {
@@ -1203,6 +1209,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                     status: "",
                     status_at: 0,
                     pty: None,
+                    quiet_means_idle,
                 })
             })
             .or_else(|| {
@@ -1222,6 +1229,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                     hook: None,
                     status,
                     status_at: app.agents_observed_at,
+                    quiet_means_idle,
                     // 他インスタンスの実行 ＝ こちらに窓が無い（材料は status）
                     pty: None,
                 })
@@ -1286,13 +1294,19 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         rows.push(kind);
     };
 
-    // 先頭: ccdesk / claude の版行と区切り線。更新があるときだけ行全体がクリック可
-    for (text, style, row) in version_rows(
-        ccdesk_update_state(app),
-        &app.footer.current,
-        claude_update_state(app),
-        inner_width,
-    ) {
+    // 先頭: ccdesk と各 agent の版行、そして区切り線。
+    // 更新があるときだけ行全体がクリック可
+    let agents: Vec<(Kind, String, UpdateState)> = Kind::ORDER
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                app.footer.version(kind).current,
+                agent_update_state(app, kind),
+            )
+        })
+        .collect();
+    for (text, style, row) in version_rows(ccdesk_update_state(app), &agents, inner_width) {
         push_row(&mut items, &mut rows, Line::from(text), style, row);
     }
 
@@ -2207,6 +2221,46 @@ pub(crate) mod tests {
         assert_eq!(tag_col(&read), HEAD_COLS);
     }
 
+    /// **ライブ状態を持たない agent は、PTY の無音で Working を降ろす。**
+    ///
+    /// codex は Esc 中断で `Stop` を撃たない（openai/codex#22858）うえ、
+    /// `agents --json` に相当する現在値も無い。補正が無いと中断した行が
+    /// 赤のまま固着する。claude は `status` が自己修復するので補正しない
+    /// （考え込んで出力が止まっている間を「手が空いた」と誤読しないため）
+    #[test]
+    fn a_quiet_pane_only_clears_working_for_an_agent_with_no_live_status() {
+        let view = |quiet_means_idle, pty| {
+            row_state(Some(Run {
+                hook: Some((WORKING, 1_000)),
+                status: "",
+                status_at: 0,
+                pty: Some(pty),
+                quiet_means_idle,
+            }))
+            .title()
+        };
+        // 補正する agent（codex）: 無音になったら降りる
+        assert_eq!(view(true, PtyHint::Quiet), "Idle");
+        assert_eq!(view(true, PtyHint::Writing), "Working");
+        assert_eq!(view(true, PtyHint::Starting), "Working");
+        // 補正しない agent（claude）: 無音でも hook のまま
+        assert_eq!(view(false, PtyHint::Quiet), "Working");
+    }
+
+    /// 補正がかかるのは Working だけ。**Waiting を無音で降ろすと、許可待ちの行が
+    /// 黙って消える**（ユーザーが動かないと進まないのに呼ばれなくなる）
+    #[test]
+    fn a_quiet_pane_never_clears_waiting() {
+        let state = row_state(Some(Run {
+            hook: Some((WAITING, 1_000)),
+            status: "",
+            status_at: 0,
+            pty: Some(PtyHint::Quiet),
+            quiet_means_idle: true,
+        }));
+        assert_eq!(state.title(), "Waiting");
+    }
+
     /// **行の状態は hook（イベント）と `status`（現在値）の新しい方で決まる。**
     ///
     /// 2 つは同じ語彙へ揃えてある（[`crate::poll::state_of_status`]）ので、
@@ -2215,7 +2269,7 @@ pub(crate) mod tests {
     #[test]
     fn the_newer_of_the_hook_and_the_live_status_decides_the_row() {
         let view = |hook, status, status_at| {
-            row_state(Some(Run { hook, status, status_at, pty: None })).title()
+            row_state(Some(Run { hook, status, status_at, pty: None, quiet_means_idle: false })).title()
         };
         // 観測の方が新しい → 観測が勝つ
         assert_eq!(view(Some((WORKING, 1_000)), "idle", 2_000), "Idle");
@@ -2238,7 +2292,7 @@ pub(crate) mod tests {
     #[test]
     fn a_status_observation_heals_a_hook_whose_closing_event_never_came() {
         let view = |hook, status| {
-            row_state(Some(Run { hook, status, status_at: 2_000, pty: None })).title()
+            row_state(Some(Run { hook, status, status_at: 2_000, pty: None, quiet_means_idle: false })).title()
         };
         // Esc 中断: working のまま固着していた行が、次の観測で赤を降りる
         assert_eq!(view(Some((WORKING, 1_000)), "idle"), "Idle");
@@ -2257,7 +2311,7 @@ pub(crate) mod tests {
     #[test]
     fn background_shell_work_is_not_a_request_for_input() {
         let view = |hook, status| {
-            row_state(Some(Run { hook, status, status_at: 2_000, pty: None })).title()
+            row_state(Some(Run { hook, status, status_at: 2_000, pty: None, quiet_means_idle: false })).title()
         };
         for status in ["idle", "shell"] {
             assert_eq!(view(None, status), "Idle", "{status:?} asks for input");
@@ -2272,7 +2326,7 @@ pub(crate) mod tests {
     /// 「入力待ち」と名乗ってユーザーを呼びつけない）
     #[test]
     fn a_row_with_no_hook_and_no_status_falls_back_to_the_pty_output() {
-        let view = |pty| row_state(Some(Run { hook: None, status: "", status_at: 0, pty: Some(pty) })).title();
+        let view = |pty| row_state(Some(Run { hook: None, status: "", status_at: 0, pty: Some(pty), quiet_means_idle: false })).title();
         // まだ端末を掴んでいない ＝ 起動中。**「もう終わった」ではない**
         assert_eq!(view(PtyHint::Starting), "Working");
         assert_eq!(view(PtyHint::Writing), "Working");
@@ -2438,6 +2492,7 @@ pub(crate) mod tests {
             status: "idle",
             status_at: 0,
             pty: None,
+            quiet_means_idle: false,
         }));
         assert_eq!(view.title(), "Stopped", "a fresh stopped was thrown away");
         assert!(!view.blinks());
@@ -2446,39 +2501,51 @@ pub(crate) mod tests {
 
         // 他の state はそのまま生きている実行として出る（畳まれるのは stopped だけ）
         assert_eq!(
-            row_state(Some(Run { hook: Some((WORKING, 0)), status: "", status_at: 0, pty: None })),
+            row_state(Some(Run { hook: Some((WORKING, 0)), status: "", status_at: 0, pty: None, quiet_means_idle: false })),
             State::Working
         );
     }
 
     /// 更新の有無で行構成が変わらない（固定ヘッダー行数もマーカー桁の位置も動かない）。
-    /// 版行 2 本 + 区切り線 1 本で必ず 3 行
+    /// 版行（ccdesk + agent の数）+ 区切り線 1 本。**行数は更新の有無で変わらない**
     #[test]
     fn version_rows_keep_a_fixed_shape_whether_or_not_updates_exist() {
+        let agents = |state: UpdateState, version: &str| -> Vec<(Kind, String, UpdateState)> {
+            Kind::ORDER
+                .into_iter()
+                .map(|kind| (kind, version.to_string(), state))
+                .collect()
+        };
+        let total = 1 + Kind::ORDER.len() + 1;
         for (ccdesk, claude) in [
             (UpdateState::Current, UpdateState::Current),
             (UpdateState::Available, UpdateState::Current),
             (UpdateState::Running, UpdateState::Available),
             (UpdateState::Restart, UpdateState::Running),
         ] {
-            let rows = version_rows(ccdesk, "2.1.220", claude, DEFAULT_INNER);
-            assert_eq!(rows.len(), 3, "expected 2 version rows + 1 separator");
+            let rows = version_rows(ccdesk, &agents(claude, "2.1.220"), DEFAULT_INNER);
+            assert_eq!(rows.len(), total, "expected one row per agent + 1 separator");
             assert!(rows[0].0.contains(env!("CARGO_PKG_VERSION")), "{:?}", rows[0].0);
             assert!(rows[1].0.contains("claude v2.1.220"), "{:?}", rows[1].0);
-            assert_eq!(rows[2].0, separator_text(DEFAULT_INNER));
+            assert!(rows[2].0.contains("codex v2.1.220"), "{:?}", rows[2].0);
+            assert_eq!(rows[total - 1].0, separator_text(DEFAULT_INNER));
             // **区切り線だけが飾り。** 版行は更新の有無に関係なく行の実体がある
             assert_eq!(
-                rows[2].2,
+                rows[total - 1].2,
                 SidebarRow::Decoration,
                 "the separator must not be a row you can touch"
             );
             assert!(
-                rows[0].2.selectable() && rows[1].2.selectable(),
+                rows[..total - 1].iter().all(|row| row.2.selectable()),
                 "a version row dropped out of the selection at {ccdesk:?} / {claude:?}"
             );
         }
         // 版が未取得なら番号を出さない（誤情報を出さない）
-        let rows = version_rows(UpdateState::Current, "", UpdateState::Current, DEFAULT_INNER);
+        let rows = version_rows(
+            UpdateState::Current,
+            &agents(UpdateState::Current, ""),
+            DEFAULT_INNER,
+        );
         assert!(rows[1].0.contains("claude"), "{:?}", rows[1].0);
         assert!(!rows[1].0.contains(" v"), "showing a v with no version: {:?}", rows[1].0);
     }
@@ -2532,14 +2599,18 @@ pub(crate) mod tests {
     #[test]
     fn version_rows_are_clickable_only_when_there_is_something_to_do() {
         let rows_of = |ccdesk, claude| {
-            let rows = version_rows(ccdesk, "2.1.220", claude, DEFAULT_INNER);
+            let agents: Vec<(Kind, String, UpdateState)> = Kind::ORDER
+                .into_iter()
+                .map(|kind| (kind, "2.1.220".to_string(), claude))
+                .collect();
+            let rows = version_rows(ccdesk, &agents, DEFAULT_INNER);
             (rows[0].2.clone(), rows[1].2.clone())
         };
         assert_eq!(
             rows_of(UpdateState::Available, UpdateState::Available),
             (
                 SidebarRow::Action(RowAction::UpdateCcdesk),
-                SidebarRow::Action(RowAction::UpdateClaude)
+                SidebarRow::Action(RowAction::UpdateAgent(Kind::Claude))
             )
         );
         // 差し替え済み: ccdesk は restart で適用できる。claude はこの状態に
@@ -2618,8 +2689,7 @@ pub(crate) mod tests {
             term_size: (120, 30),
             footer: FooterInfo {
                 account: AccountStatus::LoggedIn("you · Acme, Inc.".to_string()),
-                current: "2.1.220".to_string(),
-                latest: None,
+                versions: Default::default(),
             },
             ..Default::default()
         };
@@ -2674,15 +2744,17 @@ pub(crate) mod tests {
     #[test]
     fn row_at_hits_the_version_rows_at_the_top_of_the_header() {
         let sl = sidebar_layout_of(29, 34);
-        let header = version_rows(
-            UpdateState::Available,
-            "2.1.220",
-            UpdateState::Available,
-            DEFAULT_INNER,
-        );
-        // 版行はヘッダーの 0・1 行目（区切り線が 2 行目）
+        let agents: Vec<(Kind, String, UpdateState)> = Kind::ORDER
+            .into_iter()
+            .map(|kind| (kind, "2.1.220".to_string(), UpdateState::Available))
+            .collect();
+        let header = version_rows(UpdateState::Available, &agents, DEFAULT_INNER);
+        // 版行はヘッダーの先頭から順に並ぶ（区切り線は末尾）
         assert_eq!(header[0].2.action(), Some(&RowAction::UpdateCcdesk));
-        assert_eq!(header[1].2.action(), Some(&RowAction::UpdateClaude));
+        assert_eq!(
+            header[1].2.action(),
+            Some(&RowAction::UpdateAgent(Kind::Claude))
+        );
         // 画面 y=1 が ccdesk 行、y=2 が claude 行（スクロール位置に関係なく固定）
         for scroll in [0usize, 5, 99] {
             assert_eq!(row_at(1, sl.capacity, 7, scroll), 0);
@@ -3838,8 +3910,7 @@ pub(crate) mod tests {
             term_size: (120, 30),
             footer: FooterInfo {
                 account: AccountStatus::LoggedIn("you · Acme, Inc.".to_string()),
-                current: "2.1.220".to_string(),
-                latest: None,
+                versions: Default::default(),
             },
             ..Default::default()
         }
@@ -3998,11 +4069,16 @@ pub(crate) mod tests {
             "hovering a version row without an update draws no band"
         );
 
-        // 区切り線（行 2 = 画面 y 3）は触れても光らない
-        app.hovered = Some(SidebarPos::Row(2));
-        assert_eq!(app.sidebar_rows[2], SidebarRow::Decoration, "row 2 is not the separator");
+        // 区切り線は触れても光らない（位置は ccdesk 行 + agent の数 ＝ 数を書き写さない）
+        let separator = 1 + Kind::ORDER.len();
+        app.hovered = Some(SidebarPos::Row(separator));
+        assert_eq!(
+            app.sidebar_rows[separator],
+            SidebarRow::Decoration,
+            "row {separator} is not the separator"
+        );
         assert!(
-            highlighted_columns(&mut app, 3).is_empty(),
+            highlighted_columns(&mut app, separator as u16 + 1).is_empty(),
             "a decoration row is highlighted"
         );
     }

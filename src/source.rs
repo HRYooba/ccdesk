@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use ccdesk::{same_dir, save_setting, save_state, update_state_list, LockExt};
 
+use crate::backend::Kind;
 use crate::hooks::HookStates;
 use crate::poll::{
     spawn_agents_poller, spawn_footer_poller, AccountStatus, AgentInfo, FooterInfo, Grouping,
@@ -685,8 +686,20 @@ fn demo_footer() -> FooterInfo {
     FooterInfo {
         // 撮影は `claude auth status` を叩かないので、アカウント行は架空のラベル
         account: AccountStatus::LoggedIn("you · Acme, Inc.".to_string()),
-        current: "2.1.220".to_string(),
-        latest: None,
+        // 撮影は agent を 1 つも起こさないので版も架空（`latest` は None なので
+        // 更新マーカーと動詞は出ない = 最新の見た目で撮れる）
+        versions: [(Kind::Claude, "2.1.220"), (Kind::Codex, "0.146.0")]
+            .into_iter()
+            .map(|(kind, current)| {
+                (
+                    kind,
+                    crate::backend::AgentVersion {
+                        current: current.to_string(),
+                        latest: None,
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
@@ -727,12 +740,15 @@ mod tests {
             DemoSource.footer().account,
             AccountStatus::LoggedIn("you · Acme, Inc.".to_string())
         );
-        // claude 版行は架空の版で埋める。更新マーカーは出さない（最新の見た目で撮る）
-        assert_eq!(DemoSource.footer().current, "2.1.220");
-        assert!(
-            DemoSource.footer().latest.is_none(),
-            "demo does not show an update marker"
-        );
+        // agent の版行は架空の版で埋める。更新マーカーは出さない（最新の見た目で撮る）
+        for kind in Kind::ORDER {
+            let version = DemoSource.footer().version(kind);
+            assert!(!version.current.is_empty(), "{kind:?} has no version to draw");
+            assert!(
+                version.latest.is_none(),
+                "demo does not show an update marker"
+            );
+        }
 
         let Usage::Ready(usage) = DemoSource.usage() else {
             panic!("usage gauge is always present in demo data");

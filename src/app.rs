@@ -61,7 +61,8 @@ pub(crate) enum RowAction {
     /// セッション行: ウィンドウが開いていれば切替、無ければ `claude -r` で再開
     Open(SessionId),
     UpdateCcdesk,  // ccdesk 自身を更新（サイドバー先頭の版行）
-    UpdateClaude,  // claude 本体を更新（同じく版行）
+    /// その agent 本体を更新（同じく版行）
+    UpdateAgent(Kind),
     /// 差し替え済みの ccdesk を再起動して新しい版で立ち上げ直す
     /// （更新完了後の版行。claude 側は次回起動で勝手に反映されるのでこの動作を持たない）
     RestartCcdesk,
@@ -1121,7 +1122,7 @@ pub(crate) enum Enter {
     /// 新規セッション画面を開く（`+ new session`）
     NewSession,
     UpdateCcdesk,
-    UpdateClaude,
+    UpdateAgent,
     /// 差し替え済みの ccdesk を再起動する（更新完了後の版行）
     RestartCcdesk,
 }
@@ -1133,7 +1134,7 @@ impl Enter {
             Self::Menu => "menu",
             Self::NewSession => "new session",
             // どちらの版行も利用者から見れば「更新する」1 つの動作
-            Self::UpdateCcdesk | Self::UpdateClaude => "update",
+            Self::UpdateCcdesk | Self::UpdateAgent => "update",
             // 行の右端の動詞（ui::UpdateState::verb）と同じ語 ＝ 押した結果が書いてある通り
             Self::RestartCcdesk => "restart",
         }
@@ -1154,7 +1155,7 @@ pub(crate) fn selected_enter(app: &App) -> Option<Enter> {
         RowAction::New => Some(Enter::NewSession),
         RowAction::Open(_) | RowAction::Project(_) | RowAction::ToggleGroup => Some(Enter::Menu),
         RowAction::UpdateCcdesk => Some(Enter::UpdateCcdesk),
-        RowAction::UpdateClaude => Some(Enter::UpdateClaude),
+        RowAction::UpdateAgent(_) => Some(Enter::UpdateAgent),
         RowAction::RestartCcdesk => Some(Enter::RestartCcdesk),
     }
 }
@@ -1196,7 +1197,7 @@ fn run_row_action(app: &mut App, action: RowAction, anchor_y: u16) {
         RowAction::Project(cwd) => open_project_popup(app, cwd, anchor_y),
         // 更新行はその場で実行するだけ（右ペインを切り替えない）
         RowAction::UpdateCcdesk => start_ccdesk_update(app),
-        RowAction::UpdateClaude => start_claude_update(app),
+        RowAction::UpdateAgent(kind) => start_agent_update(app, kind),
         RowAction::RestartCcdesk => request_restart(app),
         // セッション行は呼び手が経路を選ぶ（クリック = 開く / Enter = メニュー）
         RowAction::Open(id) => {
@@ -2259,19 +2260,21 @@ fn request_restart(app: &mut App) {
 /// claude 本体の更新を実行する（公式 `claude update`）。
 /// 公式仕様: 更新は次回起動時から有効で、実行中セッションは現行版のまま動き続ける。
 /// 完了後はフッターを再取得し、最新化されれば版行は最新表示へ戻る
-fn start_claude_update(app: &mut App) {
+fn start_agent_update(app: &mut App, kind: Kind) {
     if app
         .claude_updating
         .swap(true, std::sync::atomic::Ordering::Relaxed)
     {
         return; // 実行中の多重起動を防ぐ
     }
+    // **どのコマンドを叩くかは agent が答える**（[`crate::backend`]）
+    let program = kind.backend().update_program();
     let updating = app.claude_updating.clone();
     let refresh = app.footer_refresh.clone();
     let dirty = app.footer_dirty.clone();
     std::thread::spawn(move || {
         use std::process::Stdio;
-        let _ = std::process::Command::new("claude")
+        let _ = std::process::Command::new(program)
             .arg("update")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -3207,7 +3210,7 @@ mod tests {
             drawn_bottom_bar(&mut app);
             app.selection = pos;
             let expected = selected_enter(&app);
-            if matches!(expected, Some(Enter::UpdateCcdesk | Enter::UpdateClaude)) {
+            if matches!(expected, Some(Enter::UpdateCcdesk | Enter::UpdateAgent)) {
                 continue;
             }
             press(&mut app, KeyCode::Enter);
@@ -3222,7 +3225,7 @@ mod tests {
                     app.restart_to.is_some(),
                     "{pos:?}: Enter restart did not arm a restart"
                 ),
-                Some(Enter::UpdateCcdesk | Enter::UpdateClaude) => unreachable!(),
+                Some(Enter::UpdateCcdesk | Enter::UpdateAgent) => unreachable!(),
                 None => {
                     assert!(app.popup.is_none(), "{pos:?}: a menu opened on a row that offers nothing");
                     assert!(
@@ -3284,8 +3287,11 @@ mod tests {
             "the hint lagged behind the selection: {inert_row:?}"
         );
 
-        // さらに下は `+ new session`（区切り線は飛ばす）＝ 別の動詞になる
-        press(&mut app, KeyCode::Down);
+        // 版行を通り過ぎたら `+ new session`（区切り線は飛ばす）＝ 別の動詞になる。
+        // **版行の数は [`Kind::ORDER`] が決める**ので、ここで数を書き写さない
+        for _ in 0..Kind::ORDER.len() {
+            press(&mut app, KeyCode::Down);
+        }
         let new_session_row = drawn_bottom_bar(&mut app);
         assert!(
             new_session_row.contains("Enter new session"),
@@ -3293,8 +3299,9 @@ mod tests {
         );
 
         // 戻しても同じフレームで戻る（片方向だけ追従しているのではない）
-        press(&mut app, KeyCode::Up);
-        press(&mut app, KeyCode::Up);
+        for _ in 0..Kind::ORDER.len() + 1 {
+            press(&mut app, KeyCode::Up);
+        }
         assert_eq!(drawn_bottom_bar(&mut app), update_row, "the hint did not follow back");
     }
 
@@ -3347,7 +3354,7 @@ mod tests {
         let mut app = test_app(sidebar_width, TERM);
         app.sidebar_rows = vec![
             SidebarRow::Action(RowAction::UpdateCcdesk),
-            SidebarRow::Action(RowAction::UpdateClaude),
+            SidebarRow::Action(RowAction::UpdateAgent(Kind::Claude)),
             SidebarRow::Decoration, // 区切り線
             SidebarRow::Action(RowAction::New),
         ];
@@ -3368,7 +3375,7 @@ mod tests {
         let rightmost = app.sidebar_width - 2;
         for (y, row, expected) in [
             (1u16, 0usize, RowAction::UpdateCcdesk),
-            (2, 1, RowAction::UpdateClaude),
+            (2, 1, RowAction::UpdateAgent(Kind::Claude)),
         ] {
             for col in [0, 1, 2, 5, rightmost - 1, rightmost] {
                 handle_mouse(&mut app, &click(col, y)).unwrap();
