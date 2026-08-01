@@ -13,6 +13,7 @@ use crossterm::event::{
 use ccdesk::{load_setting, log_error};
 
 mod app;
+mod backend;
 mod claude_format;
 mod cli;
 mod git;

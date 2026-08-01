@@ -24,6 +24,8 @@ use serde_json::{json, Value};
 
 use ccdesk::{lock_path_for, write_json_atomically, Lock, LockExt, LOCK_STALE};
 
+use crate::backend::Kind;
+
 /// 保管ファイルのトップレベルキー（`{"sessions": [ … ]}`）
 const SESSIONS_KEY: &str = "sessions";
 /// 行 1 件のキー。**読みと書きで同じ定数を使う**（片側だけ直した状態を作らない）
@@ -31,6 +33,7 @@ const ID_KEY: &str = "session_id";
 const CWD_KEY: &str = "cwd";
 const TRANSCRIPT_KEY: &str = "transcript";
 const PINNED_KEY: &str = "pinned";
+const KIND_KEY: &str = "kind";
 const LAST_OPENED_AT_KEY: &str = "last_opened_at";
 const CREATED_AT_KEY: &str = "created_at";
 const UPDATED_AT_KEY: &str = "updated_at";
@@ -114,6 +117,9 @@ impl std::fmt::Display for SessionId {
 pub(crate) struct SessionRow {
     /// 行の identity（[`SessionId`]）
     pub(crate) session_id: SessionId,
+    /// どの agent の行か。**保存値が無い行は claude**（[`Kind`] の既定）:
+    /// この項目より前に作られた行は全部 claude なので、既定が移行の答えになる
+    pub(crate) kind: Kind,
     pub(crate) cwd: String,
     /// **解決済みの transcript の場所。** cwd から毎回導かない理由は、cwd が
     /// 動く値だから（セッションは走行中に git worktree へ移れる）。不変であるはずの
@@ -135,6 +141,9 @@ impl SessionRow {
     pub(crate) fn new(session_id: SessionId, cwd: impl Into<String>, now: u64) -> Self {
         Self {
             session_id,
+            // **既定は claude。** codex の行は起こす側が明示する
+            // （`crate::app` の `start_foreground`）
+            kind: Kind::default(),
             cwd: cwd.into(),
             transcript: None,
             pinned: false,
@@ -149,6 +158,7 @@ impl SessionRow {
         json!({
             ID_KEY: self.session_id.as_str(),
             CWD_KEY: self.cwd,
+            KIND_KEY: self.kind.as_str(),
             // 解決できていない行はキーごと出さない（「まだ解決していない」と
             // 「解決したが空だった」を保存の形で作り分けない）
             TRANSCRIPT_KEY: self.transcript.as_ref().map(|p| p.to_string_lossy()),
@@ -178,6 +188,9 @@ impl SessionRow {
         }
         Some(Self {
             session_id,
+            // 知らない綴り（未来の版が書いた agent）は既定へ倒す ＝ 行が消えるより
+            // claude として出る方が、少なくとも一覧から辿れる
+            kind: Kind::parse(&text(KIND_KEY)).unwrap_or_default(),
             cwd: text(CWD_KEY),
             transcript: value
                 .get(TRANSCRIPT_KEY)

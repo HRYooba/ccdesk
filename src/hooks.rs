@@ -80,17 +80,17 @@ const ATTENTION_MATCHER: &str =
 
 /// 注入する hook 1 件。**`--settings` の生成（[`inject_settings`]）と受け口
 /// （[`run_hook`]）が同じ表を読む**ので、片方だけ増えた状態にならない。
-struct HookEvent {
-    event: &'static str,
+pub(crate) struct HookEvent {
+    pub(crate) event: &'static str,
     /// 発火を絞る matcher。None は全発火を拾う（そのイベント自体が 1 つの意味しか
     /// 持たないもの）
-    matcher: Option<&'static str>,
+    pub(crate) matcher: Option<&'static str>,
     /// この hook が意味する state。**要約文は持たない**（行に出るのは状態だけ）
-    state: State,
+    pub(crate) state: State,
     /// この hook が**ユーザーの見るべき新しい出来事**か（未読 `●` の材料）。
     /// 状態と未読を同じ時刻で判定していた頃は、`SessionEnd` の記録が
     /// 「claude が何か言った」に数えられ、stop しただけの行が再起動後に未読になった
-    activity: bool,
+    pub(crate) activity: bool,
 }
 
 /// 注入する hook の表。同じイベント名を複数載せてよい（matcher で発火を分ける形を
@@ -107,7 +107,7 @@ struct HookEvent {
 /// ものを除いた 1 回だけ）。turn より頻繁になり得るのは事実だが、頻度の実体は
 /// 「ユーザーへの割り込み」であって「道具の呼び出し」ではないので、この原則が
 /// 避けたい害（turn の何倍もプロセスを起こす）には当たらない
-const HOOK_EVENTS: [HookEvent; 7] = [
+pub(crate) const HOOK_EVENTS: [HookEvent; 7] = [
     // 起動直後・再開直後は**プロンプトで待機している**（claude は動いておらず、
     // ユーザーへの要求も無い）。ユーザー自身の操作なので未読にはしない。
     //
@@ -563,18 +563,43 @@ pub(crate) fn states_stamp() -> Option<(u64, std::time::SystemTime)> {
 /// hook と併存する（claude は設定ソースごとの hook を合成する。公式に文書化）。
 /// スカラーのキーは併存せず上書きになるので、**hook 以外は載せない**
 /// （[`settings_document`] のテストがそれを固定する）
-pub(crate) fn inject_settings() -> Option<PathBuf> {
+pub(crate) fn inject_settings() -> Option<Injection> {
     // 内容は exe パスにしか依存せず、走っているプロセスの `current_exe()` は
     // 自己更新でも変わらない ＝ **1 プロセス 1 回書けば足りる**。
     // 失敗はキャッシュしない（次のセッション起動で再試行する）
-    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    if let Some(path) = PATH.get() {
-        return Some(path.clone());
+    static DONE: std::sync::OnceLock<Injection> = std::sync::OnceLock::new();
+    if let Some(done) = DONE.get() {
+        return Some(done.clone());
     }
-    let path = write_inject_settings()?;
-    let _ = PATH.set(path.clone());
-    Some(path)
+    let done = write_inject_settings()?;
+    let _ = DONE.set(done.clone());
+    Some(done)
 }
+
+/// 書き出し済みの hook 注入。**agent ごとに使う部分が違う**
+/// （claude は `settings`、codex は `exe`。載せ方は
+/// [`crate::backend::Backend::command`]）。
+///
+/// どちらも同じ 1 つの事実（ccdesk 実行ファイルの場所）から導かれるが、claude 側は
+/// ファイルの書き出しを伴うので、書けたパスを一緒に運ぶ
+#[derive(Clone)]
+pub(crate) struct Injection {
+    /// ccdesk 実行ファイル（`/` 区切り）
+    pub(crate) exe: String,
+    /// claude が `--settings` で読むファイル
+    pub(crate) settings: PathBuf,
+}
+
+/// hook の子プロセスへ**行の identity を渡す**環境変数。
+///
+/// **codex のためにある。** codex はセッション ID を自分で採番し、ccdesk は起動前に
+/// それを知れない（`--session-id` 相当のフラグが無い）。そこで ccdesk の行 ID を
+/// env に立てておき、hook がそれを名乗る。env は codex を経由して hook の
+/// 子プロセスまで継承される（実測）。
+///
+/// claude では立てない（渡した UUID がそのまま payload の `session_id` になるので
+/// 相関が要らない）。読み手が無ければ payload 側へ落ちる
+pub(crate) const ROW_ENV: &str = "CCDESK_ROW";
 
 /// 注入ファイルの実書き込み。
 ///
@@ -584,7 +609,7 @@ pub(crate) fn inject_settings() -> Option<PathBuf> {
 /// state hook が黙って消える。
 /// 失敗も黙らない: hooks 無しで起動すると行の状態が縮退するので、ログに 1 行残す
 /// （呼び手は None を受けて下部バーにも出す。[`crate::app`]）
-fn write_inject_settings() -> Option<PathBuf> {
+fn write_inject_settings() -> Option<Injection> {
     let exe = std::env::current_exe().ok()?;
     let dir = ccdesk::ccdesk_dir()?;
     let exe_fwd = exe.to_string_lossy().replace('\\', "/");
@@ -593,7 +618,10 @@ fn write_inject_settings() -> Option<PathBuf> {
         ccdesk::log_error(&format!("could not write the hook settings: {e}"));
         return None;
     }
-    Some(path)
+    Some(Injection {
+        exe: exe_fwd,
+        settings: path,
+    })
 }
 
 /// 注入する hook 1 本あたりのタイムアウト（秒）。claude 側の既定は 600 秒だが、
@@ -609,7 +637,7 @@ fn write_inject_settings() -> Option<PathBuf> {
 /// （どのイベントも同じ 1 プロセス起動＋ JSON 書き込みだけ）ので、`HookEvent` に
 /// フィールドを足して行ごとに持たせるより、注入する側でまとめて出す方が
 /// 構造が増えない
-const HOOK_TIMEOUT_SECS: u64 = 5;
+pub(crate) const HOOK_TIMEOUT_SECS: u64 = 5;
 
 /// 注入ファイルの中身（[`inject_settings`] の判断だけを取り出したもの。
 /// ファイルを書かずに検査できる）

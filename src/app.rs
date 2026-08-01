@@ -13,7 +13,8 @@ use crate::hooks::HookStates;
 use crate::keys::{encode_key, forward_mouse};
 use crate::poll::{AgentInfo, FooterInfo, Grouping};
 use crate::usage::Usage;
-use crate::session::{Launch, Session};
+use crate::backend::{Inject, Kind, Launch};
+use crate::session::Session;
 use crate::sessions::{SessionId, SessionRow};
 use crate::source::{DataSource, PollSinks, WindowItem, PROJECTS_LIMIT};
 use crate::title::Titles;
@@ -1203,7 +1204,7 @@ pub(crate) fn start_new_session(app: &mut App) -> anyhow::Result<()> {
     };
     let cwd = state.cur_dir.clone();
     let prompt = state.prompt.text.trim().to_string();
-    dispatch_session(app, cwd, prompt);
+    dispatch_session(app, Kind::Claude, cwd, prompt);
     Ok(())
 }
 
@@ -1637,7 +1638,7 @@ fn selected_row_y(app: &App) -> u16 {
 ///
 /// **PTY の起動は同期**（数 ms）。結果を待つ別スレッドが要らないので、
 /// 起動と反映が 1 本の流れに収まる
-fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
+fn dispatch_session(app: &mut App, kind: Kind, cwd: String, prompt: String) {
     // フォルダの登録はここでは行わない（起動が成功してから ＝ [`apply_launch`]）。
     // 打った文字列は new session 画面の初期値として持つだけに留める
     app.dispatch_cwd = cwd.clone();
@@ -1650,7 +1651,7 @@ fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
     // 起動しない ＝ 失敗もしないので `Ok(None)` で実データと同じ反映経路へ渡す
     // （demo だけフォルダの登録の意味が違う、という状態を作らない）
     let launched = if app.source.spawns_sessions() {
-        start_foreground(app, &cwd, &prompt)
+        start_foreground(app, kind, &cwd, &prompt)
     } else {
         Ok(None)
     };
@@ -1664,25 +1665,30 @@ fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
 /// 新規生成なので同 cwd の既存 transcript と衝突しない。
 ///
 /// **行を足すのは起動できてから**（起動できなかったセッションを一覧に残さない）
-fn start_foreground(app: &mut App, cwd: &str, prompt: &str) -> Launched {
+fn start_foreground(app: &mut App, kind: Kind, cwd: &str, prompt: &str) -> Launched {
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
     // state を取る hook を注入する（statusLine は載せない ＝ ユーザーの
     // statusline を奪わない。[`crate::hooks::inject_settings`]）
-    let settings = hook_settings(app);
+    let injection = hook_settings(app);
+    let inject = injection.as_ref().map(as_inject);
     let (rows, cols) = app.pane_size();
     let window = Session::spawn(
+        kind.backend(),
         &session_id,
         cwd,
         rows,
         cols,
         Launch::New { prompt },
-        settings.as_deref(),
+        inject.as_ref(),
     )
     .map_err(|e| format!("failed to start session: {e}"))?;
     // **名前は入れない。** 1 ターン目が終わるまで transcript は無いので、
     // それまでこの行は [`UNTITLED`] で出る（起動プロンプトの写しを行へ置くと、
     // 正本が 2 つになって同じ問題が戻る）
-    app.sessions.push(SessionRow::new(session_id.clone(), cwd, now_ms()));
+    app.sessions.push(SessionRow {
+        kind,
+        ..SessionRow::new(session_id.clone(), cwd, now_ms())
+    });
     save_sessions(app);
     app.windows.push(window);
     app.show_session(app.windows.len() - 1);
@@ -1988,7 +1994,8 @@ fn run_popup_action(app: &mut App, action: PopupAction) {
         PopupAction::Close(id) => menu_close(app, &id),
         PopupAction::SetGrouping(next) => set_grouping(app, next),
         // 空プロンプトで起動する（登録は dispatch_session が行う）
-        PopupAction::NewSessionIn(cwd) => dispatch_session(app, cwd, String::new()),
+        // **UI が agent を選べるようになるのは次の段**（`docs/codex-support.md` §3.3）
+        PopupAction::NewSessionIn(cwd) => dispatch_session(app, Kind::Claude, cwd, String::new()),
         PopupAction::RemoveProject(cwd) => remove_project(app, &cwd),
     }
 }
@@ -2051,7 +2058,7 @@ fn menu_close(app: &mut App, id: &SessionId) {
 /// **書けなかったことを黙らせない**: hooks 無しで起動したセッションは状態報告が
 /// 縮退する（入力待ち・完了が導出できなくなる）ので、下部バーへ 1 行出す。
 /// セッション自体は hooks 無しで起動を続ける（起動を止めるほどの失敗ではない）
-fn hook_settings(app: &mut App) -> Option<std::path::PathBuf> {
+fn hook_settings(app: &mut App) -> Option<crate::hooks::Injection> {
     let settings = crate::hooks::inject_settings();
     if settings.is_none() {
         set_notice(
@@ -2061,6 +2068,15 @@ fn hook_settings(app: &mut App) -> Option<std::path::PathBuf> {
         );
     }
     settings
+}
+
+/// 書き出し済みの注入（[`crate::hooks::Injection`]）を、起動 1 回ぶんの借用へ。
+/// **所有と借用の変換だけ**（どう載せるかは [`crate::backend`] が決める）
+fn as_inject(injection: &crate::hooks::Injection) -> Inject<'_> {
+    Inject {
+        exe: &injection.exe,
+        settings: &injection.settings,
+    }
 }
 
 /// 指定セッションのウィンドウを閉じる（＝ 子プロセスを終わらせる）。
@@ -2357,9 +2373,16 @@ fn expire_input_gate(app: &mut App) -> bool {
 fn relaunch<'a>(
     titles: &crate::title::Titles,
     row: &'a SessionRow,
-) -> (Launch<'static>, std::borrow::Cow<'a, str>) {
+) -> (Launch<'a>, std::borrow::Cow<'a, str>) {
     match titles.resume_cwd(row) {
-        Some(cwd) => (Launch::Resume, std::borrow::Cow::Owned(cwd)),
+        // **再開に使う ID は行の ID**（claude は ccdesk が採番した値をそのまま
+        // 使うので一致する。codex は codex 側の ID になる ＝ `crate::backend`）
+        Some(cwd) => (
+            Launch::Resume {
+                id: row.session_id.as_str(),
+            },
+            std::borrow::Cow::Owned(cwd),
+        ),
         None => (
             Launch::New { prompt: "" },
             std::borrow::Cow::Borrowed(row.cwd.as_str()),
@@ -2409,14 +2432,18 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
         );
         return false;
     }
+    // **注入は行を借りる前に済ませる**（`hook_settings` は notice を出すので
+    // `&mut App` が要り、`relaunch` が返す `Launch` は行を借り続ける）
+    let injection = hook_settings(app);
+    let inject = injection.as_ref().map(as_inject);
     let Some(row) = app.row(id) else {
         return false; // 再読み込みで消えた行（クリックと削除の競合）は何もしない
     };
+    let kind = row.kind;
     let (launch, cwd) = relaunch(&app.titles, row);
     let cwd = cwd.into_owned();
-    let settings = hook_settings(app);
     let (rows, cols) = app.pane_size();
-    match Session::spawn(id, &cwd, rows, cols, launch, settings.as_deref()) {
+    match Session::spawn(kind.backend(), id, &cwd, rows, cols, launch, inject.as_ref()) {
         Ok(window) => {
             // 既読は**起こせてから**付ける（起こせなかった行の未読 ● を、
             // 内容を見ていないのに消さない）
@@ -3915,7 +3942,7 @@ mod tests {
         titles.title_now(&mut row);
         let (launch, cwd) = relaunch(&titles, &row);
         assert!(
-            matches!(launch, Launch::Resume),
+            matches!(launch, Launch::Resume { .. }),
             "a row that has a conversation must be resumed"
         );
         assert_eq!(cwd, row.cwd);
