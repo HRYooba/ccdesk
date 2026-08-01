@@ -1216,7 +1216,9 @@ pub(crate) fn start_new_session(app: &mut App) -> anyhow::Result<()> {
     };
     let cwd = state.cur_dir.clone();
     let prompt = state.prompt.text.trim().to_string();
-    dispatch_session(app, Kind::Claude, cwd, prompt);
+    // **どの agent を起こすかは New 画面の選択が正本**
+    let kind = state.kind;
+    dispatch_session(app, kind, cwd, prompt);
     Ok(())
 }
 
