@@ -14,6 +14,7 @@
 
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod codex_index;
 
 use portable_pty::CommandBuilder;
 
@@ -65,6 +66,10 @@ impl Kind {
     /// 表示順（grouping の節・New 画面の切替行・メニューの並びもこれに従う）
     pub(crate) const ORDER: [Self; 2] = [Self::Claude, Self::Codex];
 
+    /// [`Self::tag`] の桁数。**全 kind で同じ**（`every_tag_is_the_same_width` が
+    /// 固定する）。サイドバーの桁予算がこの値に乗る
+    pub(crate) const TAG_COLS: usize = 4;
+
     /// **保存値（`sessions.json`）と CLI 引数の唯一の綴り。**
     /// 読み・書きが別々に綴りを持つと、片方だけ変えたときに保存値が読めなくなる
     /// （行が黙って claude 扱いへ戻る）
@@ -78,6 +83,26 @@ impl Kind {
     /// 保存値からの復元。**知らない綴りは None**（呼び手が既定を決める）
     pub(crate) fn parse(text: &str) -> Option<Self> {
         Self::ORDER.into_iter().find(|kind| kind.as_str() == text)
+    }
+
+    /// 幅に余裕のある場所（版行・使用率行・grouping の見出し）に出す名前。
+    ///
+    /// **記号は使わない。** claude 公式の印は `✻`（1 桁）、codex 公式の印は `>_`
+    /// （2 桁）で幅が揃わず、列が崩れる。両方を 1 画面に並べる慣習も見当たらない。
+    /// 加えて ccdesk は状態アイコン（かつての `✻`/`✽`/`∙`）を廃止した経緯があり、
+    /// 同じ記号を別の意味で復活させると読み手の中で衝突する
+    pub(crate) fn title(self) -> &'static str {
+        self.as_str()
+    }
+
+    /// サイドバーの行に出す略記。**幅が足りないのはここだけ**なので、
+    /// 略記もここだけ（[`Self::title`] が入らない場所の代替）。
+    /// **全 kind で同じ桁**（揃っていないと行ごとに名前の開始位置がずれる）
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            Self::Claude => "[cc]",
+            Self::Codex => "[cx]",
+        }
     }
 
     /// この kind の実装。**`&'static` にしてある**ので、行やコマンドを組む側は
@@ -132,6 +157,21 @@ pub(crate) mod tests {
     fn the_stored_spelling_of_every_kind_is_fixed() {
         let spellings: Vec<&str> = Kind::ORDER.iter().map(|k| k.as_str()).collect();
         assert_eq!(spellings, ["claude", "codex"]);
+    }
+
+    /// 略記は**サイドバーの桁予算に乗る**（`MIN_NAME_COLS` の根拠）ので、
+    /// 長さが揃っていないと行ごとに名前の開始位置がずれる
+    #[test]
+    fn every_tag_is_the_same_width() {
+        let widths: Vec<usize> = Kind::ORDER
+            .iter()
+            .map(|k| unicode_width::UnicodeWidthStr::width(k.tag()))
+            .collect();
+        assert!(
+            widths.iter().all(|w| *w == Kind::TAG_COLS),
+            "a tag is not {} columns wide: {widths:?}",
+            Kind::TAG_COLS
+        );
     }
 
     #[test]

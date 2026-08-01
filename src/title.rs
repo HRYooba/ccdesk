@@ -306,6 +306,9 @@ pub(crate) struct Titles {
     /// 撮影用の固定表。空でなければ transcript より優先する
     /// （`--demo` は実セッションの名前を 1 つも出さない）
     fixed: HashMap<SessionId, String>,
+    /// codex の会話名。**codex 側に正本がある**ので走査せず索引を読むだけ
+    /// （[`crate::backend::codex_index`]）
+    codex: crate::backend::codex_index::CodexNames,
 }
 
 impl Default for Titles {
@@ -314,6 +317,7 @@ impl Default for Titles {
             projects: projects_dir(),
             seen: HashMap::new(),
             fixed: HashMap::new(),
+            codex: Default::default(),
         }
     }
 }
@@ -325,6 +329,7 @@ impl Titles {
             projects: None,
             seen: HashMap::new(),
             fixed: names,
+            codex: Default::default(),
         }
     }
 
@@ -335,6 +340,15 @@ impl Titles {
     pub(crate) fn of(&self, row: &SessionRow) -> String {
         if let Some(name) = self.fixed.get(&row.session_id) {
             return name.clone();
+        }
+        // **codex は走査しない。** 会話名の正本が codex 側の索引にある
+        if row.kind == crate::backend::Kind::Codex {
+            return row
+                .agent_session_id
+                .as_deref()
+                .and_then(|id| self.codex.get(id))
+                .unwrap_or(UNTITLED)
+                .to_string();
         }
         self.seen
             .get(&row.session_id)
@@ -372,6 +386,11 @@ impl Titles {
     /// 名前は出てしまう（下位の候補で埋まる）＝ リネームだけが静かに拾えなくなる
     pub(crate) fn refresh_all(&mut self, rows: &mut [SessionRow], budget: &mut u64) -> bool {
         let mut changed = false;
+        // codex の会話名は索引 1 本を読むだけ（走査の予算とは無関係）。
+        // **codex の行が 1 つも無ければ触らない**
+        if rows.iter().any(|row| row.kind == crate::backend::Kind::Codex) {
+            self.codex.refresh();
+        }
         // 解決と stat は行あたりここで 1 回だけ（段ごとに回すと段の数だけ増える）
         let mut plans = Vec::with_capacity(rows.len());
         for row in rows.iter_mut() {
@@ -610,6 +629,12 @@ impl Titles {
     /// その会話を見つけられないので、`claude -r` を打っても
     /// `No conversation found` になる ＝ 新規として起こすのが正しい）
     pub(crate) fn resume_cwd(&self, row: &SessionRow) -> Option<String> {
+        // **codex は行の cwd でそのまま再開できる**（`codex resume <uuid>` は
+        // 会話を ID で名指しする）。要るのは agent が採番した ID の方で、
+        // それが取れていなければ再開できない
+        if row.kind == crate::backend::Kind::Codex {
+            return row.agent_session_id.as_ref().map(|_| row.cwd.clone());
+        }
         let path = row.transcript.as_ref()?;
         if !path.is_file() {
             return None;
@@ -669,6 +694,7 @@ impl Titles {
             projects: Some(projects),
             seen: HashMap::new(),
             fixed: HashMap::new(),
+            codex: Default::default(),
         }
     }
 

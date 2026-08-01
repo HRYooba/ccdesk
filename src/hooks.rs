@@ -169,6 +169,9 @@ const STATE_KEY: &str = "state";
 const AT_KEY: &str = "at";
 const PID_KEY: &str = "pid";
 const ACTIVITY_AT_KEY: &str = "activity_at";
+/// agent 自身が採番したセッション ID。**claude では行の ID と同じ**なので
+/// 意味を持たず、codex の再開（`codex resume <uuid>`）のためにある
+const AGENT_ID_KEY: &str = "agent_id";
 
 
 /// 受けた state を保つ期間。**動いているセッションは毎 turn 書き直す**ので、
@@ -213,6 +216,12 @@ struct Entry {
     /// 「まだ見ていない完了」の記録は消えない。None は一度も起きていない
     /// （旧形式の保管を含む）
     activity_at: Option<u64>,
+    /// agent 自身が採番したセッション ID（hook の payload の `session_id`）。
+    ///
+    /// **キーと同じとは限らない。** 保管のキーは ccdesk の行 ID で、claude では
+    /// 両者が一致する（ccdesk が採番を強制するため）が、codex は codex 自身が
+    /// 採番するので別の値になる。`codex resume` に渡せるのはこちら
+    agent_id: Option<String>,
 }
 
 /// hook が書いた state の写し（`session_id` → [`Entry`]）
@@ -240,6 +249,16 @@ impl HookStates {
     pub(crate) fn get(&self, id: &SessionId, launched: Option<u64>) -> Option<(State, u64)> {
         let entry = self.0.get(id)?;
         (entry.at >= launched?).then_some((entry.state, entry.at))
+    }
+
+    /// その行を動かしている agent が名乗ったセッション ID。
+    ///
+    /// **codex の再開に要る**（`codex resume <uuid>`）。claude では行の ID と同じ
+    /// 値なので使い道が無い。**`launched` で絞らない**のが [`Self::get`] との違い:
+    /// 状態は「前回の実行の残骸」を捨てる必要があるが、ID は実行をまたいで同じ
+    /// （同じ会話を指し続ける）ので、古い記録でも再開先として正しい
+    pub(crate) fn agent_id(&self, id: &SessionId) -> Option<&str> {
+        self.0.get(id)?.agent_id.as_deref()
     }
 
     /// 前回の写しと比べて、**新しく手が空いた行があるか**（使用率取得の合図）。
@@ -324,6 +343,7 @@ impl HookStates {
                             at,
                             pid,
                             activity_at: Some(at),
+                            agent_id: None,
                         },
                     )
                 })
@@ -398,11 +418,19 @@ pub(crate) fn run_hook(event: &str, state: Option<&str>) -> anyhow::Result<()> {
     use std::io::Read as _;
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
-    let Some((session_id, state, activity, pid)) = hook_entry(event, state, &input) else {
+    let Some(entry) = hook_entry(event, state, &input) else {
         return Ok(());
     };
     if let Some(path) = ccdesk::hook_states_path() {
-        record(&path, &session_id, state, activity, now_ms(), pid);
+        record(
+            &path,
+            &entry.row,
+            entry.state,
+            entry.activity,
+            now_ms(),
+            entry.pid,
+            Some(entry.agent_id.as_str()),
+        );
     }
     Ok(())
 }
@@ -413,14 +441,41 @@ pub(crate) fn run_hook(event: &str, state: Option<&str>) -> anyhow::Result<()> {
 ///
 /// 知らないイベント / 表に無い (event, state) / `session_id` が読めない入力は
 /// None（何も書かない）
-fn hook_entry(
-    event: &str,
-    state: Option<&str>,
-    input: &str,
-) -> Option<(SessionId, State, bool, Option<u32>)> {
+fn hook_entry(event: &str, state: Option<&str>, input: &str) -> Option<HookRecord> {
     let (state, activity) = resolve(event, state)?;
-    let session_id = session_id_of(input)?;
-    Some((session_id, state, activity, claude_pid()))
+    let agent_id = session_id_of(input)?;
+    // **行の ID は env が優先。** codex は自分でセッション ID を採番するので、
+    // payload の値では ccdesk の行を名指しできない（[`ROW_ENV`]）。
+    // env が無ければ payload の値がそのまま行の ID（claude ＝ ccdesk が採番を強制）
+    let row = row_env().unwrap_or_else(|| agent_id.clone());
+    Some(HookRecord {
+        row,
+        agent_id: agent_id.to_string(),
+        state,
+        activity,
+        pid: claude_pid(),
+    })
+}
+
+/// hook 1 回ぶんの記録。**行の ID と agent の ID を分けて持つ**のが要点で、
+/// この 2 つが違い得ることが codex 対応の核心（[`ROW_ENV`]）
+#[derive(Debug, PartialEq, Eq)]
+struct HookRecord {
+    /// 保管のキー ＝ ccdesk の行
+    row: SessionId,
+    /// agent 自身が採番したセッション ID（再開に使う）
+    agent_id: String,
+    state: State,
+    activity: bool,
+    pid: Option<u32>,
+}
+
+/// ccdesk が起動時に立てた行 ID（[`ROW_ENV`]）。**空文字は無いものとして扱う**
+/// （env が中途半端に立っている環境で、空のキーの記録を作らない）
+fn row_env() -> Option<SessionId> {
+    let value = std::env::var(ROW_ENV).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| SessionId::new(value))
 }
 
 /// この hook を呼んだ claude の pid（[`CLAUDE_PID_ENV`]）。
@@ -447,7 +502,15 @@ fn session_id_of(input: &str) -> Option<SessionId> {
 ///
 /// 古い項目はここで落とす（[`KEEP`]）。掃除の契機を別に持たないのは、
 /// 書くのがこの 1 箇所だけで、**書くたびに掃除すれば積もらない**ため
-fn record(path: &Path, session_id: &SessionId, state: State, activity: bool, now: u64, pid: Option<u32>) {
+fn record(
+    path: &Path,
+    session_id: &SessionId,
+    state: State,
+    activity: bool,
+    now: u64,
+    pid: Option<u32>,
+    agent_id: Option<&str>,
+) {
     let Ok(_guard) = Lock::acquire(&lock_path_for(path), LOCK_WAIT, LOCK_STALE) else {
         return;
     };
@@ -458,6 +521,12 @@ fn record(path: &Path, session_id: &SessionId, state: State, activity: bool, now
     } else {
         entries.get(session_id).and_then(|entry| entry.activity_at)
     };
+    // **取れなかったら前回の値を残す**（1 回でも拾えていれば再開できる）
+    let agent_id = agent_id.map(str::to_string).or_else(|| {
+        entries
+            .get(session_id)
+            .and_then(|entry| entry.agent_id.clone())
+    });
     entries.insert(
         session_id.clone(),
         Entry {
@@ -465,6 +534,7 @@ fn record(path: &Path, session_id: &SessionId, state: State, activity: bool, now
             at: now,
             pid,
             activity_at,
+            agent_id,
         },
     );
     let document = json!({
@@ -475,6 +545,7 @@ fn record(path: &Path, session_id: &SessionId, state: State, activity: bool, now
                 AT_KEY: entry.at,
                 PID_KEY: entry.pid,
                 ACTIVITY_AT_KEY: entry.activity_at,
+                AGENT_ID_KEY: entry.agent_id,
             })))
             .collect::<serde_json::Map<_, _>>()
     });
@@ -515,6 +586,11 @@ fn read_entries(path: &Path, now: u64) -> BTreeMap<SessionId, Entry> {
             // 旧形式の保管（キーが無い）は None で読む ＝ 未読は付かない。
             // 移行データ（KEEP=7日）としてそのまま許容する
             let activity_at = entry.get(ACTIVITY_AT_KEY).and_then(Value::as_u64);
+            let agent_id = entry
+                .get(AGENT_ID_KEY)
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
             (!id.is_empty() && at <= horizon).then(|| {
                 (
                     SessionId::new(id.clone()),
@@ -523,6 +599,7 @@ fn read_entries(path: &Path, now: u64) -> BTreeMap<SessionId, Entry> {
                         at,
                         pid,
                         activity_at,
+                        agent_id,
                     },
                 )
             })
@@ -1009,15 +1086,15 @@ mod tests {
         let temp = TempStore::new("a_recorded_state_reaches_the_reader");
         assert_eq!(states_at(&temp.path()), HookStates::default(), "not empty for a missing file");
 
-        record(&temp.path(), &id("s-1"), WORKING, true, 1_000, None);
-        record(&temp.path(), &id("s-2"), WAITING, true, 1_000, None);
+        record(&temp.path(), &id("s-1"), WORKING, true, 1_000, None, None);
+        record(&temp.path(), &id("s-2"), WAITING, true, 1_000, None, None);
         assert_eq!(
             states_at(&temp.path()),
             HookStates::from_entries([("s-1", WORKING, 1_000), ("s-2", WAITING, 1_000)])
         );
 
         // 同じセッションの次のイベントは上書き（状態は最後に受けたものが正しい）
-        record(&temp.path(), &id("s-1"), IDLE, true, 2_000, None);
+        record(&temp.path(), &id("s-1"), IDLE, true, 2_000, None, None);
         let states = states_at(&temp.path());
         assert_eq!(stored(&states, &id("s-1")), Some(IDLE));
         assert_eq!(
@@ -1086,8 +1163,8 @@ mod tests {
             ..SessionRow::new(id("s"), "C:\\dev\\app", 0)
         };
         // 質問ダイアログ表示（waiting・未読の材料）→ 回答（working・材料ではない）
-        record(&temp.path(), &id("s"), WAITING, true, 1_000, None);
-        record(&temp.path(), &id("s"), WORKING, false, 2_000, None);
+        record(&temp.path(), &id("s"), WAITING, true, 1_000, None, None);
+        record(&temp.path(), &id("s"), WORKING, false, 2_000, None, None);
         let states = states_at(&temp.path());
         assert_eq!(stored(&states, &id("s")), Some(WORKING), "the answer did not resume the state");
         // 未読の起点は質問の時刻のまま（回答の時刻に進まない）
@@ -1108,8 +1185,8 @@ mod tests {
             ..SessionRow::new(id("s"), "C:\\dev\\app", 0)
         };
         // ターン完了（未読の材料）→ stop（材料ではない）
-        record(&temp.path(), &id("s"), IDLE, true, 1_000, None);
-        record(&temp.path(), &id("s"), STOPPED, false, 2_000, None);
+        record(&temp.path(), &id("s"), IDLE, true, 1_000, None, None);
+        record(&temp.path(), &id("s"), STOPPED, false, 2_000, None, None);
         let states = states_at(&temp.path());
         assert_eq!(stored(&states, &id("s")), Some(STOPPED));
         // 完了を見ていない ＝ stop 後も未読のまま
@@ -1118,8 +1195,8 @@ mod tests {
         assert!(!states.unread(&row(1_500)), "the stop itself created an unread mark");
 
         // 一度も activity が無い行（起動して stop しただけ）はいつでも既読
-        record(&temp.path(), &id("t"), WAITING, false, 3_000, None);
-        record(&temp.path(), &id("t"), STOPPED, false, 4_000, None);
+        record(&temp.path(), &id("t"), WAITING, false, 3_000, None, None);
+        record(&temp.path(), &id("t"), STOPPED, false, 4_000, None, None);
         assert!(
             !states_at(&temp.path()).unread(&SessionRow {
                 last_opened_at: 0,
@@ -1134,8 +1211,8 @@ mod tests {
     #[test]
     fn the_activity_time_survives_a_round_trip() {
         let temp = TempStore::new("the_activity_time_survives_a_round_trip");
-        record(&temp.path(), &id("s"), IDLE, true, 1_000, None);
-        record(&temp.path(), &id("s"), STOPPED, false, 2_000, None);
+        record(&temp.path(), &id("s"), IDLE, true, 1_000, None, None);
+        record(&temp.path(), &id("s"), STOPPED, false, 2_000, None, None);
         let row = SessionRow {
             last_opened_at: 500,
             ..SessionRow::new(id("s"), "C:\\dev\\app", 0)
@@ -1169,19 +1246,19 @@ mod tests {
 
         // **記録に pid まで載る**（載らないと pid での引き当てが黙って効かなくなる）
         assert_eq!(
-            padded,
-            Some((id("s-1"), IDLE, false, Some(4242))),
+            padded.as_ref().map(|r| r.pid),
+            Some(Some(4242)),
             "the pid did not reach the record"
         );
         assert_eq!(bare, Some(4242), "the pid is not read from the environment");
         assert_eq!(
-            broken,
-            Some((id("s-1"), IDLE, false, None)),
+            broken.as_ref().map(|r| r.pid),
+            Some(None),
             "built a pid out of something that is not a number"
         );
         assert_eq!(
-            missing,
-            Some((id("s-1"), IDLE, false, None)),
+            missing.as_ref().map(|r| r.pid),
+            Some(None),
             "answered with a pid when the variable is not set"
         );
         // 知らないイベント / 読めない入力は何も書かない
@@ -1194,13 +1271,13 @@ mod tests {
     #[test]
     fn the_pid_of_the_calling_claude_survives_a_round_trip() {
         let temp = TempStore::new("the_pid_of_the_calling_claude_survives_a_round_trip");
-        record(&temp.path(), &id("s"), WORKING, true, 1_000, Some(4242));
+        record(&temp.path(), &id("s"), WORKING, true, 1_000, Some(4242), None);
         assert_eq!(
             states_at(&temp.path()),
             HookStates::from_records([("s", WORKING, 1_000, Some(4242))])
         );
         // pid の無い記録も読める（環境変数が取れなかった場合）
-        record(&temp.path(), &id("s"), IDLE, true, 2_000, None);
+        record(&temp.path(), &id("s"), IDLE, true, 2_000, None, None);
         assert_eq!(
             states_at(&temp.path()),
             HookStates::from_records([("s", IDLE, 2_000, None)])
@@ -1240,9 +1317,9 @@ mod tests {
                 .map(|m| (m.len(), m.modified().ok()))
         };
         assert_eq!(stamp(&temp.path()), None, "answered for a missing file");
-        record(&temp.path(), &id("s"), WORKING, true, 1_000, Some(1));
+        record(&temp.path(), &id("s"), WORKING, true, 1_000, Some(1), None);
         let before = stamp(&temp.path()).expect("no stamp after a write");
-        record(&temp.path(), &id("s-2"), WAITING, true, 2_000, Some(2));
+        record(&temp.path(), &id("s-2"), WAITING, true, 2_000, Some(2), None);
         assert_ne!(stamp(&temp.path()), Some(before), "the stamp did not move");
     }
 
@@ -1253,10 +1330,10 @@ mod tests {
     fn recording_drops_entries_older_than_the_keep_window() {
         let temp = TempStore::new("recording_drops_entries_older_than_the_keep_window");
         let keep = KEEP.as_millis() as u64;
-        record(&temp.path(), &id("old"), IDLE, true, 0, None);
-        record(&temp.path(), &id("fresh"), WORKING, true, keep, None);
+        record(&temp.path(), &id("old"), IDLE, true, 0, None, None);
+        record(&temp.path(), &id("fresh"), WORKING, true, keep, None, None);
         // old は keep をちょうど過ぎた時点で落ちる
-        record(&temp.path(), &id("now"), WAITING, true, keep + 1, None);
+        record(&temp.path(), &id("now"), WAITING, true, keep + 1, None, None);
         let states = states_at(&temp.path());
         assert_eq!(stored(&states, &id("old")), None, "an entry past the keep window remains");
         assert_eq!(
@@ -1276,7 +1353,7 @@ mod tests {
     fn records_from_a_future_clock_are_ignored_and_swept() {
         let temp = TempStore::new("records_from_a_future_clock_are_ignored_and_swept");
         let skew = FUTURE_SKEW.as_millis() as u64;
-        record(&temp.path(), &id("future"), STOPPED, true, 1_000_000, None);
+        record(&temp.path(), &id("future"), STOPPED, true, 1_000_000, None, None);
 
         // 時計が 1_000 まで巻き戻った世界では、その記録は見えない
         assert_eq!(
@@ -1291,7 +1368,7 @@ mod tests {
         );
 
         // 巻き戻った時計で次の記録が載ると、未来の記録はファイルからも落ちる
-        record(&temp.path(), &id("s"), WORKING, true, 1_000, None);
+        record(&temp.path(), &id("s"), WORKING, true, 1_000, None, None);
         assert_eq!(
             stored(&states_at(&temp.path()), &id("future")),
             None,
@@ -1351,7 +1428,7 @@ mod tests {
     #[test]
     fn writes_land_atomically_without_leaving_a_tmp_or_a_lock() {
         let temp = TempStore::new("writes_land_atomically_without_leaving_a_tmp_or_a_lock");
-        record(&temp.path(), &id("s"), WORKING, true, 1_000, None);
+        record(&temp.path(), &id("s"), WORKING, true, 1_000, None, None);
         let leftovers: Vec<_> = std::fs::read_dir(temp.0.path())
             .unwrap()
             .flatten()
@@ -1367,19 +1444,19 @@ mod tests {
     #[test]
     fn a_held_lock_makes_the_hook_give_up_instead_of_waiting() {
         let temp = TempStore::new("a_held_lock_makes_the_hook_give_up_instead_of_waiting");
-        record(&temp.path(), &id("s"), WORKING, true, 1_000, None);
+        record(&temp.path(), &id("s"), WORKING, true, 1_000, None, None);
         let before = std::fs::read(temp.path()).unwrap();
 
         let held = Lock::acquire(&lock_path_for(&temp.path()), Duration::ZERO, LOCK_STALE).unwrap();
         let started = std::time::Instant::now();
-        record(&temp.path(), &id("s"), IDLE, true, 2_000, None);
+        record(&temp.path(), &id("s"), IDLE, true, 2_000, None, None);
         let waited = started.elapsed();
         drop(held);
 
         assert!(waited < Duration::from_secs(5), "wait was not bounded: {waited:?}");
         assert_eq!(std::fs::read(temp.path()).unwrap(), before, "wrote even though the lock wasn't acquired");
         // 解放後は通常どおり載る（ロックが理由で壊れているわけではない）
-        record(&temp.path(), &id("s"), IDLE, true, 2_000, None);
+        record(&temp.path(), &id("s"), IDLE, true, 2_000, None, None);
         assert_eq!(stored(&states_at(&temp.path()), &id("s")), Some(IDLE));
     }
 }

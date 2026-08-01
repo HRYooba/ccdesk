@@ -176,6 +176,10 @@ pub(crate) enum PopupKind {
         pinned: bool,
         /// 窓が開いていて子プロセスが生きているか（`stop` を出せるかの判断）
         open: bool,
+        /// **開き直せるか。** codex はセッション ID を自分で採番するので、
+        /// hook が名乗るまで（起動から数秒）は再開先が分からない。
+        /// その間 `open` を押せると「何も起きない」か別の会話が開く
+        can_open: bool,
     },
     State,
     /// プロジェクト単位の操作。`has_sessions` は開いた時点の写し（[`PopupKind::Session`] の
@@ -200,8 +204,8 @@ enum PopupAction {
     /// 一覧から行を外す（transcript は消さない ＝ 会話ログは残る）
     Close(SessionId),
     SetGrouping(Grouping),
-    /// 指定フォルダで新規セッション
-    NewSessionIn(String),
+    /// 指定フォルダで新規セッション（agent を選んで起こす）
+    NewSessionIn(Kind, String),
     /// プロジェクトを一覧から外す
     RemoveProject(String),
 }
@@ -243,14 +247,14 @@ impl PopupKind {
             // **アーカイブは持たない**: `close` は行を忘れるだけで
             // `~/.claude/projects/**/*.jsonl` を消さないので、アーカイブとの差は
             // 「戻す導線があるか」だけになる ＝ 節を 1 つ増やす価値が無い
-            PopupKind::Session { id, pinned, open } => {
+            PopupKind::Session { id, pinned, open, can_open } => {
                 let entry = |label: &str, enabled: bool, action: PopupAction| PopupEntry {
                     label: label.to_string(),
                     enabled,
                     action,
                 };
                 vec![
-                    entry("open", true, PopupAction::OpenSession(id.clone())),
+                    entry("open", *can_open, PopupAction::OpenSession(id.clone())),
                     entry(
                         if *pinned { "unpin" } else { "pin" },
                         true,
@@ -275,18 +279,25 @@ impl PopupKind {
             // 「登録リスト ∪ セッションの cwd」なので、登録を外してもセッション由来で
             // 見出しは出続ける。押せるのに表示が変わらないのは嘘なので、
             // stop と同じ仕組み（実行可能フラグ）で落とす
-            PopupKind::Project { cwd, has_sessions } => vec![
-                PopupEntry {
-                    label: "new session".to_string(),
+            //
+            // **`new session` は agent ごとに項目を分ける。** この入口は New 画面を
+            // 通らず即起動するので、既定で黙って起こすと「押すまで何が起きるか
+            // 分からない」ことになる
+            PopupKind::Project { cwd, has_sessions } => Kind::ORDER
+                .into_iter()
+                .map(|kind| PopupEntry {
+                    label: format!("new {} session", kind.title()),
                     enabled: true,
-                    action: PopupAction::NewSessionIn(cwd.clone()),
-                },
-                PopupEntry {
-                    label: "remove project".to_string(),
-                    enabled: !has_sessions,
-                    action: PopupAction::RemoveProject(cwd.clone()),
-                },
-            ],
+                    action: PopupAction::NewSessionIn(kind, cwd.clone()),
+                })
+                .chain([
+                    PopupEntry {
+                        label: "remove project".to_string(),
+                        enabled: !has_sessions,
+                        action: PopupAction::RemoveProject(cwd.clone()),
+                    },
+                ])
+                .collect(),
         }
     }
 
@@ -1431,9 +1442,43 @@ fn adopt_hook_states(app: &mut App) {
     if app.hook_states.any_row_went_idle_since(&previous) {
         app.source.note_turn_finished();
     }
+    adopt_agent_ids(app);
     let shown: Option<SessionId> = app.shown_session().cloned();
     if let Some(id) = shown {
         mark_read(app, &id);
+    }
+}
+
+/// **その行を開き直せるか。** claude は行の ID がそのまま再開先なので常に真。
+/// codex は agent が採番した ID を hook 経由で受け取るまで再開できない
+fn can_resume(row: &SessionRow) -> bool {
+    row.kind != Kind::Codex || row.agent_session_id.is_some()
+}
+
+/// hook が名乗った **agent 側のセッション ID** を行へ写す。
+///
+/// **codex の再開に要る**（`codex resume <uuid>`）。codex は ID を自分で採番するので、
+/// ccdesk は hook 経由でしか知れない。一度取れたら行に持ち、再起動後も使う。
+///
+/// **claude の行では何もしない**（行の ID と同じ値なので持つ意味が無く、
+/// 書けば `updated_at` が動いて経過時間が無意味に 0 へ戻る）
+fn adopt_agent_ids(app: &mut App) {
+    let mut changed = false;
+    for row in &mut app.sessions {
+        if row.kind == Kind::Claude {
+            continue;
+        }
+        let Some(agent_id) = app.hook_states.agent_id(&row.session_id) else {
+            continue;
+        };
+        if row.agent_session_id.as_deref() == Some(agent_id) {
+            continue;
+        }
+        row.agent_session_id = Some(agent_id.to_string());
+        changed = true;
+    }
+    if changed {
+        save_sessions(app);
     }
 }
 
@@ -1906,6 +1951,8 @@ fn open_session_popup(app: &mut App, id: &SessionId, anchor_y: u16) {
         id: id.clone(),
         pinned: row.is_some_and(|r| r.pinned),
         open,
+        // 窓が開いていれば切替なので常に押せる。閉じている行は再開先が要る
+        can_open: open || row.is_some_and(can_resume),
     };
     open_popup(app, kind, anchor_y);
 }
@@ -1994,8 +2041,7 @@ fn run_popup_action(app: &mut App, action: PopupAction) {
         PopupAction::Close(id) => menu_close(app, &id),
         PopupAction::SetGrouping(next) => set_grouping(app, next),
         // 空プロンプトで起動する（登録は dispatch_session が行う）
-        // **UI が agent を選べるようになるのは次の段**（`docs/codex-support.md` §3.3）
-        PopupAction::NewSessionIn(cwd) => dispatch_session(app, Kind::Claude, cwd, String::new()),
+        PopupAction::NewSessionIn(kind, cwd) => dispatch_session(app, kind, cwd, String::new()),
         PopupAction::RemoveProject(cwd) => remove_project(app, &cwd),
     }
 }
@@ -2375,11 +2421,12 @@ fn relaunch<'a>(
     row: &'a SessionRow,
 ) -> (Launch<'a>, std::borrow::Cow<'a, str>) {
     match titles.resume_cwd(row) {
-        // **再開に使う ID は行の ID**（claude は ccdesk が採番した値をそのまま
-        // 使うので一致する。codex は codex 側の ID になる ＝ `crate::backend`）
+        // **再開に使う ID は agent が採番した方**（claude は ccdesk が採番した値を
+        // 強制するので行の ID と一致する。codex は別の値）。
+        // 取れていない codex の行はここへ来ない（`can_resume` が止める）
         Some(cwd) => (
             Launch::Resume {
-                id: row.session_id.as_str(),
+                id: row.agent_session_id.as_deref().unwrap_or(row.session_id.as_str()),
             },
             std::borrow::Cow::Owned(cwd),
         ),
@@ -2664,6 +2711,7 @@ mod tests {
             id: SessionId::new(id),
             pinned: false,
             open,
+            can_open: true,
         }
     }
 
@@ -2716,6 +2764,7 @@ mod tests {
             id: SessionId::new("s1"),
             pinned: true,
             open: false,
+            can_open: true,
         };
         let labels = labels(&marked, Grouping::State);
         assert!(labels.contains(&"unpin".to_string()), "a pinned row must show unpin: {labels:?}");
@@ -2741,11 +2790,11 @@ mod tests {
     fn group_menu_marks_the_current_grouping_and_maps_each_row_to_it() {
         assert_eq!(
             labels(&PopupKind::State, Grouping::State),
-            ["● state", "  directory"]
+            ["● state", "  directory", "  agent"]
         );
         assert_eq!(
             labels(&PopupKind::State, Grouping::Directory),
-            ["  state", "● directory"]
+            ["  state", "● directory", "  agent"]
         );
         assert_eq!(
             PopupKind::State.action(Grouping::State, 0),
@@ -2755,7 +2804,14 @@ mod tests {
             PopupKind::State.action(Grouping::State, 1),
             Some(PopupAction::SetGrouping(Grouping::Directory))
         );
-        assert_eq!(PopupKind::State.action(Grouping::State, 2), None);
+        assert_eq!(
+            PopupKind::State.action(Grouping::State, 2),
+            Some(PopupAction::SetGrouping(Grouping::Agent))
+        );
+        assert_eq!(
+            PopupKind::State.action(Grouping::State, Grouping::ORDER.len()),
+            None
+        );
     }
 
     /// セッション行の**行末** `=` クリックでメニューが開く（二次操作の入口）。
@@ -2779,6 +2835,7 @@ mod tests {
                 pinned: true,
                 // 生きた窓が無い = 止めるものが無い
                 open: false,
+            can_open: true,
             }
         );
         assert_eq!(
@@ -2824,19 +2881,31 @@ mod tests {
             cwd: "C:\\dev\\shop-app".to_string(),
             has_sessions: false,
         };
+        // **agent ごとに項目が並ぶ**（この入口は New 画面を通さず即起動するので、
+        // 押す前にどちらが起きるか分かる必要がある）
         assert_eq!(
             labels(&kind, Grouping::State),
-            ["new session", "remove project"]
+            ["new claude session", "new codex session", "remove project"]
         );
         assert_eq!(
             kind.action(Grouping::State, 0),
-            Some(PopupAction::NewSessionIn("C:\\dev\\shop-app".to_string()))
+            Some(PopupAction::NewSessionIn(
+                Kind::Claude,
+                "C:\\dev\\shop-app".to_string()
+            ))
         );
         assert_eq!(
             kind.action(Grouping::State, 1),
+            Some(PopupAction::NewSessionIn(
+                Kind::Codex,
+                "C:\\dev\\shop-app".to_string()
+            ))
+        );
+        assert_eq!(
+            kind.action(Grouping::State, 2),
             Some(PopupAction::RemoveProject("C:\\dev\\shop-app".to_string()))
         );
-        assert_eq!(kind.action(Grouping::State, 2), None);
+        assert_eq!(kind.action(Grouping::State, 3), None);
     }
 
     /// Esc は開いているメニューを閉じる（階層を持たないので戻り先も無い）。
@@ -2859,12 +2928,15 @@ mod tests {
     #[test]
     fn arrow_keys_clamp_the_selection_to_the_entry_range() {
         let mut app = test_app(34, TERM);
-        // 2 項目のメニュー（state / directory）
         open(&mut app, PopupKind::State, 3);
         for _ in 0..5 {
             handle_popup_key(&mut app, KeyCode::Down);
         }
-        assert_eq!(app.popup.as_ref().unwrap().selected, 1);
+        // 末尾で止まる（項目数は [`Grouping::ORDER`] が決める ＝ 数を書き写さない）
+        assert_eq!(
+            app.popup.as_ref().unwrap().selected,
+            Grouping::ORDER.len() - 1
+        );
         for _ in 0..5 {
             handle_popup_key(&mut app, KeyCode::Up);
         }
@@ -3029,8 +3101,9 @@ mod tests {
             "must overlap the resize border by the test's premise"
         );
         let border_col = app.sidebar_width;
-        // 2 行目 = `remove project`（実行されると登録から外れる ＝ 結果が見える）
-        handle_mouse(&mut app, &click(border_col, rect.y + 2)).unwrap();
+        // 末尾の行 = `remove project`（実行されると登録から外れる ＝ 結果が見える）
+        let last = rect.y + rect.height - 2;
+        handle_mouse(&mut app, &click(border_col, last)).unwrap();
         assert!(!app.dragging, "must not start a resize drag");
         assert_eq!(app.sidebar_width, 12, "sidebar width must not change");
         assert!(
@@ -4302,14 +4375,16 @@ mod tests {
         assert_eq!(
             entry_pairs(&project("C:\\dev\\api", false), Grouping::Directory),
             [
-                ("new session".to_string(), true),
+                ("new claude session".to_string(), true),
+                ("new codex session".to_string(), true),
                 ("remove project".to_string(), true),
             ]
         );
         assert_eq!(
             entry_pairs(&project("C:\\dev\\api", true), Grouping::Directory),
             [
-                ("new session".to_string(), true),
+                ("new claude session".to_string(), true),
+                ("new codex session".to_string(), true),
                 ("remove project".to_string(), false),
             ],
             "remove project must not be selectable while sessions remain"
@@ -4532,7 +4607,10 @@ mod tests {
         let mut app = test_app(34, TERM);
         app.projects = vec!["C:\\dev\\api".to_string(), "C:\\work\\api".to_string()];
         open(&mut app, project("C:\\work\\api", false), 5);
-        handle_popup_key(&mut app, KeyCode::Down);
+        // 末尾の `remove project` まで下げる（項目数は [`Kind::ORDER`] が決める）
+        for _ in 0..Kind::ORDER.len() {
+            handle_popup_key(&mut app, KeyCode::Down);
+        }
         handle_popup_key(&mut app, KeyCode::Enter);
         assert!(app.popup.is_none(), "the menu is still open after the action ran");
         assert_eq!(app.projects, ["C:\\dev\\api"]);
@@ -4768,7 +4846,7 @@ mod tests {
             .map(|x| buffer[(x, rect.y + 1)].symbol())
             .collect();
         assert!(
-            drawn.contains("new session"),
+            drawn.contains("new claude session"),
             "the label is chopped by the right pane: {drawn:?}"
         );
         // そのはみ出した列のクリックが、描かれている項目どおりに効く

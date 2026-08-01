@@ -34,6 +34,7 @@ const CWD_KEY: &str = "cwd";
 const TRANSCRIPT_KEY: &str = "transcript";
 const PINNED_KEY: &str = "pinned";
 const KIND_KEY: &str = "kind";
+const AGENT_ID_KEY: &str = "agent_id";
 const LAST_OPENED_AT_KEY: &str = "last_opened_at";
 const CREATED_AT_KEY: &str = "created_at";
 const UPDATED_AT_KEY: &str = "updated_at";
@@ -120,6 +121,12 @@ pub(crate) struct SessionRow {
     /// どの agent の行か。**保存値が無い行は claude**（[`Kind`] の既定）:
     /// この項目より前に作られた行は全部 claude なので、既定が移行の答えになる
     pub(crate) kind: Kind,
+    /// agent 自身が採番したセッション ID。**再開に使うのはこちら**。
+    ///
+    /// claude では [`Self::session_id`] と同じ値になる（ccdesk が `--session-id` で
+    /// 採番を強制するため）。codex は codex 自身が採番するので別の値で、
+    /// hook が名乗るまで（起動から数秒）は None ＝ **その間は再開できない**
+    pub(crate) agent_session_id: Option<String>,
     pub(crate) cwd: String,
     /// **解決済みの transcript の場所。** cwd から毎回導かない理由は、cwd が
     /// 動く値だから（セッションは走行中に git worktree へ移れる）。不変であるはずの
@@ -144,6 +151,7 @@ impl SessionRow {
             // **既定は claude。** codex の行は起こす側が明示する
             // （`crate::app` の `start_foreground`）
             kind: Kind::default(),
+            agent_session_id: None,
             cwd: cwd.into(),
             transcript: None,
             pinned: false,
@@ -159,6 +167,9 @@ impl SessionRow {
             ID_KEY: self.session_id.as_str(),
             CWD_KEY: self.cwd,
             KIND_KEY: self.kind.as_str(),
+            // 未取得はキーごと出さない（「まだ取れていない」と「空だった」を
+            // 保存の形で作り分けない ＝ transcript と同じ方針）
+            AGENT_ID_KEY: self.agent_session_id,
             // 解決できていない行はキーごと出さない（「まだ解決していない」と
             // 「解決したが空だった」を保存の形で作り分けない）
             TRANSCRIPT_KEY: self.transcript.as_ref().map(|p| p.to_string_lossy()),
@@ -191,6 +202,11 @@ impl SessionRow {
             // 知らない綴り（未来の版が書いた agent）は既定へ倒す ＝ 行が消えるより
             // claude として出る方が、少なくとも一覧から辿れる
             kind: Kind::parse(&text(KIND_KEY)).unwrap_or_default(),
+            agent_session_id: value
+                .get(AGENT_ID_KEY)
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
             cwd: text(CWD_KEY),
             transcript: value
                 .get(TRANSCRIPT_KEY)

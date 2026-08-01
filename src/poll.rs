@@ -589,11 +589,13 @@ pub(crate) fn spawn_footer_poller(
 pub(crate) enum Grouping {
     State,
     Directory,
+    /// agent 種別で分ける（claude / codex）
+    Agent,
 }
 
 impl Grouping {
     /// 表示順（メニューの項目の並びもこれに従う）
-    pub(crate) const ORDER: [Self; 2] = [Self::State, Self::Directory];
+    pub(crate) const ORDER: [Self; 3] = [Self::State, Self::Directory, Self::Agent];
 
     /// **保存値（config.json）と画面表示の唯一の綴り**。
     /// 読み・書き・メニュー・現在値表示が別々に綴りを持つと、片方だけ変えたときに
@@ -602,6 +604,7 @@ impl Grouping {
         match self {
             Self::State => "state",
             Self::Directory => "directory",
+            Self::Agent => "agent",
         }
     }
 

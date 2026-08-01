@@ -15,6 +15,7 @@ use crate::app::{
     selected_enter, App, Focus, Popup, PopupKind, RightView, RowAction, SelfUpdate, SidebarPos,
     SidebarRow,
 };
+use crate::backend::Kind;
 use crate::poll::{row_state, AccountStatus, State, Grouping, Run};
 use crate::sessions::SessionId;
 use crate::theme::{
@@ -97,8 +98,15 @@ const PINNED_TITLE: &str = "pinned";
 /// （手で数えた桁を別ファイルに書き写さない）
 pub(crate) const HEAD_COLS: usize = 3;
 
-/// 名前に最低限残す桁（詰め切ったサイドバーでも行を見分けられる下限）
-const MIN_NAME_COLS: usize = 4;
+/// 名前に最低限残す桁（詰め切ったサイドバーでも行を見分けられる下限）。
+///
+/// **接頭辞（[`Kind::tag`] + 空白）ぶんを含む。** 接頭辞は名前の予算に乗るので、
+/// ここを広げないと詰め切ったサイドバーで名前が接頭辞に食われて消える
+const MIN_NAME_COLS: usize = KIND_TAG_COLS + 4;
+
+/// 行頭の agent 略記が食う桁（[`Kind::tag`] + 区切りの空白 1）。
+/// **[`MIN_NAME_COLS`] の根拠**なので、値は [`Kind::tag`] から導いて書き写さない
+const KIND_TAG_COLS: usize = Kind::TAG_COLS + 1;
 
 /// **セッション行 1 本が要る内側の桁数**（行頭 + 名前の下限 + 行末のメニュー）。
 /// [`MIN_SIDEBAR`] はこれに枠の 2 桁を足したもの ＝
@@ -814,6 +822,9 @@ struct RowData {
     /// （これを別フィールドで持っていた頃は、`look_fixture` のような手組みの
     /// `RowData` で Stopped なのに Working の色、という矛盾を作れてしまっていた）
     group: State,
+    /// どの agent の行か。**行頭の略記の材料**（[`Kind::tag`]）。
+    /// grouping が agent のときの振り分けキーでもある
+    kind: Kind,
     cwd: String,
     label: String,
     /// 今ペインに出ている行（[`Look::open`] の材料）
@@ -853,7 +864,9 @@ fn session_row_line(d: &RowData, look: Look, inner_width: u16, blink_lit: bool) 
     } else {
         Style::default()
     };
-    let (name, gap) = row_name_and_gap(&d.label, inner_width);
+    // **どの agent の行かは名前の接頭で出す**（記号を使わない理由は [`Kind::tag`]）。
+    // 名前の桁予算に乗るので、詰めた幅では接頭辞ごと右で切れる
+    let (name, gap) = row_name_and_gap(&format!("{} {}", d.kind.tag(), d.label), inner_width);
     let mut spans = head;
     spans.push(Span::styled(name, name_style));
     spans.push(Span::raw(gap));
@@ -1219,6 +1232,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         data.push(RowData {
             action: RowAction::Open(row.session_id.clone()),
             group: row_state(run),
+            kind: row.kind,
             cwd: row.cwd.clone(),
             label: app.titles.of(row),
             is_active_window: window.is_some_and(|(i, _)| i == active)
@@ -1372,6 +1386,18 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                     .filter(|d| d.group == group)
                     .collect();
                 push_section(&mut items, &mut rows, group.title(), &members);
+            }
+        }
+        // **種別の節はここだけ**。他の 2 軸では claude と codex が同じ節に並ぶ
+        // （同じプロジェクトの作業を種別で引き離さない）
+        Grouping::Agent => {
+            for kind in Kind::ORDER {
+                let members: Vec<&RowData> = unpinned
+                    .iter()
+                    .copied()
+                    .filter(|d| d.kind == kind)
+                    .collect();
+                push_section(&mut items, &mut rows, kind.title(), &members);
             }
         }
         Grouping::Directory => {
@@ -1698,6 +1724,7 @@ pub(crate) mod tests {
             id: SessionId::new("s1"),
             pinned: false,
             open: true,
+            can_open: true,
         };
         let widest = kind
             .entries(Grouping::State)
@@ -2108,10 +2135,14 @@ pub(crate) mod tests {
             titles: fixed_titles(),
             ..Default::default()
         };
-        let line = session_lines(&mut app)
-            .into_iter()
-            .find(|line| line.contains("some-session"))
-            .expect("no session row");
+        // **名前では探さない**: 行頭の agent 略記（[`Kind::tag`]）が名前の桁を食うので、
+        // 幅によっては名前が右で切れて needle と一致しなくなる
+        let lines = session_lines(&mut app);
+        let line = lines
+            .iter()
+            .find(|line| line.contains(Kind::Claude.tag()))
+            .unwrap_or_else(|| panic!("no session row: {lines:?}"))
+            .clone();
         assert!(line.ends_with(MENU_MARK), "the menu mark is not at the end: {line:?}");
         // 行は内側の幅ちょうど（＝ 記号は内側の右端の桁に来る）
         let drawn = sidebar_cols(&app);
@@ -2164,15 +2195,16 @@ pub(crate) mod tests {
                 .unwrap_or_else(|| panic!("{needle} is not on any row: {lines:?}"))
                 .clone()
         };
-        let (unread, read) = (at("fresh-row"), at("seen-row"));
+        let (unread, read) = (at("fresh"), at("seen"));
         // 印はそれぞれ決まった桁に出る（ペインに出ていないので 1 桁目は空白）。
         // 窓が無い行 ＝ Stopped なので丸は小さい側、塗りは未読/既読で割れる
         assert!(unread.starts_with(&format!("{CLOSED_MARK}{DOT_STOPPED_FILLED}")), "{unread:?}");
         assert!(read.starts_with(&format!("{CLOSED_MARK}{DOT_STOPPED_HOLLOW}")), "{read:?}");
-        // 名前の開始桁は 2 本とも同じ（消えている印の桁も確保されている）
-        let name_col = |line: &str, name: &str| line[..line.find(name).unwrap()].width();
-        assert_eq!(name_col(&unread, "fresh-row"), HEAD_COLS);
-        assert_eq!(name_col(&read, "seen-row"), HEAD_COLS);
+        // 名前欄の開始桁は 2 本とも同じ（消えている印の桁も確保されている）。
+        // 名前欄の先頭は agent の略記（[`Kind::tag`]）
+        let tag_col = |line: &str| line[..line.find(Kind::Claude.tag()).unwrap()].width();
+        assert_eq!(tag_col(&unread), HEAD_COLS);
+        assert_eq!(tag_col(&read), HEAD_COLS);
     }
 
     /// **行の状態は hook（イベント）と `status`（現在値）の新しい方で決まる。**
@@ -3217,6 +3249,7 @@ pub(crate) mod tests {
     /// 見た目」を検査することになる（状態別の見え方は各テストが自分で `group` を置く）
     fn look_fixture() -> RowData {
         RowData {
+            kind: Kind::Claude,
             action: RowAction::Open(SessionId::new("a")),
             group: State::Waiting,
             cwd: "C:\\dev\\api".to_string(),
@@ -4041,7 +4074,15 @@ pub(crate) mod tests {
         let row = |y: u16| -> String {
             (rect.x..rect.right()).map(|x| buffer[(x, y)].symbol()).collect()
         };
-        assert_eq!(row(rect.y + 1), "│ new session   │", "row 1 is overwritten by the right pane");
-        assert_eq!(row(rect.y + 2), "│ remove project│", "row 2 is overwritten by the right pane");
+        assert_eq!(
+            row(rect.y + 1),
+            "│ new claude session│",
+            "row 1 is overwritten by the right pane"
+        );
+        assert_eq!(
+            row(rect.y + 3),
+            "│ remove project    │",
+            "the last row is overwritten by the right pane"
+        );
     }
 }
