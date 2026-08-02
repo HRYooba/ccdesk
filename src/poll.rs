@@ -43,13 +43,6 @@ pub(crate) struct AgentInfo {
     /// 常に「今」なので status が hook に必ず勝ち、陳腐化した `busy` を新しい
     /// `idle` hook で降ろせなくなる
     pub(crate) status_at: u64,
-    /// そのセッションを動かしているプロセス。
-    ///
-    /// **`sessionId` と対で読むのが要点**: ペインの中で `/resume` すると
-    /// 同じプロセスが別の `sessionId` に移るので、ccdesk が自分の子（pid は
-    /// 知っている）が今どのセッションを動かしているかを知る唯一の口になる
-    /// （[`crate::app`] の `live_session_of`）
-    pub(crate) pid: Option<u32>,
 }
 
 impl AgentInfo {
@@ -126,7 +119,6 @@ fn read_session_file(path: &std::path::Path) -> Option<AgentInfo> {
         // 時刻の項目が無い版のために、ファイルの更新時刻へ落とす。0 のままに
         // すると hook が必ず勝ち、hook を取り逃した行を status で直せなくなる
         status_at: num(AGENT_STATUS_UPDATED_AT).unwrap_or_else(|| modified_ms(path)),
-        pid: Some(pid),
     })
 }
 
@@ -565,6 +557,7 @@ fn account_step(
 ///   `claude update` 完了時の再取得要求。どちらも**起動時に 1 度取る**
 ///   （`version_age` の初期値が周期を超えているため）
 pub(crate) fn spawn_footer_poller(
+    kinds: Vec<Kind>,
     versions: VersionSinks,
     refresh: Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -575,11 +568,14 @@ pub(crate) fn spawn_footer_poller(
         ccdesk_dirty,
     } = versions;
     std::thread::spawn(move || {
-        // **agent ごとに 1 本ずつ**（アカウントは agent ごとに別物）。
-        // 共有側へ最後に書いた値も手元に持つ ＝ 毎秒ロックを取らずに比べられる
-        let mut accounts: BTreeMap<Kind, (AccountPollState, AccountStatus)> = Kind::ORDER
-            .into_iter()
-            .map(|kind| (kind, (AccountPollState::new(), AccountStatus::default())))
+        // **出す agent ごとに 1 本ずつ**（アカウントは agent ごとに別物）。
+        // 共有側へ最後に書いた値も手元に持つ ＝ 毎秒ロックを取らずに比べられる。
+        // 一覧は [`Kind::enabled`] が絞ったもの ＝ **切った agent の実行ファイルは
+        // 1 回も起こさない**（入れていない agent のアカウント取得は毎回失敗し、
+        // [`ACCOUNT_RETRY_SECS`] ごとに起動を試み続けるため）
+        let mut accounts: BTreeMap<Kind, (AccountPollState, AccountStatus)> = kinds
+            .iter()
+            .map(|kind| (*kind, (AccountPollState::new(), AccountStatus::default())))
             .collect();
         let mut version_age = u64::MAX / 2; // 初回は即取得
         loop {
@@ -606,11 +602,11 @@ pub(crate) fn spawn_footer_poller(
             // 「起動時 1 回」のような別の規則へ流れる（実際そうなっていた）
             if refetch_due(version_age, VERSION_INTERVAL_SECS, false, forced) {
                 version_age = 0;
-                // **agent ごとに 1 本ずつ取る。** どれを取るかは
-                // [`Kind::ORDER`] が決めるので、agent を足しても取り漏らさない
-                let fetched: BTreeMap<Kind, AgentVersion> = Kind::ORDER
-                    .into_iter()
-                    .map(|kind| (kind, kind.backend().version()))
+                // **出す agent ごとに 1 本ずつ取る。** 一覧はアカウントと同じ
+                // [`Kind::enabled`] の結果なので、版行とアカウント行がずれない
+                let fetched: BTreeMap<Kind, AgentVersion> = kinds
+                    .iter()
+                    .map(|kind| (*kind, kind.backend().version()))
                     // 取得に失敗した（current が空）ものは載せない。1 回の失敗で
                     // バージョン表記と更新ボタン行が 1 時間消えるのを防ぐ
                     .filter(|(_, v)| !v.current.is_empty())
@@ -754,8 +750,14 @@ impl State {
         }
     }
 
-    /// この状態の色。**行のドット・集計・節が同じこの 1 箇所を読む**ので、
-    /// 状態を増やしたときに色の対応を書き忘れる場所が増えない
+    /// [`Self::title`] を縦に揃えるための桁。**サイドバーの行末がこれで揃う**
+    /// （状態語の右端が揃っていないと、行ごとにメニュー記号の手前がガタつく）。
+    /// 値は綴りから導くのではなく固定し、`every_title_fits_its_column` が
+    /// 全状態の収まりを見る
+    pub(crate) const TITLE_COLS: usize = 7;
+
+    /// この状態の色。**行のドット・行末の状態語・集計・節が同じこの 1 箇所を読む**
+    /// ので、状態を増やしたときに色の対応を書き忘れる場所が増えない
     /// （以前は `StateView.color` が別に持っていて、食い違う値を作れてしまっていた）
     pub(crate) fn color(self) -> Color {
         match self {
@@ -1081,6 +1083,27 @@ mod tests {
         for unknown in ["", "blocked", "done", "completed", "Working", "idle "] {
             assert_eq!(State::parse(unknown), None, "{unknown:?}");
         }
+    }
+
+    /// 状態語は**サイドバーの行末で縦に揃える**ので、桁に収まらないと
+    /// 右隣のメニュー記号の手前が行ごとにガタつく
+    #[test]
+    fn every_title_fits_its_column() {
+        let widths: Vec<usize> = State::ORDER
+            .iter()
+            .map(|state| unicode_width::UnicodeWidthStr::width(state.title()))
+            .collect();
+        assert!(
+            widths.iter().all(|w| *w <= State::TITLE_COLS),
+            "a title does not fit in {} columns: {widths:?}",
+            State::TITLE_COLS
+        );
+        // **桁を余らせない**（一番長い語が幅そのもの）＝ 語を短くしたら定数も下がる
+        assert_eq!(
+            widths.iter().copied().max(),
+            Some(State::TITLE_COLS),
+            "the column is wider than the longest state word"
+        );
     }
 
     /// claude の `status` の写し先。**`shell` を `idle` と同じに畳むのは意図した判断**で、

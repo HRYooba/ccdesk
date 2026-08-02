@@ -10,7 +10,8 @@
 //! それに聞く。agent を足すときに増えるのは `backend/` のファイル 1 枚と
 //! [`Kind`] の値 1 つで、コンパイラが未実装のメソッドを要求する。
 //!
-//! 設計の背景は `docs/codex-support.md`。
+//! **どの agent を出すかは設定 1 箇所**（[`Kind::enabled`]）。任意の agent は
+//! opt-in で、切っている間は表示も導線もポーリングもその agent へ届かない。
 
 pub(crate) mod claude;
 pub(crate) mod codex;
@@ -21,21 +22,40 @@ use portable_pty::CommandBuilder;
 
 use crate::sessions::SessionId;
 
-/// 起動の種類。**新規と再開でコマンドラインが違う**ことだけをここに持たせる
-/// （どちらを使うかを決めるのは呼び出し側 ＝ 会話の記録があるか）
+/// 起動の種類。**会話をどう決めるか**の 3 通りで、どれを使うかは呼び出し側が
+/// 行の [`crate::sessions::Conversation`] から決める（`crate::app` の `relaunch`）
 pub(crate) enum Launch<'a> {
-    /// 新規セッション。`prompt` は最初のメッセージ（空なら渡さない）
+    /// 新規の会話。`prompt` は最初のメッセージ（空なら渡さない）。
+    /// **会話 ID を採番するかは agent 次第**（[`Spawn::conversation`]）
     New { prompt: &'a str },
-    /// 既存セッションの再開。**cwd の一致が必須**（別 cwd からは会話が見つからない
-    /// ＝ 記録が在る作業ツリーで開く。判断は
-    /// [`crate::title::Titles::resume_cwd`]）。
-    /// **会話の記録が無い行には使えない**
+    /// **確かめた**会話の再開。**cwd の一致が必須**（別 cwd からは会話が見つからない
+    /// ＝ 記録が在る作業ツリーで開く。判断は [`crate::title::Titles::resume_cwd`]）
     Resume {
-        /// 再開に使う ID。**行の ID とは限らない。** claude は ccdesk が採番した
-        /// 値をそのまま使うので一致するが、codex は codex 自身が採番した値で、
-        /// ccdesk の行 ID では会話が見つからない
+        /// 再開に使う ID。**行の ID ではない**（行 ID は `CCDESK_ROW` 以外の
+        /// どこにも出ない）。hook が名乗った値だけがここへ来る
         id: &'a str,
     },
+    /// **agent 自身の会話ピッカーを開く**（ID を渡さない）。
+    ///
+    /// 会話を確かめていない行を開くときに使う。**推測で resume しない**のが
+    /// 要点で、渡す ID が違えば別の会話を開く / 見つからずに落ちる。
+    /// `claude -r` は値が任意、`codex resume` は既定でピッカー
+    Pick,
+}
+
+/// 起こす子プロセス 1 つぶん。
+///
+/// **コマンドラインと「どの会話に載るか」を対で返すことがこの型の存在理由。**
+/// claude は ccdesk が UUID を採番して押し付け、codex は codex 自身が採番する
+/// （`--session-id` 相当が無い）。この違いを「採番できるか」のような bool で
+/// 返すと、呼び手が agent ごとに分岐して採番を代行することになり、agent を
+/// 足すたびに呼び手が増える
+pub(crate) struct Spawn {
+    pub(crate) cmd: CommandBuilder,
+    /// この起動が載る会話。**None は「起こす前には分からない」**（codex の新規と
+    /// [`Launch::Pick`]）。分かるまで行は会話を持たず、hook が名乗って初めて
+    /// [`crate::sessions::Conversation::Observed`] になる
+    pub(crate) conversation: Option<String>,
 }
 
 /// hook を注入するための材料。
@@ -54,6 +74,11 @@ pub(crate) struct Inject<'a> {
     pub(crate) settings: &'a std::path::Path,
 }
 
+/// 任意 agent を出す設定値。**綴りはここ 1 箇所**（`~/.ccdesk/config.json` の
+/// `"codex": "on"`）。これ以外の値・キーが無い場合は off と読む ＝
+/// 設定ファイルを持たない人には出ない
+pub(crate) const ON: &str = "on";
+
 /// どの agent の行か。**保存と表示の綴りをここ 1 箇所が持つ**
 /// （[`crate::poll::State`] と同じ作り: 語彙の正本を 1 つにし、2 つの顔を生やす）。
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Hash)]
@@ -64,12 +89,41 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
-    /// 表示順（grouping の節・New 画面の切替行・メニューの並びもこれに従う）
+    /// **ccdesk が知っている agent の全部**（表示順）。grouping の節・New 画面の
+    /// 切替行・メニューの並びもこれに従う。
+    ///
+    /// **「今出す agent」はこれではない**（[`Self::enabled`]）。この一覧は
+    /// 保存値の復元（[`Self::parse`]）と網羅の検査が読む正本で、設定で切っても
+    /// 縮まない ＝ off の agent の行を保存から読めなくなることがない
     pub(crate) const ORDER: [Self; 2] = [Self::Claude, Self::Codex];
 
-    /// [`Self::tag`] の桁数。**全 kind で同じ**（`every_tag_is_the_same_width` が
-    /// 固定する）。サイドバーの桁予算がこの値に乗る
-    pub(crate) const TAG_COLS: usize = 4;
+    /// **opt-in の agent**（既定では出さない）。ここに載っていない agent は
+    /// 設定に関係なく常に出る。
+    ///
+    /// claude は ccdesk の前提（無ければ何もできない）なので切れない。
+    /// codex は任意なので opt-in ＝ 「選べるのは追加の agent だけ」という規則
+    const OPTIONAL: [Self; 1] = [Self::Codex];
+
+    /// 設定（`~/.ccdesk/config.json`）から今出す agent の一覧を組む。
+    ///
+    /// `setting` はその agent の綴りをキーにした値（例 `"codex"` → `"on"`）を
+    /// 引く関数。**既定は off** ＝ 設定を書いていない人には claude だけが出る。
+    ///
+    /// **既定で出さないのは、入れていない agent のポーリングが無駄に回るから。**
+    /// アカウント取得はその agent の実行ファイルを起こすので、入っていなければ
+    /// 毎回失敗し、[`crate::poll`] の再試行間隔（5 秒）で起動を試み続ける。
+    /// 使っている人だけが 1 行書く形なら、その空振りが誰にも起きない。
+    ///
+    /// 判断をこの純関数に閉じてあるので、ファイルを置かずにテストできる
+    pub(crate) fn enabled(setting: impl Fn(&str) -> Option<String>) -> Vec<Self> {
+        Self::ORDER
+            .into_iter()
+            .filter(|kind| {
+                !Self::OPTIONAL.contains(kind)
+                    || setting(kind.as_str()).as_deref() == Some(ON)
+            })
+            .collect()
+    }
 
     /// **保存値（`sessions.json`）と CLI 引数の唯一の綴り。**
     /// 読み・書きが別々に綴りを持つと、片方だけ変えたときに保存値が読めなくなる
@@ -96,15 +150,11 @@ impl Kind {
         self.as_str()
     }
 
-    /// サイドバーの行に出す略記。**幅が足りないのはここだけ**なので、
-    /// 略記もここだけ（[`Self::title`] が入らない場所の代替）。
-    /// **全 kind で同じ桁**（揃っていないと行ごとに名前の開始位置がずれる）
-    pub(crate) fn tag(self) -> &'static str {
-        match self {
-            Self::Claude => "[cc]",
-            Self::Codex => "[cx]",
-        }
-    }
+    /// [`Self::title`] を縦に揃えるための桁。**サイドバーの行末がこれで揃う**
+    /// （状態語の右に agent 名が並ぶので、揃っていないと行の右端がガタつく）。
+    /// 値は綴りから導くのではなく固定し、`every_title_fits_its_column` が
+    /// 全 kind の収まりを見る
+    pub(crate) const TITLE_COLS: usize = 6;
 
     /// この kind の実装。**`&'static` にしてある**ので、行やコマンドを組む側は
     /// 寿命を気にせず持ち回せる
@@ -113,6 +163,26 @@ impl Kind {
             Self::Claude => &claude::Claude,
             Self::Codex => &codex::Codex,
         }
+    }
+
+    /// 行を 1 つ起こすコマンド。**セッションを起こす唯一の口**
+    /// （[`Backend::command`] を直に呼ぶのはここだけ）。
+    ///
+    /// **`CCDESK_ROW` を立てるのがここ 1 箇所であることが、この関数の存在理由。**
+    /// 行 ID は hook の子プロセスへ env でしか渡らず（argv にも transcript 名にも
+    /// 出さない）、立て忘れた agent の行は**無音で状態を失う**
+    /// ＝ 起動が落ちるわけでもエラーが出るわけでもないので気づけない。
+    /// 各 backend に任せていた頃、実際に codex だけが立てていた
+    pub(crate) fn spawn_command(
+        self,
+        row: &SessionId,
+        cwd: &str,
+        launch: Launch<'_>,
+        inject: Option<&Inject>,
+    ) -> Spawn {
+        let mut spawn = self.backend().command(cwd, launch, inject);
+        spawn.cmd.env(crate::hooks::ROW_ENV, row.as_str());
+        spawn
     }
 }
 
@@ -139,14 +209,11 @@ pub(crate) trait Backend: Send + Sync {
     /// 引数を間違えれば起動が落ち、除去を落とせば会話の記録が保存されない）。
     ///
     /// `inject` は state を戻す hook の材料（[`Inject`]）。None なら hook 無しで
-    /// 起こす ＝ 行の状態が縮退するだけで、セッション自体は動く
-    fn command(
-        &self,
-        session_id: &SessionId,
-        cwd: &str,
-        launch: Launch<'_>,
-        inject: Option<&Inject>,
-    ) -> CommandBuilder;
+    /// 起こす ＝ 行の状態が縮退するだけで、セッション自体は動く。
+    ///
+    /// **行 ID を受け取らない。** 行 ID を argv や会話名へ出さないのが今の設計で、
+    /// hook へ渡す env は共通の口（[`Kind::spawn_command`]）が立てる
+    fn command(&self, cwd: &str, launch: Launch<'_>, inject: Option<&Inject>) -> Spawn;
 
     /// **hook を取り逃したとき、PTY の無音を「手が空いた」と読んでよいか。**
     ///
@@ -181,6 +248,83 @@ pub(crate) trait Backend: Send + Sync {
     /// **これが変わったときだけ [`Self::account`] を叩く**（取得はプロセス起動を
     /// 伴うので毎周は回さない）。読めない環境では None ＝ 周期フォールバックだけが効く
     fn auth_fingerprint(&self) -> crate::poll::CredentialsFp;
+
+    /// 会話の記録（claude の transcript / codex の rollout）を探す根。
+    ///
+    /// **根だけを返し、探すのは [`Self::transcript_in`] に分けてある。**
+    /// [`crate::title::Titles`] が根を保持して差し替えられるようにするためで、
+    /// テストが実ユーザーの `~/.claude` `~/.codex` を絶対に触らないという
+    /// この repo の約束がそこに乗っている
+    fn transcript_root(&self) -> Option<std::path::PathBuf>;
+
+    /// その根の下で、この会話の記録がどこにあるか。
+    ///
+    /// **`cwd` を受けるのは claude のため**（記録の置き場所が作業ツリーから
+    /// 決まる）。codex は会話 ID だけで決まるので使わない
+    fn transcript_in(
+        &self,
+        root: &std::path::Path,
+        conversation: &str,
+        cwd: &str,
+    ) -> Option<std::path::PathBuf>;
+
+    /// **その会話を再開できる cwd**（`transcript` は解決済みの記録の場所）。
+    ///
+    /// 別 cwd から打つと会話が見つからない agent があるので、「どこで打つか」まで
+    /// 答える必要がある。見つからなければ None ＝ 呼び手は新規として起こす
+    fn resume_cwd(&self, cwd: &str, transcript: Option<&std::path::Path>) -> Option<String>;
+
+    /// 会話に名前を与えうる記録。**この並びが優先順そのもの**
+    fn title_records(&self) -> &'static [Candidate];
+
+    /// 記録の外に agent 自身が持っている会話名の索引
+    /// （None ＝ この agent は記録の中で名前を持つ）
+    fn name_index(&self) -> Option<NameIndex>;
+}
+
+/// 会話に名前を与えうる記録が、その会話の記録ファイルの**どこに現れるか**。
+/// 走査の範囲はこの性質から機械的に決まる（[`crate::title::Titles::refresh_all`]）
+/// ので、候補と範囲の対応表を別に持たない。
+///
+/// **この区別を落とすと実害が出る**: claude の `custom-title` を末尾 64 KiB
+/// だけで探していた頃は、長い会話の早い段階でリネームした記録が範囲の外に出て
+/// 拾えず、記録全体を読む `/resume` のピッカーと名前が食い違っていた
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Span {
+    /// セッション中に繰り返し追記される。**最新が答え**なので末尾で足りる
+    Appended,
+    /// 会話の先頭に 1 度だけ書かれ、**最初の値が答え**。追記されない範囲なので
+    /// 1 会話 1 回の有界読みで済む（codex の最初のプロンプトがこれ）
+    Head,
+    /// まれにしか書かれない。末尾から [`crate::title::RARE_BYTES`] まで遡って探す
+    Rare,
+}
+
+/// 会話に名前を与えうる記録 1 種類。
+///
+/// **取り出しを関数で持つのは、agent ごとに記録の形が違うから。** claude は平ら
+/// （`{"type":"last-prompt","lastPrompt":…}`）だが、codex は入れ子
+/// （`{"type":"event_msg","payload":{"type":"user_message","message":…}}`）で、
+/// (型名, キー) の組では codex を表せない
+pub(crate) struct Candidate {
+    /// JSON を組む前の足切りに使う文字列。**走査の速さの要点**で、
+    /// 記録は 1 MB を超えることがあり全行をパースすると走査 1 回が行数に比例する
+    pub(crate) marker: &'static str,
+    /// 解析済みの 1 行から表示名を取り出す（None ＝ この候補ではない）
+    pub(crate) text: fn(&serde_json::Value) -> Option<&str>,
+    pub(crate) span: Span,
+}
+
+/// agent 自身が**記録の外**に持っている会話名の索引（1 行 1 会話の JSONL）。
+///
+/// **「索引を持つか」の bool ではなく、どこをどう読むかを返す。** 呼び手は
+/// None なら索引を持たないだけで、agent ごとの分岐を書かない
+pub(crate) struct NameIndex {
+    pub(crate) path: std::path::PathBuf,
+    /// 会話 ID のキー
+    pub(crate) id_key: &'static str,
+    /// 表示名のキー
+    pub(crate) name_key: &'static str,
 }
 
 /// agent 1 つぶんの版。**「新しい版があるときだけ Some」**という形は
@@ -217,19 +361,77 @@ pub(crate) mod tests {
         assert_eq!(spellings, ["claude", "codex"]);
     }
 
-    /// 略記は**サイドバーの桁予算に乗る**（`MIN_NAME_COLS` の根拠）ので、
-    /// 長さが揃っていないと行ごとに名前の開始位置がずれる
+    /// **任意の agent は opt-in。** 設定を持たない人には claude だけが出る。
+    ///
+    /// 既定を on 側にすると、codex を入れていない全員の環境でアカウント取得が
+    /// 空振りし続ける（実行ファイルが無く、5 秒ごとに起動を試みる）。
+    /// **`"on"` 以外は全部 off** ＝ 綴り違いで黙って有効にならない
     #[test]
-    fn every_tag_is_the_same_width() {
+    fn an_optional_agent_shows_up_only_when_the_setting_says_on() {
+        let fixed = |value: Option<&str>| {
+            let value = value.map(str::to_string);
+            move |_: &str| value.clone()
+        };
+        assert_eq!(Kind::enabled(fixed(None)), [Kind::Claude], "the default is not claude only");
+        assert_eq!(Kind::enabled(fixed(Some(ON))), Kind::ORDER, "\"on\" did not add the agent");
+        // 綴り違い・空・off はすべて出さない側（曖昧な値で黙って有効にしない）
+        for value in ["", "off", "ON", "true", "yes", "on "] {
+            assert_eq!(
+                Kind::enabled(fixed(Some(value))),
+                [Kind::Claude],
+                "{value:?} turned an optional agent on"
+            );
+        }
+        // **claude は設定で消せない**（無ければ ccdesk が何もできない）
+        assert!(
+            !Kind::OPTIONAL.contains(&Kind::Claude),
+            "claude became switchable, so a setting could leave ccdesk with no agent"
+        );
+        // キーは agent の綴りそのもの（`"codex"`）＝ 設定の綴りを別に持たない
+        let by_key = |key: &str| (key == Kind::Codex.as_str()).then(|| ON.to_string());
+        assert_eq!(Kind::enabled(by_key), Kind::ORDER);
+    }
+
+    /// 表示名は**サイドバーの行末で縦に揃える**ので、桁に収まらないと
+    /// 右隣の状態語の開始位置が行ごとにずれる
+    #[test]
+    fn every_title_fits_its_column() {
         let widths: Vec<usize> = Kind::ORDER
             .iter()
-            .map(|k| unicode_width::UnicodeWidthStr::width(k.tag()))
+            .map(|k| unicode_width::UnicodeWidthStr::width(k.title()))
             .collect();
         assert!(
-            widths.iter().all(|w| *w == Kind::TAG_COLS),
-            "a tag is not {} columns wide: {widths:?}",
-            Kind::TAG_COLS
+            widths.iter().all(|w| *w <= Kind::TITLE_COLS),
+            "a title does not fit in {} columns: {widths:?}",
+            Kind::TITLE_COLS
         );
+    }
+
+    /// **行 ID は `CCDESK_ROW` にしか出ない。** hook はこの env でしか
+    /// 「どの行の出来事か」を知れず、立て忘れた agent の行は無音で状態を失う
+    /// （起動は成功し、エラーも出ない）。だから全 kind をここでまとめて固定する。
+    ///
+    /// 併せて **argv へ漏れていない**ことも見る: 行 ID を引数に出すと、その値が
+    /// agent 側の世界（transcript 名・会話 ID）へ流れ込み、行と会話をもう一度
+    /// 結び付けてしまう
+    #[test]
+    fn every_kind_hands_the_row_id_over_through_the_environment_and_nowhere_else() {
+        let row = SessionId::new("11111111-1111-4111-8111-111111111111");
+        for kind in Kind::ORDER {
+            for launch in [Launch::New { prompt: "" }, Launch::Resume { id: "conv" }, Launch::Pick] {
+                let cmd = kind.spawn_command(&row, "C:\\dev\\app", launch, None).cmd;
+                let found = cmd
+                    .iter_full_env_as_str()
+                    .find(|(key, _)| *key == crate::hooks::ROW_ENV)
+                    .map(|(_, value)| value.to_string());
+                assert_eq!(found.as_deref(), Some(row.as_str()), "{kind:?} does not hand over the row id");
+                assert!(
+                    !argv(&cmd).iter().any(|arg| arg.contains(row.as_str())),
+                    "{kind:?} leaked the row id into its arguments: {:?}",
+                    argv(&cmd)
+                );
+            }
+        }
     }
 
     #[test]
@@ -246,12 +448,14 @@ pub(crate) mod tests {
     #[test]
     fn every_kind_resolves_to_a_backend_that_launches_its_own_program() {
         for kind in Kind::ORDER {
-            let cmd = kind.backend().command(
-                &SessionId::new("row"),
-                "C:\\dev\\app",
-                Launch::New { prompt: "" },
-                None,
-            );
+            let cmd = kind
+                .spawn_command(
+                    &SessionId::new("row"),
+                    "C:\\dev\\app",
+                    Launch::New { prompt: "" },
+                    None,
+                )
+                .cmd;
             // **拡張子とディレクトリは環境で変わる**（PATH の解決を通すので、
             // 入っていれば `C:\…\codex.cmd`、入っていなければ `codex`）。
             // 見るのは「どの名前の実行ファイルを起こすか」だけ

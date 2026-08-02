@@ -170,10 +170,6 @@ pub(crate) enum PopupKind {
         pinned: bool,
         /// 窓が開いていて子プロセスが生きているか（`stop` を出せるかの判断）
         open: bool,
-        /// **開き直せるか。** codex はセッション ID を自分で採番するので、
-        /// hook が名乗るまで（起動から数秒）は再開先が分からない。
-        /// その間 `open` を押せると「何も起きない」か別の会話が開く
-        can_open: bool,
     },
     State,
     /// プロジェクト単位の操作。`has_sessions` は開いた時点の写し（[`PopupKind::Session`] の
@@ -216,7 +212,9 @@ pub(crate) struct PopupEntry {
 
 impl PopupKind {
     /// メニューの項目表（並び順 = 表示順）
-    pub(crate) fn entries(&self, grouping: Grouping) -> Vec<PopupEntry> {
+    /// `kinds` は今出す agent（[`crate::app::App::kinds`]）。**切った agent で
+    /// 新規セッションを起こす項目を出さない**ためだけに要る
+    pub(crate) fn entries(&self, grouping: Grouping, kinds: &[Kind]) -> Vec<PopupEntry> {
         match self {
             // 二次操作はここに集約する（ショートカットキーを併設しない ＝
             // 入口を 2 つ持たない）。
@@ -241,14 +239,16 @@ impl PopupKind {
             // **アーカイブは持たない**: `close` は行を忘れるだけで
             // `~/.claude/projects/**/*.jsonl` を消さないので、アーカイブとの差は
             // 「戻す導線があるか」だけになる ＝ 節を 1 つ増やす価値が無い
-            PopupKind::Session { id, pinned, open, can_open } => {
+            PopupKind::Session { id, pinned, open } => {
                 let entry = |label: &str, enabled: bool, action: PopupAction| PopupEntry {
                     label: label.to_string(),
                     enabled,
                     action,
                 };
                 vec![
-                    entry("open", *can_open, PopupAction::OpenSession(id.clone())),
+                    // **常に押せる。** 会話を確かめていない行も agent 自身の
+                    // ピッカーで開く（`relaunch`）ので、押せない行が無い
+                    entry("open", true, PopupAction::OpenSession(id.clone())),
                     entry(
                         if *pinned { "unpin" } else { "pin" },
                         true,
@@ -277,8 +277,9 @@ impl PopupKind {
             // **`new session` は agent ごとに項目を分ける。** この入口は New 画面を
             // 通らず即起動するので、既定で黙って起こすと「押すまで何が起きるか
             // 分からない」ことになる
-            PopupKind::Project { cwd, has_sessions } => Kind::ORDER
-                .into_iter()
+            PopupKind::Project { cwd, has_sessions } => kinds
+                .iter()
+                .copied()
                 .map(|kind| PopupEntry {
                     label: format!("new {} session", kind.title()),
                     enabled: true,
@@ -299,7 +300,7 @@ impl PopupKind {
     /// 引く**ので、表示と動作が index でずれることは構造的に無い
     #[cfg(test)]
     fn action(&self, grouping: Grouping, index: usize) -> Option<PopupAction> {
-        let mut entries = self.entries(grouping);
+        let mut entries = self.entries(grouping, &Kind::ORDER);
         (index < entries.len()).then(|| entries.swap_remove(index).action)
     }
 }
@@ -449,6 +450,14 @@ pub(crate) struct App {
     // 下部バーに数秒表示するエラー等の通知
     pub(crate) notice: Option<(String, std::time::Instant)>,
     pub(crate) grouping: Grouping,
+    /// **今出す agent**（設定から起動時に 1 度組む。[`Kind::enabled`]）。
+    ///
+    /// 版行・使用率行・grouping の節・New 画面の切替・フォルダメニューの
+    /// new session・一覧に出す行 が全部これを読むので、**「codex を出すか」の
+    /// 判断が画面のあちこちに散らない**。設定は config.json だけなので
+    /// 起動中は変わらないが、`Kind::ORDER` を直に読む場所を残すと
+    /// そこだけ off に従わない、という抜けができる
+    pub(crate) kinds: Vec<Kind>,
     // 登録済みプロジェクト（ディレクトリ）の絶対パス。**この Vec が登録内容の正本**で、
     // 変更のたび全量を供給元へ書き戻す。directory グルーピングの見出しは
     // 「この一覧 ∪ セッションの cwd」なので、セッションが 0 本になっても
@@ -537,6 +546,12 @@ impl Default for App {
             input_gate: None,
             notice: None,
             grouping: Grouping::State,
+            // テストの既定は**全 agent**。本番の既定（claude だけ。
+            // [`Kind::enabled`]）とは違えてある: 複数 agent の桁割り・節・
+            // 下部バーの行数を見るテストが多く、既定を claude だけにすると
+            // それらが黙って 1 agent の経路しか通らなくなる。
+            // claude だけの見え方はその一覧を明示するテストが受け持つ
+            kinds: Kind::ORDER.to_vec(),
             projects: Vec::new(),
             popup: None,
             // サイドバー側にしておく（set_focus が PTY へ通知を出さない）
@@ -801,8 +816,9 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             app.last_live_scan = std::time::Instant::now();
         }
         // **hook の書き込みに気づいたら周期を待たずに読み直す。** ペインの中で
-        // `/resume` `/clear` すると claude は新しいセッションの `SessionStart` を
-        // その場で撃つので、これが「一覧に新しい行を出す合図」になる。
+        // `/resume` `/clear` すると agent は新しい会話の `SessionStart` を
+        // その場で撃つので、これが「行が別の会話へ移った合図」になる
+        // （行は増えない ＝ `adopt_conversations`）。
         // 見るのはファイルの長さと更新時刻だけ（中身は読まない）ので毎周でも安い
         let hooks_changed = hook_store_changed(&mut app.hook_stamp, app.source.hook_stamp());
         if hooks_changed {
@@ -812,17 +828,14 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             refresh_sessions(app);
             // 一覧を読み直した直後に hook の state を載せる。**順序に意味がある**:
             // 読み直しは丸ごとの置き換えなので、先に載せるとその場で上書きされる。
-            // **張り替えより前**でもある: ペインの中で切り替わったことに気づく材料が
-            // hook の写しなので、古い写しのまま張り替えを判断させない。
+            // **名前の読み直しより前**でもある: 行が今どの会話に載っているかを
+            // ここで確定させてから、その会話の transcript を読ませる
+            // （逆にすると `/clear` の周だけ古い会話の名前が 1 周残る）。
             // **読み直すのはファイルが実際に動いた周だけ**（何も起きていない
             // 2 秒周期のたびに全読み + JSON パースをやり直さない）
             if hooks_changed {
                 adopt_hook_states(app);
             }
-            // ペインの中で `/resume` された窓を新しいセッションの行へ張り替える。
-            // **名前の読み直しの前**に置く: 張り替えで作った行の表示名は
-            // transcript から来るので、同じ周期の refresh_transcripts が拾う
-            follow_session_switches(app);
             refresh_transcripts(app);
             app.last_scan = std::time::Instant::now();
             force_draw = true; // 並びが変わったら即描画（表示と行データのずれを残さない）
@@ -1277,15 +1290,43 @@ fn save_sessions(app: &mut App) {
 /// 落ちていた行はここで戻し、次の保存でもう一度ディスクへ載せに行く
 fn refresh_sessions(app: &mut App) {
     let open: Vec<SessionId> = app.windows.iter().map(|w| w.session_id.clone()).collect();
-    let fresh = app.source.sessions();
+    let mut fresh = app.source.sessions();
     let dropped: Vec<SessionRow> = rows_dropped_while_open(&fresh, &app.sessions, &open)
         .into_iter()
         .cloned()
         .collect();
+    restore_conversations(&mut fresh, &app.sessions);
     app.sessions = fresh;
     if !dropped.is_empty() {
         app.sessions.extend(dropped);
         save_sessions(app);
+    }
+}
+
+/// 読み直しで会話を失った行へ、**メモリ上の写しが知っている会話を戻す**
+/// （[`refresh_sessions`] の判断。副作用を持たないので単体で検査できる）。
+///
+/// **保存されるのは確かめた会話だけ**（[`crate::sessions::Conversation::Observed`]）
+/// なので、起動直後の `Assigned`（ccdesk が採番して `--session-id` で渡した値）は
+/// ディスクに載らない。読み直しは丸ごとの置き換えなので、戻さないと
+/// **2 秒ごとに会話を失う**。
+///
+/// 普段は同じ周期の `adopt_conversations` が hook から `Observed` を戻すので
+/// 気づけないが、**hook が一度も来ない行は永久に会話を失う**（表示名が
+/// `new session` に固定され、開き直しが agent のピッカーになる）。hook の注入は
+/// 実際に失敗し得る（[`hook_settings`] が None を返す環境、codex なら exe パスに
+/// 空白がある場合）ので、hook 1 本に全部を賭けない。
+///
+/// **戻すのは `Unknown` の行だけ。** ディスクが会話を持っているなら、それは
+/// 他インスタンスが確かめた値かもしれない ＝ こちらの古い写しで踏み潰さない
+fn restore_conversations(fresh: &mut [SessionRow], mine: &[SessionRow]) {
+    for row in fresh
+        .iter_mut()
+        .filter(|row| row.conversation.id().is_none())
+    {
+        if let Some(known) = mine.iter().find(|m| m.session_id == row.session_id) {
+            row.conversation = known.conversation.clone();
+        }
     }
 }
 
@@ -1324,101 +1365,6 @@ fn hook_store_changed(
     true
 }
 
-/// その pid が**今**動かしているセッション。材料は 2 つあり、**hook が主**:
-///
-/// - **hook**（[`crate::hooks::HookStates::session_of`]）: claude は hook の子へ
-///   `CLAUDE_PID` を渡すので、記録は「どの claude が」「どのセッションで」起きたかを
-///   持っている。**turn が動いた瞬間に届く**ので、`/resume` `/clear` の張り替えを
-///   周期で待たない
-/// - **ライブ状態**（`~/.claude/sessions/<pid>.json`）: hook を
-///   注入できていないセッションのための従経路。2 秒周期のプロセス起動で届く
-///
-/// pid が分からない / どちらにもエントリが無い / `sessionId` が空なら None
-/// （＝ 何も張り替えない。npm 版のように `claude` が中間プロセス越しに起動する
-/// 環境では自分の子の pid が載らないので、この機能は黙って効かないだけになる）
-fn live_session_of(
-    pid: Option<u32>,
-    launched_at: u64,
-    hooks: &HookStates,
-    agents: &[AgentInfo],
-) -> Option<SessionId> {
-    let pid = pid?;
-    if let Some(id) = hooks.session_of(pid, launched_at) {
-        return Some(id.clone());
-    }
-    agents
-        .iter()
-        .filter(|a| a.is_interactive() && a.pid == Some(pid))
-        .map(|a| SessionId::new(a.session_id.clone()))
-        .find(|id| !id.is_empty())
-}
-
-/// ペインの中で `/resume` された窓を、**今動かしているセッションの行へ張り替える**。
-///
-/// `/resume` は claude の内部で起きるので ccdesk は関与しない ＝ 窓が起動時の UUID を
-/// 指したままだと、行が古い会話（と古い名前）を指し続ける。追従の鍵は pid で、
-/// 自分の子の pid はこちらが知っており、その pid が今どのセッションを動かしているかは
-/// [`live_session_of`] が答える。
-///
-/// **張り替えの検出はこの関数の比較 1 箇所だけ。** 行の作成・表示名・`last_view` の
-/// 更新はすべて [`adopt_switched_session`] が受け持つので、「切り替わったか」の
-/// 判断が 2 箇所に増えない
-fn follow_session_switches(app: &mut App) {
-    let switches: Vec<(usize, SessionId)> = app
-        .windows
-        .iter()
-        .enumerate()
-        .filter_map(|(i, window)| {
-            let next = live_session_of(
-                window.child.process_id(),
-                window.started_at,
-                &app.hook_states,
-                &app.agents,
-            )?;
-            (next != window.session_id).then_some((i, next))
-        })
-        .collect();
-    for (index, next) in switches {
-        let Some(window) = app.windows.get_mut(index) else {
-            continue;
-        };
-        let previous = std::mem::replace(&mut window.session_id, next.clone());
-        adopt_switched_session(app, &previous, &next, index == app.active);
-    }
-}
-
-/// 張り替え先の行を用意する（[`follow_session_switches`] だけが呼ぶ）。
-///
-/// **窓に触らないので単体で検査できる**（PTY を起こさずに、行の作成・`last_view` の
-/// 保存を確かめられる）。`shown` は「その窓が今ペインに出ているか」＝
-/// `last_view` を書き換えてよいかの判断。
-///
-/// 行が無ければ作る（`/resume` で選べる会話は ccdesk の一覧に無いこともある）。
-/// **名前は行が持たない**ので、作った行の表示名は次の描画で transcript から導かれる
-fn adopt_switched_session(app: &mut App, previous: &SessionId, next: &SessionId, shown: bool) {
-    let cwd = app
-        .row(previous)
-        .map(|row| row.cwd.clone())
-        .unwrap_or_default();
-    if app.row(next).is_none() {
-        app.sessions.push(SessionRow::new(next.clone(), cwd, now_ms()));
-        save_sessions(app);
-    }
-    // **次回起動で開く画面もこの窓の新しいセッションにする。** 保存は
-    // [`App::show_session`] と同じ [`WindowItem::LastView`] だが、切替の契機は
-    // ccdesk の外（claude の `/resume`）なのでその経路を通らない ＝ ここで書く。
-    // 呼ばれるのは張り替わった周期だけなので、書き込みも張り替え 1 回につき 1 度
-    if shown {
-        app.source.save_window(WindowItem::LastView(Some(next)));
-        // **離れた行へは何も書かない。** 窓が新しいセッションへ移った時点でその行を
-        // 動かしているものは無くなり、次の描画でそのまま Stopped になる
-        // （書き戻していた頃は、hook が持つ新しい記録より古い `stopped` が行に残った）。
-        // 既読にするのは**ペインに出ている窓**の張り替えだけ: 裏へ回した窓の
-        // `/resume` が遅れて反映された周で、見てもいない行の未読 ● を消さない
-        mark_read(app, next);
-    }
-}
-
 /// hook が書いた state を読み直す。**行へは何も写さない**（写していた頃は
 /// 保管と hook が食い違い、しかもどちらが新しいかが行ごとに逆になった）。
 ///
@@ -1433,40 +1379,31 @@ fn adopt_hook_states(app: &mut App) {
     if app.hook_states.any_row_went_idle_since(&previous) {
         app.source.note_turn_finished();
     }
-    adopt_agent_ids(app);
+    adopt_conversations(app);
     let shown: Option<SessionId> = app.shown_session().cloned();
     if let Some(id) = shown {
         mark_read(app, &id);
     }
 }
 
-/// **その行を開き直せるか。** claude は行の ID がそのまま再開先なので常に真。
-/// codex は agent が採番した ID を hook 経由で受け取るまで再開できない
-fn can_resume(row: &SessionRow) -> bool {
-    row.kind != Kind::Codex || row.agent_session_id.is_some()
-}
-
-/// hook が名乗った **agent 側のセッション ID** を行へ写す。
+/// hook が名乗った会話を行へ写す（[`crate::sessions::Conversation::Observed`]）。
 ///
-/// **codex の再開に要る**（`codex resume <uuid>`）。codex は ID を自分で採番するので、
-/// ccdesk は hook 経由でしか知れない。一度取れたら行に持ち、再起動後も使う。
+/// **ペインの中の `/clear` `/resume` `/new` に追随する唯一の口。** どちらの agent も
+/// 会話が変われば `SessionStart` を撃ち、その payload は**その時点の**会話 ID を
+/// 運ぶ（両方実測）。記録の鍵は `CCDESK_ROW` ＝ 行なので、行はそのまま、
+/// 載っている会話だけが差し替わる ＝ **サイドバーに行は増えない**。
 ///
-/// **claude の行では何もしない**（行の ID と同じ値なので持つ意味が無く、
-/// 書けば `updated_at` が動いて経過時間が無意味に 0 へ戻る）
-fn adopt_agent_ids(app: &mut App) {
+/// **claude と codex で分岐しない**のが以前との違い。かつては codex の行だけを
+/// 写していた（claude は「行 ID ＝ 会話 ID」だったので写す意味が無かった）が、
+/// その前提こそがペイン内の切り替えを pid 相関で追いかける羽目になった原因で、
+/// 行 ID を会話から切り離した今は両方が同じ 1 本の経路を通る
+fn adopt_conversations(app: &mut App) {
     let mut changed = false;
     for row in &mut app.sessions {
-        if row.kind == Kind::Claude {
-            continue;
-        }
-        let Some(agent_id) = app.hook_states.agent_id(&row.session_id) else {
+        let Some(observed) = app.hook_states.conversation(&row.session_id) else {
             continue;
         };
-        if row.agent_session_id.as_deref() == Some(agent_id) {
-            continue;
-        }
-        row.agent_session_id = Some(agent_id.to_string());
-        changed = true;
+        changed |= row.conversation.observe(observed);
     }
     if changed {
         save_sessions(app);
@@ -1706,23 +1643,21 @@ fn start_foreground(app: &mut App, kind: Kind, cwd: &str, prompt: &str) -> Launc
     let injection = hook_settings(app);
     let inject = injection.as_ref().map(as_inject);
     let (rows, cols) = app.pane_size();
-    let window = Session::spawn(
-        kind.backend(),
-        &session_id,
-        cwd,
-        rows,
-        cols,
-        Launch::New { prompt },
-        inject.as_ref(),
-    )
-    .map_err(|e| format!("failed to start session: {e}"))?;
+    let spawn = kind.spawn_command(&session_id, cwd, Launch::New { prompt }, inject.as_ref());
+    // **渡した会話 ID を控えるのは起こす前。** 起こしてから読み直せる場所は無い
+    // （argv には出ているが、そこから読み戻すのは同じ知識の 2 本目になる）
+    let conversation = spawn.conversation;
+    let window = Session::spawn(&session_id, spawn.cmd, rows, cols)
+        .map_err(|e| format!("failed to start session: {e}"))?;
     // **名前は入れない。** 1 ターン目が終わるまで transcript は無いので、
     // それまでこの行は [`UNTITLED`] で出る（起動プロンプトの写しを行へ置くと、
     // 正本が 2 つになって同じ問題が戻る）
-    app.sessions.push(SessionRow {
+    let mut row = SessionRow {
         kind,
         ..SessionRow::new(session_id.clone(), cwd, now_ms())
-    });
+    };
+    row.conversation.assign(conversation);
+    app.sessions.push(row);
     save_sessions(app);
     app.windows.push(window);
     app.show_session(app.windows.len() - 1);
@@ -1840,12 +1775,7 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         // 一覧のヒットテスト（`row_at` はフッター帯を不感帯にする）ではなくここで受ける。
         // 画面 y → 行 index（列は見ないので行のどこを押しても当たる）。
         // 計算は描画側と同じ ui::row_at を共有する
-        let row = row_at(
-            mouse.row,
-            sl.capacity,
-            app.sidebar_header_rows,
-            app.sidebar_scroll,
-        );
+        let row = row_at(mouse.row, sl.capacity, app.sidebar_header_rows, app.sidebar_scroll);
         // hover: **実体のある行**の上にいるときだけハイライト（飾りは光らせない）。
         // 押しても何も起きない行も行なので、ここは動作の有無では見ない。
         // **hover の判断に clone は要らない**（マウス移動は毎秒 100 回以上届くので、
@@ -1883,12 +1813,14 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         if let MouseEventKind::Down(_) = mouse.kind {
             app.set_focus(Focus::Terminal);
         }
-        // 右ペイン矩形は state の可変借用の前に取る（正本は ui::pane_rect）
+        // 右ペイン矩形と出す agent は state の可変借用の前に取る
+        // （矩形の正本は ui::pane_rect、agent の正本は App::kinds）
         let pane = crate::ui::pane_rect(app);
+        let kinds = app.kinds.clone();
         // New 画面: 入力の解釈は new_view 側（ヒットテストのジオメトリ知識を
         // レイアウトと同じファイルに閉じる）。起動だけは state の借用を抜けて実行
         if let RightView::New(state) = &mut app.right_view {
-            let action = state.handle_mouse(pane, mouse);
+            let action = state.handle_mouse(pane, mouse, &kinds);
             if action == Some(crate::ui::new_view::NewAction::Launch) {
                 start_new_session(app)?;
             }
@@ -1931,8 +1863,6 @@ fn open_session_popup(app: &mut App, id: &SessionId, anchor_y: u16) {
         id: id.clone(),
         pinned: row.is_some_and(|r| r.pinned),
         open,
-        // 窓が開いていれば切替なので常に押せる。閉じている行は再開先が要る
-        can_open: open || row.is_some_and(can_resume),
     };
     open_popup(app, kind, anchor_y);
 }
@@ -1940,6 +1870,7 @@ fn open_session_popup(app: &mut App, id: &SessionId, anchor_y: u16) {
 /// モーダル表示中のキー操作（Esc = 全閉 / ↑↓ = 選択 / Enter = 実行）
 fn handle_popup_key(app: &mut App, code: KeyCode) {
     let grouping = app.grouping;
+    let kinds = app.kinds.clone();
     match code {
         // 階層を積まないので戻り先は無い。どの階層でも 1 度で全部閉じる
         KeyCode::Esc => app.popup = None,
@@ -1950,7 +1881,7 @@ fn handle_popup_key(app: &mut App, code: KeyCode) {
         }
         KeyCode::Down => {
             if let Some(popup) = app.popup.as_mut() {
-                let last = popup.kind.entries(grouping).len().saturating_sub(1);
+                let last = popup.kind.entries(grouping, &kinds).len().saturating_sub(1);
                 popup.selected = (popup.selected + 1).min(last);
             }
         }
@@ -1982,7 +1913,7 @@ fn handle_popup_click(app: &mut App, col: u16, row: u16) {
     // 枠内に入りきらないメニューは描画がスクロールしている（[`crate::ui::popup_scroll`]）
     // ので、クリックの行 → 項目 index も同じずらしを通す
     let visible = rect.height.saturating_sub(2) as usize;
-    let total = popup.kind.entries(app.grouping).len();
+    let total = popup.kind.entries(app.grouping, &app.kinds).len();
     let offset = crate::ui::popup_scroll(popup.selected, total, visible);
     activate_popup(app, offset + (row - rect.y - 1) as usize);
 }
@@ -1992,7 +1923,7 @@ fn activate_popup(app: &mut App, index: usize) {
     let Some(popup) = app.popup.as_ref() else {
         return;
     };
-    let mut entries = popup.kind.entries(app.grouping);
+    let mut entries = popup.kind.entries(app.grouping, &app.kinds);
     if index >= entries.len() {
         return;
     }
@@ -2383,36 +2314,40 @@ fn expire_input_gate(app: &mut App) -> bool {
 
 /// 止まっている行の起こし直し方と、**その起動先の cwd**。
 ///
-/// 判断材料は 1 つ ＝ **`claude -r` が会話を見つけられる cwd があるか**
-/// （[`crate::title::Titles::resume_cwd`]）。副作用を持たないので単体で検査できる。
+/// **推測で resume しない**のがこの関数の芯。渡す ID が違えば別の会話が開くか、
+/// 見つからずに落ちる。だから材料は 2 つで、両方揃ったときだけ名指しする:
 ///
-/// - ある → その cwd で `claude -r <uuid>` を打つ
-/// - ない → **同じ UUID で新規として起こす**（行の cwd で）。会話が無い行
-///   （起こしただけで 1 ターンも終わっていない）と、会話はあるがその作業ツリーが
-///   消えている行の両方がここへ来る。どちらも `claude -r` は
-///   `No conversation found` になる（実測）
+/// | 行の会話 | 記録の在り処 | 起こし方 |
+/// |:--|:--|:--|
+/// | 確かめた（`Observed`） | 分かる | その cwd で `-r <id>` / `resume <id>` |
+/// | 確かめた（`Observed`） | 分からない | 行の cwd で**新規**（後述） |
+/// | それ以外 | — | 行の cwd で **agent のピッカー**（[`Launch::Pick`]） |
+///
+/// **2 段目が新規なのは、名指しもピッカーも答えを持たないから**: 記録の在り処が
+/// 分からない ＝ その作業ツリーが消えている（[`crate::title::Titles::resume_cwd`]）
+/// ので、`-r <id>` は `No conversation found`（実測）、ピッカーはその cwd の会話
+/// しか並べないのでその会話が出てこない。新規なら少なくとも行が動く。
+///
+/// **3 段目がピッカーなのは、こちらには答えがあり得るから**: 会話を確かめて
+/// いないだけで、agent 側には会話が在るかもしれない（hook を取り逃した等）。
+/// ccdesk が勝手に 1 つ選ぶより、ユーザーに選ばせる方が壊さない。
 ///
 /// **cwd を返すのが要点**: セッションは走行中に git worktree へ移れて、移った先の
-/// 会話は行の cwd から `claude -r` を打っても見つからない
-/// （`/resume` のピッカーに出ないのと同じ範囲の話）
+/// 会話は行の cwd から `-r` を打っても見つからない
+/// （`/resume` のピッカーに出ないのと同じ範囲の話）。
+///
+/// 副作用を持たないので単体で検査できる
 fn relaunch<'a>(
     titles: &crate::title::Titles,
     row: &'a SessionRow,
 ) -> (Launch<'a>, std::borrow::Cow<'a, str>) {
+    let here = std::borrow::Cow::Borrowed(row.cwd.as_str());
+    let Some(id) = row.conversation.observed() else {
+        return (Launch::Pick, here);
+    };
     match titles.resume_cwd(row) {
-        // **再開に使う ID は agent が採番した方**（claude は ccdesk が採番した値を
-        // 強制するので行の ID と一致する。codex は別の値）。
-        // 取れていない codex の行はここへ来ない（`can_resume` が止める）
-        Some(cwd) => (
-            Launch::Resume {
-                id: row.agent_session_id.as_deref().unwrap_or(row.session_id.as_str()),
-            },
-            std::borrow::Cow::Owned(cwd),
-        ),
-        None => (
-            Launch::New { prompt: "" },
-            std::borrow::Cow::Borrowed(row.cwd.as_str()),
-        ),
+        Some(cwd) => (Launch::Resume { id }, std::borrow::Cow::Owned(cwd)),
+        None => (Launch::New { prompt: "" }, here),
     }
 }
 
@@ -2442,16 +2377,21 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
         let _ = app.windows[i].child.kill();
         remove_window(app, i);
     }
-    // **別のインスタンス（または ccdesk の外）で動いているセッションを
+    // **別のインスタンス（または ccdesk の外）で動いている会話を
     // `claude -r` で二重に起こさない**: 同じ会話を 2 プロセスが同時に更新する。
-    // 判定材料はライブ状態（生きている前景セッションだけが載る）。
+    // **照合は会話 ID**（ライブ状態が載せているのは会話の側で、ccdesk の行 ID は
+    // どこにも出ない）。判定材料はライブ状態（生きている前景セッションだけが載る）。
     // 観測は 2 秒周期なので、止めた直後の自分のセッションが最大 2 秒ほど
     // 残って見えることがある（その間の open は 1 度空振りするだけで、壊れない）
-    if app
-        .agents
-        .iter()
-        .any(|a| a.is_interactive() && a.session_id == id.as_str())
-    {
+    let running = app
+        .row(id)
+        .and_then(|row| row.conversation.observed())
+        .is_some_and(|conversation| {
+            app.agents
+                .iter()
+                .any(|a| a.is_interactive() && a.session_id == conversation)
+        });
+    if running {
         set_notice(
             app,
             format!("session {id} is already running in another window"),
@@ -2468,9 +2408,19 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
     let kind = row.kind;
     let (launch, cwd) = relaunch(&app.titles, row);
     let cwd = cwd.into_owned();
+    let spawn = kind.spawn_command(id, &cwd, launch, inject.as_ref());
+    let conversation = spawn.conversation;
     let (rows, cols) = app.pane_size();
-    match Session::spawn(kind.backend(), id, &cwd, rows, cols, launch, inject.as_ref()) {
+    match Session::spawn(id, spawn.cmd, rows, cols) {
         Ok(window) => {
+            // **起こし直しで会話が変わり得る**（記録を見失った行の新規起動）。
+            // 行はそのままで、載っている会話だけを差し替える。**保存まで済ませる**
+            // のは、記録を見失った行を新規で起こし直したときに古い会話が
+            // ディスクへ残るため（次に開くとその古い会話を名指ししてしまう）
+            if let Some(row) = app.row_mut(id) {
+                row.conversation.assign(conversation);
+            }
+            save_sessions(app);
             // 既読は**起こせてから**付ける（起こせなかった行の未読 ● を、
             // 内容を見ていないのに消さない）
             mark_read(app, id);
@@ -2495,6 +2445,7 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
 mod tests {
     use super::*;
 
+    use crate::sessions::Conversation;
     use crate::source::{persist_projects, WindowState};
     use crate::ui::MIN_SIDEBAR;
 
@@ -2519,8 +2470,10 @@ mod tests {
         });
     }
 
+    /// 既定（全 agent）の項目表。agent を切ったときの見え方は
+    /// 一覧を明示するテストが自分で `entries` を呼ぶ
     fn labels(kind: &PopupKind, grouping: Grouping) -> Vec<String> {
-        kind.entries(grouping)
+        kind.entries(grouping, &Kind::ORDER)
             .into_iter()
             .map(|entry| entry.label)
             .collect()
@@ -2528,7 +2481,7 @@ mod tests {
 
     /// (表示名, 実行可能か) の一覧（項目表の見た目を比べるテスト用）
     fn entry_pairs(kind: &PopupKind, grouping: Grouping) -> Vec<(String, bool)> {
-        kind.entries(grouping)
+        kind.entries(grouping, &Kind::ORDER)
             .into_iter()
             .map(|entry| (entry.label, entry.enabled))
             .collect()
@@ -2582,13 +2535,13 @@ mod tests {
     fn clicking_the_usage_gauge_refetches_it() {
         let (mut app, refreshes) = usage_app();
         let hits = crate::ui::usage_hits(&app);
-        // **行は agent ごとに 1 本ずつ**（数も並びも [`Kind::ORDER`] が決める）
+        // **行は出す agent ごとに 1 本ずつ**（数も並びも [`App::kinds`] が決める）
         assert_eq!(
             hits.iter().map(|h| h.kind).collect::<Vec<_>>(),
-            Kind::ORDER.to_vec(),
+            app.kinds,
             "the gauge does not have one row per agent"
         );
-        let top = TERM.1 - crate::ui::BOTTOM_BAR_ROWS;
+        let top = TERM.1 - crate::ui::bottom_bar_rows(&app);
         assert_eq!(
             hits.iter().map(|h| h.row).collect::<Vec<_>>(),
             vec![top, top + 1]
@@ -2759,7 +2712,6 @@ mod tests {
             id: SessionId::new(id),
             pinned: false,
             open,
-            can_open: true,
         }
     }
 
@@ -2785,7 +2737,7 @@ mod tests {
         );
         assert_eq!(
             session("s1", false)
-                .entries(Grouping::State)
+                .entries(Grouping::State, &Kind::ORDER)
                 .into_iter()
                 .map(|entry| entry.enabled)
                 .collect::<Vec<_>>(),
@@ -2812,7 +2764,6 @@ mod tests {
             id: SessionId::new("s1"),
             pinned: true,
             open: false,
-            can_open: true,
         };
         let labels = labels(&marked, Grouping::State);
         assert!(labels.contains(&"unpin".to_string()), "a pinned row must show unpin: {labels:?}");
@@ -2883,7 +2834,6 @@ mod tests {
                 pinned: true,
                 // 生きた窓が無い = 止めるものが無い
                 open: false,
-            can_open: true,
             }
         );
         assert_eq!(
@@ -2998,7 +2948,7 @@ mod tests {
         let kind = session("s1", false);
         // 位置は並びから引く（項目を足したときに黙って別の行を突かない）
         let stop = kind
-            .entries(app.grouping)
+            .entries(app.grouping, &app.kinds)
             .iter()
             .position(|entry| entry.label == "stop")
             .expect("the stop entry is gone");
@@ -3178,8 +3128,11 @@ mod tests {
         app
     }
 
-    /// 1 フレーム描いて最下行（下部バーの案内）を読む。**本番と同じ [`draw`]** を通す
-    /// ので、サイドバーの行の積み方と案内の対応がそのまま検査対象になる
+    /// 1 フレーム描いて下部バーの案内の行を読む。**本番と同じ [`draw`]** を通す
+    /// ので、サイドバーの行の積み方と案内の対応がそのまま検査対象になる。
+    ///
+    /// 読むのは下部バーの**1 行目**（案内はそこに出る。位置の正本は
+    /// [`crate::ui::BOTTOM_BAR_ROWS`] なので、最下行を数え直さない）
     fn drawn_bottom_bar(app: &mut App) -> String {
         let (w, h) = app.term_size;
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
@@ -3190,7 +3143,8 @@ mod tests {
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        (0..w).map(|x| buffer[(x, h - 1)].symbol()).collect()
+        let hint_row = h - crate::ui::bottom_bar_rows(app);
+        (0..w).map(|x| buffer[(x, hint_row)].symbol()).collect()
     }
 
     /// 触れる位置（一覧の実体のある行）を、**描画が積んだ行から**列挙する
@@ -3512,9 +3466,6 @@ mod tests {
         /// 実ファイルを読まないので、テストが開発者の
         /// `~/.ccdesk/hook-states.json` に左右されない
         hooks: HookStates,
-        /// [`WindowItem::LastView`] として保存された値の記録（**保存された回数まで
-        /// 見たい**ので Vec）。実ファイル（`~/.ccdesk/state.json`）は書かない
-        views: Arc<Mutex<Vec<String>>>,
         /// [`DataSource::refresh_usage`] が呼ばれた回数（agent は起こさない）。
         /// **回数まで見る**のは、押していないのに取り直す経路が生えたら気づくため
         usage_refreshes: Arc<std::sync::atomic::AtomicUsize>,
@@ -3524,6 +3475,11 @@ mod tests {
         /// [`DataSource::usage`] が返す値（当たり判定は「今出ているか」で決まるので、
         /// 出ている状態を作れる必要がある）
         usage: Usage,
+        /// 一覧の保存が呼ばれた回数（**保存しないことを検査する軸**）
+        session_saves: Arc<std::sync::atomic::AtomicUsize>,
+        /// 「ディスクにはこう載っている」一覧（[`DataSource::sessions`] が返す値）。
+        /// **読み直しが何を落とすか**を見るための軸で、実ファイルは読まない
+        disk_sessions: Vec<SessionRow>,
     }
 
     /// プロジェクト永続化側の振る舞い
@@ -3551,10 +3507,27 @@ mod tests {
             Self {
                 projects: ProjectsBackend::Absent,
                 hooks: HookStates::default(),
-                views: Arc::new(Mutex::new(Vec::new())),
                 usage_refreshes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 usage_asked: Arc::new(Mutex::new(Vec::new())),
                 usage: Usage::Unknown,
+                session_saves: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                disk_sessions: Vec::new(),
+            }
+        }
+
+        /// ディスクにこの一覧が載っている供給元（読み直しの検査）
+        fn for_disk_sessions(disk_sessions: Vec<SessionRow>) -> Self {
+            Self {
+                disk_sessions,
+                ..Self::plain()
+            }
+        }
+
+        /// 一覧の保存回数だけを見る供給元
+        fn for_session_saves(session_saves: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                session_saves,
+                ..Self::plain()
             }
         }
 
@@ -3587,13 +3560,6 @@ mod tests {
             }
         }
 
-        /// 開いていた画面（[`WindowItem::LastView`]）の保存を記録する供給元
-        fn for_views(views: Arc<Mutex<Vec<String>>>) -> Self {
-            Self {
-                views,
-                ..Self::plain()
-            }
-        }
     }
 
     impl DataSource for TestSource {
@@ -3602,10 +3568,12 @@ mod tests {
         // 保存は渡された一覧をそのまま返す（ディスクが空の単独起動と同じ結果なので
         // live の意味論と矛盾しない。[`ProjectsBackend::Absent`] と同じ判断）
         fn sessions(&self) -> Vec<SessionRow> {
-            Vec::new()
+            self.disk_sessions.clone()
         }
 
         fn store_sessions(&self, next: &[SessionRow]) -> Vec<SessionRow> {
+            self.session_saves
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             next.to_vec()
         }
 
@@ -3661,16 +3629,8 @@ mod tests {
             }
         }
 
-        // 記録するのは「次に開く画面」だけ（他の項目は実ファイルへも書かない）。
-        // None（new session 画面）の保存表記は live 側の持ち物なので、
-        // ここでは Option の形をそのまま記録する
-        fn save_window(&self, item: WindowItem<'_>) {
-            if let WindowItem::LastView(view) = item {
-                self.views
-                    .lock_recover()
-                    .push(view.map(|id| id.to_string()).unwrap_or_default());
-            }
-        }
+        // 実ファイル（`~/.ccdesk/state.json`）は書かない
+        fn save_window(&self, _item: WindowItem<'_>) {}
 
         fn store_projects(&self, next: &[String]) -> Vec<String> {
             match &self.projects {
@@ -3689,6 +3649,12 @@ mod tests {
         }
 
         fn spawn_pollers(&self, _sinks: PollSinks) {}
+
+        /// テストの供給元は設定を読まない（全 agent）。切った見え方を見たい
+        /// テストは `App::kinds` を直接置く
+        fn kinds(&self) -> Vec<Kind> {
+            Kind::ORDER.to_vec()
+        }
 
         // テストが実プロセス（claude）を起こさない。既定の供給元
         // （[`crate::source::DemoSource`]）と同じ約束を、差し替えた側でも守る
@@ -3866,10 +3832,14 @@ mod tests {
     }
 
     /// テスト用の一覧行 1 本（cwd と更新時刻だけが関心事）。
-    /// `updated_at` は埋め戻しの「新しい順」に効くので明示で受ける
+    /// `updated_at` は埋め戻しの「新しい順」に効くので明示で受ける。
+    ///
+    /// **会話 ID は行 ID とわざと別の値**（`title` 側の fixture と同じ理由 ＝
+    /// 行 ID で会話を引く実装でも通ってしまうテストにしない）
     fn session_row(id: &str, cwd: &str, updated_at: u64) -> SessionRow {
         SessionRow {
             updated_at,
+            conversation: Conversation::Observed(format!("conv-{id}")),
             ..SessionRow::new(SessionId::new(id), cwd, updated_at)
         }
     }
@@ -3880,12 +3850,15 @@ mod tests {
     #[test]
     fn opening_a_session_running_elsewhere_does_not_double_resume() {
         let mut app = test_app(34, TERM);
-        app.sessions = vec![session_row("s", "C:\\dev\\api", 1)];
+        // **照合は会話 ID**（ライブ状態が名乗るのは会話の側。行 ID は出てこない）
+        app.sessions = vec![SessionRow {
+            conversation: Conversation::Observed("conv-1".to_string()),
+            ..session_row("s", "C:\\dev\\api", 1)
+        }];
         app.agents = vec![AgentInfo {
-            session_id: "s".to_string(),
+            session_id: "conv-1".to_string(),
             kind: "interactive".to_string(),
             status: "busy".to_string(),
-            pid: Some(4242),
             ..AgentInfo::default()
         }];
         assert!(
@@ -3908,30 +3881,54 @@ mod tests {
 
     // ── 起こし直し方 / `/resume` の追従 / リネームの書き先 ──────────────────
 
-    /// **1 ターンも会話していない行は `claude -r` で開けない。**
+    /// **推測で resume しない。** 起こし直し方は 3 通りで、`relaunch` の doc の
+    /// 表をそのまま固定する。
     ///
-    /// 前景セッションは 1 ターン終わるまで transcript を作らないので、起こして
-    /// すぐ `close` した行を `open` すると `No conversation found` になっていた。
-    /// **起動先の cwd も一緒に決まる**（会話が在る作業ツリーで打つ）
+    /// 3 通りに割れているのは、間違った ID を渡すと**別の会話が開くか、
+    /// 見つからずに落ちる**から。前景セッションは 1 ターン終わるまで transcript を
+    /// 作らないので、起こしてすぐ `close` した行を `-r` で開くと
+    /// `No conversation found` になっていた
     #[test]
-    fn a_row_with_no_transcript_is_started_fresh_instead_of_resumed() {
-        let temp =
-            crate::title::tests::TempProjects::new("a_row_with_no_transcript_is_started_fresh");
+    fn a_row_is_only_resumed_when_both_the_conversation_and_its_record_are_known() {
+        let temp = crate::title::tests::TempProjects::new("relaunch_needs_conversation_and_record");
         let mut titles = temp.titles();
+
+        // 1) 会話を確かめていない行 → agent 自身のピッカー（ID を渡さない）
+        let unknown = SessionRow {
+            conversation: Conversation::Unknown,
+            ..session_row("u", "C:\\dev\\api", 1)
+        };
+        let (launch, cwd) = relaunch(&titles, &unknown);
+        assert!(matches!(launch, Launch::Pick), "guessed a conversation to resume");
+        assert_eq!(cwd, unknown.cwd);
+
+        // 渡しただけ（`Assigned`）も同じ扱い。まだ 1 ターンも終わっていない会話を
+        // 名指しすると `No conversation found` になる
+        let assigned = SessionRow {
+            conversation: Conversation::Assigned("conv-a".to_string()),
+            ..session_row("a", "C:\\dev\\api", 1)
+        };
+        assert!(
+            matches!(relaunch(&titles, &assigned).0, Launch::Pick),
+            "an unconfirmed conversation was resumed by name"
+        );
+
+        // 2) 確かめた会話だが記録の在り処が分からない → 行の cwd で新規
         let mut row = session_row("s", "C:\\dev\\api", 1);
         let (launch, cwd) = relaunch(&titles, &row);
         assert!(
             matches!(launch, Launch::New { prompt } if prompt.is_empty()),
-            "a row with no conversation must not be resumed with -r"
+            "resumed a conversation whose record cannot be found"
         );
         assert_eq!(cwd, row.cwd, "a fresh start must use the row's own cwd");
-        // 1 ターン終わって transcript ができたら再開になる
+
+        // 3) 両方揃った → **会話 ID**で名指し（行 ID ではない）
         titles.write_transcript(&row, "{\"type\":\"user\"}\n");
         titles.title_now(&mut row);
         let (launch, cwd) = relaunch(&titles, &row);
         assert!(
-            matches!(launch, Launch::Resume { .. }),
-            "a row that has a conversation must be resumed"
+            matches!(launch, Launch::Resume { id } if id == "conv-s"),
+            "resumed with something other than the observed conversation"
         );
         assert_eq!(cwd, row.cwd);
     }
@@ -4139,147 +4136,139 @@ mod tests {
     }
 
 
-    /// **`/resume` の追従は pid → sessionId の 1 つの写像で決まる。**
-    /// 自分の子の pid はこちらが知っているので、その pid が今動かしている
-    /// セッションと窓の指す行がずれたら張り替えの合図になる
+    /// **ペインの中で会話が変わっても行は増えない**（1 ペイン = 1 行）。
+    ///
+    /// `/clear` `/resume` `/new` はどれも agent の内部で起きるので ccdesk は
+    /// 関与しない。気づく口は hook 1 本で、記録の鍵が行（`CCDESK_ROW`）なぶん、
+    /// 差し替わるのは行に載っている会話だけになる。
+    ///
+    /// **これが「行を増やす」方式との分かれ目。** 増やす方式では `/clear` の
+    /// たびにサイドバーへ行が生え、しかも会話 ID を採番しない codex では
+    /// 行が作れなかった
     #[test]
-    fn the_live_session_of_a_pid_comes_from_the_interactive_entry() {
-        let agent = |pid: Option<u32>, kind: &str, session: &str| AgentInfo {
-            session_id: session.to_string(),
-            kind: kind.to_string(),
-            pid,
-            ..AgentInfo::default()
-        };
-        let agents = vec![
-            agent(Some(10), "interactive", "after-resume"),
-            agent(Some(11), "interactive", "someone-else"),
-            agent(Some(12), "bg", "a-background-job"),
-            agent(Some(13), "interactive", ""),
-        ];
-        // hook が何も知らない間はライブ状態が答える（従経路）
-        let none = HookStates::default();
-        let of = |pid, hooks: &HookStates| live_session_of(pid, 0, hooks, &agents);
-        assert_eq!(of(Some(10), &none), Some(SessionId::new("after-resume")));
-        // pid が分からない / 載っていない / bg / sessionId が空 は追従しない
-        assert_eq!(of(None, &none), None);
-        assert_eq!(of(Some(99), &none), None);
-        assert_eq!(of(Some(12), &none), None, "a bg entry answered for a pane");
-        assert_eq!(of(Some(13), &none), None, "an empty id became a row");
-
-        // **hook が主。** 同じ pid について hook が別のセッションを知っていれば
-        // そちらを採る（hook は turn の瞬間に届くのでライブ状態より新しい）
-        let hooks = HookStates::from_records([("just-cleared", crate::poll::State::Waiting, 5_000, Some(10))]);
-        assert_eq!(of(Some(10), &hooks), Some(SessionId::new("just-cleared")));
-        // 窓の起動より古い hook は前回の実行のもの ＝ 従経路へ落ちる
-        assert_eq!(
-            live_session_of(Some(10), 5_001, &hooks, &agents),
-            Some(SessionId::new("after-resume"))
-        );
-        // hook しか知らない pid にも答える（ライブ状態が pid を載せない環境）
-        let only_hook = HookStates::from_records([("hook-only", crate::poll::State::Working, 1, Some(77))]);
-        assert_eq!(of(Some(77), &only_hook), Some(SessionId::new("hook-only")));
-    }
-
-    /// 張り替えたら**新しいセッションの行を用意し、次に開く画面もそれにする**。
-    /// 行が無ければ作る（`/resume` で選べる会話は ccdesk の一覧に無いこともある）
-    #[test]
-    fn adopting_a_switched_session_adds_the_row_and_moves_the_last_view() {
-        let views = Arc::new(Mutex::new(Vec::new()));
+    fn a_switch_inside_the_pane_moves_the_rows_conversation_without_adding_a_row() {
         let mut app = App {
-            sessions: vec![session_row("before", "C:\\dev\\api", 1)],
-            source: Arc::new(TestSource::for_views(views.clone())),
+            sessions: vec![
+                SessionRow {
+                    conversation: Conversation::Observed("conv-1".to_string()),
+                    ..session_row("row", "C:\\dev\\api", 1)
+                },
+                session_row("untouched", "C:\\dev\\api", 1),
+            ],
+            hook_states: HookStates::from_records([(
+                "row",
+                crate::poll::State::Idle,
+                5_000,
+                Some("conv-2"),
+            )]),
             ..test_app(34, TERM)
         };
-        let (before, after) = (SessionId::new("before"), SessionId::new("after"));
-        adopt_switched_session(&mut app, &before, &after, true);
+        adopt_conversations(&mut app);
 
-        let added = app
-            .sessions
-            .iter()
-            .find(|row| row.session_id == after)
-            .expect("the row for the new session was not created");
-        assert_eq!(added.cwd, "C:\\dev\\api", "the folder of the pane was not carried over");
-        assert!(
-            !app.hook_states.unread(added),
-            "the session showing in the pane became unread"
-        );
+        assert_eq!(app.sessions.len(), 2, "a row appeared for the new conversation");
         assert_eq!(
-            views.lock().unwrap().as_slice(),
-            ["after"],
-            "the next start would open the session from before the /resume"
+            app.sessions[0].conversation,
+            Conversation::Observed("conv-2".to_string()),
+            "the row kept pointing at the conversation from before the /clear"
         );
-        // **離れた行へは何も書かない。** 窓が移った時点でその行を動かすものは無く、
-        // 表示は描画側が Stopped にする（記録を残さないので古い値も残らない）
-        let left = app
-            .sessions
-            .iter()
-            .find(|row| row.session_id == before)
-            .expect("the row that was left behind is gone");
-        assert_eq!(left, &session_row("before", "C:\\dev\\api", 1), "the row left behind was written to");
-        assert!(
-            !app.hook_states.unread(left),
-            "leaving a row put an unread mark on it"
+        // hook が何も知らない行は触らない
+        assert_eq!(
+            app.sessions[1].conversation,
+            Conversation::Observed("conv-untouched".to_string())
         );
-
-        // 既にある行へ戻ったときは行を増やさない（`last_view` だけが動く）
-        adopt_switched_session(&mut app, &after, &before, true);
-        assert_eq!(app.sessions.len(), 2, "an existing row was duplicated");
-        assert_eq!(views.lock().unwrap().as_slice(), ["after", "before"]);
     }
 
-    /// **ペインに出ていない窓の張り替えでは `last_view` を動かさない**
-    /// （次に開くのは「最後に見ていた画面」なので、裏の窓で書き換えたら嘘になる）
+    /// **一覧の読み直しが、渡したばかりの会話を捨てない。**
+    ///
+    /// ディスクに載るのは確かめた会話だけなので、起動直後の `Assigned`
+    /// （ccdesk が採番して `--session-id` で渡した値）は読み直しで消える。
+    /// 普段は同じ周期の hook が `Observed` を戻すが、**hook が一度も来ない行**
+    /// （注入に失敗した環境）はここで会話を失うと二度と取り戻せない
     #[test]
-    fn adopting_a_switch_in_a_background_window_leaves_the_last_view_alone() {
-        let views = Arc::new(Mutex::new(Vec::new()));
+    fn a_reload_does_not_drop_a_conversation_the_disk_never_stored() {
+        let assigned = SessionRow {
+            conversation: Conversation::Assigned("conv-just-launched".to_string()),
+            ..session_row("s", "C:\\dev\\api", 1)
+        };
+        // ディスクから返る姿（`Assigned` は保存されないので会話を持たない）
+        let mut fresh = vec![SessionRow {
+            conversation: Conversation::Unknown,
+            ..session_row("s", "C:\\dev\\api", 1)
+        }];
+        restore_conversations(&mut fresh, std::slice::from_ref(&assigned));
+        assert_eq!(
+            fresh[0].conversation,
+            Conversation::Assigned("conv-just-launched".to_string()),
+            "the conversation ccdesk minted was thrown away by the reload"
+        );
+
+        // **ディスクが会話を持っていれば触らない**（他インスタンスが確かめた値を
+        // こちらの古い写しで踏み潰さない）
+        let mut fresh = vec![SessionRow {
+            conversation: Conversation::Observed("conv-from-another-instance".to_string()),
+            ..session_row("s", "C:\\dev\\api", 1)
+        }];
+        restore_conversations(&mut fresh, std::slice::from_ref(&assigned));
+        assert_eq!(
+            fresh[0].conversation,
+            Conversation::Observed("conv-from-another-instance".to_string()),
+            "clobbered another instance's conversation"
+        );
+
+        // 知らない行には何もしない（他インスタンスが作った行）
+        let mut fresh = vec![SessionRow {
+            conversation: Conversation::Unknown,
+            ..session_row("other", "C:\\dev\\api", 1)
+        }];
+        restore_conversations(&mut fresh, std::slice::from_ref(&assigned));
+        assert_eq!(fresh[0].conversation, Conversation::Unknown);
+
+        // **読み直しの経路が実際にこれを通る。** 純関数だけを固定すると、
+        // 呼び出しごと外れても気づけない（外れた瞬間、hook が来ない行が
+        // 2 秒ごとに会話を失う）
         let mut app = App {
-            sessions: vec![session_row("before", "C:\\dev\\api", 1)],
-            source: Arc::new(TestSource::for_views(views.clone())),
+            sessions: vec![assigned.clone()],
+            source: Arc::new(TestSource::for_disk_sessions(vec![SessionRow {
+                conversation: Conversation::Unknown,
+                ..session_row("s", "C:\\dev\\api", 1)
+            }])),
             ..test_app(34, TERM)
         };
-        adopt_switched_session(
-            &mut app,
-            &SessionId::new("before"),
-            &SessionId::new("after"),
-            false,
-        );
-        assert!(
-            views.lock().unwrap().is_empty(),
-            "a window that is not showing moved the next start's screen: {:?}",
-            views.lock().unwrap()
+        refresh_sessions(&mut app);
+        assert_eq!(
+            app.sessions[0].conversation,
+            Conversation::Assigned("conv-just-launched".to_string()),
+            "the reload path does not restore the conversation"
         );
     }
 
-    /// **変わっていない周期では何も保存しない。** 追従は 2 秒ごとのポーリングで
-    /// 見るので、毎周期書くと `~/.ccdesk/state.json` のロックを無駄に取り合う
+    /// **同じ会話を名乗り直した周では保存しない。** 名乗りは turn のたびに来るので、
+    /// 毎回保存すると `sessions.json` のロックを無駄に取り合う
     #[test]
-    fn a_pane_that_did_not_switch_saves_nothing() {
-        let views = Arc::new(Mutex::new(Vec::new()));
+    fn re_announcing_the_same_conversation_saves_nothing() {
+        let saves = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut app = App {
-            sessions: vec![session_row("same", "C:\\dev\\api", 1)],
-            source: Arc::new(TestSource::for_views(views.clone())),
-            // その pid は起動時と同じセッションを動かしている
-            agents: vec![AgentInfo {
-                session_id: "same".to_string(),
-                kind: "interactive".to_string(),
-                pid: Some(4242),
-                ..AgentInfo::default()
+            sessions: vec![SessionRow {
+                conversation: Conversation::Observed("conv-1".to_string()),
+                ..session_row("row", "C:\\dev\\api", 1)
             }],
+            source: Arc::new(TestSource::for_session_saves(Arc::clone(&saves))),
+            hook_states: HookStates::from_records([(
+                "row",
+                crate::poll::State::Idle,
+                5_000,
+                Some("conv-1"),
+            )]),
             ..test_app(34, TERM)
         };
-        // 窓が無い（PTY を起こさない）ので、検出の入口が空回りすることも同時に見る
-        follow_session_switches(&mut app);
-        assert!(
-            views.lock().unwrap().is_empty(),
-            "saved the next start's screen without a switch"
-        );
-        assert_eq!(app.sessions.len(), 1, "a row appeared without a switch");
-        // 「切り替わっていない」の判定そのもの（窓が指す ID と pid の現在の ID が同じ）
-        assert_eq!(
-            live_session_of(Some(4242), 0, &app.hook_states, &app.agents),
-            Some(SessionId::new("same")),
-            "the pid no longer resolves to the session it was started with"
-        );
+        adopt_conversations(&mut app);
+        assert_eq!(saves.load(std::sync::atomic::Ordering::Relaxed), 0, "saved without a change");
+
+        // 別の会話を名乗ったら 1 度だけ保存する
+        app.hook_states =
+            HookStates::from_records([("row", crate::poll::State::Idle, 6_000, Some("conv-2"))]);
+        adopt_conversations(&mut app);
+        assert_eq!(saves.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     /// **セッションが残っているプロジェクトは登録解除できない。** 一覧は
@@ -5177,15 +5166,17 @@ mod tests {
     #[test]
     fn the_session_menu_open_entry_routes_through_open_session() {
         let mut app = test_app(34, TERM);
-        app.sessions = vec![session_row("s", "C:\\ccdesk-test-no-such-folder", 1)];
+        app.sessions = vec![SessionRow {
+            conversation: Conversation::Observed("conv-1".to_string()),
+            ..session_row("s", "C:\\ccdesk-test-no-such-folder", 1)
+        }];
         // claude が行を開いた後に何か言った ＝ 未読
         app.hook_states = HookStates::from_entries([("s", crate::poll::State::Idle, 2)]);
         // 別インスタンスで稼働中 ＝ open_session のガードが決定的に止める
         app.agents = vec![AgentInfo {
-            session_id: "s".to_string(),
+            session_id: "conv-1".to_string(),
             kind: "interactive".to_string(),
             status: "busy".to_string(),
-            pid: Some(4242),
             ..AgentInfo::default()
         }];
         app.sidebar_rows = vec![SidebarRow::Action(RowAction::Open(SessionId::new("s")))];
@@ -5202,7 +5193,7 @@ mod tests {
             .as_ref()
             .expect("no menu opened")
             .kind
-            .entries(app.grouping)
+            .entries(app.grouping, &app.kinds)
             .iter()
             .position(|entry| entry.label == "open")
             .expect("the menu has no open entry");

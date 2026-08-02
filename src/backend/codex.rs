@@ -2,22 +2,27 @@
 //!
 //! **claude と決定的に違うのは ID の採番。** codex に `--session-id` 相当は無く
 //! （`codex --help` の全項目で確認）、セッション ID は codex 自身が起動時に決める。
-//! そこで ccdesk は自分の行 ID を環境変数（[`crate::hooks::ROW_ENV`]）で渡し、
-//! hook の子プロセスがそれを読んで「どの行の出来事か」を名乗る。**env は codex を
-//! 経由して hook まで継承される**（実測）。
+//! だから codex の新規起動は会話 ID を名乗れない（[`Spawn::conversation`] が None）。
+//!
+//! 行との相関は環境変数（[`crate::hooks::ROW_ENV`]）で、**立てるのは共通の口**
+//! （[`crate::backend::Kind::spawn_command`]）。hook の子プロセスがそれを読んで
+//! 「どの行の出来事か」を名乗る。**env は codex を経由して hook まで継承される**（実測）。
 //!
 //! 再開は `codex resume <uuid>` で、この `<uuid>` は **codex が採番した方**
 //! （[`Launch::Resume`] の `id`）。ccdesk の行 ID ではない。
 //!
-//! 計測の前提と経緯は `docs/codex-support.md`。
+//! **codex は opt-in**（`~/.ccdesk/config.json` の `"codex": "on"`。
+//! [`crate::backend::Kind::enabled`]）。off の間はこのファイルの経路を
+//! 1 度も通らない ＝ codex を入れていない環境でプロセスを起こさない。
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
-use portable_pty::CommandBuilder;
-
-use crate::backend::{codex_app_server, codex_index, AgentVersion, Backend, Inject, Launch};
-use crate::hooks::{HOOK_EVENTS, HOOK_TIMEOUT_SECS, ROW_ENV};
-use crate::sessions::SessionId;
+use crate::backend::{
+    codex_app_server, codex_index, AgentVersion, Backend, Candidate, Inject, Launch, NameIndex,
+    Span, Spawn,
+};
+use crate::hooks::{HOOK_EVENTS, HOOK_TIMEOUT_SECS};
 
 const PROGRAM: &str = "codex";
 
@@ -64,18 +69,10 @@ const _: () = assert!(SESSION_END_TIMEOUT_SECS < HOOK_TIMEOUT_SECS);
 pub(crate) struct Codex;
 
 impl Backend for Codex {
-    fn command(
-        &self,
-        session_id: &SessionId,
-        cwd: &str,
-        launch: Launch<'_>,
-        inject: Option<&Inject>,
-    ) -> CommandBuilder {
+    fn command(&self, cwd: &str, launch: Launch<'_>, inject: Option<&Inject>) -> Spawn {
         let mut cmd = crate::backend::program(PROGRAM);
+        let mut conversation = None;
         cmd.cwd(cwd);
-        // **行の相関はここだけ。** codex が採番する ID を ccdesk は前もって知れないので、
-        // 自分の行 ID を env で渡し、hook 側が payload の session_id と一緒に記録する
-        cmd.env(ROW_ENV, session_id.as_str());
         if let Some(inject) = inject
             && let Some(toml) = hook_toml(inject.exe)
         {
@@ -84,6 +81,8 @@ impl Backend for Codex {
             cmd.arg(BYPASS_TRUST);
         }
         match launch {
+            // **ID は渡さない**（`--session-id` 相当が codex に無い）。会話 ID は
+            // codex が採番し、最初のターンまで存在しない ＝ 起こす前には知れない
             Launch::New { prompt } => {
                 // 空プロンプトは渡さない（claude と同じ: 空メッセージを送った
                 // セッションにしない）
@@ -95,9 +94,13 @@ impl Backend for Codex {
             Launch::Resume { id } => {
                 cmd.arg("resume");
                 cmd.arg(id);
+                conversation = Some(id.to_string());
             }
+            // 値なしの `resume` は codex 自身のピッカー（公式: "Resume a previous
+            // interactive session (picker by default; use --last …)"）
+            Launch::Pick => cmd.arg("resume"),
         }
-        cmd
+        Spawn { cmd, conversation }
     }
 
     /// **要る。** codex に claude の `status` 相当のライブ状態は無く、Esc 中断では
@@ -149,6 +152,85 @@ impl Backend for Codex {
     fn auth_fingerprint(&self) -> crate::poll::CredentialsFp {
         codex_index::auth_fingerprint()
     }
+
+    fn transcript_root(&self) -> Option<PathBuf> {
+        Some(codex_index::codex_home()?.join("sessions"))
+    }
+
+    /// rollout は `sessions/YYYY/MM/DD/rollout-<現地時刻>-<会話 ID>.jsonl`。
+    ///
+    /// **ファイル名の時刻部分を組み立て直さない。** 書いた時のタイムゾーンに
+    /// 依存するので、組み立てた名前は環境が変わると黙って外れる。会話 ID は
+    /// **UUIDv7**（先頭 48bit が生成時刻の ms）なので、そこから**日のディレクトリ
+    /// だけ**を導き、その日と前後 1 日の中から末尾が `-<会話 ID>.jsonl` の
+    /// ファイルを探す。時計の仮定は「どの日か」だけに縮む。
+    ///
+    /// 前後 1 日も見るのは、ファイル名が**現地時刻**でディレクトリを決めるため
+    /// （UTC から導いた日と最大 1 日ずれる）
+    fn transcript_in(&self, root: &Path, conversation: &str, _cwd: &str) -> Option<PathBuf> {
+        let suffix = format!("-{conversation}.jsonl");
+        let day = codex_index::minted_at_days(conversation)?;
+        // その日 → 前日 → 翌日 の順（同名は在り得ないので見つかった時点で確定）
+        [0i64, -1, 1].into_iter().find_map(|shift| {
+            let dir = root.join(codex_index::day_path(day.checked_add(shift)?)?);
+            std::fs::read_dir(dir)
+                .ok()?
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(&suffix))
+                })
+        })
+    }
+
+    /// **行の cwd でそのまま再開できる**（`codex resume <uuid>` は会話を ID で
+    /// 名指しするので、打つ場所を選ばない）。記録の場所も見ない
+    fn resume_cwd(&self, cwd: &str, _transcript: Option<&Path>) -> Option<String> {
+        Some(cwd.to_string())
+    }
+
+    /// **索引で拾えない会話のための下段**（[`Self::name_index`] が主）。
+    ///
+    /// 索引に載るのは名前が決まった会話だけで、実測（実機 2026-08-02）では
+    /// **ターンのある rollout 211 本のうち 65 本（31%）**しか載っていない。
+    /// 残りは rollout の**最初のユーザー発話**で名乗る ＝ claude が
+    /// `last-prompt` へ落ちるのと同じ形。
+    ///
+    /// **[`Span::Head`] なのが claude との違い。** codex の rollout は道具の出力が
+    /// 末尾を埋めるので末尾窓では届かない（実測 60%）が、先頭は
+    /// `session_meta` → 前置き → 最初のプロンプトと決まった形で、
+    /// 先頭 256 KiB に 213/214（99.5%）が収まる。**先頭は追記されない**ので
+    /// 1 会話 1 回の有界読みで済む
+    fn title_records(&self) -> &'static [Candidate] {
+        &TITLE_RECORDS
+    }
+
+    fn name_index(&self) -> Option<NameIndex> {
+        codex_index::name_index()
+    }
+}
+
+/// 表示名の候補。**索引（`thread_name`）が上、これは下段**なので 1 つだけ
+static TITLE_RECORDS: [Candidate; 1] = [Candidate {
+    marker: USER_MESSAGE,
+    text: first_prompt,
+    span: Span::Head,
+}];
+
+/// rollout の中でユーザーの打鍵そのものを運ぶ行の型名。
+///
+/// **`role: "user"` の `response_item` は使わない。** あちらには AGENTS.md や
+/// permissions の前置きも同じ形で入るので、名前にすると前置きが行に出る
+const USER_MESSAGE: &str = "user_message";
+
+/// `{"type":"event_msg","payload":{"type":"user_message","message":"…"}}` から
+/// 打鍵を取り出す
+fn first_prompt(value: &serde_json::Value) -> Option<&str> {
+    let payload = value.get("payload")?;
+    (payload.get("type").and_then(serde_json::Value::as_str) == Some(USER_MESSAGE))
+        .then(|| payload.get("message").and_then(serde_json::Value::as_str))?
 }
 
 /// `-c` に渡す hook の定義（TOML）。**注入できない形なら None**（hook 無しで
@@ -217,11 +299,6 @@ mod tests {
     use super::*;
     use crate::backend::tests::argv;
 
-    /// ccdesk の行 ID（codex が採番する ID ではない）
-    fn row() -> SessionId {
-        SessionId::new("8a1c0f52-0b3e-4a6d-9f11-2c7d5e8b0a34")
-    }
-
     fn inject() -> Inject<'static> {
         Inject {
             exe: "C:/Users/me/ccdesk.exe",
@@ -229,51 +306,47 @@ mod tests {
         }
     }
 
-    fn build(launch: Launch<'_>, inject: Option<&Inject>) -> CommandBuilder {
-        Codex.command(&row(), "C:\\dev\\app", launch, inject)
+    fn build(launch: Launch<'_>, inject: Option<&Inject>) -> Spawn {
+        Codex.command("C:\\dev\\app", launch, inject)
     }
 
     /// 新規はプロンプトだけ。**`--session-id` に相当するものは渡さない**
-    /// （codex に無い ＝ 渡すと起動が落ちる）
+    /// （codex に無い ＝ 渡すと起動が落ちる）。会話 ID は codex が採番するので、
+    /// **起こす前には名乗れない**（hook が来るまで行は会話を持たない）
     #[test]
-    fn a_new_session_passes_only_the_prompt() {
-        let cmd = build(
+    fn a_new_session_passes_only_the_prompt_and_claims_no_conversation() {
+        let spawn = build(
             Launch::New {
                 prompt: "fix login form validation",
             },
             None,
         );
-        assert_eq!(argv(&cmd), ["fix login form validation"]);
+        assert_eq!(argv(&spawn.cmd), ["fix login form validation"]);
+        assert_eq!(spawn.conversation, None);
         assert_eq!(
-            cmd.get_cwd().map(|c| c.to_string_lossy().to_string()),
+            spawn.cmd.get_cwd().map(|c| c.to_string_lossy().to_string()),
             Some("C:\\dev\\app".to_string()),
             "cwd is not passed through"
         );
-        assert!(argv(&build(Launch::New { prompt: "" }, None)).is_empty());
+        assert!(argv(&build(Launch::New { prompt: "" }, None).cmd).is_empty());
     }
 
     /// 再開は **codex が採番した ID**（行 ID ではない）。取り違えると
     /// `codex resume` が別の会話を開く / 見つからずに落ちる
     #[test]
-    fn resuming_uses_the_id_codex_minted_not_the_row_id() {
-        let cmd = build(Launch::Resume { id: "019fbe35-5ffa" }, None);
-        assert_eq!(argv(&cmd), ["resume", "019fbe35-5ffa"]);
-        assert!(
-            !argv(&cmd).contains(&row().as_str().to_string()),
-            "the ccdesk row id leaked into the resume arguments"
-        );
+    fn resuming_uses_the_id_codex_minted() {
+        let spawn = build(Launch::Resume { id: "019fbe35-5ffa" }, None);
+        assert_eq!(argv(&spawn.cmd), ["resume", "019fbe35-5ffa"]);
+        assert_eq!(spawn.conversation.as_deref(), Some("019fbe35-5ffa"));
     }
 
-    /// **行の相関は env の 1 本だけ。** これが落ちると hook が「どの行の出来事か」を
-    /// 名乗れず、codex の行は永久に状態が付かない
+    /// **ピッカーには ID を渡さない**（claude と同じ扱い）。値なしの `resume` が
+    /// codex 自身のピッカーで、選ぶのはユーザー
     #[test]
-    fn the_row_id_is_handed_over_through_the_environment() {
-        let cmd = build(Launch::New { prompt: "" }, None);
-        let found = cmd
-            .iter_full_env_as_str()
-            .find(|(key, _)| *key == ROW_ENV)
-            .map(|(_, value)| value.to_string());
-        assert_eq!(found, Some(row().as_str().to_string()));
+    fn picking_passes_no_id_and_claims_no_conversation() {
+        let spawn = build(Launch::Pick, None);
+        assert_eq!(argv(&spawn.cmd), ["resume"]);
+        assert_eq!(spawn.conversation, None);
     }
 
     /// hook は `-c` で 1 起動限り渡し、trust の確認を飛ばす（ユーザーの
@@ -281,7 +354,7 @@ mod tests {
     #[test]
     fn the_hooks_are_injected_before_the_subcommand() {
         let inject = inject();
-        let args = argv(&build(Launch::Resume { id: "abc" }, Some(&inject)));
+        let args = argv(&build(Launch::Resume { id: "abc" }, Some(&inject)).cmd);
         assert_eq!(args[0], "-c");
         assert!(args[1].starts_with("hooks={"), "{args:?}");
         assert_eq!(args[2], BYPASS_TRUST);
@@ -379,6 +452,6 @@ mod tests {
             exe: "C:/it's here/ccdesk.exe",
             settings: std::path::Path::new("x"),
         };
-        assert!(argv(&build(Launch::New { prompt: "" }, Some(&inject))).is_empty());
+        assert!(argv(&build(Launch::New { prompt: "" }, Some(&inject)).cmd).is_empty());
     }
 }

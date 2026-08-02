@@ -17,7 +17,6 @@ use ccdesk::{new_parser, now_ms, LockExt, Parser};
 
 // 継承させない環境変数の一覧は claude の非公開な形なので
 // [`crate::claude_format`] が持つ（外れたときに直す場所を 1 つにするため）
-use crate::backend::{Backend, Inject, Launch};
 use crate::poll::PtyHint;
 use crate::sessions::SessionId;
 use crate::theme::HOST_COLORS;
@@ -205,15 +204,16 @@ pub(crate) struct Session {
 
 impl Session {
     /// 前景セッションを PTY で起こす。**セッションの実体はこの子プロセス**
-    /// （ccdesk を閉じると終わる。行は `sessions.json` に残る）
+    /// （ccdesk を閉じると終わる。行は `sessions.json` に残る）。
+    ///
+    /// **コマンドは組み立て済みで受ける**（[`crate::backend::Kind::spawn_command`]）。
+    /// 組み立てには「どの会話に載るか」の答えが付いてきて、それを行へ記録するのは
+    /// 呼び手の仕事 ＝ ここが会話のことを知る必要が無い
     pub(crate) fn spawn(
-        backend: &dyn Backend,
         session_id: &SessionId,
-        cwd: &str,
+        cmd: portable_pty::CommandBuilder,
         rows: u16,
         cols: u16,
-        launch: Launch<'_>,
-        inject: Option<&Inject>,
     ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -222,9 +222,7 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        let child = pair
-            .slave
-            .spawn_command(backend.command(session_id, cwd, launch, inject))?;
+        let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
         let parser = Arc::new(Mutex::new(new_parser(rows, cols, SCROLLBACK)));

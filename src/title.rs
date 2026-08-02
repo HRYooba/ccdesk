@@ -35,16 +35,13 @@
 //! [`UNTITLED`] へ落ちるだけで機能は落ちない。パースは行単位で捨てるので
 //! 壊れた JSON でも panic しない。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::claude_format::{
-    project_dir_name, projects_dir, transcript_file_name, AI_TITLE, CUSTOM_TITLE, LAST_PROMPT,
-};
-use crate::git::worktrees_of;
+use crate::backend::{Candidate, Kind, NameIndex, Span};
 use crate::sessions::{SessionId, SessionRow};
 
 /// 畳んだ名前として**保持する**文字数の上限。
@@ -67,38 +64,61 @@ pub(crate) const UNTITLED: &str = "new session";
 /// この外に出るので、初回だけ先頭から読む
 pub(crate) const TAIL_BYTES: u64 = 64 * 1024;
 
-/// 候補が transcript の**どこに現れるか**。走査の範囲はこの性質から機械的に決まる
-/// （[`Titles::refresh_all`]）ので、候補と範囲の対応表を別に持たない。
+/// [`Span::Rare`] の候補を探して**末尾から遡る上限**。
 ///
-/// **この区別を落とすと実害が出る**: `custom-title` を末尾 64 KiB だけで探していた
-/// 頃は、長い会話の早い段階でリネームした記録が範囲の外に出て拾えず、
-/// transcript 全体を読む `/resume` のピッカーと名前が食い違っていた
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Span {
-    /// セッション中に繰り返し追記される。最新は必ず末尾側にあるので末尾で足りる
-    Appended,
-    /// まれにしか書かれない。**ファイルのどこにあるか分からない**ので全体を見る
-    Rare,
-}
+/// **これが無いと transcript を丸ごと後方走査する。** 実測（実機 802 本 /
+/// 492.8 MB、2026-08-02）: `custom-title` を持つのは 77 本だけで、
+///
+/// | 末尾から | 拾える |
+/// |--:|--:|
+/// | 64 KiB（[`TAIL_BYTES`]） | 75 / 77 |
+/// | 512 KiB | 76 / 77 |
+/// | **1 MiB** | **77 / 77** |
+///
+/// つまり無制限に遡っても 1 MiB を超えて拾える例は 1 本も無い一方、
+/// 手元の 6 行では 35.6 MB を舐めていた（起動のたびに UI スレッドで
+/// 予算 1 周期ぶんを 9 周期）。**上限を置いても失うものが実測で 0 本**なので置く。
+///
+/// 代償: 1 MiB より前のリネームは拾えず、下位の候補（`ai-title` /
+/// `last-prompt`）へ落ちる。腐ったら測り直す種類の定数
+pub(crate) const RARE_BYTES: u64 = 1024 * 1024;
 
-/// transcript の 1 行から拾う表示名の候補（レコードと、現れる場所）。
-/// **この配列の順序が優先順そのもの**なので、候補を増やすときに触るのはここだけ
-/// （綴りの正本は [`crate::claude_format`]）
-const CANDIDATES: [(crate::claude_format::Record, Span); 3] = [
-    (CUSTOM_TITLE, Span::Rare),
-    (AI_TITLE, Span::Appended),
-    (LAST_PROMPT, Span::Appended),
-];
+/// 遡る上限は末尾窓より広くなければ意味が無い（同じなら初回の走査で
+/// 読み終えており、遡る余地が残らない）
+const _: () = assert!(RARE_BYTES > TAIL_BYTES, "the rare window must reach past the tail window");
 
-/// 走査 1 回で見つかった候補（[`CANDIDATES`] と同じ並び）
-type Found = [Option<String>; CANDIDATES.len()];
+/// [`Span::Head`] の候補を探す**先頭からの窓**。
+///
+/// **codex のためにある。** rollout は道具の出力が末尾を埋めるので末尾窓では
+/// 最初のプロンプトに届かない（実測 214 本中 128 本 ＝ 60%）が、先頭は
+/// `session_meta` → 前置き → 最初のプロンプトと形が決まっている:
+///
+/// | 先頭から | 拾える |
+/// |--:|--:|
+/// | 64 KiB | 189 / 214 |
+/// | 128 KiB | 212 / 214 |
+/// | **256 KiB** | **213 / 214** |
+/// | 512 KiB | 214 / 214 |
+///
+/// 512 KiB で 100% になるが、1 本のために窓を倍にする値段（1 会話あたり
+/// 予算の 12.5%）に見合わないので 256 KiB。**先頭は追記されない**ので、
+/// 読むのは 1 会話につき 1 回きり
+pub(crate) const HEAD_BYTES: u64 = 256 * 1024;
 
-/// [`Span::Rare`] の候補にまだ答えが無いか（＝ 先頭側の走査を続ける理由があるか）
-fn rare_missing(found: &Found) -> bool {
-    CANDIDATES
+/// 走査 1 回で見つかった候補（agent の [`Candidate`] の並びと同じ長さ）
+type Found = Vec<Option<String>>;
+
+/// [`Span::Rare`] の候補にまだ答えが無いか（＝ 遡る走査を続ける理由があるか）
+fn rare_missing(found: &Found, records: &[Candidate]) -> bool {
+    records
         .iter()
         .enumerate()
-        .any(|(i, (_, span))| *span == Span::Rare && found[i].is_none())
+        .any(|(i, c)| c.span == Span::Rare && found.get(i).is_none_or(Option::is_none))
+}
+
+/// その agent の候補ぶんの空欄
+fn empty_found(records: &[Candidate]) -> Found {
+    vec![None; records.len()]
 }
 
 /// 1 周期（一覧の読み直し 1 回）に読んでよいバイト数。**全行で分け合う。**
@@ -195,44 +215,98 @@ fn end_of_complete_lines(bytes: &[u8]) -> usize {
     bytes.iter().rposition(|&b| b == b'\n').map_or(0, |at| at + 1)
 }
 
+/// その記録ファイルがこの会話のものか。**agent をまたいで同じ判定**で、
+/// claude は `<会話 ID>.jsonl`、codex は `rollout-<時刻>-<会話 ID>.jsonl` ＝
+/// どちらも**拡張子を除いた名前が会話 ID で終わる**
+fn is_for(path: &Path, conversation: &str) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.ends_with(conversation))
+}
+
+/// agent 自身が記録の外に持っている会話名の写し（[`NameIndex`]）。
+///
+/// **ファイルの大きさが変わったときだけ読み直す。** 索引は 1 会話 1 行の追記型
+/// （リネームも追記される ＝ 長さは必ず増える）で実測 11 KB 程度だが、一覧の
+/// 読み直しは 2 秒ごとなので、変わっていないファイルを舐め続ける理由が無い
+#[derive(Default)]
+pub(crate) struct ConversationNames {
+    names: HashMap<String, String>,
+    /// 索引ごとの最後に読んだ大きさ。**agent ごとに別のファイル**
+    seen_len: HashMap<PathBuf, u64>,
+}
+
+impl ConversationNames {
+    /// 索引を読み直す（変わっていなければ何もしない）。
+    /// **読めないときは前回の表を保つ**（一時的な失敗で名前が消えない）
+    fn refresh(&mut self, index: &NameIndex) {
+        let Ok(meta) = std::fs::metadata(&index.path) else {
+            return;
+        };
+        if self.seen_len.get(&index.path) == Some(&meta.len()) {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(&index.path) else {
+            return;
+        };
+        self.seen_len.insert(index.path.clone(), meta.len());
+        // **行単位で捨てる**（1 行壊れても他は読む ＝ 索引は agent が書く外部
+        // ファイルで、書き込み途中を読むことがある）。同じ会話が 2 度出てきたら
+        // 後の行が勝つ（リネームは追記されるため）
+        self.names.extend(text.lines().filter_map(|line| {
+            let value: Value = serde_json::from_str(line).ok()?;
+            let id = value.get(index.id_key)?.as_str()?;
+            let name = value.get(index.name_key)?.as_str()?.trim();
+            (!id.is_empty() && !name.is_empty()).then(|| (id.to_string(), title_text(name)))
+        }));
+    }
+
+    fn get(&self, conversation: &str) -> Option<&str> {
+        self.names.get(conversation).map(String::as_str)
+    }
+}
+
 /// バイト列を走査して候補を拾う。**位置の計算は生バイトで済ませ、ここで初めて
 /// 文字列にする**（壊れたバイトは lossy で受ける ＝ 途中から読んでも失敗しない）
-fn scan_bytes(bytes: &[u8], spans: &[Span], found: &mut Found) {
-    scan_into(&String::from_utf8_lossy(bytes), spans, found);
+fn scan_bytes(bytes: &[u8], records: &[Candidate], spans: &[Span], found: &mut Found) {
+    scan_into(&String::from_utf8_lossy(bytes), records, spans, found);
 }
 
 /// 範囲 `text` を走査して候補を拾う。`spans` に載る性質の候補だけを見るので、
-/// 「末尾でしか探さない候補」と「全体で探す候補」を同じ 1 つの走査で表せる。
+/// 「末尾でしか探さない候補」「先頭でしか探さない候補」「遡って探す候補」を
+/// 同じ 1 つの走査で表せる。
 ///
-/// **後から現れた値が前の値を上書きする**（同じ候補は最後に現れたものが最新）。
+/// **[`Span::Head`] だけは先に見つけた値を守る**（会話の先頭に 1 度だけ書かれ、
+/// **最初の値が答え**）。他は後から現れた値が前の値を上書きする（最後が最新）。
 /// 壊れた行・知らない形は捨てる。
 ///
-/// **JSON を組む前に型名の文字列で弾く**のが速さの要点: transcript は 1 MB を
+/// **JSON を組む前に印の文字列で弾く**のが速さの要点: 記録は 1 MB を
 /// 超えることがあり、全行をパースすると走査 1 回に行数ぶんの時間がかかる
-fn scan_into(text: &str, spans: &[Span], found: &mut Found) {
-    let wanted = |span: &Span| spans.contains(span);
+fn scan_into(text: &str, records: &[Candidate], spans: &[Span], found: &mut Found) {
+    let wanted = |span: Span| spans.contains(&span);
     for line in text.lines() {
         let line = line.trim();
         if !line.starts_with('{') {
             continue;
         }
-        if !CANDIDATES
+        if !records
             .iter()
-            .any(|((name, _), span)| wanted(span) && line.contains(name))
+            .any(|c| wanted(c.span) && line.contains(c.marker))
         {
             continue;
         }
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue; // 壊れた行（書き込みの途中で読んだ場合を含む）
         };
-        let Some(kind) = value.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        for (i, ((name, key), span)) in CANDIDATES.iter().enumerate() {
-            if kind != *name || !wanted(span) {
+        for (i, candidate) in records.iter().enumerate() {
+            if !wanted(candidate.span) {
                 continue;
             }
-            let text = value.get(key).and_then(Value::as_str).map(title_text);
+            // 先頭に 1 度だけ書かれる候補は、最初に拾った値が答え
+            if candidate.span == Span::Head && found[i].is_some() {
+                continue;
+            }
+            let text = (candidate.text)(&value).map(title_text);
             if let Some(text) = text.filter(|t| !t.is_empty()) {
                 found[i] = Some(text);
             }
@@ -240,14 +314,14 @@ fn scan_into(text: &str, spans: &[Span], found: &mut Found) {
     }
 }
 
-/// 拾った候補から表示名を選ぶ。順は [`CANDIDATES`]（＝ 優先順）で、
+/// 拾った候補から表示名を選ぶ。順は agent の [`Candidate`] の並び（＝ 優先順）で、
 /// **上位が 1 つでも見つかれば下位は見ない**
 fn pick(found: &Found) -> Option<&String> {
     found.iter().flatten().next()
 }
 
-/// すべての候補をすべての範囲で探す（走査を範囲で分けない場合の指定）
-const EVERY_SPAN: [Span; 2] = [Span::Rare, Span::Appended];
+/// 末尾窓で探す性質（[`Span::Head`] は先頭窓が別に読む）
+const TAIL_SPANS: [Span; 2] = [Span::Rare, Span::Appended];
 
 /// 1 周期でその行に要る読み取りの種類。**予算が足りないときに何を先に捨てるかは
 /// これで決まる**（順序と根拠は [`Titles::refresh_all`] の表）。
@@ -293,43 +367,64 @@ struct Scan {
 /// transcript が前回から変わったかの判定材料（長さ・更新時刻）
 type Stamp = (u64, Option<std::time::SystemTime>);
 
-/// transcript から表示名を導く。**書き込みは一切しない。**
+/// 会話の記録から表示名を導く。**書き込みは一切しない。**
 ///
-/// **パスは注入で受ける**（[`Self::default`] が既定の `~/.claude/projects` を入れる）:
-/// 理由は [`crate::sessions`] と同じで、テストが実ユーザーの transcript を
-/// 絶対に触らないため。撮影用の供給元は [`Self::fixed`]（ファイルを 1 つも見ない）
+/// **パスは注入で受ける**（[`Self::default`] が各 agent の既定の根を入れる）:
+/// 理由は [`crate::sessions`] と同じで、テストが実ユーザーの `~/.claude`
+/// `~/.codex` を絶対に触らないため。撮影用の供給元は [`Self::fixed`]
+/// （ファイルを 1 つも見ない）。
+///
+/// **agent ごとの知識は 1 つも持たない。** 記録の場所・候補の並び・索引の在り処は
+/// すべて [`Backend`] に聞く（[`Backend::transcript_in`] /
+/// [`Backend::title_records`] / [`Backend::name_index`]）ので、agent を足すときに
+/// このファイルは触らない
 pub(crate) struct Titles {
-    /// transcript を探す根（`~/.claude/projects`）。None ＝ 何も読まない
-    projects: Option<PathBuf>,
-    /// 行ごとの走査のキャッシュ（[`Scan`]）
-    seen: HashMap<SessionId, Scan>,
-    /// 撮影用の固定表。空でなければ transcript より優先する
+    /// agent ごとの記録の根。**None ＝ その agent の記録は読まない**
+    roots: BTreeMap<Kind, PathBuf>,
+    /// **会話**ごとの走査のキャッシュ（[`Scan`]）。
+    ///
+    /// **鍵が会話 ID であることがこの型の要。** 中身は特定の会話の transcript を
+    /// 走った結果なので、行 ID で引くと**行が別の会話へ移った瞬間に嘘になる**
+    /// （ペインの中の `/clear` `/resume`、記録を見失った行の起こし直し）。
+    /// 行 ID で持っていた頃は `plan` の「パスが変わったらリセット」だけが整合を
+    /// 保っており、**`refresh_all` が回るまで前の会話の名前が出続けた**。
+    ///
+    /// 鍵を会話にすると、会話が変わった時点でそもそも引ける値が無い ＝
+    /// 無効化を呼ぶ側の責任が消える（呼び忘れても「古い名前が出る」だけなので
+    /// 気づけない種類の責任だった）。
+    ///
+    /// 代償は「行数で有界でなくなる」こと（`/clear` のたびに会話が増える）なので、
+    /// [`Self::refresh_all`] の最後にどの行も指していない会話を落とす
+    scans: HashMap<String, Scan>,
+    /// 撮影用の固定表。空でなければ記録より優先する
     /// （`--demo` は実セッションの名前を 1 つも出さない）
     fixed: HashMap<SessionId, String>,
-    /// codex の会話名。**codex 側に正本がある**ので走査せず索引を読むだけ
-    /// （[`crate::backend::codex_index`]）
-    codex: crate::backend::codex_index::CodexNames,
+    /// agent 自身が記録の外に持っている会話名（[`Backend::name_index`]）
+    names: ConversationNames,
 }
 
 impl Default for Titles {
     fn default() -> Self {
         Self {
-            projects: projects_dir(),
-            seen: HashMap::new(),
+            roots: Kind::ORDER
+                .into_iter()
+                .filter_map(|kind| Some((kind, kind.backend().transcript_root()?)))
+                .collect(),
+            scans: HashMap::new(),
             fixed: HashMap::new(),
-            codex: Default::default(),
+            names: ConversationNames::default(),
         }
     }
 }
 
 impl Titles {
-    /// 撮影用: 固定の表示名だけを返す（transcript も `~/.claude` も読まない）
+    /// 撮影用: 固定の表示名だけを返す（記録も `~/.claude` `~/.codex` も読まない）
     pub(crate) fn fixed(names: HashMap<SessionId, String>) -> Self {
         Self {
-            projects: None,
-            seen: HashMap::new(),
+            roots: BTreeMap::new(),
+            scans: HashMap::new(),
             fixed: names,
-            codex: Default::default(),
+            names: ConversationNames::default(),
         }
     }
 
@@ -341,20 +436,19 @@ impl Titles {
         if let Some(name) = self.fixed.get(&row.session_id) {
             return name.clone();
         }
-        // **codex は走査しない。** 会話名の正本が codex 側の索引にある
-        if row.kind == crate::backend::Kind::Codex {
-            return row
-                .agent_session_id
-                .as_deref()
-                .and_then(|id| self.codex.get(id))
-                .unwrap_or(UNTITLED)
-                .to_string();
-        }
-        self.seen
-            .get(&row.session_id)
-            .and_then(|scan| pick(&scan.found))
-            .cloned()
-            .unwrap_or_else(|| UNTITLED.to_string())
+        // **名前は会話に付く。** 会話が分からない行は名前も持てない
+        // （行 ID から引いていた頃は、会話が変わっても前の名前が出続けた）
+        let Some(conversation) = row.conversation.id() else {
+            return UNTITLED.to_string();
+        };
+        // **索引が上、走査が下。** agent 自身が名前を決めているなら（codex の
+        // `thread_name`）それが正本で、決めていない会話だけを記録から導く
+        // ＝ claude と codex が同じ 2 段を通る（`match Kind` が要らない）
+        self.names
+            .get(conversation)
+            .or_else(|| self.scans.get(conversation).and_then(|s| pick(&s.found)).map(String::as_str))
+            .unwrap_or(UNTITLED)
+            .to_string()
     }
 
     /// **全行を 1 周期ぶん読み直す。** 戻り値は「どれかの行の `transcript` の記録を
@@ -386,10 +480,14 @@ impl Titles {
     /// 名前は出てしまう（下位の候補で埋まる）＝ リネームだけが静かに拾えなくなる
     pub(crate) fn refresh_all(&mut self, rows: &mut [SessionRow], budget: &mut u64) -> bool {
         let mut changed = false;
-        // codex の会話名は索引 1 本を読むだけ（走査の予算とは無関係）。
-        // **codex の行が 1 つも無ければ触らない**
-        if rows.iter().any(|row| row.kind == crate::backend::Kind::Codex) {
-            self.codex.refresh();
+        // 索引は 1 本を読むだけ（走査の予算とは無関係）。**その agent の行が
+        // 1 つも無ければ触らない**
+        for kind in Kind::ORDER {
+            if rows.iter().any(|row| row.kind == kind)
+                && let Some(index) = kind.backend().name_index()
+            {
+                self.names.refresh(&index);
+            }
         }
         // 解決と stat は行あたりここで 1 回だけ（段ごとに回すと段の数だけ増える）
         let mut plans = Vec::with_capacity(rows.len());
@@ -409,18 +507,31 @@ impl Titles {
                 if planned != stage {
                     continue;
                 }
+                // 走査の鍵は会話（段の計画が立った行は必ず会話を持っている）
+                let Some(conversation) = row.conversation.id() else {
+                    continue;
+                };
                 let mut allot = Self::allowance(stage, *budget, left);
                 let offered = allot;
-                self.run(&row.session_id, planned, stamp, &mut allot);
+                self.run(conversation, row.kind, planned, stamp, &mut allot);
                 *budget -= offered - allot;
                 left -= 1;
             }
         }
         for row in rows.iter() {
-            if let Some(scan) = self.seen.get_mut(&row.session_id) {
-                Self::drain_head(scan, budget);
+            let records = row.kind.backend().title_records();
+            if let Some(conversation) = row.conversation.id()
+                && let Some(scan) = self.scans.get_mut(conversation)
+            {
+                Self::drain_head(scan, records, budget);
             }
         }
+        // **どの行も指していない会話の走査結果を落とす。** 鍵が行から会話へ移った
+        // 以上、ペインの中で `/clear` を繰り返すと会話は増え続ける（行は増えない）
+        // ので、放っておくとキャッシュが行数で有界にならない
+        let live: std::collections::HashSet<&str> =
+            rows.iter().filter_map(|row| row.conversation.id()).collect();
+        self.scans.retain(|id, _| live.contains(id.as_str()));
         changed
     }
 
@@ -428,6 +539,10 @@ impl Titles {
     /// 戻り値の bool は「行の `transcript` 記録を書き換えたか」
     fn plan(&mut self, row: &mut SessionRow) -> (Option<(Stage, Stamp)>, bool) {
         let (path, resolved_changed) = self.resolve(row);
+        // 会話が分からない行は走査する対象が無い（Scan も持っていない）
+        let Some(conversation) = row.conversation.id().map(str::to_string) else {
+            return (None, resolved_changed);
+        };
         // 解決できない・消えた ＝ 読む対象が無い。**拾った値も一緒に落とす**
         // （残すと、消えたファイルから拾った名前が行に出続ける ＝ キャッシュが
         // 状態になってしまう）。ここが唯一の stat（resolve の確認と合わせて
@@ -438,16 +553,18 @@ impl Titles {
                 Some((path, meta))
             })
         else {
-            self.seen.remove(&row.session_id);
+            self.scans.remove(&conversation);
             return (None, resolved_changed);
         };
         let stamp = (meta.len(), meta.modified().ok());
-        let scan = self.seen.entry(row.session_id.clone()).or_default();
-        // 別のファイルへ解決し直された / 縮んだ（追記ではなく作り直された）なら、
-        // 覚えた範囲も候補も当てにならない
-        if scan.path != path || meta.len() < scan.scanned {
+        let records = row.kind.backend().title_records();
+        let scan = self.scans.entry(conversation).or_default();
+        // 別のファイルへ解決し直された / 縮んだ（追記ではなく作り直された）／
+        // 候補の数が変わった（版が上がった）なら、覚えた範囲も候補も当てにならない
+        if scan.path != path || meta.len() < scan.scanned || scan.found.len() != records.len() {
             *scan = Scan {
                 path: path.clone(),
+                found: empty_found(records),
                 ..Scan::default()
             };
         }
@@ -489,25 +606,40 @@ impl Titles {
     }
 
     /// [`Self::plan`] が決めた読み取りを実行する
-    fn run(&mut self, id: &SessionId, stage: Stage, stamp: Stamp, budget: &mut u64) {
-        let Some(scan) = self.seen.get_mut(id) else {
+    fn run(&mut self, conversation: &str, kind: Kind, stage: Stage, stamp: Stamp, budget: &mut u64) {
+        let records = kind.backend().title_records();
+        let Some(scan) = self.scans.get_mut(conversation) else {
             return;
         };
         match stage {
-            Stage::First => Self::first_scan(scan, stamp, budget),
-            Stage::Append => Self::append_scan(scan, stamp, budget),
+            Stage::First => Self::first_scan(scan, records, stamp, budget),
+            Stage::Append => Self::append_scan(scan, records, stamp, budget),
         }
     }
 
-    /// 初回の走査: 末尾 [`TAIL_BYTES`] を全候補で読み、先頭側を読み残しとして記録する。
+    /// 初回の走査: 末尾 [`TAIL_BYTES`] を全候補で読み、そこから [`RARE_BYTES`] まで
+    /// 遡る範囲を読み残しとして記録する。
     ///
     /// **末尾窓は分割して読まない**（予算が窓ぶんに満たない周期は何もせず次へ回す）。
     /// 先頭側の消化（[`Self::drain_head`]）が探すのは [`Span::Rare`] だけなので、
     /// 窓を半端に読むと追記型の候補（ai-title / last-prompt）が読み残し側へ落ちて
     /// **どの段も拾わない** ＝ その行の名前が永久に出ない。
     /// 窓が予算より大きくなることは無い（[`SCAN_BUDGET`] の直下で固定してある）
-    fn first_scan(scan: &mut Scan, stamp: Stamp, budget: &mut u64) {
+    fn first_scan(scan: &mut Scan, records: &[Candidate], stamp: Stamp, budget: &mut u64) {
         let len = stamp.0;
+        // **先頭窓は、先頭にしか現れない候補を持つ agent だけが読む**（codex）。
+        // 先頭は追記されないので、読むのは 1 会話につきこの 1 回きり
+        if records.iter().any(|c| c.span == Span::Head) {
+            let want = HEAD_BYTES.min(len);
+            if *budget < want {
+                return; // 次の周期へ（窓は必ず丸ごと読む）
+            }
+            if let Some(bytes) = read_range(&scan.path, 0, want) {
+                *budget = budget.saturating_sub(want);
+                let complete = end_of_complete_lines(&bytes);
+                scan_bytes(&bytes[..complete], records, &[Span::Head], &mut scan.found);
+            }
+        }
         let from = len.saturating_sub(TAIL_BYTES);
         let want = len - from;
         if *budget < want {
@@ -517,15 +649,23 @@ impl Titles {
             return;
         };
         *budget = budget.saturating_sub(want);
-        // 行の途中から読んだときだけ、半端な先頭行を落とす（その行は先頭側の
+        // 行の途中から読んだときだけ、半端な先頭行を落とす（その行は遡る側の
         // 読み残しに含まれるので、取りこぼしにはならない）
         let skip = if from > 0 { after_first_newline(&bytes) } else { 0 };
         let complete = end_of_complete_lines(&bytes[skip..]);
-        scan_bytes(&bytes[skip..skip + complete], &EVERY_SPAN, &mut scan.found);
+        scan_bytes(&bytes[skip..skip + complete], records, &TAIL_SPANS, &mut scan.found);
         let start = from + skip as u64;
         scan.stamp = Some(stamp);
         scan.scanned = start + complete as u64;
-        scan.head_pending = (start > 0).then_some(0..start);
+        // **遡るのは末尾から [`RARE_BYTES`] まで。** ファイルの先頭まで残すと、
+        // 22 MB の transcript 1 本で予算 1 周期ぶんを 6 周期使い切る（実機で
+        // 6 行 35.6 MB。しかもその 6 行は `custom-title` を 1 つも持っていない）
+        let rare_from = len.saturating_sub(RARE_BYTES);
+        scan.head_pending = records
+            .iter()
+            .any(|c| c.span == Span::Rare)
+            .then(|| (start > rare_from).then_some(rare_from..start))
+            .flatten();
     }
 
     /// 追記ぶんの走査（常に行の切れ目 ＝ `scanned` から始まる）。
@@ -541,7 +681,7 @@ impl Titles {
     /// なら読まずに次の周期へ回す。区別せずに塊を飛ばしていた頃は、周期の終わりに
     /// 当たった**ごく普通の長さの行**が候補を持っていると二度と拾えなかった
     /// （次の周期は行の途中から読み始め、頭の欠けた行は JSON として捨てられる）
-    fn append_scan(scan: &mut Scan, stamp: Stamp, budget: &mut u64) {
+    fn append_scan(scan: &mut Scan, records: &[Candidate], stamp: Stamp, budget: &mut u64) {
         let delta = stamp.0.saturating_sub(scan.scanned);
         if delta == 0 {
             scan.stamp = Some(stamp); // 中身は増えていない（更新時刻だけ動いた）
@@ -557,7 +697,8 @@ impl Titles {
         *budget = budget.saturating_sub(take);
         // 走査するのは行が完結している範囲まで（書きかけの最終行は次回に回す）
         let complete = end_of_complete_lines(&bytes);
-        scan_bytes(&bytes[..complete], &EVERY_SPAN, &mut scan.found);
+        // 追記ぶんに [`Span::Head`] は現れない（先頭に 1 度だけ書かれる候補）
+        scan_bytes(&bytes[..complete], records, &TAIL_SPANS, &mut scan.found);
         if take < delta {
             // まだ EOF に届いていない。**[`TAIL_BYTES`] 読んで改行が 1 つも無い ＝
             // 予算では追えない長さの 1 行**なので、その行は諦めて先へ進む
@@ -576,9 +717,9 @@ impl Titles {
     /// Rare の答えは「ファイル中で最後に現れた値」なので、末尾に近い塊から読めば
     /// **最初に見つかった値が答え**になり、見つかった時点で残りは読まずに済む
     /// （末尾スキャンで既に見つかっていれば先頭側は 1 バイトも読まない）
-    fn drain_head(scan: &mut Scan, budget: &mut u64) {
+    fn drain_head(scan: &mut Scan, records: &[Candidate], budget: &mut u64) {
         while let Some(range) = scan.head_pending.clone() {
-            if range.is_empty() || !rare_missing(&scan.found) {
+            if range.is_empty() || !rare_missing(&scan.found, records) {
                 scan.head_pending = None;
                 return;
             }
@@ -602,11 +743,11 @@ impl Titles {
             } else {
                 0
             };
-            let mut fresh = Found::default();
-            scan_bytes(&bytes[skip..], &[Span::Rare], &mut fresh);
-            for (i, (_, span)) in CANDIDATES.iter().enumerate() {
+            let mut fresh = empty_found(records);
+            scan_bytes(&bytes[skip..], records, &[Span::Rare], &mut fresh);
+            for (i, candidate) in records.iter().enumerate() {
                 // 既にある値（末尾側 ＝ より新しい塊で見つけたもの）は上書きしない
-                if *span == Span::Rare && scan.found[i].is_none() {
+                if candidate.span == Span::Rare && scan.found[i].is_none() {
                     scan.found[i] = fresh[i].take();
                 }
             }
@@ -621,64 +762,49 @@ impl Titles {
         }
     }
 
-    /// **`claude -r` を打てる cwd**（transcript が無い ＝ 再開できない行は None）。
+    /// **その会話を再開できる cwd**（見つからない行は None ＝ 新規として起こす）。
     ///
-    /// 記録した transcript がどの作業ツリーのものかで決まる:
-    /// 行の cwd から導いた置き場所に在るならその cwd、別の作業ツリーの置き場所に
-    /// 在るならその作業ツリー。**作業ツリーが消えていれば None**（claude 自身も
-    /// その会話を見つけられないので、`claude -r` を打っても
-    /// `No conversation found` になる ＝ 新規として起こすのが正しい）
+    /// 判断は agent が持つ（[`Backend::resume_cwd`]）。ここが渡すのは行の cwd と
+    /// 解決済みの記録の場所だけで、**「その会話を確かめたか」は見ない**
+    /// （判断は呼び手 1 箇所 ＝ `crate::app` の `relaunch`）
     pub(crate) fn resume_cwd(&self, row: &SessionRow) -> Option<String> {
-        // **codex は行の cwd でそのまま再開できる**（`codex resume <uuid>` は
-        // 会話を ID で名指しする）。要るのは agent が採番した ID の方で、
-        // それが取れていなければ再開できない
-        if row.kind == crate::backend::Kind::Codex {
-            return row.agent_session_id.as_ref().map(|_| row.cwd.clone());
-        }
-        let path = row.transcript.as_ref()?;
-        if !path.is_file() {
-            return None;
-        }
-        let dir = path.parent()?.file_name()?.to_str()?;
-        if project_dir_name(&row.cwd) == dir {
-            return Some(row.cwd.clone());
-        }
-        worktrees_of(&row.cwd)
-            .into_iter()
-            .map(|tree| tree.display().to_string())
-            .find(|tree| project_dir_name(tree) == dir)
+        row.kind
+            .backend()
+            .resume_cwd(&row.cwd, row.transcript.as_deref())
     }
 
-    /// 行の transcript の場所。**記録が生きている間は解決し直さない。**
+    /// 行の会話の記録の場所。**記録が生きている間は解決し直さない。**
     ///
-    /// 解決の手順は claude 本体と同じ:
+    /// 探し方そのものは agent が持つ（[`Backend::transcript_in`]）。ここが持つのは
+    /// 「いつ探し直すか」と「行に書き戻すか」だけ。
     ///
-    /// 1. 行の cwd のプロジェクトディレクトリ（200 字超は畳んだ派生名）
-    /// 2. **行の cwd の git 作業ツリー**のプロジェクトディレクトリ
-    ///    （セッションは走行中に worktree へ移れる。[`crate::git`]）
-    ///
-    /// `~/.claude/projects` の全走査はしない（実機で 67 ディレクトリある）。
-    /// 見つからなければ記録も残さない ＝ 1 ターン終わって transcript ができた
-    /// 時点で次の周期が拾う
     /// 戻り値の bool は「行の `transcript` 記録を書き換えたか」（呼び手が
-    /// 保存の要否に使う ＝ 変化検出のためだけの clone を呼び手に持たせない）
+    /// 保存の要否に使う ＝ 変化検出のためだけの clone を呼び手に持たせない）。
+    ///
+    /// **記録は「今の会話のものか」まで見る。** ファイル名には会話 ID が入るので、
+    /// ペインの中で `/clear` を打った行の記録は**そのファイルが在るまま**古い
+    /// 会話を指す。存在だけで済ませていた頃は、`/clear` の後も前の会話の名前が
+    /// サイドバーに残り続けた（行 ID と会話 ID が同じ値だった間は起こり得なかった）
     fn resolve(&self, row: &mut SessionRow) -> (Option<PathBuf>, bool) {
-        if row.transcript.as_ref().is_some_and(|p| p.is_file()) {
+        // 会話が分からない行は記録も持てない（残っていれば落とす）
+        let Some(conversation) = row.conversation.id() else {
+            return (None, row.transcript.take().is_some());
+        };
+        if row
+            .transcript
+            .as_ref()
+            .is_some_and(|p| is_for(p, conversation) && p.is_file())
+        {
             return (row.transcript.clone(), false);
         }
-        let Some(projects) = self.projects.as_ref() else {
+        let Some(root) = self.roots.get(&row.kind) else {
+            // 根が無い ＝ 何も読まない供給元（撮影用）。記録は触らない
             return (None, false);
         };
-        let file = transcript_file_name(row.session_id.as_str());
-        let at = |cwd: &str| {
-            let path = projects.join(project_dir_name(cwd)).join(&file);
-            path.is_file().then_some(path)
-        };
-        let found = at(&row.cwd).or_else(|| {
-            worktrees_of(&row.cwd)
-                .into_iter()
-                .find_map(|tree| at(&tree.display().to_string()))
-        });
+        let found = row
+            .kind
+            .backend()
+            .transcript_in(root, conversation, &row.cwd);
         // 見つからなかったときは記録を消す（消えた worktree の記録を残さない）
         let changed = row.transcript != found;
         row.transcript = found.clone();
@@ -688,24 +814,33 @@ impl Titles {
 
 #[cfg(test)]
 impl Titles {
-    /// テスト用: transcript の根を差し替える（実ユーザーの transcript を絶対に触らない）
-    pub(crate) fn with_projects(projects: PathBuf) -> Self {
+    /// テスト用: 記録の根を差し替える（実ユーザーの `~/.claude` `~/.codex` を
+    /// 絶対に触らない）。**agent ごとに別の根**
+    pub(crate) fn with_root(kind: Kind, root: PathBuf) -> Self {
         Self {
-            projects: Some(projects),
-            seen: HashMap::new(),
+            roots: [(kind, root)].into_iter().collect(),
+            scans: HashMap::new(),
             fixed: HashMap::new(),
-            codex: Default::default(),
+            names: ConversationNames::default(),
         }
     }
 
-    /// テスト用: その cwd の置き場所へ transcript を作る（**パスの導出は本番と同じ**）
+    /// テスト用: claude の記録の根を差し替える
+    pub(crate) fn with_projects(projects: PathBuf) -> Self {
+        Self::with_root(Kind::Claude, projects)
+    }
+
+    /// テスト用: その cwd の置き場所へ claude の transcript を作る
+    /// （**パスの導出は本番と同じ**）。ファイル名は**会話 ID**（行 ID ではない
+    /// ＝ [`Self::resolve`] と同じ材料）
     pub(crate) fn write_transcript_for(&self, row: &SessionRow, cwd: &str, contents: &str) {
+        let conversation = row.conversation.id().expect("the row has no conversation");
         let path = self
-            .projects
-            .as_ref()
+            .roots
+            .get(&row.kind)
             .expect("no transcript root")
-            .join(project_dir_name(cwd))
-            .join(transcript_file_name(row.session_id.as_str()));
+            .join(crate::claude_format::project_dir_name(cwd))
+            .join(crate::claude_format::transcript_file_name(conversation));
         std::fs::create_dir_all(path.parent().expect("no parent")).expect("mkdir failed");
         std::fs::write(&path, contents).expect("write failed");
     }
@@ -730,8 +865,9 @@ impl Titles {
 /// 範囲を分けて走るので、範囲の話を抜きにした優先順の検査はこれを使う）
 #[cfg(test)]
 fn pick_title(text: &str) -> Option<String> {
-    let mut found = Found::default();
-    scan_into(text, &EVERY_SPAN, &mut found);
+    let records = Kind::Claude.backend().title_records();
+    let mut found = empty_found(records);
+    scan_into(text, records, &TAIL_SPANS, &mut found);
     pick(&found).cloned()
 }
 
@@ -812,9 +948,16 @@ pub(crate) mod tests {
     }
 
 
-    /// テスト用の行（cwd は transcript のディレクトリ名を決める材料）
+    /// テスト用の行（cwd は transcript のディレクトリ名を決める材料）。
+    ///
+    /// **会話 ID を行 ID とわざと別の値にしてある。** transcript を行 ID で
+    /// 引いていた実装でも通ってしまうテストにしないため（引いていた頃は、
+    /// ペインの中で `/clear` した行に古い名前が残り続けた）
     fn row(id: &str) -> SessionRow {
-        SessionRow::new(SessionId::new(id), "C:\\dev\\app", 1_000)
+        SessionRow {
+            conversation: crate::sessions::Conversation::Observed(format!("conv-{id}")),
+            ..SessionRow::new(SessionId::new(id), "C:\\dev\\app", 1_000)
+        }
     }
 
     /// **材料が無い行は [`UNTITLED`]**（起こしただけで 1 ターンも終わっていない行と、
@@ -833,6 +976,173 @@ pub(crate) mod tests {
         assert_eq!(titles.title_now(&mut row), UNTITLED);
         // transcript はあるので再開はできる
         assert_eq!(titles.resume_cwd(&row).as_deref(), Some(row.cwd.as_str()));
+    }
+
+    /// **行が別の会話へ移ったら、前の会話の名前も記録も残らない。**
+    ///
+    /// ペインの中で `/clear` を打つと行はそのまま会話だけが変わる
+    /// （`crate::app` の `adopt_conversations`）。transcript は**会話 ID の
+    /// ファイル名**なので、前の会話のファイルはその場に**在り続ける** ＝
+    /// 「記録したパスが在るなら解決し直さない」だけでは古い名前が張り付く。
+    ///
+    /// 行 ID と会話 ID が同じ値だった間はこの形が作れず、
+    /// **切り離した瞬間に生きたバグになる**種類の穴だった
+    #[test]
+    fn moving_the_row_to_another_conversation_drops_the_previous_name_and_record() {
+        let temp = TempProjects::new("moving_the_row_to_another_conversation");
+        let mut titles = temp.titles();
+        let mut row = row("44444444-4444-4444-8444-444444444444");
+        titles.write_transcript(&row, &format!("{}\n", line("ai-title", "aiTitle", "before clear")));
+        assert_eq!(titles.title_now(&mut row), "before clear");
+        let before = row.transcript.clone().expect("the first conversation was not resolved");
+
+        // `/clear`: 同じ行が新しい会話へ移る（前の会話のファイルは残ったまま）
+        row.conversation = crate::sessions::Conversation::Observed("conv-after-clear".to_string());
+        assert_eq!(
+            titles.title_now(&mut row),
+            UNTITLED,
+            "the name of the conversation from before the /clear stuck to the row"
+        );
+        assert_ne!(row.transcript.as_ref(), Some(&before), "the row still points at the old record");
+        assert!(before.is_file(), "the test premise broke: the old transcript is gone");
+
+        // 新しい会話が 1 ターン終えたら、その名前が出る
+        titles.write_transcript(&row, &format!("{}\n", line("ai-title", "aiTitle", "after clear")));
+        assert_eq!(titles.title_now(&mut row), "after clear");
+
+        // **`refresh_all` を待たずに古い名前が消える。** ここが `of()` 単体なのが
+        // 要点で、`title_now`（＝ refresh_all + of）で見ると「周期が直してくれる」
+        // 実装でも通ってしまう。会話を変えた経路（`app` の `open_session` は
+        // 周期の外で会話を差し替える）が名前を巻き戻さないことを固定する
+        row.conversation = crate::sessions::Conversation::Observed("conv-yet-another".to_string());
+        assert_eq!(
+            titles.of(&row),
+            UNTITLED,
+            "the name of the previous conversation survived the switch until the next cycle"
+        );
+
+        // 会話そのものが分からなくなったら記録も落とす（消えたファイルから
+        // 拾った名前を出し続けない）
+        row.conversation = crate::sessions::Conversation::Unknown;
+        assert_eq!(titles.title_now(&mut row), UNTITLED);
+        assert_eq!(row.transcript, None, "kept a record for a row with no conversation");
+    }
+
+    /// **索引に載らない codex の会話も名前を持つ。**
+    ///
+    /// codex の索引（`session_index.jsonl`）に載るのは名前が決まった会話だけで、
+    /// 実測（実機 2026-08-02）では**ターンのある rollout 211 本のうち 65 本
+    /// （31%）**しか載っていない。残り 69% は ccdesk で永久に `new session`
+    /// だった ＝ claude が `last-prompt` へ落ちるのに対して codex は諦めていた。
+    ///
+    /// **最初の発話を採るのが要点**（最後ではなく）: 会話の identity として
+    /// 安定するうえ、rollout の先頭は追記されないので有界に読める
+    #[test]
+    fn a_codex_conversation_that_is_not_in_the_index_is_named_by_its_first_prompt() {
+        let temp = crate::testutil::TempDir::new("title", "codex_first_prompt");
+        let conversation = "019fc236-22c1-7bd3-8fcc-954de8d2ea9a";
+        // 実機の形そのまま: session_meta → 前置き（AGENTS.md 等）→ 最初の発話
+        let body = concat!(
+            r#"{"timestamp":"2026-08-02T11:22:35Z","type":"session_meta","payload":{"id":"019fc236-22c1-7bd3-8fcc-954de8d2ea9a"}}"#, "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"permissions preamble"}]}}"#, "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"fix the login form","images":[]}}"#, "\n",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"working on it"}}"#, "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"now do the signup form","images":[]}}"#, "\n",
+        );
+        write_rollout(temp.path(), conversation, "2026-08-02T20-22-35", body);
+
+        let mut titles = Titles::with_root(Kind::Codex, temp.path().to_path_buf());
+        let mut row = SessionRow {
+            kind: Kind::Codex,
+            conversation: crate::sessions::Conversation::Observed(conversation.to_string()),
+            ..SessionRow::new(SessionId::new("row"), "C:\\dev\\app", 1_000)
+        };
+        assert_eq!(
+            titles.title_now(&mut row),
+            "fix the login form",
+            "a later prompt won over the first one"
+        );
+        // 記録の場所は**会話 ID から日ディレクトリを導いて**見つける
+        // （ファイル名の時刻部分を組み立て直すとタイムゾーンで腐る）
+        assert!(
+            row.transcript.as_ref().is_some_and(|p| is_for(p, conversation)),
+            "did not record where the rollout is: {:?}",
+            row.transcript
+        );
+        // 会話が変われば名前も落ちる（claude と同じ扱い）
+        row.conversation = crate::sessions::Conversation::Observed("019fc299-0000-7000-8000-000000000000".to_string());
+        assert_eq!(titles.of(&row), UNTITLED);
+    }
+
+    /// テスト用: codex の rollout を本番と同じ形で置く
+    /// （`sessions/YYYY/MM/DD/rollout-<現地時刻>-<会話 ID>.jsonl`）
+    fn write_rollout(root: &Path, conversation: &str, stamp: &str, body: &str) {
+        let day = crate::backend::codex_index::minted_at_days(conversation).expect("not a uuid v7");
+        let dir = root.join(crate::backend::codex_index::day_path(day).expect("no day"));
+        std::fs::create_dir_all(&dir).expect("mkdir failed");
+        std::fs::write(dir.join(format!("rollout-{stamp}-{conversation}.jsonl")), body)
+            .expect("write failed");
+    }
+
+    /// **agent 自身が名前を決めているなら、それが走査より上。**
+    /// codex が `thread_name` を書いた会話は、rollout を読まずにその名前が出る
+    #[test]
+    fn a_name_the_agent_recorded_wins_over_the_scan() {
+        let temp = crate::testutil::TempDir::new("title", "name_index_wins");
+        let path = temp.join("session_index.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"id":"a","thread_name":"named by the agent"}"#, "\n",
+                "{not json\n",
+                r#"{"thread_name":"no id"}"#, "\n",
+                r#"{"id":"c","thread_name":"   "}"#, "\n",
+                // リネームは**追記**される（実測: 同じ id が 2 行並ぶ）ので後が勝つ
+                r#"{"id":"a","thread_name":"renamed later"}"#, "\n",
+            ),
+        )
+        .expect("write failed");
+        let index = NameIndex { path: path.clone(), id_key: "id", name_key: "thread_name" };
+
+        let mut names = ConversationNames::default();
+        names.refresh(&index);
+        assert_eq!(names.get("a"), Some("renamed later"), "the rename was not picked up");
+        assert_eq!(names.get("c"), None, "an empty name was kept");
+        assert_eq!(names.get("unknown"), None);
+
+        // **読めないときは前回の表を保つ**（一時的な失敗で名前が消えない）
+        std::fs::remove_file(&path).expect("remove failed");
+        names.refresh(&index);
+        assert_eq!(names.get("a"), Some("renamed later"), "a transient read failure erased the names");
+    }
+
+    /// **どの行も指していない会話の走査結果は溜めない。**
+    ///
+    /// 鍵が行から会話へ移ったので、ペインの中で `/clear` を繰り返すと会話は
+    /// 増え続ける（行は増えない）。回収しないとキャッシュが行数で有界にならず、
+    /// 走査結果（候補の文字列と読み位置）が起動中ずっと積もる
+    #[test]
+    fn scans_of_conversations_no_row_points_at_are_reclaimed() {
+        let temp = TempProjects::new("scans_of_conversations_no_row_points_at");
+        let mut titles = temp.titles();
+        let mut row = row("66666666-6666-4666-8666-666666666666");
+        titles.write_transcript(&row, &format!("{}\n", line("ai-title", "aiTitle", "first")));
+        assert_eq!(titles.title_now(&mut row), "first");
+        assert_eq!(titles.scans.len(), 1);
+
+        // `/clear` を 3 回。行は 1 本のままなので、残る Scan も 1 本であるべき
+        for i in 0..3 {
+            row.conversation = crate::sessions::Conversation::Observed(format!("conv-cleared-{i}"));
+            titles.write_transcript(&row, &format!("{}\n", line("ai-title", "aiTitle", "later")));
+            titles.title_now(&mut row);
+        }
+        assert_eq!(
+            titles.scans.len(),
+            1,
+            "the scans of abandoned conversations piled up: {:?}",
+            titles.scans.keys().collect::<Vec<_>>()
+        );
+        assert!(titles.scans.contains_key("conv-cleared-2"), "reclaimed the live conversation");
     }
 
     /// **表示名はキャッシュに依存しない。** 増分走査を積み重ねた [`Titles`] と、
@@ -884,7 +1194,7 @@ pub(crate) mod tests {
         assert_eq!(titles.title_now(&mut row), "named in the worktree");
         assert_eq!(
             row.transcript.as_deref().and_then(Path::parent).and_then(Path::file_name),
-            Some(std::ffi::OsStr::new(&project_dir_name(&worktree))),
+            Some(std::ffi::OsStr::new(&crate::claude_format::project_dir_name(&worktree))),
             "did not record where the transcript actually is"
         );
         // 再開は移った先から打つ（行の cwd では claude が会話を見つけられない）
@@ -966,8 +1276,8 @@ pub(crate) mod tests {
         titles.write_transcript(&row, &body);
         let path = temp
             .0
-            .join(&project_dir_name(&row.cwd))
-            .join(transcript_file_name(row.session_id.as_str()));
+            .join(&crate::claude_format::project_dir_name(&row.cwd))
+            .join(crate::claude_format::transcript_file_name(row.conversation.id().expect("no conversation")));
 
         assert_eq!(titles.title_now(&mut row), "a name");
         assert!(titles.resume_cwd(&row).is_some());
@@ -1155,6 +1465,53 @@ pub(crate) mod tests {
         assert!(took < std::time::Duration::from_secs(2), "scanning took {took:?}");
     }
 
+    /// **遡りは末尾から [`RARE_BYTES`] で打ち切る。**
+    ///
+    /// 上限が無かった頃は transcript を丸ごと後方走査していた（実機 6 行で
+    /// 35.6 MB、しかも探している `custom-title` は 1 つも無かった）。
+    /// 実測では 1 MiB を超えて拾える例が 802 本中 0 本なので、失うものは無い。
+    ///
+    /// **読んだ量まで見る**のが要点で、「名前が下位候補へ落ちる」だけを見ると、
+    /// 全部読んだうえで拾えなかった実装でも通ってしまう
+    #[test]
+    fn the_backward_scan_stops_at_the_rare_window_instead_of_reading_the_whole_file() {
+        let temp = TempProjects::new("the_backward_scan_stops_at_the_rare_window");
+        let mut titles = temp.titles();
+        let mut row = row("77777777-7777-4777-8777-777777777777");
+        // 先頭にリネーム、その後ろに RARE_BYTES を超える詰め物、末尾に下位候補
+        let filler = format!("{}\n", line("noise", "text", &"x".repeat(2_000)))
+            .repeat((RARE_BYTES / 2_000) as usize * 2);
+        let body = format!(
+            "{}\n{filler}{}\n",
+            line("custom-title", "customTitle", "renamed long ago"),
+            line("last-prompt", "lastPrompt", "the latest prompt"),
+        );
+        assert!(
+            body.len() as u64 > RARE_BYTES + TAIL_BYTES,
+            "the premise broke - the rename is inside the rare window"
+        );
+        titles.write_transcript(&row, &body);
+
+        // 予算を潤沢にしても、遡りは窓で止まる
+        let mut budget = u64::MAX;
+        titles.refresh_all(std::slice::from_mut(&mut row), &mut budget);
+        for _ in 0..8 {
+            let mut budget = u64::MAX;
+            titles.refresh_all(std::slice::from_mut(&mut row), &mut budget);
+        }
+        assert_eq!(
+            titles.of(&row),
+            "the latest prompt",
+            "found a rename that is further back than the rare window"
+        );
+        let read = u64::MAX - budget;
+        assert!(
+            read <= RARE_BYTES + TAIL_BYTES,
+            "read {read} bytes for a window of {RARE_BYTES}; the whole file is {} bytes",
+            body.len()
+        );
+    }
+
     /// **初回の先頭側スキャンは予算で数周期に分かれても答えが変わらない。**
     /// 末尾から遠い位置のリネーム記録は、予算が尽きた周期では拾えず、
     /// 続きの周期（同じ Titles への次の refresh）で拾える
@@ -1223,7 +1580,7 @@ pub(crate) mod tests {
         let mut budget = SCAN_BUDGET;
         titles.refresh_all(std::slice::from_mut(&mut row), &mut budget);
         assert_eq!(titles.of(&row), "named at the top");
-        let scanned = titles.seen[&row.session_id].scanned;
+        let scanned = titles.scans[row.conversation.id().expect("no conversation")].scanned;
         assert!(scanned <= len, "remembered {scanned} bytes of a {len} byte file");
 
         // 見え方が変わっていない 2 周期目は 1 バイトも読まない
@@ -1246,14 +1603,16 @@ pub(crate) mod tests {
         // 実在するが範囲に足りないファイル ＝ 読み取りが必ず失敗する
         let path = temp.0.join("short.jsonl");
         std::fs::write(&path, "{}\n").expect("write failed");
+        let records = Kind::Claude.backend().title_records();
         let mut scan = Scan {
             path,
             head_pending: Some(0..10_000),
+            found: empty_found(records),
             ..Scan::default()
         };
 
         let mut budget = 10_000;
-        Titles::drain_head(&mut scan, &mut budget);
+        Titles::drain_head(&mut scan, records, &mut budget);
 
         assert_eq!(
             scan.head_pending,
@@ -1308,7 +1667,7 @@ pub(crate) mod tests {
         }
         assert_eq!(titles.of(&row), "the new name", "the append was never finished");
         assert_eq!(
-            titles.seen[&row.session_id].scanned,
+            titles.scans[row.conversation.id().expect("no conversation")].scanned,
             appended.len() as u64,
             "the append was not read to the end"
         );

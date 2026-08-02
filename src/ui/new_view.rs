@@ -73,14 +73,19 @@ pub(crate) struct NewState {
 }
 
 impl NewState {
-    /// 次の agent へ回す（[`Kind::ORDER`] の並びで巡回）。
-    /// **数を書き写さない**ので、agent を足しても切替の実装は変わらない
-    pub(crate) fn cycle_kind(&mut self) {
-        let at = Kind::ORDER
-            .iter()
-            .position(|k| *k == self.kind)
-            .unwrap_or(0);
-        self.kind = Kind::ORDER[(at + 1) % Kind::ORDER.len()];
+    /// 次の agent へ回す（`kinds` ＝ 今出す agent の並びで巡回）。
+    /// **数を書き写さない**ので、agent を足しても切替の実装は変わらない。
+    ///
+    /// 切った agent を渡されない限りそこへは回らない ＝ off の agent を
+    /// この画面から起こせない。今の選択が一覧に無ければ先頭へ戻す
+    /// （設定を変えた後の最初の起動で、選択が消えた agent に残らない）
+    pub(crate) fn cycle_kind(&mut self, kinds: &[Kind]) {
+        let Some(&first) = kinds.first() else { return };
+        let at = kinds.iter().position(|k| *k == self.kind);
+        self.kind = match at {
+            Some(at) => kinds[(at + 1) % kinds.len()],
+            None => first,
+        };
     }
 
     pub(crate) fn browse(dir: &str) -> Self {
@@ -218,7 +223,12 @@ impl NewState {
     /// ヒットテストは描画と同じ [`NewLayout`]。戻り値の [`NewAction::Launch`] は
     /// 「選択済みの起動ボタンを再クリックした」で、起動の実行（`start_new_session`）は
     /// App を持つ呼び手が行う
-    pub(crate) fn handle_mouse(&mut self, pane: Rect, mouse: &MouseEvent) -> Option<NewAction> {
+    pub(crate) fn handle_mouse(
+        &mut self,
+        pane: Rect,
+        mouse: &MouseEvent,
+        kinds: &[Kind],
+    ) -> Option<NewAction> {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let layout = NewLayout::compute(pane);
@@ -229,7 +239,7 @@ impl NewState {
                     // AGENT 行はクリックで次の agent へ回す（項目ごとの当たり判定を
                     // 持たない ＝ 桁の計算を描画と 2 箇所で持たない）
                     self.focus = NewFocus::Agent;
-                    self.cycle_kind();
+                    self.cycle_kind(kinds);
                 } else if mouse.row >= layout.folder_hd_y && mouse.row <= layout.sep_y {
                     // FOLDER セクション（見出し・パス値・┄ 区切り）クリック → パスフィールド。
                     // パス値の行ならカーソルも移動、他はカーソル位置維持
@@ -432,6 +442,8 @@ pub(crate) enum NewAction {
 
 /// 「選択 → 再クリックで実行」の 2 段階（判定は [`NewState::click_activates`]）
 pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Result<()> {
+    // 画面より先に控える（`right_view` を可変で借りると `app` を読めなくなる）
+    let kinds = app.kinds.clone();
     let RightView::New(state) = &mut app.right_view else {
         return Ok(());
     };
@@ -469,7 +481,7 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
                 key.code,
                 KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
             ) {
-                state.cycle_kind();
+                state.cycle_kind(&kinds);
             }
         }
         NewFocus::Path => {
