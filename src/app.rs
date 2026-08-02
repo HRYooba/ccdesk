@@ -13,7 +13,10 @@ use crate::hooks::HookStates;
 use crate::keys::{encode_key, forward_mouse};
 use crate::poll::{AgentInfo, FooterInfo, Grouping};
 use crate::usage::Usage;
-use crate::session::{Launch, Session};
+use std::collections::BTreeMap;
+
+use crate::backend::{Inject, Kind, Launch};
+use crate::session::Session;
 use crate::sessions::{SessionId, SessionRow};
 use crate::source::{DataSource, PollSinks, WindowItem, PROJECTS_LIMIT};
 use crate::title::Titles;
@@ -60,7 +63,8 @@ pub(crate) enum RowAction {
     /// セッション行: ウィンドウが開いていれば切替、無ければ `claude -r` で再開
     Open(SessionId),
     UpdateCcdesk,  // ccdesk 自身を更新（サイドバー先頭の版行）
-    UpdateClaude,  // claude 本体を更新（同じく版行）
+    /// その agent 本体を更新（同じく版行）
+    UpdateAgent(Kind),
     /// 差し替え済みの ccdesk を再起動して新しい版で立ち上げ直す
     /// （更新完了後の版行。claude 側は次回起動で勝手に反映されるのでこの動作を持たない）
     RestartCcdesk,
@@ -119,25 +123,16 @@ impl SidebarRow {
 pub(crate) enum SidebarPos {
     /// 一覧の行（[`App::sidebar_rows`] の index）
     Row(usize),
-    /// フッターのアカウント行。**今サインインしているアカウントを出すだけの行**で、
-    /// 選択とホバーはできるが押しても何も起きない（[`SidebarRow::Inert`] と同じ扱い。
-    /// 切り替えを持たない理由は [`crate::poll::AccountStatus`]）。
-    ///
-    /// **`SidebarRow::Inert` へは寄せられない**: あちらは `sidebar_rows` に積まれた
-    /// 行の種類で、この行はフッター（一覧の外・下端に固定）に描かれるため index を
-    /// 持たない。「押しても何も起きない」という**答え**は
-    /// [`selected_enter`] が `None` を返す 1 箇所に揃えてある
-    Account,
 }
 
 impl SidebarPos {
-    /// 一覧の行なら index。**アカウント行は一覧の外なので `None`**
-    /// （行のハイライト・行の動作の引き当て・スクロール追従はこれを見る）
+    /// 一覧の行の index（行のハイライト・行の動作の引き当て・スクロール追従が読む）。
+    ///
+    /// **`Option` のまま残してある**: 一覧の外を指す位置（かつてのアカウント行）が
+    /// また要るかもしれないので、呼び手を「必ず行がある」前提にしない
     pub(crate) fn row(self) -> Option<usize> {
-        match self {
-            Self::Row(row) => Some(row),
-            Self::Account => None,
-        }
+        let Self::Row(row) = self;
+        Some(row)
     }
 }
 
@@ -199,8 +194,8 @@ enum PopupAction {
     /// 一覧から行を外す（transcript は消さない ＝ 会話ログは残る）
     Close(SessionId),
     SetGrouping(Grouping),
-    /// 指定フォルダで新規セッション
-    NewSessionIn(String),
+    /// 指定フォルダで新規セッション（agent を選んで起こす）
+    NewSessionIn(Kind, String),
     /// プロジェクトを一覧から外す
     RemoveProject(String),
 }
@@ -217,7 +212,9 @@ pub(crate) struct PopupEntry {
 
 impl PopupKind {
     /// メニューの項目表（並び順 = 表示順）
-    pub(crate) fn entries(&self, grouping: Grouping) -> Vec<PopupEntry> {
+    /// `kinds` は今出す agent（[`crate::app::App::kinds`]）。**切った agent で
+    /// 新規セッションを起こす項目を出さない**ためだけに要る
+    pub(crate) fn entries(&self, grouping: Grouping, kinds: &[Kind]) -> Vec<PopupEntry> {
         match self {
             // 二次操作はここに集約する（ショートカットキーを併設しない ＝
             // 入口を 2 つ持たない）。
@@ -249,6 +246,8 @@ impl PopupKind {
                     action,
                 };
                 vec![
+                    // **常に押せる。** 会話を確かめていない行も agent 自身の
+                    // ピッカーで開く（`relaunch`）ので、押せない行が無い
                     entry("open", true, PopupAction::OpenSession(id.clone())),
                     entry(
                         if *pinned { "unpin" } else { "pin" },
@@ -274,18 +273,26 @@ impl PopupKind {
             // 「登録リスト ∪ セッションの cwd」なので、登録を外してもセッション由来で
             // 見出しは出続ける。押せるのに表示が変わらないのは嘘なので、
             // stop と同じ仕組み（実行可能フラグ）で落とす
-            PopupKind::Project { cwd, has_sessions } => vec![
-                PopupEntry {
-                    label: "new session".to_string(),
+            //
+            // **`new session` は agent ごとに項目を分ける。** この入口は New 画面を
+            // 通らず即起動するので、既定で黙って起こすと「押すまで何が起きるか
+            // 分からない」ことになる
+            PopupKind::Project { cwd, has_sessions } => kinds
+                .iter()
+                .copied()
+                .map(|kind| PopupEntry {
+                    label: format!("new {} session", kind.title()),
                     enabled: true,
-                    action: PopupAction::NewSessionIn(cwd.clone()),
-                },
-                PopupEntry {
-                    label: "remove project".to_string(),
-                    enabled: !has_sessions,
-                    action: PopupAction::RemoveProject(cwd.clone()),
-                },
-            ],
+                    action: PopupAction::NewSessionIn(kind, cwd.clone()),
+                })
+                .chain([
+                    PopupEntry {
+                        label: "remove project".to_string(),
+                        enabled: !has_sessions,
+                        action: PopupAction::RemoveProject(cwd.clone()),
+                    },
+                ])
+                .collect(),
         }
     }
 
@@ -293,7 +300,7 @@ impl PopupKind {
     /// 引く**ので、表示と動作が index でずれることは構造的に無い
     #[cfg(test)]
     fn action(&self, grouping: Grouping, index: usize) -> Option<PopupAction> {
-        let mut entries = self.entries(grouping);
+        let mut entries = self.entries(grouping, &Kind::ORDER);
         (index < entries.len()).then(|| entries.swap_remove(index).action)
     }
 }
@@ -402,8 +409,11 @@ pub(crate) struct App {
     pub(crate) footer_shared: Arc<Mutex<FooterInfo>>,
     pub(crate) footer_dirty: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) footer_refresh: Arc<std::sync::atomic::AtomicBool>,
-    // claude update 実行中（行の連打防止と "updating…" 表示）
-    pub(crate) claude_updating: Arc<std::sync::atomic::AtomicBool>,
+    /// `<agent> update` 実行中の旗（行の連打防止と "updating…" 表示）。
+    ///
+    /// **agent ごとに 1 本。** 共有にすると片方の更新中にもう片方の版行まで
+    /// Running になり、押せなくなる（実機で踏んだ）
+    pub(crate) agent_updating: BTreeMap<Kind, Arc<std::sync::atomic::AtomicBool>>,
     // ccdesk 自身の更新の進行状態（版行の表示と多重起動防止の正本）
     pub(crate) ccdesk_update: Arc<Mutex<SelfUpdate>>,
     // 版行の restart で立った再起動要求（起こす exe のパス）。run ループは
@@ -417,17 +427,19 @@ pub(crate) struct App {
     // 使用率（5h / 7d / モデル別週次）。**取るかどうかの判断は供給元**
     // （`DataSource::usage`）が持つので、ここは受け取った値だけを持つ。
     // 注入する settings には一切関係しない（[`crate::hooks::inject_settings`]）
-    pub(crate) usage: Usage,
+    pub(crate) usage: BTreeMap<Kind, Usage>,
     /// 使用率が更新されたことを取得スレッドが立てる合図（フッターと同じ作法）。
     /// **周期で読みに行かない**ので、使用率を切った環境ではこの旗が一度も立たない
     pub(crate) usage_dirty: Arc<std::sync::atomic::AtomicBool>,
     /// **クリック起点の**取得が進行中か（リングをスピナーに変える材料）。
     /// 自動取得（保険の周期・ターン完了）では立たない ＝ 押していないのに回らない。
     /// 立てるのはクリック（即時）と取得スレッド、降ろすのは取得スレッドだけ
-    pub(crate) usage_fetching: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) usage_fetching: BTreeMap<Kind, Arc<std::sync::atomic::AtomicBool>>,
     /// マウスが使用率ゲージの上にいるか（押せることを帯で示す）。
     /// 一覧の行ではないので [`Self::hovered`]（[`SidebarPos`]）では表せない
-    pub(crate) usage_hovered: bool,
+    /// マウスが乗っている使用率の行（**どの agent の行か**。無ければ None）。
+    /// 行ごとに取り直せるので、乗っている 1 行だけを帯にする
+    pub(crate) usage_hovered: Option<Kind>,
     // 画面に出す値の供給元（実データ / 撮影用の固定データ）。起動時に 1 度だけ選ばれ、
     // 以降ここを通る限り「今 demo か」を問う必要が無い
     pub(crate) source: Arc<dyn DataSource>,
@@ -438,6 +450,14 @@ pub(crate) struct App {
     // 下部バーに数秒表示するエラー等の通知
     pub(crate) notice: Option<(String, std::time::Instant)>,
     pub(crate) grouping: Grouping,
+    /// **今出す agent**（設定から起動時に 1 度組む。[`Kind::enabled`]）。
+    ///
+    /// 版行・使用率行・grouping の節・New 画面の切替・フォルダメニューの
+    /// new session・一覧に出す行 が全部これを読むので、**「codex を出すか」の
+    /// 判断が画面のあちこちに散らない**。設定は config.json だけなので
+    /// 起動中は変わらないが、`Kind::ORDER` を直に読む場所を残すと
+    /// そこだけ off に従わない、という抜けができる
+    pub(crate) kinds: Vec<Kind>,
     // 登録済みプロジェクト（ディレクトリ）の絶対パス。**この Vec が登録内容の正本**で、
     // 変更のたび全量を供給元へ書き戻す。directory グルーピングの見出しは
     // 「この一覧 ∪ セッションの cwd」なので、セッションが 0 本になっても
@@ -510,22 +530,28 @@ impl Default for App {
             footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
             footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            agent_updating: agent_updating_flags(),
             ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
             restart_to: None,
             ccdesk_latest: None,
             ccdesk_latest_shared: Arc::new(Mutex::new(None)),
             ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            usage: Usage::default(),
+            usage: BTreeMap::new(),
             usage_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            usage_fetching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            usage_hovered: false,
+            usage_fetching: agent_updating_flags(),
+            usage_hovered: None,
             // 撮影用の供給元は state.json / config.json を書かないので、
             // テストが開発者の設定を踏まない
             source: Arc::new(crate::source::DemoSource),
             input_gate: None,
             notice: None,
             grouping: Grouping::State,
+            // テストの既定は**全 agent**。本番の既定（claude だけ。
+            // [`Kind::enabled`]）とは違えてある: 複数 agent の桁割り・節・
+            // 下部バーの行数を見るテストが多く、既定を claude だけにすると
+            // それらが黙って 1 agent の経路しか通らなくなる。
+            // claude だけの見え方はその一覧を明示するテストが受け持つ
+            kinds: Kind::ORDER.to_vec(),
             projects: Vec::new(),
             popup: None,
             // サイドバー側にしておく（set_focus が PTY へ通知を出さない）
@@ -790,8 +816,9 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             app.last_live_scan = std::time::Instant::now();
         }
         // **hook の書き込みに気づいたら周期を待たずに読み直す。** ペインの中で
-        // `/resume` `/clear` すると claude は新しいセッションの `SessionStart` を
-        // その場で撃つので、これが「一覧に新しい行を出す合図」になる。
+        // `/resume` `/clear` すると agent は新しい会話の `SessionStart` を
+        // その場で撃つので、これが「行が別の会話へ移った合図」になる
+        // （行は増えない ＝ `adopt_conversations`）。
         // 見るのはファイルの長さと更新時刻だけ（中身は読まない）ので毎周でも安い
         let hooks_changed = hook_store_changed(&mut app.hook_stamp, app.source.hook_stamp());
         if hooks_changed {
@@ -801,17 +828,14 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             refresh_sessions(app);
             // 一覧を読み直した直後に hook の state を載せる。**順序に意味がある**:
             // 読み直しは丸ごとの置き換えなので、先に載せるとその場で上書きされる。
-            // **張り替えより前**でもある: ペインの中で切り替わったことに気づく材料が
-            // hook の写しなので、古い写しのまま張り替えを判断させない。
+            // **名前の読み直しより前**でもある: 行が今どの会話に載っているかを
+            // ここで確定させてから、その会話の transcript を読ませる
+            // （逆にすると `/clear` の周だけ古い会話の名前が 1 周残る）。
             // **読み直すのはファイルが実際に動いた周だけ**（何も起きていない
             // 2 秒周期のたびに全読み + JSON パースをやり直さない）
             if hooks_changed {
                 adopt_hook_states(app);
             }
-            // ペインの中で `/resume` された窓を新しいセッションの行へ張り替える。
-            // **名前の読み直しの前**に置く: 張り替えで作った行の表示名は
-            // transcript から来るので、同じ周期の refresh_transcripts が拾う
-            follow_session_switches(app);
             refresh_transcripts(app);
             app.last_scan = std::time::Instant::now();
             force_draw = true; // 並びが変わったら即描画（表示と行データのずれを残さない）
@@ -845,7 +869,10 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             .usage_dirty
             .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            let usage = app.source.usage();
+            let usage: BTreeMap<Kind, Usage> = Kind::ORDER
+                .into_iter()
+                .map(|kind| (kind, app.source.usage(kind)))
+                .collect();
             if usage != app.usage {
                 app.usage = usage;
                 force_draw = true;
@@ -1101,7 +1128,7 @@ pub(crate) enum Enter {
     /// 新規セッション画面を開く（`+ new session`）
     NewSession,
     UpdateCcdesk,
-    UpdateClaude,
+    UpdateAgent,
     /// 差し替え済みの ccdesk を再起動する（更新完了後の版行）
     RestartCcdesk,
 }
@@ -1113,7 +1140,7 @@ impl Enter {
             Self::Menu => "menu",
             Self::NewSession => "new session",
             // どちらの版行も利用者から見れば「更新する」1 つの動作
-            Self::UpdateCcdesk | Self::UpdateClaude => "update",
+            Self::UpdateCcdesk | Self::UpdateAgent => "update",
             // 行の右端の動詞（ui::UpdateState::verb）と同じ語 ＝ 押した結果が書いてある通り
             Self::RestartCcdesk => "restart",
         }
@@ -1126,15 +1153,12 @@ impl Enter {
 /// ここが `None` を返すことで表す ＝ 更新の無い版行（[`SidebarRow::Inert`]）と
 /// アカウント行（[`SidebarPos::Account`]）が同じ 1 つの答えを共有する
 pub(crate) fn selected_enter(app: &App) -> Option<Enter> {
-    let SidebarPos::Row(row) = app.selection else {
-        // アカウント行は今サインインしているアカウントを出すだけ
-        return None;
-    };
+    let SidebarPos::Row(row) = app.selection;
     match app.sidebar_rows.get(row)?.action()? {
         RowAction::New => Some(Enter::NewSession),
         RowAction::Open(_) | RowAction::Project(_) | RowAction::ToggleGroup => Some(Enter::Menu),
         RowAction::UpdateCcdesk => Some(Enter::UpdateCcdesk),
-        RowAction::UpdateClaude => Some(Enter::UpdateClaude),
+        RowAction::UpdateAgent(_) => Some(Enter::UpdateAgent),
         RowAction::RestartCcdesk => Some(Enter::RestartCcdesk),
     }
 }
@@ -1149,9 +1173,7 @@ pub(crate) fn selected_enter(app: &App) -> Option<Enter> {
 /// 位置はクリックで開くときと同じ [`selected_row_y`]（開き方で場所が変わらない）
 fn run_enter(app: &mut App) {
     let anchor_y = selected_row_y(app);
-    let SidebarPos::Row(row) = app.selection else {
-        return; // メニューを持たない位置（アカウント行）
-    };
+    let SidebarPos::Row(row) = app.selection;
     let Some(action) = app.sidebar_rows.get(row).and_then(SidebarRow::action).cloned() else {
         return;
     };
@@ -1176,7 +1198,7 @@ fn run_row_action(app: &mut App, action: RowAction, anchor_y: u16) {
         RowAction::Project(cwd) => open_project_popup(app, cwd, anchor_y),
         // 更新行はその場で実行するだけ（右ペインを切り替えない）
         RowAction::UpdateCcdesk => start_ccdesk_update(app),
-        RowAction::UpdateClaude => start_claude_update(app),
+        RowAction::UpdateAgent(kind) => start_agent_update(app, kind),
         RowAction::RestartCcdesk => request_restart(app),
         // セッション行は呼び手が経路を選ぶ（クリック = 開く / Enter = メニュー）
         RowAction::Open(id) => {
@@ -1195,7 +1217,9 @@ pub(crate) fn start_new_session(app: &mut App) -> anyhow::Result<()> {
     };
     let cwd = state.cur_dir.clone();
     let prompt = state.prompt.text.trim().to_string();
-    dispatch_session(app, cwd, prompt);
+    // **どの agent を起こすかは New 画面の選択が正本**
+    let kind = state.kind;
+    dispatch_session(app, kind, cwd, prompt);
     Ok(())
 }
 
@@ -1266,15 +1290,43 @@ fn save_sessions(app: &mut App) {
 /// 落ちていた行はここで戻し、次の保存でもう一度ディスクへ載せに行く
 fn refresh_sessions(app: &mut App) {
     let open: Vec<SessionId> = app.windows.iter().map(|w| w.session_id.clone()).collect();
-    let fresh = app.source.sessions();
+    let mut fresh = app.source.sessions();
     let dropped: Vec<SessionRow> = rows_dropped_while_open(&fresh, &app.sessions, &open)
         .into_iter()
         .cloned()
         .collect();
+    restore_conversations(&mut fresh, &app.sessions);
     app.sessions = fresh;
     if !dropped.is_empty() {
         app.sessions.extend(dropped);
         save_sessions(app);
+    }
+}
+
+/// 読み直しで会話を失った行へ、**メモリ上の写しが知っている会話を戻す**
+/// （[`refresh_sessions`] の判断。副作用を持たないので単体で検査できる）。
+///
+/// **保存されるのは確かめた会話だけ**（[`crate::sessions::Conversation::Observed`]）
+/// なので、起動直後の `Assigned`（ccdesk が採番して `--session-id` で渡した値）は
+/// ディスクに載らない。読み直しは丸ごとの置き換えなので、戻さないと
+/// **2 秒ごとに会話を失う**。
+///
+/// 普段は同じ周期の `adopt_conversations` が hook から `Observed` を戻すので
+/// 気づけないが、**hook が一度も来ない行は永久に会話を失う**（表示名が
+/// `new session` に固定され、開き直しが agent のピッカーになる）。hook の注入は
+/// 実際に失敗し得る（[`hook_settings`] が None を返す環境、codex なら exe パスに
+/// 空白がある場合）ので、hook 1 本に全部を賭けない。
+///
+/// **戻すのは `Unknown` の行だけ。** ディスクが会話を持っているなら、それは
+/// 他インスタンスが確かめた値かもしれない ＝ こちらの古い写しで踏み潰さない
+fn restore_conversations(fresh: &mut [SessionRow], mine: &[SessionRow]) {
+    for row in fresh
+        .iter_mut()
+        .filter(|row| row.conversation.id().is_none())
+    {
+        if let Some(known) = mine.iter().find(|m| m.session_id == row.session_id) {
+            row.conversation = known.conversation.clone();
+        }
     }
 }
 
@@ -1313,101 +1365,6 @@ fn hook_store_changed(
     true
 }
 
-/// その pid が**今**動かしているセッション。材料は 2 つあり、**hook が主**:
-///
-/// - **hook**（[`crate::hooks::HookStates::session_of`]）: claude は hook の子へ
-///   `CLAUDE_PID` を渡すので、記録は「どの claude が」「どのセッションで」起きたかを
-///   持っている。**turn が動いた瞬間に届く**ので、`/resume` `/clear` の張り替えを
-///   周期で待たない
-/// - **ライブ状態**（`~/.claude/sessions/<pid>.json`）: hook を
-///   注入できていないセッションのための従経路。2 秒周期のプロセス起動で届く
-///
-/// pid が分からない / どちらにもエントリが無い / `sessionId` が空なら None
-/// （＝ 何も張り替えない。npm 版のように `claude` が中間プロセス越しに起動する
-/// 環境では自分の子の pid が載らないので、この機能は黙って効かないだけになる）
-fn live_session_of(
-    pid: Option<u32>,
-    launched_at: u64,
-    hooks: &HookStates,
-    agents: &[AgentInfo],
-) -> Option<SessionId> {
-    let pid = pid?;
-    if let Some(id) = hooks.session_of(pid, launched_at) {
-        return Some(id.clone());
-    }
-    agents
-        .iter()
-        .filter(|a| a.is_interactive() && a.pid == Some(pid))
-        .map(|a| SessionId::new(a.session_id.clone()))
-        .find(|id| !id.is_empty())
-}
-
-/// ペインの中で `/resume` された窓を、**今動かしているセッションの行へ張り替える**。
-///
-/// `/resume` は claude の内部で起きるので ccdesk は関与しない ＝ 窓が起動時の UUID を
-/// 指したままだと、行が古い会話（と古い名前）を指し続ける。追従の鍵は pid で、
-/// 自分の子の pid はこちらが知っており、その pid が今どのセッションを動かしているかは
-/// [`live_session_of`] が答える。
-///
-/// **張り替えの検出はこの関数の比較 1 箇所だけ。** 行の作成・表示名・`last_view` の
-/// 更新はすべて [`adopt_switched_session`] が受け持つので、「切り替わったか」の
-/// 判断が 2 箇所に増えない
-fn follow_session_switches(app: &mut App) {
-    let switches: Vec<(usize, SessionId)> = app
-        .windows
-        .iter()
-        .enumerate()
-        .filter_map(|(i, window)| {
-            let next = live_session_of(
-                window.child.process_id(),
-                window.started_at,
-                &app.hook_states,
-                &app.agents,
-            )?;
-            (next != window.session_id).then_some((i, next))
-        })
-        .collect();
-    for (index, next) in switches {
-        let Some(window) = app.windows.get_mut(index) else {
-            continue;
-        };
-        let previous = std::mem::replace(&mut window.session_id, next.clone());
-        adopt_switched_session(app, &previous, &next, index == app.active);
-    }
-}
-
-/// 張り替え先の行を用意する（[`follow_session_switches`] だけが呼ぶ）。
-///
-/// **窓に触らないので単体で検査できる**（PTY を起こさずに、行の作成・`last_view` の
-/// 保存を確かめられる）。`shown` は「その窓が今ペインに出ているか」＝
-/// `last_view` を書き換えてよいかの判断。
-///
-/// 行が無ければ作る（`/resume` で選べる会話は ccdesk の一覧に無いこともある）。
-/// **名前は行が持たない**ので、作った行の表示名は次の描画で transcript から導かれる
-fn adopt_switched_session(app: &mut App, previous: &SessionId, next: &SessionId, shown: bool) {
-    let cwd = app
-        .row(previous)
-        .map(|row| row.cwd.clone())
-        .unwrap_or_default();
-    if app.row(next).is_none() {
-        app.sessions.push(SessionRow::new(next.clone(), cwd, now_ms()));
-        save_sessions(app);
-    }
-    // **次回起動で開く画面もこの窓の新しいセッションにする。** 保存は
-    // [`App::show_session`] と同じ [`WindowItem::LastView`] だが、切替の契機は
-    // ccdesk の外（claude の `/resume`）なのでその経路を通らない ＝ ここで書く。
-    // 呼ばれるのは張り替わった周期だけなので、書き込みも張り替え 1 回につき 1 度
-    if shown {
-        app.source.save_window(WindowItem::LastView(Some(next)));
-        // **離れた行へは何も書かない。** 窓が新しいセッションへ移った時点でその行を
-        // 動かしているものは無くなり、次の描画でそのまま Stopped になる
-        // （書き戻していた頃は、hook が持つ新しい記録より古い `stopped` が行に残った）。
-        // 既読にするのは**ペインに出ている窓**の張り替えだけ: 裏へ回した窓の
-        // `/resume` が遅れて反映された周で、見てもいない行の未読 ● を消さない
-        mark_read(app, next);
-    }
-}
-
 /// hook が書いた state を読み直す。**行へは何も写さない**（写していた頃は
 /// 保管と hook が食い違い、しかもどちらが新しいかが行ごとに逆になった）。
 ///
@@ -1422,9 +1379,34 @@ fn adopt_hook_states(app: &mut App) {
     if app.hook_states.any_row_went_idle_since(&previous) {
         app.source.note_turn_finished();
     }
+    adopt_conversations(app);
     let shown: Option<SessionId> = app.shown_session().cloned();
     if let Some(id) = shown {
         mark_read(app, &id);
+    }
+}
+
+/// hook が名乗った会話を行へ写す（[`crate::sessions::Conversation::Observed`]）。
+///
+/// **ペインの中の `/clear` `/resume` `/new` に追随する唯一の口。** どちらの agent も
+/// 会話が変われば `SessionStart` を撃ち、その payload は**その時点の**会話 ID を
+/// 運ぶ（両方実測）。記録の鍵は `CCDESK_ROW` ＝ 行なので、行はそのまま、
+/// 載っている会話だけが差し替わる ＝ **サイドバーに行は増えない**。
+///
+/// **claude と codex で分岐しない**のが以前との違い。かつては codex の行だけを
+/// 写していた（claude は「行 ID ＝ 会話 ID」だったので写す意味が無かった）が、
+/// その前提こそがペイン内の切り替えを pid 相関で追いかける羽目になった原因で、
+/// 行 ID を会話から切り離した今は両方が同じ 1 本の経路を通る
+fn adopt_conversations(app: &mut App) {
+    let mut changed = false;
+    for row in &mut app.sessions {
+        let Some(observed) = app.hook_states.conversation(&row.session_id) else {
+            continue;
+        };
+        changed |= row.conversation.observe(observed);
+    }
+    if changed {
+        save_sessions(app);
     }
 }
 
@@ -1618,10 +1600,8 @@ fn open_project_popup(app: &mut App, cwd: String, anchor_y: u16) {
 /// メニューが行からずれて出るので、**キーボードもマウスもこの 1 つの計算に乗せる**。
 /// メニューの矩形はこの 1 つ下に出るので、Enter でメニューを開く位置は全部これを使う
 fn selected_row_y(app: &App) -> u16 {
-    match app.selection {
-        SidebarPos::Row(row) => row_y(row, app.sidebar_header_rows, app.sidebar_scroll),
-        SidebarPos::Account => sidebar_layout(app).account_y,
-    }
+    let SidebarPos::Row(row) = app.selection;
+    row_y(row, app.sidebar_header_rows, app.sidebar_scroll)
 }
 
 /// 指定フォルダ・プロンプトで前景セッションを 1 本起こす
@@ -1629,7 +1609,7 @@ fn selected_row_y(app: &App) -> u16 {
 ///
 /// **PTY の起動は同期**（数 ms）。結果を待つ別スレッドが要らないので、
 /// 起動と反映が 1 本の流れに収まる
-fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
+fn dispatch_session(app: &mut App, kind: Kind, cwd: String, prompt: String) {
     // フォルダの登録はここでは行わない（起動が成功してから ＝ [`apply_launch`]）。
     // 打った文字列は new session 画面の初期値として持つだけに留める
     app.dispatch_cwd = cwd.clone();
@@ -1642,7 +1622,7 @@ fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
     // 起動しない ＝ 失敗もしないので `Ok(None)` で実データと同じ反映経路へ渡す
     // （demo だけフォルダの登録の意味が違う、という状態を作らない）
     let launched = if app.source.spawns_sessions() {
-        start_foreground(app, &cwd, &prompt)
+        start_foreground(app, kind, &cwd, &prompt)
     } else {
         Ok(None)
     };
@@ -1656,25 +1636,28 @@ fn dispatch_session(app: &mut App, cwd: String, prompt: String) {
 /// 新規生成なので同 cwd の既存 transcript と衝突しない。
 ///
 /// **行を足すのは起動できてから**（起動できなかったセッションを一覧に残さない）
-fn start_foreground(app: &mut App, cwd: &str, prompt: &str) -> Launched {
+fn start_foreground(app: &mut App, kind: Kind, cwd: &str, prompt: &str) -> Launched {
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
     // state を取る hook を注入する（statusLine は載せない ＝ ユーザーの
     // statusline を奪わない。[`crate::hooks::inject_settings`]）
-    let settings = hook_settings(app);
+    let injection = hook_settings(app);
+    let inject = injection.as_ref().map(as_inject);
     let (rows, cols) = app.pane_size();
-    let window = Session::spawn(
-        &session_id,
-        cwd,
-        rows,
-        cols,
-        Launch::New { prompt },
-        settings.as_deref(),
-    )
-    .map_err(|e| format!("failed to start session: {e}"))?;
+    let spawn = kind.spawn_command(&session_id, cwd, Launch::New { prompt }, inject.as_ref());
+    // **渡した会話 ID を控えるのは起こす前。** 起こしてから読み直せる場所は無い
+    // （argv には出ているが、そこから読み戻すのは同じ知識の 2 本目になる）
+    let conversation = spawn.conversation;
+    let window = Session::spawn(&session_id, spawn.cmd, rows, cols)
+        .map_err(|e| format!("failed to start session: {e}"))?;
     // **名前は入れない。** 1 ターン目が終わるまで transcript は無いので、
     // それまでこの行は [`UNTITLED`] で出る（起動プロンプトの写しを行へ置くと、
     // 正本が 2 つになって同じ問題が戻る）
-    app.sessions.push(SessionRow::new(session_id.clone(), cwd, now_ms()));
+    let mut row = SessionRow {
+        kind,
+        ..SessionRow::new(session_id.clone(), cwd, now_ms())
+    };
+    row.conversation.assign(conversation);
+    app.sessions.push(row);
     save_sessions(app);
     app.windows.push(window);
     app.show_session(app.windows.len() - 1);
@@ -1699,8 +1682,8 @@ fn resize_terminal(app: &mut App, w: u16, h: u16) {
 /// 表示を変えるので常に描く
 fn mouse_needs_redraw(
     kind: MouseEventKind,
-    prev_hover: (Option<SidebarPos>, bool),
-    hover: (Option<SidebarPos>, bool),
+    prev_hover: (Option<SidebarPos>, Option<Kind>),
+    hover: (Option<SidebarPos>, Option<Kind>),
 ) -> bool {
     !matches!(kind, MouseEventKind::Moved) || prev_hover != hover
 }
@@ -1753,18 +1736,23 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
     // 右ペインの列範囲に描かれるため、後回しにするとペインのクリックに食われる。
     // 当たり判定は描画と同じ導出（[`crate::ui::usage_hit`]）なので、
     // 出していないとき（notice 表示中・狭い端末・使用率を切っている）は当たらない
-    let on_usage = crate::ui::usage_hit(app)
-        .is_some_and(|hit| mouse.row == hit.row && hit.columns.contains(&mouse.column));
+    // **行ごとに当たる**（押した行の agent だけを取り直す）
+    let on_usage = crate::ui::usage_hits(app).into_iter().find(|hit| {
+        hit.row == mouse.row && hit.columns.contains(&mouse.column)
+    });
     // 乗っている間は帯で「押せる」ことを示す（一覧の行のホバーと同じ手段）
-    app.usage_hovered = on_usage;
-    if on_usage && let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+    app.usage_hovered = on_usage.as_ref().map(|hit| hit.kind);
+    if let Some(hit) = on_usage
+        && let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+    {
         // 取り直しを実際に頼めたときだけスピナーを始める（撮影用の供給元は
         // 取得しない ＝ 降ろす者がいない旗を立てない）。ここで立てるのは
         // クリック直後のフレームから回すため（取得スレッド任せだと最初の
         // 描き直しまで押した反応が出ない）
-        if app.source.refresh_usage() {
-            app.usage_fetching
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+        if app.source.refresh_usage(hit.kind)
+            && let Some(flag) = app.usage_fetching.get(&hit.kind)
+        {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         return Ok(false);
     }
@@ -1785,28 +1773,9 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         }
         // アカウント行（フッター下段）はサイドバー一覧の行ではないので、
         // 一覧のヒットテスト（`row_at` はフッター帯を不感帯にする）ではなくここで受ける。
-        // **列は見ない = 行のどこを押しても当たる**（一覧の行と同じ規則）。
-        // **押しても何も起きない行**（今サインインしているアカウントを出すだけ）
-        // なので、受けるのは選択とホバーだけ ＝ 更新の無い版行と同じ扱い
-        if sl.footer_visible && mouse.row == sl.account_y {
-            // ホバーもここで決める ＝ **当たり判定はクリックと同じこの 1 分岐**
-            // （フッターを描いていない狭い端末はこの分岐に入らないのでホバーもしない）
-            app.hovered = Some(SidebarPos::Account);
-            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                app.set_focus(Focus::Sidebar);
-                // 選択もここへ移す（キーボードで降りたときと同じ位置に居る）
-                app.selection = SidebarPos::Account;
-            }
-            return Ok(false);
-        }
         // 画面 y → 行 index（列は見ないので行のどこを押しても当たる）。
         // 計算は描画側と同じ ui::row_at を共有する
-        let row = row_at(
-            mouse.row,
-            sl.capacity,
-            app.sidebar_header_rows,
-            app.sidebar_scroll,
-        );
+        let row = row_at(mouse.row, sl.capacity, app.sidebar_header_rows, app.sidebar_scroll);
         // hover: **実体のある行**の上にいるときだけハイライト（飾りは光らせない）。
         // 押しても何も起きない行も行なので、ここは動作の有無では見ない。
         // **hover の判断に clone は要らない**（マウス移動は毎秒 100 回以上届くので、
@@ -1844,12 +1813,14 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         if let MouseEventKind::Down(_) = mouse.kind {
             app.set_focus(Focus::Terminal);
         }
-        // 右ペイン矩形は state の可変借用の前に取る（正本は ui::pane_rect）
+        // 右ペイン矩形と出す agent は state の可変借用の前に取る
+        // （矩形の正本は ui::pane_rect、agent の正本は App::kinds）
         let pane = crate::ui::pane_rect(app);
+        let kinds = app.kinds.clone();
         // New 画面: 入力の解釈は new_view 側（ヒットテストのジオメトリ知識を
         // レイアウトと同じファイルに閉じる）。起動だけは state の借用を抜けて実行
         if let RightView::New(state) = &mut app.right_view {
-            let action = state.handle_mouse(pane, mouse);
+            let action = state.handle_mouse(pane, mouse, &kinds);
             if action == Some(crate::ui::new_view::NewAction::Launch) {
                 start_new_session(app)?;
             }
@@ -1899,6 +1870,7 @@ fn open_session_popup(app: &mut App, id: &SessionId, anchor_y: u16) {
 /// モーダル表示中のキー操作（Esc = 全閉 / ↑↓ = 選択 / Enter = 実行）
 fn handle_popup_key(app: &mut App, code: KeyCode) {
     let grouping = app.grouping;
+    let kinds = app.kinds.clone();
     match code {
         // 階層を積まないので戻り先は無い。どの階層でも 1 度で全部閉じる
         KeyCode::Esc => app.popup = None,
@@ -1909,7 +1881,7 @@ fn handle_popup_key(app: &mut App, code: KeyCode) {
         }
         KeyCode::Down => {
             if let Some(popup) = app.popup.as_mut() {
-                let last = popup.kind.entries(grouping).len().saturating_sub(1);
+                let last = popup.kind.entries(grouping, &kinds).len().saturating_sub(1);
                 popup.selected = (popup.selected + 1).min(last);
             }
         }
@@ -1941,7 +1913,7 @@ fn handle_popup_click(app: &mut App, col: u16, row: u16) {
     // 枠内に入りきらないメニューは描画がスクロールしている（[`crate::ui::popup_scroll`]）
     // ので、クリックの行 → 項目 index も同じずらしを通す
     let visible = rect.height.saturating_sub(2) as usize;
-    let total = popup.kind.entries(app.grouping).len();
+    let total = popup.kind.entries(app.grouping, &app.kinds).len();
     let offset = crate::ui::popup_scroll(popup.selected, total, visible);
     activate_popup(app, offset + (row - rect.y - 1) as usize);
 }
@@ -1951,7 +1923,7 @@ fn activate_popup(app: &mut App, index: usize) {
     let Some(popup) = app.popup.as_ref() else {
         return;
     };
-    let mut entries = popup.kind.entries(app.grouping);
+    let mut entries = popup.kind.entries(app.grouping, &app.kinds);
     if index >= entries.len() {
         return;
     }
@@ -1980,7 +1952,7 @@ fn run_popup_action(app: &mut App, action: PopupAction) {
         PopupAction::Close(id) => menu_close(app, &id),
         PopupAction::SetGrouping(next) => set_grouping(app, next),
         // 空プロンプトで起動する（登録は dispatch_session が行う）
-        PopupAction::NewSessionIn(cwd) => dispatch_session(app, cwd, String::new()),
+        PopupAction::NewSessionIn(kind, cwd) => dispatch_session(app, kind, cwd, String::new()),
         PopupAction::RemoveProject(cwd) => remove_project(app, &cwd),
     }
 }
@@ -2043,7 +2015,7 @@ fn menu_close(app: &mut App, id: &SessionId) {
 /// **書けなかったことを黙らせない**: hooks 無しで起動したセッションは状態報告が
 /// 縮退する（入力待ち・完了が導出できなくなる）ので、下部バーへ 1 行出す。
 /// セッション自体は hooks 無しで起動を続ける（起動を止めるほどの失敗ではない）
-fn hook_settings(app: &mut App) -> Option<std::path::PathBuf> {
+fn hook_settings(app: &mut App) -> Option<crate::hooks::Injection> {
     let settings = crate::hooks::inject_settings();
     if settings.is_none() {
         set_notice(
@@ -2053,6 +2025,15 @@ fn hook_settings(app: &mut App) -> Option<std::path::PathBuf> {
         );
     }
     settings
+}
+
+/// 書き出し済みの注入（[`crate::hooks::Injection`]）を、起動 1 回ぶんの借用へ。
+/// **所有と借用の変換だけ**（どう載せるかは [`crate::backend`] が決める）
+fn as_inject(injection: &crate::hooks::Injection) -> Inject<'_> {
+    Inject {
+        exe: &injection.exe,
+        settings: &injection.settings,
+    }
 }
 
 /// 指定セッションのウィンドウを閉じる（＝ 子プロセスを終わらせる）。
@@ -2103,33 +2084,20 @@ fn remove_window(app: &mut App, idx: usize) {
 /// （飾り ＝ [`SidebarRow::Decoration`] は飛ばす。押しても何も起きない行は止まる ＝
 /// 「触れる行」の集合はホバーと同じ [`SidebarRow::selectable`] 1 つで決まる）。
 ///
-/// **一覧とアカウント行は 1 つの輪**（マウスで押せる行はキーボードでも届く）:
-/// 一覧の末尾で `↓` → アカウント行 → もう一度 `↓` で一覧の先頭へ戻り、
-/// 一覧の先頭で `↑` はアカウント行へ回る。端で止めると「アカウント行から
-/// 一覧の先頭へ戻る」ために一覧全体を遡ることになる。
+/// **一覧は 1 つの輪**: 末尾で `↓` を押すと先頭へ、先頭で `↑` を押すと末尾へ回る。
+/// 端で止めると、先頭へ戻るために一覧全体を遡ることになる。
 ///
-/// **フッターを描いていないときは一覧の中だけで巡回する** ＝ 判断はマウスの
-/// 当たり判定と同じ [`sidebar_layout`] の `footer_visible`。
 /// 触れる行が 1 つも無ければ何も動かさない（無限に回らない）
 pub(crate) fn move_selection(app: &mut App, dir: i32) {
-    let len = app.sidebar_rows.len() as i32;
-    let account = sidebar_layout(app).footer_visible;
-    // アカウント行は「一覧の末尾の 1 つ先」に居る扱い。輪の長さはその 1 行を含む
-    let ring = len + i32::from(account);
+    let ring = app.sidebar_rows.len() as i32;
     if ring <= 0 {
         return;
     }
-    let mut at = match app.selection {
-        SidebarPos::Row(row) => row as i32,
-        SidebarPos::Account => len,
-    };
+    let SidebarPos::Row(row) = app.selection;
+    let mut at = row as i32;
     // 輪を 1 周するまで探す（触れる行が無ければ元の位置のまま戻る）
     for _ in 0..ring {
         at = (at + dir).rem_euclid(ring);
-        if at == len {
-            app.selection = SidebarPos::Account;
-            return;
-        }
         if app.sidebar_rows[at as usize].selectable() {
             app.selection = SidebarPos::Row(at as usize);
             app.sidebar_follow_sel = true; // 次の draw で選択行が見えるようスクロール
@@ -2186,22 +2154,34 @@ fn request_restart(app: &mut App) {
     app.restart_to = Some(exe);
 }
 
-/// claude 本体の更新を実行する（公式 `claude update`）。
+/// agent ごとの更新中の旗。**作るのはここ 1 箇所**なので、agent が増えても
+/// 旗を作り忘れた kind ができない（[`Kind::ORDER`] から導く）
+pub(crate) fn agent_updating_flags(
+) -> BTreeMap<Kind, Arc<std::sync::atomic::AtomicBool>> {
+    Kind::ORDER
+        .into_iter()
+        .map(|kind| (kind, Arc::new(std::sync::atomic::AtomicBool::new(false))))
+        .collect()
+}
+
+/// agent 本体の更新を実行する（`<agent> update`）。
 /// 公式仕様: 更新は次回起動時から有効で、実行中セッションは現行版のまま動き続ける。
 /// 完了後はフッターを再取得し、最新化されれば版行は最新表示へ戻る
-fn start_claude_update(app: &mut App) {
-    if app
-        .claude_updating
-        .swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
-        return; // 実行中の多重起動を防ぐ
+fn start_agent_update(app: &mut App, kind: Kind) {
+    let Some(flag) = app.agent_updating.get(&kind).cloned() else {
+        return;
+    };
+    if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return; // その agent の更新が走っている間の連打を防ぐ
     }
-    let updating = app.claude_updating.clone();
+    // **どのコマンドを叩くかは agent が答える**（[`crate::backend`]）
+    let program = kind.backend().update_program();
+    let updating = flag;
     let refresh = app.footer_refresh.clone();
     let dirty = app.footer_dirty.clone();
     std::thread::spawn(move || {
         use std::process::Stdio;
-        let _ = std::process::Command::new("claude")
+        let _ = std::process::Command::new(program)
             .arg("update")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2334,28 +2314,40 @@ fn expire_input_gate(app: &mut App) -> bool {
 
 /// 止まっている行の起こし直し方と、**その起動先の cwd**。
 ///
-/// 判断材料は 1 つ ＝ **`claude -r` が会話を見つけられる cwd があるか**
-/// （[`crate::title::Titles::resume_cwd`]）。副作用を持たないので単体で検査できる。
+/// **推測で resume しない**のがこの関数の芯。渡す ID が違えば別の会話が開くか、
+/// 見つからずに落ちる。だから材料は 2 つで、両方揃ったときだけ名指しする:
 ///
-/// - ある → その cwd で `claude -r <uuid>` を打つ
-/// - ない → **同じ UUID で新規として起こす**（行の cwd で）。会話が無い行
-///   （起こしただけで 1 ターンも終わっていない）と、会話はあるがその作業ツリーが
-///   消えている行の両方がここへ来る。どちらも `claude -r` は
-///   `No conversation found` になる（実測）
+/// | 行の会話 | 記録の在り処 | 起こし方 |
+/// |:--|:--|:--|
+/// | 確かめた（`Observed`） | 分かる | その cwd で `-r <id>` / `resume <id>` |
+/// | 確かめた（`Observed`） | 分からない | 行の cwd で**新規**（後述） |
+/// | それ以外 | — | 行の cwd で **agent のピッカー**（[`Launch::Pick`]） |
+///
+/// **2 段目が新規なのは、名指しもピッカーも答えを持たないから**: 記録の在り処が
+/// 分からない ＝ その作業ツリーが消えている（[`crate::title::Titles::resume_cwd`]）
+/// ので、`-r <id>` は `No conversation found`（実測）、ピッカーはその cwd の会話
+/// しか並べないのでその会話が出てこない。新規なら少なくとも行が動く。
+///
+/// **3 段目がピッカーなのは、こちらには答えがあり得るから**: 会話を確かめて
+/// いないだけで、agent 側には会話が在るかもしれない（hook を取り逃した等）。
+/// ccdesk が勝手に 1 つ選ぶより、ユーザーに選ばせる方が壊さない。
 ///
 /// **cwd を返すのが要点**: セッションは走行中に git worktree へ移れて、移った先の
-/// 会話は行の cwd から `claude -r` を打っても見つからない
-/// （`/resume` のピッカーに出ないのと同じ範囲の話）
+/// 会話は行の cwd から `-r` を打っても見つからない
+/// （`/resume` のピッカーに出ないのと同じ範囲の話）。
+///
+/// 副作用を持たないので単体で検査できる
 fn relaunch<'a>(
     titles: &crate::title::Titles,
     row: &'a SessionRow,
-) -> (Launch<'static>, std::borrow::Cow<'a, str>) {
+) -> (Launch<'a>, std::borrow::Cow<'a, str>) {
+    let here = std::borrow::Cow::Borrowed(row.cwd.as_str());
+    let Some(id) = row.conversation.observed() else {
+        return (Launch::Pick, here);
+    };
     match titles.resume_cwd(row) {
-        Some(cwd) => (Launch::Resume, std::borrow::Cow::Owned(cwd)),
-        None => (
-            Launch::New { prompt: "" },
-            std::borrow::Cow::Borrowed(row.cwd.as_str()),
-        ),
+        Some(cwd) => (Launch::Resume { id }, std::borrow::Cow::Owned(cwd)),
+        None => (Launch::New { prompt: "" }, here),
     }
 }
 
@@ -2385,31 +2377,50 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
         let _ = app.windows[i].child.kill();
         remove_window(app, i);
     }
-    // **別のインスタンス（または ccdesk の外）で動いているセッションを
+    // **別のインスタンス（または ccdesk の外）で動いている会話を
     // `claude -r` で二重に起こさない**: 同じ会話を 2 プロセスが同時に更新する。
-    // 判定材料はライブ状態（生きている前景セッションだけが載る）。
+    // **照合は会話 ID**（ライブ状態が載せているのは会話の側で、ccdesk の行 ID は
+    // どこにも出ない）。判定材料はライブ状態（生きている前景セッションだけが載る）。
     // 観測は 2 秒周期なので、止めた直後の自分のセッションが最大 2 秒ほど
     // 残って見えることがある（その間の open は 1 度空振りするだけで、壊れない）
-    if app
-        .agents
-        .iter()
-        .any(|a| a.is_interactive() && a.session_id == id.as_str())
-    {
+    let running = app
+        .row(id)
+        .and_then(|row| row.conversation.observed())
+        .is_some_and(|conversation| {
+            app.agents
+                .iter()
+                .any(|a| a.is_interactive() && a.session_id == conversation)
+        });
+    if running {
         set_notice(
             app,
             format!("session {id} is already running in another window"),
         );
         return false;
     }
+    // **注入は行を借りる前に済ませる**（`hook_settings` は notice を出すので
+    // `&mut App` が要り、`relaunch` が返す `Launch` は行を借り続ける）
+    let injection = hook_settings(app);
+    let inject = injection.as_ref().map(as_inject);
     let Some(row) = app.row(id) else {
         return false; // 再読み込みで消えた行（クリックと削除の競合）は何もしない
     };
+    let kind = row.kind;
     let (launch, cwd) = relaunch(&app.titles, row);
     let cwd = cwd.into_owned();
-    let settings = hook_settings(app);
+    let spawn = kind.spawn_command(id, &cwd, launch, inject.as_ref());
+    let conversation = spawn.conversation;
     let (rows, cols) = app.pane_size();
-    match Session::spawn(id, &cwd, rows, cols, launch, settings.as_deref()) {
+    match Session::spawn(id, spawn.cmd, rows, cols) {
         Ok(window) => {
+            // **起こし直しで会話が変わり得る**（記録を見失った行の新規起動）。
+            // 行はそのままで、載っている会話だけを差し替える。**保存まで済ませる**
+            // のは、記録を見失った行を新規で起こし直したときに古い会話が
+            // ディスクへ残るため（次に開くとその古い会話を名指ししてしまう）
+            if let Some(row) = app.row_mut(id) {
+                row.conversation.assign(conversation);
+            }
+            save_sessions(app);
             // 既読は**起こせてから**付ける（起こせなかった行の未読 ● を、
             // 内容を見ていないのに消さない）
             mark_read(app, id);
@@ -2434,6 +2445,7 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
 mod tests {
     use super::*;
 
+    use crate::sessions::Conversation;
     use crate::source::{persist_projects, WindowState};
     use crate::ui::MIN_SIDEBAR;
 
@@ -2458,8 +2470,10 @@ mod tests {
         });
     }
 
+    /// 既定（全 agent）の項目表。agent を切ったときの見え方は
+    /// 一覧を明示するテストが自分で `entries` を呼ぶ
     fn labels(kind: &PopupKind, grouping: Grouping) -> Vec<String> {
-        kind.entries(grouping)
+        kind.entries(grouping, &Kind::ORDER)
             .into_iter()
             .map(|entry| entry.label)
             .collect()
@@ -2467,7 +2481,7 @@ mod tests {
 
     /// (表示名, 実行可能か) の一覧（項目表の見た目を比べるテスト用）
     fn entry_pairs(kind: &PopupKind, grouping: Grouping) -> Vec<(String, bool)> {
-        kind.entries(grouping)
+        kind.entries(grouping, &Kind::ORDER)
             .into_iter()
             .map(|entry| (entry.label, entry.enabled))
             .collect()
@@ -2499,8 +2513,19 @@ mod tests {
         let usage = crate::usage::sample_ready(Vec::new());
         let mut app = test_app(34, TERM);
         app.source = Arc::new(TestSource::for_usage(usage.clone(), Arc::clone(&refreshes)));
-        app.usage = usage;
+        app.usage = Kind::ORDER.into_iter().map(|k| (k, usage.clone())).collect();
         (app, refreshes)
+    }
+
+    /// テスト用供給元が記録した「取り直しを頼まれた agent」の並び
+    fn usage_asked() -> Arc<Mutex<Vec<Kind>>> {
+        USAGE_ASKED.with(|slot| Arc::clone(&slot.borrow()))
+    }
+
+    thread_local! {
+        /// [`TestSource::for_usage`] が作った記録の写し（テストから引くため）
+        static USAGE_ASKED: std::cell::RefCell<Arc<Mutex<Vec<Kind>>>> =
+            std::cell::RefCell::new(Arc::new(Mutex::new(Vec::new())));
     }
 
     /// **右下の使用率を押すとその場で取り直す**（周期を待たない）。
@@ -2509,10 +2534,21 @@ mod tests {
     #[test]
     fn clicking_the_usage_gauge_refetches_it() {
         let (mut app, refreshes) = usage_app();
-        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
-        assert_eq!(hit.row, TERM.1 - 1, "the gauge is on the bottom bar");
+        let hits = crate::ui::usage_hits(&app);
+        // **行は出す agent ごとに 1 本ずつ**（数も並びも [`App::kinds`] が決める）
+        assert_eq!(
+            hits.iter().map(|h| h.kind).collect::<Vec<_>>(),
+            app.kinds,
+            "the gauge does not have one row per agent"
+        );
+        let top = TERM.1 - crate::ui::bottom_bar_rows(&app);
+        assert_eq!(
+            hits.iter().map(|h| h.row).collect::<Vec<_>>(),
+            vec![top, top + 1]
+        );
 
         // 領域の左端・右端どちらを押しても当たる
+        let hit = &hits[0];
         for column in [hit.columns.start, hit.columns.end - 1] {
             let before = refreshes.load(std::sync::atomic::Ordering::Relaxed);
             handle_mouse(&mut app, &click(column, hit.row)).unwrap();
@@ -2524,12 +2560,52 @@ mod tests {
         }
     }
 
+    /// **押した行の agent だけを取り直す。** 行をまたいで取りに行くと、
+    /// 見てもいない agent のプロセスが起きる
+    #[test]
+    fn clicking_one_usage_row_refetches_only_that_agent() {
+        let (mut app, refreshes) = usage_app();
+        let asked = usage_asked();
+        for hit in crate::ui::usage_hits(&app) {
+            let before = refreshes.load(std::sync::atomic::Ordering::Relaxed);
+            handle_mouse(&mut app, &click(hit.columns.start, hit.row)).unwrap();
+            assert_eq!(
+                refreshes.load(std::sync::atomic::Ordering::Relaxed),
+                before + 1,
+                "one click asked for more than one refetch"
+            );
+            assert_eq!(
+                asked.lock_recover().last().copied(),
+                Some(hit.kind),
+                "the click on row {} went to the wrong agent",
+                hit.row
+            );
+        }
+    }
+
+    /// **帯が乗るのは乗っている 1 行だけ**（押せる場所と光る場所を 1 対 1 にする）
+    #[test]
+    fn hovering_one_usage_row_marks_only_that_row() {
+        let (mut app, _) = usage_app();
+        let hits = crate::ui::usage_hits(&app);
+        for hit in &hits {
+            handle_mouse(&mut app, &moved(hit.columns.start, hit.row)).unwrap();
+            assert_eq!(
+                app.usage_hovered,
+                Some(hit.kind),
+                "row {} marked the wrong agent",
+                hit.row
+            );
+        }
+    }
+
     /// **使用率の外を押しても取り直さない。** 右ペイン側の列に描かれるので、
     /// 1 桁ずれただけでペインのクリックへ落ちることを固定する
     #[test]
     fn clicking_outside_the_usage_gauge_does_not_refetch() {
         let (mut app, refreshes) = usage_app();
-        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
+        let hits = crate::ui::usage_hits(&app);
+        let hit = hits.first().expect("the gauge is on screen");
         // 領域の 1 桁左、そして同じ列の 1 行上
         for (column, row) in [(hit.columns.start - 1, hit.row), (hit.columns.start, hit.row - 1)] {
             handle_mouse(&mut app, &click(column, row)).unwrap();
@@ -2543,12 +2619,13 @@ mod tests {
     #[test]
     fn hovering_the_usage_gauge_lights_it_up_and_redraws_once() {
         let (mut app, _) = usage_app();
-        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
+        let hits = crate::ui::usage_hits(&app);
+        let hit = hits.first().expect("the gauge is on screen");
 
         // 乗った ＝ 点く + 描き直す
         let prev = (app.hovered, app.usage_hovered);
         handle_mouse(&mut app, &moved(hit.columns.start, hit.row)).unwrap();
-        assert!(app.usage_hovered, "the gauge is not marked as hovered");
+        assert!(app.usage_hovered.is_some(), "the gauge is not marked as hovered");
         assert!(
             mouse_needs_redraw(MouseEventKind::Moved, prev, (app.hovered, app.usage_hovered)),
             "entering the gauge must ask for a redraw"
@@ -2564,7 +2641,7 @@ mod tests {
 
         // 外れた ＝ 消える（1 桁左はゲージの外）
         handle_mouse(&mut app, &moved(hit.columns.start - 1, hit.row)).unwrap();
-        assert!(!app.usage_hovered, "the mark stays after the mouse left");
+        assert!(app.usage_hovered.is_none(), "the mark stays after the mouse left");
     }
 
     /// **押した瞬間からスピナーが回る。** 旗はクリック側が立てる（取得スレッド任せ
@@ -2574,20 +2651,23 @@ mod tests {
     fn a_click_starts_the_spinner_only_when_a_fetch_was_requested() {
         // 取り直しを頼めた ＝ 回し始める
         let (mut app, _) = usage_app();
-        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
+        let hit = crate::ui::usage_hits(&app).remove(0);
         handle_mouse(&mut app, &click(hit.columns.start, hit.row)).unwrap();
         assert!(
-            app.usage_fetching.load(std::sync::atomic::Ordering::Relaxed),
+            app.usage_fetching[&hit.kind].load(std::sync::atomic::Ordering::Relaxed),
             "the spinner did not start on click"
         );
 
         // 取得しない供給元（既定の DemoSource は取り直さない）＝ 立てない
         let mut app = test_app(34, TERM);
-        app.usage = crate::usage::sample_ready(Vec::new());
-        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
+        app.usage = Kind::ORDER
+            .into_iter()
+            .map(|k| (k, crate::usage::sample_ready(Vec::new())))
+            .collect();
+        let hit = crate::ui::usage_hits(&app).remove(0);
         handle_mouse(&mut app, &click(hit.columns.start, hit.row)).unwrap();
         assert!(
-            !app.usage_fetching.load(std::sync::atomic::Ordering::Relaxed),
+            !app.usage_fetching[&hit.kind].load(std::sync::atomic::Ordering::Relaxed),
             "a spinner started that no one will stop"
         );
     }
@@ -2597,17 +2677,20 @@ mod tests {
     #[test]
     fn a_hidden_usage_gauge_has_no_hit_area() {
         let app = test_app(34, TERM);
-        assert!(matches!(app.usage, Usage::Unknown), "the fixture's premise broke");
-        assert!(crate::ui::usage_hit(&app).is_none());
+        assert!(app.usage.is_empty(), "the fixture's premise broke");
+        assert!(crate::ui::usage_hits(&app).is_empty());
     }
 
     /// notice を出している間は下部バーが notice に置き換わるので、当たり判定も無い
     #[test]
     fn a_notice_takes_the_bottom_bar_and_the_hit_area_with_it() {
         let (mut app, _) = usage_app();
-        assert!(crate::ui::usage_hit(&app).is_some(), "the fixture's premise broke");
+        assert!(
+            !crate::ui::usage_hits(&app).is_empty(),
+            "the fixture's premise broke"
+        );
         app.notice = Some(("something happened".to_string(), std::time::Instant::now()));
-        assert!(crate::ui::usage_hit(&app).is_none());
+        assert!(crate::ui::usage_hits(&app).is_empty());
     }
 
     /// プロジェクトメニューが指すフォルダ
@@ -2654,7 +2737,7 @@ mod tests {
         );
         assert_eq!(
             session("s1", false)
-                .entries(Grouping::State)
+                .entries(Grouping::State, &Kind::ORDER)
                 .into_iter()
                 .map(|entry| entry.enabled)
                 .collect::<Vec<_>>(),
@@ -2706,11 +2789,11 @@ mod tests {
     fn group_menu_marks_the_current_grouping_and_maps_each_row_to_it() {
         assert_eq!(
             labels(&PopupKind::State, Grouping::State),
-            ["● state", "  directory"]
+            ["● state", "  directory", "  agent"]
         );
         assert_eq!(
             labels(&PopupKind::State, Grouping::Directory),
-            ["  state", "● directory"]
+            ["  state", "● directory", "  agent"]
         );
         assert_eq!(
             PopupKind::State.action(Grouping::State, 0),
@@ -2720,7 +2803,14 @@ mod tests {
             PopupKind::State.action(Grouping::State, 1),
             Some(PopupAction::SetGrouping(Grouping::Directory))
         );
-        assert_eq!(PopupKind::State.action(Grouping::State, 2), None);
+        assert_eq!(
+            PopupKind::State.action(Grouping::State, 2),
+            Some(PopupAction::SetGrouping(Grouping::Agent))
+        );
+        assert_eq!(
+            PopupKind::State.action(Grouping::State, Grouping::ORDER.len()),
+            None
+        );
     }
 
     /// セッション行の**行末** `=` クリックでメニューが開く（二次操作の入口）。
@@ -2789,19 +2879,31 @@ mod tests {
             cwd: "C:\\dev\\shop-app".to_string(),
             has_sessions: false,
         };
+        // **agent ごとに項目が並ぶ**（この入口は New 画面を通さず即起動するので、
+        // 押す前にどちらが起きるか分かる必要がある）
         assert_eq!(
             labels(&kind, Grouping::State),
-            ["new session", "remove project"]
+            ["new claude session", "new codex session", "remove project"]
         );
         assert_eq!(
             kind.action(Grouping::State, 0),
-            Some(PopupAction::NewSessionIn("C:\\dev\\shop-app".to_string()))
+            Some(PopupAction::NewSessionIn(
+                Kind::Claude,
+                "C:\\dev\\shop-app".to_string()
+            ))
         );
         assert_eq!(
             kind.action(Grouping::State, 1),
+            Some(PopupAction::NewSessionIn(
+                Kind::Codex,
+                "C:\\dev\\shop-app".to_string()
+            ))
+        );
+        assert_eq!(
+            kind.action(Grouping::State, 2),
             Some(PopupAction::RemoveProject("C:\\dev\\shop-app".to_string()))
         );
-        assert_eq!(kind.action(Grouping::State, 2), None);
+        assert_eq!(kind.action(Grouping::State, 3), None);
     }
 
     /// Esc は開いているメニューを閉じる（階層を持たないので戻り先も無い）。
@@ -2824,12 +2926,15 @@ mod tests {
     #[test]
     fn arrow_keys_clamp_the_selection_to_the_entry_range() {
         let mut app = test_app(34, TERM);
-        // 2 項目のメニュー（state / directory）
         open(&mut app, PopupKind::State, 3);
         for _ in 0..5 {
             handle_popup_key(&mut app, KeyCode::Down);
         }
-        assert_eq!(app.popup.as_ref().unwrap().selected, 1);
+        // 末尾で止まる（項目数は [`Grouping::ORDER`] が決める ＝ 数を書き写さない）
+        assert_eq!(
+            app.popup.as_ref().unwrap().selected,
+            Grouping::ORDER.len() - 1
+        );
         for _ in 0..5 {
             handle_popup_key(&mut app, KeyCode::Up);
         }
@@ -2843,7 +2948,7 @@ mod tests {
         let kind = session("s1", false);
         // 位置は並びから引く（項目を足したときに黙って別の行を突かない）
         let stop = kind
-            .entries(app.grouping)
+            .entries(app.grouping, &app.kinds)
             .iter()
             .position(|entry| entry.label == "stop")
             .expect("the stop entry is gone");
@@ -2994,8 +3099,9 @@ mod tests {
             "must overlap the resize border by the test's premise"
         );
         let border_col = app.sidebar_width;
-        // 2 行目 = `remove project`（実行されると登録から外れる ＝ 結果が見える）
-        handle_mouse(&mut app, &click(border_col, rect.y + 2)).unwrap();
+        // 末尾の行 = `remove project`（実行されると登録から外れる ＝ 結果が見える）
+        let last = rect.y + rect.height - 2;
+        handle_mouse(&mut app, &click(border_col, last)).unwrap();
         assert!(!app.dragging, "must not start a resize drag");
         assert_eq!(app.sidebar_width, 12, "sidebar width must not change");
         assert!(
@@ -3022,8 +3128,11 @@ mod tests {
         app
     }
 
-    /// 1 フレーム描いて最下行（下部バーの案内）を読む。**本番と同じ [`draw`]** を通す
-    /// ので、サイドバーの行の積み方と案内の対応がそのまま検査対象になる
+    /// 1 フレーム描いて下部バーの案内の行を読む。**本番と同じ [`draw`]** を通す
+    /// ので、サイドバーの行の積み方と案内の対応がそのまま検査対象になる。
+    ///
+    /// 読むのは下部バーの**1 行目**（案内はそこに出る。位置の正本は
+    /// [`crate::ui::BOTTOM_BAR_ROWS`] なので、最下行を数え直さない）
     fn drawn_bottom_bar(app: &mut App) -> String {
         let (w, h) = app.term_size;
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
@@ -3034,17 +3143,16 @@ mod tests {
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        (0..w).map(|x| buffer[(x, h - 1)].symbol()).collect()
+        let hint_row = h - crate::ui::bottom_bar_rows(app);
+        (0..w).map(|x| buffer[(x, hint_row)].symbol()).collect()
     }
 
-    /// 触れる位置（一覧の実体のある行 + フッターのアカウント行）を、
-    /// **描画が積んだ行から**列挙する
+    /// 触れる位置（一覧の実体のある行）を、**描画が積んだ行から**列挙する
     fn touchable_positions(app: &mut App) -> Vec<SidebarPos> {
         drawn_bottom_bar(app); // 1 フレーム描いて行を積む
         (0..app.sidebar_rows.len())
             .filter(|row| app.sidebar_rows[*row].selectable())
             .map(SidebarPos::Row)
-            .chain(std::iter::once(SidebarPos::Account))
             .collect()
     }
 
@@ -3099,7 +3207,7 @@ mod tests {
             drawn_bottom_bar(&mut app);
             app.selection = pos;
             let expected = selected_enter(&app);
-            if matches!(expected, Some(Enter::UpdateCcdesk | Enter::UpdateClaude)) {
+            if matches!(expected, Some(Enter::UpdateCcdesk | Enter::UpdateAgent)) {
                 continue;
             }
             press(&mut app, KeyCode::Enter);
@@ -3114,7 +3222,7 @@ mod tests {
                     app.restart_to.is_some(),
                     "{pos:?}: Enter restart did not arm a restart"
                 ),
-                Some(Enter::UpdateCcdesk | Enter::UpdateClaude) => unreachable!(),
+                Some(Enter::UpdateCcdesk | Enter::UpdateAgent) => unreachable!(),
                 None => {
                     assert!(app.popup.is_none(), "{pos:?}: a menu opened on a row that offers nothing");
                     assert!(
@@ -3176,8 +3284,11 @@ mod tests {
             "the hint lagged behind the selection: {inert_row:?}"
         );
 
-        // さらに下は `+ new session`（区切り線は飛ばす）＝ 別の動詞になる
-        press(&mut app, KeyCode::Down);
+        // 版行を通り過ぎたら `+ new session`（区切り線は飛ばす）＝ 別の動詞になる。
+        // **版行の数は [`Kind::ORDER`] が決める**ので、ここで数を書き写さない
+        for _ in 0..Kind::ORDER.len() {
+            press(&mut app, KeyCode::Down);
+        }
         let new_session_row = drawn_bottom_bar(&mut app);
         assert!(
             new_session_row.contains("Enter new session"),
@@ -3185,8 +3296,9 @@ mod tests {
         );
 
         // 戻しても同じフレームで戻る（片方向だけ追従しているのではない）
-        press(&mut app, KeyCode::Up);
-        press(&mut app, KeyCode::Up);
+        for _ in 0..Kind::ORDER.len() + 1 {
+            press(&mut app, KeyCode::Up);
+        }
         assert_eq!(drawn_bottom_bar(&mut app), update_row, "the hint did not follow back");
     }
 
@@ -3239,7 +3351,7 @@ mod tests {
         let mut app = test_app(sidebar_width, TERM);
         app.sidebar_rows = vec![
             SidebarRow::Action(RowAction::UpdateCcdesk),
-            SidebarRow::Action(RowAction::UpdateClaude),
+            SidebarRow::Action(RowAction::UpdateAgent(Kind::Claude)),
             SidebarRow::Decoration, // 区切り線
             SidebarRow::Action(RowAction::New),
         ];
@@ -3260,7 +3372,7 @@ mod tests {
         let rightmost = app.sidebar_width - 2;
         for (y, row, expected) in [
             (1u16, 0usize, RowAction::UpdateCcdesk),
-            (2, 1, RowAction::UpdateClaude),
+            (2, 1, RowAction::UpdateAgent(Kind::Claude)),
         ] {
             for col in [0, 1, 2, 5, rightmost - 1, rightmost] {
                 handle_mouse(&mut app, &click(col, y)).unwrap();
@@ -3354,15 +3466,20 @@ mod tests {
         /// 実ファイルを読まないので、テストが開発者の
         /// `~/.ccdesk/hook-states.json` に左右されない
         hooks: HookStates,
-        /// [`WindowItem::LastView`] として保存された値の記録（**保存された回数まで
-        /// 見たい**ので Vec）。実ファイル（`~/.ccdesk/state.json`）は書かない
-        views: Arc<Mutex<Vec<String>>>,
-        /// [`DataSource::refresh_usage`] が呼ばれた回数（claude は起こさない）。
+        /// [`DataSource::refresh_usage`] が呼ばれた回数（agent は起こさない）。
         /// **回数まで見る**のは、押していないのに取り直す経路が生えたら気づくため
         usage_refreshes: Arc<std::sync::atomic::AtomicUsize>,
+        /// 取り直しを頼まれた agent の並び。**どの行を押したかが正しく届いたか**を
+        /// 見る（回数だけだと、別の agent を取りに行っても気づけない）
+        usage_asked: Arc<Mutex<Vec<Kind>>>,
         /// [`DataSource::usage`] が返す値（当たり判定は「今出ているか」で決まるので、
         /// 出ている状態を作れる必要がある）
         usage: Usage,
+        /// 一覧の保存が呼ばれた回数（**保存しないことを検査する軸**）
+        session_saves: Arc<std::sync::atomic::AtomicUsize>,
+        /// 「ディスクにはこう載っている」一覧（[`DataSource::sessions`] が返す値）。
+        /// **読み直しが何を落とすか**を見るための軸で、実ファイルは読まない
+        disk_sessions: Vec<SessionRow>,
     }
 
     /// プロジェクト永続化側の振る舞い
@@ -3390,19 +3507,41 @@ mod tests {
             Self {
                 projects: ProjectsBackend::Absent,
                 hooks: HookStates::default(),
-                views: Arc::new(Mutex::new(Vec::new())),
                 usage_refreshes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                usage_asked: Arc::new(Mutex::new(Vec::new())),
                 usage: Usage::Unknown,
+                session_saves: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                disk_sessions: Vec::new(),
+            }
+        }
+
+        /// ディスクにこの一覧が載っている供給元（読み直しの検査）
+        fn for_disk_sessions(disk_sessions: Vec<SessionRow>) -> Self {
+            Self {
+                disk_sessions,
+                ..Self::plain()
+            }
+        }
+
+        /// 一覧の保存回数だけを見る供給元
+        fn for_session_saves(session_saves: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                session_saves,
+                ..Self::plain()
             }
         }
 
         /// 使用率が出ている供給元（クリック当たり判定の検査）
         fn for_usage(usage: Usage, usage_refreshes: Arc<std::sync::atomic::AtomicUsize>) -> Self {
-            Self {
+            let source = Self {
                 usage,
                 usage_refreshes,
                 ..Self::plain()
-            }
+            };
+            // 記録の写しをテストから引けるようにする（供給元は Arc<dyn> の裏に
+            // 隠れるので、ダウンキャストせずに済ませる）
+            USAGE_ASKED.with(|slot| *slot.borrow_mut() = Arc::clone(&source.usage_asked));
+            source
         }
 
         /// プロジェクト側だけを見る供給元
@@ -3421,13 +3560,6 @@ mod tests {
             }
         }
 
-        /// 開いていた画面（[`WindowItem::LastView`]）の保存を記録する供給元
-        fn for_views(views: Arc<Mutex<Vec<String>>>) -> Self {
-            Self {
-                views,
-                ..Self::plain()
-            }
-        }
     }
 
     impl DataSource for TestSource {
@@ -3436,10 +3568,12 @@ mod tests {
         // 保存は渡された一覧をそのまま返す（ディスクが空の単独起動と同じ結果なので
         // live の意味論と矛盾しない。[`ProjectsBackend::Absent`] と同じ判断）
         fn sessions(&self) -> Vec<SessionRow> {
-            Vec::new()
+            self.disk_sessions.clone()
         }
 
         fn store_sessions(&self, next: &[SessionRow]) -> Vec<SessionRow> {
+            self.session_saves
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             next.to_vec()
         }
 
@@ -3467,12 +3601,13 @@ mod tests {
             FooterInfo::default()
         }
 
-        fn usage(&self) -> Usage {
-            // テスト用の供給元は claude を起こさない（値は仕込まれたものを返すだけ）
+        fn usage(&self, _kind: Kind) -> Usage {
+            // テスト用の供給元は agent を起こさない（値は仕込まれたものを返すだけ）
             self.usage.clone()
         }
 
-        fn refresh_usage(&self) -> bool {
+        fn refresh_usage(&self, kind: Kind) -> bool {
+            self.usage_asked.lock_recover().push(kind);
             self.usage_refreshes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true
@@ -3494,16 +3629,8 @@ mod tests {
             }
         }
 
-        // 記録するのは「次に開く画面」だけ（他の項目は実ファイルへも書かない）。
-        // None（new session 画面）の保存表記は live 側の持ち物なので、
-        // ここでは Option の形をそのまま記録する
-        fn save_window(&self, item: WindowItem<'_>) {
-            if let WindowItem::LastView(view) = item {
-                self.views
-                    .lock_recover()
-                    .push(view.map(|id| id.to_string()).unwrap_or_default());
-            }
-        }
+        // 実ファイル（`~/.ccdesk/state.json`）は書かない
+        fn save_window(&self, _item: WindowItem<'_>) {}
 
         fn store_projects(&self, next: &[String]) -> Vec<String> {
             match &self.projects {
@@ -3523,6 +3650,12 @@ mod tests {
 
         fn spawn_pollers(&self, _sinks: PollSinks) {}
 
+        /// テストの供給元は設定を読まない（全 agent）。切った見え方を見たい
+        /// テストは `App::kinds` を直接置く
+        fn kinds(&self) -> Vec<Kind> {
+            Kind::ORDER.to_vec()
+        }
+
         // テストが実プロセス（claude）を起こさない。既定の供給元
         // （[`crate::source::DemoSource`]）と同じ約束を、差し替えた側でも守る
         fn spawns_sessions(&self) -> bool {
@@ -3536,55 +3669,16 @@ mod tests {
         use crate::poll::AccountStatus;
         App {
             footer: FooterInfo {
-                account: AccountStatus::LoggedIn("taro".to_string()),
+                accounts: Kind::ORDER
+                    .into_iter()
+                    .map(|kind| (kind, AccountStatus::LoggedIn("taro".to_string())))
+                    .collect(),
                 ..FooterInfo::default()
             },
             ..test_app(34, TERM)
         }
     }
 
-    /// **アカウント行は押しても何も起きない。** 出しているのは「今サインインして
-    /// いるのは誰か」だけなので、行全体が当たっても起きるのは選択とホバーだけ
-    /// （メニューは開かず、幅変更ドラッグにもならない）。
-    /// 当たり判定は描画と同じ [`sidebar_layout`] の `account_y`
-    #[test]
-    fn clicking_the_account_row_only_moves_the_selection() {
-        let mut app = app_with_account_footer();
-        let sl = sidebar_layout(&app);
-        assert!(sl.footer_visible, "the footer must be visible for this test's premise");
-        // 内容の桁は x=1..=sidebar_width-2（枠の内側）。列 0 も行に当たる
-        let rightmost = app.sidebar_width - 2;
-        for col in [0, 1, 2, 5, rightmost - 1, rightmost] {
-            app.selection = SidebarPos::Row(0);
-            handle_mouse(&mut app, &click(col, sl.account_y)).unwrap();
-            assert!(app.popup.is_none(), "a menu opened at col={col}");
-            assert!(!app.dragging, "col={col} must not start a resize drag");
-            // 選択はアカウント行へ移る（キーボードで降りたときと同じ位置に居る）
-            assert_eq!(app.selection, SidebarPos::Account, "col={col}");
-            // ホバーもアカウント行を指す（一覧の行 index には化けない）
-            assert_eq!(app.hovered, Some(SidebarPos::Account), "col={col}");
-        }
-        assert_eq!(app.sidebar_width, 34, "sidebar width must not change");
-    }
-
-    /// **アカウント行を選んだ `Enter` は何も起こさない。**
-    /// 更新の無い版行（[`SidebarRow::Inert`]）と同じ答えを
-    /// [`selected_enter`] 1 箇所から得ることの固定
-    #[test]
-    fn pressing_enter_on_the_account_row_does_nothing() {
-        let mut app = app_with_account_footer();
-        app.sidebar_rows = vec![SidebarRow::Action(RowAction::New)];
-        app.sidebar_header_rows = 1;
-        app.selection = SidebarPos::Account;
-        assert_eq!(selected_enter(&app), None, "the account row claims an Enter action");
-        press(&mut app, KeyCode::Enter);
-        assert!(app.popup.is_none(), "Enter opened a menu on the account row");
-        assert!(
-            matches!(app.right_view, RightView::Sessions),
-            "Enter changed the right pane from the account row"
-        );
-        assert_eq!(app.selection, SidebarPos::Account, "Enter moved the selection");
-    }
 
     /// ホバーの行き先が両方ある `App`: フッターのアカウント行と、一覧の押せる行 1 本
     fn app_with_hoverable_rows() -> App {
@@ -3594,100 +3688,25 @@ mod tests {
         app
     }
 
-    /// **アカウント行はマウスを乗せただけでホバー対象になる。** 一覧の行 index では
-    /// 表せない位置なので、以前は「一覧の行ではない」として除外されていた。
-    /// マウスが離れれば（他の行・サイドバーの外）ホバーは外れる
-    #[test]
-    fn hovering_the_account_row_marks_it_as_hovered() {
-        let mut app = app_with_hoverable_rows();
-        let sl = sidebar_layout(&app);
-        assert!(sl.footer_visible, "the footer must be visible for this test's premise");
-
-        handle_mouse(&mut app, &moved(3, sl.account_y)).unwrap();
-        assert_eq!(app.hovered, Some(SidebarPos::Account));
-
-        // 一覧の行へ移ればそちらのホバーへ移る（アカウント行のハイライトは消える）
-        handle_mouse(&mut app, &moved(3, 1)).unwrap();
-        assert_eq!(app.hovered, Some(SidebarPos::Row(0)));
-        // サイドバーの外へ出ればホバーは無くなる
-        let outside = app.sidebar_width + 5;
-        handle_mouse(&mut app, &moved(outside, sl.account_y)).unwrap();
-        assert_eq!(app.hovered, None);
-    }
-
-    /// **ホバーとクリックはまったく同じ行に当たる。** 当たり判定を別に計算していない
-    /// ことの担保なので、片方の y だけを見るのではなく、サイドバー内の全 y について
-    /// 「ホバーがアカウント行になる y」と「クリックで選択がアカウント行へ移る y」の
-    /// 集合が一致することを見る
-    #[test]
-    fn the_hover_and_the_click_hit_the_account_row_at_the_same_rows() {
-        // 突く桁は枠の内側かつ幅変更のつかみ代の外（行のどこでも当たるので 1 つで足りる）
-        const COL: u16 = 3;
-        let sl = sidebar_layout(&app_with_hoverable_rows());
-        assert!(
-            COL < app_with_hoverable_rows().sidebar_width - 1,
-            "the probed column must be inside the sidebar"
-        );
-        let rows = TERM.1;
-        let hovered_rows: Vec<u16> = (0..rows)
-            .filter(|y| {
-                let mut app = app_with_hoverable_rows();
-                handle_mouse(&mut app, &moved(COL, *y)).unwrap();
-                app.hovered == Some(SidebarPos::Account)
-            })
-            .collect();
-        let clicked_rows: Vec<u16> = (0..rows)
-            .filter(|y| {
-                let mut app = app_with_hoverable_rows();
-                handle_mouse(&mut app, &click(COL, *y)).unwrap();
-                app.selection == SidebarPos::Account
-            })
-            .collect();
-        assert_eq!(hovered_rows, clicked_rows, "the hover and the click hit different rows");
-        // 空集合どうしの一致で通らないように、その 1 行が描画のジオメトリと同じことも見る
-        assert_eq!(
-            hovered_rows,
-            vec![sl.account_y],
-            "the account row is not where sidebar_layout says"
-        );
-    }
-
-    /// フッターが無い（狭い）端末ではアカウント行は描かれないのでホバー対象にもしない。
-    /// **描いていない行を光らせない**という選択と同じ規則
-    #[test]
-    fn a_hidden_footer_keeps_the_account_row_out_of_the_hover() {
-        let mut app = app_with_hoverable_rows();
-        app.term_size = (60, 8); // 下部バー 1 行を引くと footer_visible が落ちる高さ
-        let sl = sidebar_layout(&app);
-        assert!(!sl.footer_visible, "the footer must be hidden for this test's premise");
-        handle_mouse(&mut app, &moved(3, sl.account_y)).unwrap();
-        assert_ne!(
-            app.hovered,
-            Some(SidebarPos::Account),
-            "a row that is not drawn must not be hovered"
-        );
-    }
-
     /// マウス移動でホバー位置が変わらないなら描き直さない（FPS 対策）。
-    /// **アカウント行でも同じ**: 行の中で桁が動いただけでは再描画しない
+    /// 行の中で桁が動いただけでは再描画しない
     #[test]
     fn moving_the_mouse_inside_the_same_row_does_not_redraw() {
         let mut app = app_with_hoverable_rows();
-        let sl = sidebar_layout(&app);
-        handle_mouse(&mut app, &moved(3, sl.account_y)).unwrap();
+        handle_mouse(&mut app, &moved(3, 1)).unwrap();
         let prev = (app.hovered, app.usage_hovered);
-        handle_mouse(&mut app, &moved(10, sl.account_y)).unwrap();
+        handle_mouse(&mut app, &moved(10, 1)).unwrap();
         assert_eq!(app.hovered, prev.0, "the same row must resolve to the same hover");
         assert!(
             !mouse_needs_redraw(MouseEventKind::Moved, prev, (app.hovered, app.usage_hovered)),
-            "moving inside the account row must not ask for a redraw"
+            "moving inside a row must not ask for a redraw"
         );
         // 行が変われば描き直す
         let prev = (app.hovered, app.usage_hovered);
-        handle_mouse(&mut app, &moved(3, 1)).unwrap();
+        handle_mouse(&mut app, &moved(3, 2)).unwrap();
         assert!(
             mouse_needs_redraw(MouseEventKind::Moved, prev, (app.hovered, app.usage_hovered)),
-            "leaving the account row must ask for a redraw"
+            "leaving a row must ask for a redraw"
         );
         // 移動以外は表示を変えるので常に描き直す
         assert!(mouse_needs_redraw(
@@ -3746,45 +3765,14 @@ mod tests {
 
         press(&mut app, KeyCode::Down); // 区切り線は飛ばす
         assert_eq!(app.selection, SidebarPos::Row(2));
-        press(&mut app, KeyCode::Down);
-        assert_eq!(app.selection, SidebarPos::Account, "must reach the account row");
-        // アカウント行の先は一覧の先頭（端で止まらない）
+        // 末尾の先は一覧の先頭（端で止まらない）
         press(&mut app, KeyCode::Down);
         assert_eq!(app.selection, SidebarPos::Row(0), "must wrap around to the top of the list");
-        // 一覧の先頭で `↑` はアカウント行へ回る
+        // 先頭で `↑` は末尾へ回る
         press(&mut app, KeyCode::Up);
-        assert_eq!(app.selection, SidebarPos::Account, "must wrap around to the account row");
-        press(&mut app, KeyCode::Up);
-        assert_eq!(app.selection, SidebarPos::Row(2), "must return to the list");
+        assert_eq!(app.selection, SidebarPos::Row(2), "must wrap around to the bottom");
     }
 
-    /// フッターが無い（狭い）端末ではアカウント行は描かれないので選択対象にもしない。
-    /// **押せない位置に選択を残さない**という一覧の行と同じ規則で、
-    /// 巡回は一覧の中だけで閉じる
-    #[test]
-    fn a_hidden_footer_keeps_the_account_row_out_of_the_selection() {
-        let mut app = app_with_account_footer();
-        app.term_size = (60, 8); // 下部バー 1 行を引くと footer_visible が落ちる高さ
-        assert!(
-            !sidebar_layout(&app).footer_visible,
-            "the footer must be hidden for this test's premise"
-        );
-        app.sidebar_rows = vec![SidebarRow::Action(RowAction::New)];
-        app.sidebar_header_rows = 1;
-        app.selection = SidebarPos::Row(0);
-        for key in [KeyCode::Down, KeyCode::Up] {
-            press(&mut app, key);
-            assert_eq!(
-                app.selection,
-                SidebarPos::Row(0),
-                "{key:?} must not select a row that is not drawn"
-            );
-        }
-        // 触れる行が 2 本あれば一覧の中で巡回する（フッターへは出ない）
-        app.sidebar_rows.push(SidebarRow::Action(RowAction::ToggleGroup));
-        press(&mut app, KeyCode::Up);
-        assert_eq!(app.selection, SidebarPos::Row(1), "the list must loop on its own");
-    }
 
     /// 更新の入口のガード。**副作用（ダウンロード）が起きない経路だけを通す**:
     /// 新しい版を知らないとき / 実行中 / 再起動待ちは、押しても何も始まらない。
@@ -3844,10 +3832,14 @@ mod tests {
     }
 
     /// テスト用の一覧行 1 本（cwd と更新時刻だけが関心事）。
-    /// `updated_at` は埋め戻しの「新しい順」に効くので明示で受ける
+    /// `updated_at` は埋め戻しの「新しい順」に効くので明示で受ける。
+    ///
+    /// **会話 ID は行 ID とわざと別の値**（`title` 側の fixture と同じ理由 ＝
+    /// 行 ID で会話を引く実装でも通ってしまうテストにしない）
     fn session_row(id: &str, cwd: &str, updated_at: u64) -> SessionRow {
         SessionRow {
             updated_at,
+            conversation: Conversation::Observed(format!("conv-{id}")),
             ..SessionRow::new(SessionId::new(id), cwd, updated_at)
         }
     }
@@ -3858,12 +3850,15 @@ mod tests {
     #[test]
     fn opening_a_session_running_elsewhere_does_not_double_resume() {
         let mut app = test_app(34, TERM);
-        app.sessions = vec![session_row("s", "C:\\dev\\api", 1)];
+        // **照合は会話 ID**（ライブ状態が名乗るのは会話の側。行 ID は出てこない）
+        app.sessions = vec![SessionRow {
+            conversation: Conversation::Observed("conv-1".to_string()),
+            ..session_row("s", "C:\\dev\\api", 1)
+        }];
         app.agents = vec![AgentInfo {
-            session_id: "s".to_string(),
+            session_id: "conv-1".to_string(),
             kind: "interactive".to_string(),
             status: "busy".to_string(),
-            pid: Some(4242),
             ..AgentInfo::default()
         }];
         assert!(
@@ -3886,30 +3881,54 @@ mod tests {
 
     // ── 起こし直し方 / `/resume` の追従 / リネームの書き先 ──────────────────
 
-    /// **1 ターンも会話していない行は `claude -r` で開けない。**
+    /// **推測で resume しない。** 起こし直し方は 3 通りで、`relaunch` の doc の
+    /// 表をそのまま固定する。
     ///
-    /// 前景セッションは 1 ターン終わるまで transcript を作らないので、起こして
-    /// すぐ `close` した行を `open` すると `No conversation found` になっていた。
-    /// **起動先の cwd も一緒に決まる**（会話が在る作業ツリーで打つ）
+    /// 3 通りに割れているのは、間違った ID を渡すと**別の会話が開くか、
+    /// 見つからずに落ちる**から。前景セッションは 1 ターン終わるまで transcript を
+    /// 作らないので、起こしてすぐ `close` した行を `-r` で開くと
+    /// `No conversation found` になっていた
     #[test]
-    fn a_row_with_no_transcript_is_started_fresh_instead_of_resumed() {
-        let temp =
-            crate::title::tests::TempProjects::new("a_row_with_no_transcript_is_started_fresh");
+    fn a_row_is_only_resumed_when_both_the_conversation_and_its_record_are_known() {
+        let temp = crate::title::tests::TempProjects::new("relaunch_needs_conversation_and_record");
         let mut titles = temp.titles();
+
+        // 1) 会話を確かめていない行 → agent 自身のピッカー（ID を渡さない）
+        let unknown = SessionRow {
+            conversation: Conversation::Unknown,
+            ..session_row("u", "C:\\dev\\api", 1)
+        };
+        let (launch, cwd) = relaunch(&titles, &unknown);
+        assert!(matches!(launch, Launch::Pick), "guessed a conversation to resume");
+        assert_eq!(cwd, unknown.cwd);
+
+        // 渡しただけ（`Assigned`）も同じ扱い。まだ 1 ターンも終わっていない会話を
+        // 名指しすると `No conversation found` になる
+        let assigned = SessionRow {
+            conversation: Conversation::Assigned("conv-a".to_string()),
+            ..session_row("a", "C:\\dev\\api", 1)
+        };
+        assert!(
+            matches!(relaunch(&titles, &assigned).0, Launch::Pick),
+            "an unconfirmed conversation was resumed by name"
+        );
+
+        // 2) 確かめた会話だが記録の在り処が分からない → 行の cwd で新規
         let mut row = session_row("s", "C:\\dev\\api", 1);
         let (launch, cwd) = relaunch(&titles, &row);
         assert!(
             matches!(launch, Launch::New { prompt } if prompt.is_empty()),
-            "a row with no conversation must not be resumed with -r"
+            "resumed a conversation whose record cannot be found"
         );
         assert_eq!(cwd, row.cwd, "a fresh start must use the row's own cwd");
-        // 1 ターン終わって transcript ができたら再開になる
+
+        // 3) 両方揃った → **会話 ID**で名指し（行 ID ではない）
         titles.write_transcript(&row, "{\"type\":\"user\"}\n");
         titles.title_now(&mut row);
         let (launch, cwd) = relaunch(&titles, &row);
         assert!(
-            matches!(launch, Launch::Resume),
-            "a row that has a conversation must be resumed"
+            matches!(launch, Launch::Resume { id } if id == "conv-s"),
+            "resumed with something other than the observed conversation"
         );
         assert_eq!(cwd, row.cwd);
     }
@@ -4117,147 +4136,139 @@ mod tests {
     }
 
 
-    /// **`/resume` の追従は pid → sessionId の 1 つの写像で決まる。**
-    /// 自分の子の pid はこちらが知っているので、その pid が今動かしている
-    /// セッションと窓の指す行がずれたら張り替えの合図になる
+    /// **ペインの中で会話が変わっても行は増えない**（1 ペイン = 1 行）。
+    ///
+    /// `/clear` `/resume` `/new` はどれも agent の内部で起きるので ccdesk は
+    /// 関与しない。気づく口は hook 1 本で、記録の鍵が行（`CCDESK_ROW`）なぶん、
+    /// 差し替わるのは行に載っている会話だけになる。
+    ///
+    /// **これが「行を増やす」方式との分かれ目。** 増やす方式では `/clear` の
+    /// たびにサイドバーへ行が生え、しかも会話 ID を採番しない codex では
+    /// 行が作れなかった
     #[test]
-    fn the_live_session_of_a_pid_comes_from_the_interactive_entry() {
-        let agent = |pid: Option<u32>, kind: &str, session: &str| AgentInfo {
-            session_id: session.to_string(),
-            kind: kind.to_string(),
-            pid,
-            ..AgentInfo::default()
-        };
-        let agents = vec![
-            agent(Some(10), "interactive", "after-resume"),
-            agent(Some(11), "interactive", "someone-else"),
-            agent(Some(12), "bg", "a-background-job"),
-            agent(Some(13), "interactive", ""),
-        ];
-        // hook が何も知らない間はライブ状態が答える（従経路）
-        let none = HookStates::default();
-        let of = |pid, hooks: &HookStates| live_session_of(pid, 0, hooks, &agents);
-        assert_eq!(of(Some(10), &none), Some(SessionId::new("after-resume")));
-        // pid が分からない / 載っていない / bg / sessionId が空 は追従しない
-        assert_eq!(of(None, &none), None);
-        assert_eq!(of(Some(99), &none), None);
-        assert_eq!(of(Some(12), &none), None, "a bg entry answered for a pane");
-        assert_eq!(of(Some(13), &none), None, "an empty id became a row");
-
-        // **hook が主。** 同じ pid について hook が別のセッションを知っていれば
-        // そちらを採る（hook は turn の瞬間に届くのでライブ状態より新しい）
-        let hooks = HookStates::from_records([("just-cleared", crate::poll::State::Waiting, 5_000, Some(10))]);
-        assert_eq!(of(Some(10), &hooks), Some(SessionId::new("just-cleared")));
-        // 窓の起動より古い hook は前回の実行のもの ＝ 従経路へ落ちる
-        assert_eq!(
-            live_session_of(Some(10), 5_001, &hooks, &agents),
-            Some(SessionId::new("after-resume"))
-        );
-        // hook しか知らない pid にも答える（ライブ状態が pid を載せない環境）
-        let only_hook = HookStates::from_records([("hook-only", crate::poll::State::Working, 1, Some(77))]);
-        assert_eq!(of(Some(77), &only_hook), Some(SessionId::new("hook-only")));
-    }
-
-    /// 張り替えたら**新しいセッションの行を用意し、次に開く画面もそれにする**。
-    /// 行が無ければ作る（`/resume` で選べる会話は ccdesk の一覧に無いこともある）
-    #[test]
-    fn adopting_a_switched_session_adds_the_row_and_moves_the_last_view() {
-        let views = Arc::new(Mutex::new(Vec::new()));
+    fn a_switch_inside_the_pane_moves_the_rows_conversation_without_adding_a_row() {
         let mut app = App {
-            sessions: vec![session_row("before", "C:\\dev\\api", 1)],
-            source: Arc::new(TestSource::for_views(views.clone())),
+            sessions: vec![
+                SessionRow {
+                    conversation: Conversation::Observed("conv-1".to_string()),
+                    ..session_row("row", "C:\\dev\\api", 1)
+                },
+                session_row("untouched", "C:\\dev\\api", 1),
+            ],
+            hook_states: HookStates::from_records([(
+                "row",
+                crate::poll::State::Idle,
+                5_000,
+                Some("conv-2"),
+            )]),
             ..test_app(34, TERM)
         };
-        let (before, after) = (SessionId::new("before"), SessionId::new("after"));
-        adopt_switched_session(&mut app, &before, &after, true);
+        adopt_conversations(&mut app);
 
-        let added = app
-            .sessions
-            .iter()
-            .find(|row| row.session_id == after)
-            .expect("the row for the new session was not created");
-        assert_eq!(added.cwd, "C:\\dev\\api", "the folder of the pane was not carried over");
-        assert!(
-            !app.hook_states.unread(added),
-            "the session showing in the pane became unread"
-        );
+        assert_eq!(app.sessions.len(), 2, "a row appeared for the new conversation");
         assert_eq!(
-            views.lock().unwrap().as_slice(),
-            ["after"],
-            "the next start would open the session from before the /resume"
+            app.sessions[0].conversation,
+            Conversation::Observed("conv-2".to_string()),
+            "the row kept pointing at the conversation from before the /clear"
         );
-        // **離れた行へは何も書かない。** 窓が移った時点でその行を動かすものは無く、
-        // 表示は描画側が Stopped にする（記録を残さないので古い値も残らない）
-        let left = app
-            .sessions
-            .iter()
-            .find(|row| row.session_id == before)
-            .expect("the row that was left behind is gone");
-        assert_eq!(left, &session_row("before", "C:\\dev\\api", 1), "the row left behind was written to");
-        assert!(
-            !app.hook_states.unread(left),
-            "leaving a row put an unread mark on it"
+        // hook が何も知らない行は触らない
+        assert_eq!(
+            app.sessions[1].conversation,
+            Conversation::Observed("conv-untouched".to_string())
         );
-
-        // 既にある行へ戻ったときは行を増やさない（`last_view` だけが動く）
-        adopt_switched_session(&mut app, &after, &before, true);
-        assert_eq!(app.sessions.len(), 2, "an existing row was duplicated");
-        assert_eq!(views.lock().unwrap().as_slice(), ["after", "before"]);
     }
 
-    /// **ペインに出ていない窓の張り替えでは `last_view` を動かさない**
-    /// （次に開くのは「最後に見ていた画面」なので、裏の窓で書き換えたら嘘になる）
+    /// **一覧の読み直しが、渡したばかりの会話を捨てない。**
+    ///
+    /// ディスクに載るのは確かめた会話だけなので、起動直後の `Assigned`
+    /// （ccdesk が採番して `--session-id` で渡した値）は読み直しで消える。
+    /// 普段は同じ周期の hook が `Observed` を戻すが、**hook が一度も来ない行**
+    /// （注入に失敗した環境）はここで会話を失うと二度と取り戻せない
     #[test]
-    fn adopting_a_switch_in_a_background_window_leaves_the_last_view_alone() {
-        let views = Arc::new(Mutex::new(Vec::new()));
+    fn a_reload_does_not_drop_a_conversation_the_disk_never_stored() {
+        let assigned = SessionRow {
+            conversation: Conversation::Assigned("conv-just-launched".to_string()),
+            ..session_row("s", "C:\\dev\\api", 1)
+        };
+        // ディスクから返る姿（`Assigned` は保存されないので会話を持たない）
+        let mut fresh = vec![SessionRow {
+            conversation: Conversation::Unknown,
+            ..session_row("s", "C:\\dev\\api", 1)
+        }];
+        restore_conversations(&mut fresh, std::slice::from_ref(&assigned));
+        assert_eq!(
+            fresh[0].conversation,
+            Conversation::Assigned("conv-just-launched".to_string()),
+            "the conversation ccdesk minted was thrown away by the reload"
+        );
+
+        // **ディスクが会話を持っていれば触らない**（他インスタンスが確かめた値を
+        // こちらの古い写しで踏み潰さない）
+        let mut fresh = vec![SessionRow {
+            conversation: Conversation::Observed("conv-from-another-instance".to_string()),
+            ..session_row("s", "C:\\dev\\api", 1)
+        }];
+        restore_conversations(&mut fresh, std::slice::from_ref(&assigned));
+        assert_eq!(
+            fresh[0].conversation,
+            Conversation::Observed("conv-from-another-instance".to_string()),
+            "clobbered another instance's conversation"
+        );
+
+        // 知らない行には何もしない（他インスタンスが作った行）
+        let mut fresh = vec![SessionRow {
+            conversation: Conversation::Unknown,
+            ..session_row("other", "C:\\dev\\api", 1)
+        }];
+        restore_conversations(&mut fresh, std::slice::from_ref(&assigned));
+        assert_eq!(fresh[0].conversation, Conversation::Unknown);
+
+        // **読み直しの経路が実際にこれを通る。** 純関数だけを固定すると、
+        // 呼び出しごと外れても気づけない（外れた瞬間、hook が来ない行が
+        // 2 秒ごとに会話を失う）
         let mut app = App {
-            sessions: vec![session_row("before", "C:\\dev\\api", 1)],
-            source: Arc::new(TestSource::for_views(views.clone())),
+            sessions: vec![assigned.clone()],
+            source: Arc::new(TestSource::for_disk_sessions(vec![SessionRow {
+                conversation: Conversation::Unknown,
+                ..session_row("s", "C:\\dev\\api", 1)
+            }])),
             ..test_app(34, TERM)
         };
-        adopt_switched_session(
-            &mut app,
-            &SessionId::new("before"),
-            &SessionId::new("after"),
-            false,
-        );
-        assert!(
-            views.lock().unwrap().is_empty(),
-            "a window that is not showing moved the next start's screen: {:?}",
-            views.lock().unwrap()
+        refresh_sessions(&mut app);
+        assert_eq!(
+            app.sessions[0].conversation,
+            Conversation::Assigned("conv-just-launched".to_string()),
+            "the reload path does not restore the conversation"
         );
     }
 
-    /// **変わっていない周期では何も保存しない。** 追従は 2 秒ごとのポーリングで
-    /// 見るので、毎周期書くと `~/.ccdesk/state.json` のロックを無駄に取り合う
+    /// **同じ会話を名乗り直した周では保存しない。** 名乗りは turn のたびに来るので、
+    /// 毎回保存すると `sessions.json` のロックを無駄に取り合う
     #[test]
-    fn a_pane_that_did_not_switch_saves_nothing() {
-        let views = Arc::new(Mutex::new(Vec::new()));
+    fn re_announcing_the_same_conversation_saves_nothing() {
+        let saves = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut app = App {
-            sessions: vec![session_row("same", "C:\\dev\\api", 1)],
-            source: Arc::new(TestSource::for_views(views.clone())),
-            // その pid は起動時と同じセッションを動かしている
-            agents: vec![AgentInfo {
-                session_id: "same".to_string(),
-                kind: "interactive".to_string(),
-                pid: Some(4242),
-                ..AgentInfo::default()
+            sessions: vec![SessionRow {
+                conversation: Conversation::Observed("conv-1".to_string()),
+                ..session_row("row", "C:\\dev\\api", 1)
             }],
+            source: Arc::new(TestSource::for_session_saves(Arc::clone(&saves))),
+            hook_states: HookStates::from_records([(
+                "row",
+                crate::poll::State::Idle,
+                5_000,
+                Some("conv-1"),
+            )]),
             ..test_app(34, TERM)
         };
-        // 窓が無い（PTY を起こさない）ので、検出の入口が空回りすることも同時に見る
-        follow_session_switches(&mut app);
-        assert!(
-            views.lock().unwrap().is_empty(),
-            "saved the next start's screen without a switch"
-        );
-        assert_eq!(app.sessions.len(), 1, "a row appeared without a switch");
-        // 「切り替わっていない」の判定そのもの（窓が指す ID と pid の現在の ID が同じ）
-        assert_eq!(
-            live_session_of(Some(4242), 0, &app.hook_states, &app.agents),
-            Some(SessionId::new("same")),
-            "the pid no longer resolves to the session it was started with"
-        );
+        adopt_conversations(&mut app);
+        assert_eq!(saves.load(std::sync::atomic::Ordering::Relaxed), 0, "saved without a change");
+
+        // 別の会話を名乗ったら 1 度だけ保存する
+        app.hook_states =
+            HookStates::from_records([("row", crate::poll::State::Idle, 6_000, Some("conv-2"))]);
+        adopt_conversations(&mut app);
+        assert_eq!(saves.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     /// **セッションが残っているプロジェクトは登録解除できない。** 一覧は
@@ -4268,14 +4279,16 @@ mod tests {
         assert_eq!(
             entry_pairs(&project("C:\\dev\\api", false), Grouping::Directory),
             [
-                ("new session".to_string(), true),
+                ("new claude session".to_string(), true),
+                ("new codex session".to_string(), true),
                 ("remove project".to_string(), true),
             ]
         );
         assert_eq!(
             entry_pairs(&project("C:\\dev\\api", true), Grouping::Directory),
             [
-                ("new session".to_string(), true),
+                ("new claude session".to_string(), true),
+                ("new codex session".to_string(), true),
                 ("remove project".to_string(), false),
             ],
             "remove project must not be selectable while sessions remain"
@@ -4498,7 +4511,10 @@ mod tests {
         let mut app = test_app(34, TERM);
         app.projects = vec!["C:\\dev\\api".to_string(), "C:\\work\\api".to_string()];
         open(&mut app, project("C:\\work\\api", false), 5);
-        handle_popup_key(&mut app, KeyCode::Down);
+        // 末尾の `remove project` まで下げる（項目数は [`Kind::ORDER`] が決める）
+        for _ in 0..Kind::ORDER.len() {
+            handle_popup_key(&mut app, KeyCode::Down);
+        }
         handle_popup_key(&mut app, KeyCode::Enter);
         assert!(app.popup.is_none(), "the menu is still open after the action ran");
         assert_eq!(app.projects, ["C:\\dev\\api"]);
@@ -4734,7 +4750,7 @@ mod tests {
             .map(|x| buffer[(x, rect.y + 1)].symbol())
             .collect();
         assert!(
-            drawn.contains("new session"),
+            drawn.contains("new claude session"),
             "the label is chopped by the right pane: {drawn:?}"
         );
         // そのはみ出した列のクリックが、描かれている項目どおりに効く
@@ -5150,15 +5166,17 @@ mod tests {
     #[test]
     fn the_session_menu_open_entry_routes_through_open_session() {
         let mut app = test_app(34, TERM);
-        app.sessions = vec![session_row("s", "C:\\ccdesk-test-no-such-folder", 1)];
+        app.sessions = vec![SessionRow {
+            conversation: Conversation::Observed("conv-1".to_string()),
+            ..session_row("s", "C:\\ccdesk-test-no-such-folder", 1)
+        }];
         // claude が行を開いた後に何か言った ＝ 未読
         app.hook_states = HookStates::from_entries([("s", crate::poll::State::Idle, 2)]);
         // 別インスタンスで稼働中 ＝ open_session のガードが決定的に止める
         app.agents = vec![AgentInfo {
-            session_id: "s".to_string(),
+            session_id: "conv-1".to_string(),
             kind: "interactive".to_string(),
             status: "busy".to_string(),
-            pid: Some(4242),
             ..AgentInfo::default()
         }];
         app.sidebar_rows = vec![SidebarRow::Action(RowAction::Open(SessionId::new("s")))];
@@ -5175,7 +5193,7 @@ mod tests {
             .as_ref()
             .expect("no menu opened")
             .kind
-            .entries(app.grouping)
+            .entries(app.grouping, &app.kinds)
             .iter()
             .position(|entry| entry.label == "open")
             .expect("the menu has no open entry");
@@ -5214,9 +5232,7 @@ mod tests {
             SidebarRow::Action(RowAction::ToggleGroup),
         ];
         app.sidebar_header_rows = app.sidebar_rows.len();
-        let positions = (0..app.sidebar_rows.len())
-            .map(SidebarPos::Row)
-            .chain(std::iter::once(SidebarPos::Account));
+        let positions = (0..app.sidebar_rows.len()).map(SidebarPos::Row);
         for pos in positions {
             for code in [KeyCode::Left, KeyCode::Right] {
                 app.selection = pos;
@@ -5316,3 +5332,4 @@ mod tests {
         assert!(app.popup.is_none(), "a removed shortcut opened a menu");
     }
 }
+

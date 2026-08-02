@@ -13,6 +13,7 @@ use crossterm::event::{
 use ccdesk::{load_setting, log_error};
 
 mod app;
+mod backend;
 mod claude_format;
 mod cli;
 mod git;
@@ -96,10 +97,22 @@ fn main() -> anyhow::Result<()> {
     //
     // **判断はここ 1 箇所**で、以降は供給元の中に閉じる
     let usage_display = load_setting("usage_display").as_deref() == Some("on");
+    // 出す agent（`~/.ccdesk/config.json` の `"codex": "on"` で足す）。
+    //
+    // **既定で出さないのは無駄なポーリングを誰にも起こさないため。** codex CLI が
+    // 無い環境ではアカウント取得が毎回失敗し、5 秒ごと（[`crate::poll`] の再試行
+    // 間隔）に codex のプロセス起動を試み続ける。使っている人だけが 1 行書く形なら、
+    // その空振りが起きる人がいない。
+    //
+    // **判断はここ 1 箇所**で、以降は `App::kinds` とポーラーへ渡した一覧が答える
+    // **設定を読むのはここだけ。** 以降は供給元（`source.kinds()`）が答えるので、
+    // 撮影用の供給元は設定に触れずに全 agent を返せる
+    let live_kinds = backend::Kind::enabled(load_setting);
     // 使用率の更新を run ループへ伝える旗と、クリック起点の取得が進行中か。
     // 供給元と App が同じものを持つ
     let usage_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let usage_fetching = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // 取得中スピナーの旗は agent ごと（押した行だけが回る）
+    let usage_fetching = app::agent_updating_flags();
     // demo / 実データの選択はこの 1 箇所だけ。以降のコードは供給元を通すので
     // 「今 demo か」を問う分岐を持たない（＝分岐の書き漏らしで実データが漏れない）
     let source: Arc<dyn DataSource> = if demo {
@@ -107,8 +120,9 @@ fn main() -> anyhow::Result<()> {
     } else {
         Arc::new(LiveSource::new(
             usage_display,
+            live_kinds,
             Arc::clone(&usage_dirty),
-            Arc::clone(&usage_fetching),
+            usage_fetching.clone(),
         ))
     };
     // セッション一覧・フッター・ウィンドウ状態はすべて供給元から受け取る
@@ -196,7 +210,7 @@ fn main() -> anyhow::Result<()> {
         footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
         footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        agent_updating: app::agent_updating_flags(),
         ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
         restart_to: None,
         ccdesk_latest: None,
@@ -204,13 +218,20 @@ fn main() -> anyhow::Result<()> {
         ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // 起動時の値は供給元から 1 度受け取る（撮影用は固定値、実データは
         // まだ取れていないので Unknown ＝ 何も描かない）
-        usage: source.usage(),
+        // **出す agent は供給元に聞く**（撮影は設定を読まない ＝ `--demo` の
+        // 見た目が撮る人の `config.json` で変わらない）
+        usage: source
+            .kinds()
+            .into_iter()
+            .map(|kind| (kind, source.usage(kind)))
+            .collect(),
         usage_dirty,
         usage_fetching,
-        usage_hovered: false,
+        usage_hovered: None,
         input_gate: None,
         notice: None,
         grouping: window.grouping,
+        kinds: source.kinds(),
         projects: window.projects,
         popup: None,
         focus: Focus::Terminal,

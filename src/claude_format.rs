@@ -137,13 +137,6 @@ pub(crate) const INHERITED_MARKERS: [&str; 8] = [
     "CLAUDE_JOB_DIR",
 ];
 
-/// hook を呼んだ claude のプロセス ID が入る環境変数（**非公開**。
-/// hook のイベント名と入力 JSON は公式なので [`crate::hooks`] 側に置く）。
-///
-/// 縮退: 読めないと「その state がどの実行のものか」を pid で言えなくなり、
-/// 行の状態は時刻の突き合わせだけに落ちる（[`crate::hooks::HookStates`]）
-pub(crate) const CLAUDE_PID_ENV: &str = "CLAUDE_PID";
-
 // ---------------------------------------------------------------------------
 // 前景セッションの生存記録 `~/.claude/sessions/<pid>.json`（**非公開の内部形式**。
 // claude が起動時に置き、状態が変わるたびに上書きし、終了時に消す。死んだ pid の

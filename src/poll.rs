@@ -7,7 +7,11 @@ use std::time::Duration;
 
 use ratatui::style::Color;
 
-use ccdesk::{claude_settings_channel, version_newer, LockExt};
+use std::collections::BTreeMap;
+
+use ccdesk::LockExt;
+
+use crate::backend::{AgentVersion, Kind};
 
 // 生存記録（`~/.claude/sessions/<pid>.json`）の項目の綴りは文書化されていないので
 // [`crate::claude_format`] が持つ（外れたときに直す場所を 1 つにするため）
@@ -39,13 +43,6 @@ pub(crate) struct AgentInfo {
     /// 常に「今」なので status が hook に必ず勝ち、陳腐化した `busy` を新しい
     /// `idle` hook で降ろせなくなる
     pub(crate) status_at: u64,
-    /// そのセッションを動かしているプロセス。
-    ///
-    /// **`sessionId` と対で読むのが要点**: ペインの中で `/resume` すると
-    /// 同じプロセスが別の `sessionId` に移るので、ccdesk が自分の子（pid は
-    /// 知っている）が今どのセッションを動かしているかを知る唯一の口になる
-    /// （[`crate::app`] の `live_session_of`）
-    pub(crate) pid: Option<u32>,
 }
 
 impl AgentInfo {
@@ -122,7 +119,6 @@ fn read_session_file(path: &std::path::Path) -> Option<AgentInfo> {
         // 時刻の項目が無い版のために、ファイルの更新時刻へ落とす。0 のままに
         // すると hook が必ず勝ち、hook を取り逃した行を status で直せなくなる
         status_at: num(AGENT_STATUS_UPDATED_AT).unwrap_or_else(|| modified_ms(path)),
-        pid: Some(pid),
     })
 }
 
@@ -205,9 +201,23 @@ pub(crate) enum AccountStatus {
 /// 書き写すと、変えたときに片方だけ古いままになる）
 #[derive(Clone, Default)]
 pub(crate) struct FooterInfo {
-    pub(crate) account: AccountStatus, // ログイン状態 + 表示ラベル
-    pub(crate) current: String,        // claude の現行バージョン
-    pub(crate) latest: Option<String>, // 新しい版があるときだけ Some
+    /// agent ごとのログイン状態 + 表示ラベル。**agent ごとに別のアカウント**
+    pub(crate) accounts: BTreeMap<Kind, AccountStatus>,
+    /// agent ごとの版（[`crate::backend::Kind::ORDER`] と同じ並び）。
+    /// **kind ごとに 1 本ずつ**なので、agent を足すと版行も自動で増える
+    pub(crate) versions: BTreeMap<Kind, AgentVersion>,
+}
+
+impl FooterInfo {
+    /// その agent の版（まだ取れていなければ既定 ＝ 現行版が空）
+    pub(crate) fn version(&self, kind: Kind) -> AgentVersion {
+        self.versions.get(&kind).cloned().unwrap_or_default()
+    }
+
+    /// その agent のアカウント（まだ取れていなければ [`AccountStatus::Unknown`]）
+    pub(crate) fn account(&self, kind: Kind) -> AccountStatus {
+        self.accounts.get(&kind).cloned().unwrap_or_default()
+    }
 }
 
 /// ccdesk 自身の版チェック（起動時 1 回の使い捨てスレッド）。
@@ -336,7 +346,10 @@ fn is_personal_org(org: &str, email: &str, subscription_type: Option<&str>) -> b
 /// ここで `status.success()` を要求すると未ログインが「取得失敗」に化けて
 /// 表示が固まるため、成否は各パーサの内容判定に委ねる
 pub(crate) fn out(cmd: &str, args: &[&str]) -> Option<String> {
-    let o = std::process::Command::new(cmd)
+    // **PATH の解決は自前でやる**（Windows の `Command::new` は `.cmd` を
+    // 見つけない。理由は [`ccdesk::resolve_program`]）
+    let program = ccdesk::resolve_program(cmd)?;
+    let o = std::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
@@ -351,7 +364,7 @@ pub(crate) fn out(cmd: &str, args: &[&str]) -> Option<String> {
 ///
 /// **内容のハッシュではない。** 見たいのは「アカウント行を取り直す契機があるか」
 /// だけなので、指紋の実体は [`ccdesk::file_stamp`]（変化検出の型を 1 つに保つ）
-type CredentialsFp = Option<(u64, std::time::SystemTime)>;
+pub(crate) type CredentialsFp = Option<(u64, std::time::SystemTime)>;
 
 /// ポーラーが見張る認証情報ファイル。**パスの解決は 1 起動につき 1 回**
 /// （指紋読みは毎秒走るので、毎ティックで環境変数からパスを組み直さない）。
@@ -430,29 +443,14 @@ impl AccountFetcher {
 
 /// アカウント行の 1 回取得（`ccdesk doctor` 用。ポーラーと同じ経路で
 /// 「今どう表示されるか」を出す）
-pub(crate) fn fetch_account() -> AccountStatus {
+pub(crate) fn fetch_claude_account() -> AccountStatus {
     AccountFetcher::default().fetch()
 }
 
-/// 現行バージョンと、それより新しい配布版があれば その版番号。
-/// 最新版は claude 本体の更新チェックと同じ公式配布エンドポイント
-/// （downloads.claude.ai/claude-code-releases/<channel> が版番号を返す。
-///  チャネルは文書化設定 autoUpdatesChannel に従う。既定 latest）
-fn fetch_version() -> (String, Option<String>) {
-    // 現行バージョン: "2.1.218 (Claude Code)" の先頭トークン
-    let current = out("claude", &["--version"])
-        .and_then(|s| s.split_whitespace().next().map(str::to_string))
-        .unwrap_or_default();
-    let channel = claude_settings_channel();
-    // ネットワークへ出る作法（タイムアウト等）は [`crate::update::http_get`] が持つ。
-    // このスレッドはアカウント取得と共用なので、応答しないネットワークで
-    // ぶら下がるとアカウント行の更新まで止まる ＝ タイムアウトが必須な理由
-    let latest = crate::update::http_get(&format!(
-        "https://downloads.claude.ai/claude-code-releases/{channel}"
-    ))
-    .map(|s| s.trim().to_string())
-    .filter(|l| l.split('.').count() >= 3 && !current.is_empty() && version_newer(l, &current));
-    (current, latest)
+/// claude の認証情報ファイルの指紋（[`AuthWatch`]）。**解決は 1 起動 1 回**
+pub(crate) fn claude_auth_fingerprint() -> CredentialsFp {
+    static WATCH: std::sync::OnceLock<AuthWatch> = std::sync::OnceLock::new();
+    WATCH.get_or_init(AuthWatch::detect).fingerprint()
 }
 
 /// アカウントの周期フォールバック（秒）。認証ファイルを見られない環境や、
@@ -559,6 +557,7 @@ fn account_step(
 ///   `claude update` 完了時の再取得要求。どちらも**起動時に 1 度取る**
 ///   （`version_age` の初期値が周期を超えているため）
 pub(crate) fn spawn_footer_poller(
+    kinds: Vec<Kind>,
     versions: VersionSinks,
     refresh: Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -569,29 +568,33 @@ pub(crate) fn spawn_footer_poller(
         ccdesk_dirty,
     } = versions;
     std::thread::spawn(move || {
-        let mut account = AccountPollState::new();
-        let mut fetcher = AccountFetcher::default();
-        // **ループの外で 1 度だけ解決する**（理由は [`AuthWatch`]）
-        let auth = AuthWatch::detect();
-        // 共有側へ最後に書いたアカウント。書き手はこのスレッドだけなので、
-        // 毎秒ロックを取らずに手元の写しと比べられる
-        let mut shown = AccountStatus::default();
+        // **出す agent ごとに 1 本ずつ**（アカウントは agent ごとに別物）。
+        // 共有側へ最後に書いた値も手元に持つ ＝ 毎秒ロックを取らずに比べられる。
+        // 一覧は [`Kind::enabled`] が絞ったもの ＝ **切った agent の実行ファイルは
+        // 1 回も起こさない**（入れていない agent のアカウント取得は毎回失敗し、
+        // [`ACCOUNT_RETRY_SECS`] ごとに起動を試み続けるため）
+        let mut accounts: BTreeMap<Kind, (AccountPollState, AccountStatus)> = kinds
+            .iter()
+            .map(|kind| (*kind, (AccountPollState::new(), AccountStatus::default())))
+            .collect();
         let mut version_age = u64::MAX / 2; // 初回は即取得
         loop {
             let forced = refresh.swap(false, std::sync::atomic::Ordering::Relaxed);
             let mut updated = false;
 
-            if let Some(next) = account_step(
-                &mut account,
-                &shown,
-                forced,
-                || auth.fingerprint(),
-                || fetcher.fetch(),
-            ) {
-                shown = next.clone();
-                shared
-                    .lock_recover()
-                    .account = next;
+            for (kind, (state, shown)) in accounts.iter_mut() {
+                let backend = kind.backend();
+                let Some(next) = account_step(
+                    state,
+                    shown,
+                    forced,
+                    || backend.auth_fingerprint(),
+                    || backend.account(),
+                ) else {
+                    continue;
+                };
+                *shown = next.clone();
+                shared.lock_recover().accounts.insert(*kind, next);
                 updated = true;
             }
 
@@ -599,15 +602,20 @@ pub(crate) fn spawn_footer_poller(
             // 「起動時 1 回」のような別の規則へ流れる（実際そうなっていた）
             if refetch_due(version_age, VERSION_INTERVAL_SECS, false, forced) {
                 version_age = 0;
-                let (current, latest) = fetch_version();
-                // 取得に失敗した（current が空）ときは書かない。1 回の失敗で
-                // バージョン表記と更新ボタン行が 1 時間消えるのを防ぐ
-                if !current.is_empty() {
+                // **出す agent ごとに 1 本ずつ取る。** 一覧はアカウントと同じ
+                // [`Kind::enabled`] の結果なので、版行とアカウント行がずれない
+                let fetched: BTreeMap<Kind, AgentVersion> = kinds
+                    .iter()
+                    .map(|kind| (*kind, kind.backend().version()))
+                    // 取得に失敗した（current が空）ものは載せない。1 回の失敗で
+                    // バージョン表記と更新ボタン行が 1 時間消えるのを防ぐ
+                    .filter(|(_, v)| !v.current.is_empty())
+                    .collect();
+                if !fetched.is_empty() {
                     let mut guard = shared
                         .lock_recover();
-                    if guard.current != current || guard.latest != latest {
-                        guard.current = current;
-                        guard.latest = latest;
+                    if guard.versions != fetched {
+                        guard.versions = fetched;
                         updated = true;
                     }
                 }
@@ -629,7 +637,9 @@ pub(crate) fn spawn_footer_poller(
                 dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             std::thread::sleep(Duration::from_secs(1));
-            account.tick();
+            for (state, _) in accounts.values_mut() {
+                state.tick();
+            }
             version_age += 1;
         }
     });
@@ -640,11 +650,13 @@ pub(crate) fn spawn_footer_poller(
 pub(crate) enum Grouping {
     State,
     Directory,
+    /// agent 種別で分ける（claude / codex）
+    Agent,
 }
 
 impl Grouping {
     /// 表示順（メニューの項目の並びもこれに従う）
-    pub(crate) const ORDER: [Self; 2] = [Self::State, Self::Directory];
+    pub(crate) const ORDER: [Self; 3] = [Self::State, Self::Directory, Self::Agent];
 
     /// **保存値（config.json）と画面表示の唯一の綴り**。
     /// 読み・書き・メニュー・現在値表示が別々に綴りを持つと、片方だけ変えたときに
@@ -653,6 +665,7 @@ impl Grouping {
         match self {
             Self::State => "state",
             Self::Directory => "directory",
+            Self::Agent => "agent",
         }
     }
 
@@ -737,8 +750,14 @@ impl State {
         }
     }
 
-    /// この状態の色。**行のドット・集計・節が同じこの 1 箇所を読む**ので、
-    /// 状態を増やしたときに色の対応を書き忘れる場所が増えない
+    /// [`Self::title`] を縦に揃えるための桁。**サイドバーの行末がこれで揃う**
+    /// （状態語の右端が揃っていないと、行ごとにメニュー記号の手前がガタつく）。
+    /// 値は綴りから導くのではなく固定し、`every_title_fits_its_column` が
+    /// 全状態の収まりを見る
+    pub(crate) const TITLE_COLS: usize = 7;
+
+    /// この状態の色。**行のドット・行末の状態語・集計・節が同じこの 1 箇所を読む**
+    /// ので、状態を増やしたときに色の対応を書き忘れる場所が増えない
     /// （以前は `StateView.color` が別に持っていて、食い違う値を作れてしまっていた）
     pub(crate) fn color(self) -> Color {
         match self {
@@ -796,6 +815,9 @@ pub(crate) struct Run<'a> {
     /// （フォーカスの出入りや再描画でも動くので精度は低い）。
     /// `None` ＝ この行に窓が無い（材料は必ず他にあるので、この値は読まれない）
     pub(crate) pty: Option<PtyHint>,
+    /// この行の agent が「PTY の無音 ＝ 手が空いた」を許すか
+    /// （[`crate::backend::Backend::quiet_means_idle`]）。**codex だけ true**
+    pub(crate) quiet_means_idle: bool,
 }
 
 /// 窓の PTY から見た様子。**2 値では足りない**のが要点で、「まだ 1 バイトも
@@ -869,6 +891,13 @@ pub(crate) fn row_state(run: Option<Run<'_>>) -> State {
         (None, observed) => observed,
     };
     match newest {
+        // **hook を取り逃した Working は PTY の無音で降ろす。** ライブ状態を持たない
+        // agent（codex）は、これが無いと中断した行が赤のまま固着する
+        Some((State::Working, _))
+            if run.quiet_means_idle && run.pty == Some(PtyHint::Quiet) =>
+        {
+            State::Idle
+        }
         Some((state, _)) => state,
         // 材料が 1 つも無い行 ＝ **自分の窓を起こした直後**（他インスタンスの行は
         // status を、撮影用の行は hook を必ず持つ）。だから「まだ何も出していない」は
@@ -1054,6 +1083,27 @@ mod tests {
         for unknown in ["", "blocked", "done", "completed", "Working", "idle "] {
             assert_eq!(State::parse(unknown), None, "{unknown:?}");
         }
+    }
+
+    /// 状態語は**サイドバーの行末で縦に揃える**ので、桁に収まらないと
+    /// 右隣のメニュー記号の手前が行ごとにガタつく
+    #[test]
+    fn every_title_fits_its_column() {
+        let widths: Vec<usize> = State::ORDER
+            .iter()
+            .map(|state| unicode_width::UnicodeWidthStr::width(state.title()))
+            .collect();
+        assert!(
+            widths.iter().all(|w| *w <= State::TITLE_COLS),
+            "a title does not fit in {} columns: {widths:?}",
+            State::TITLE_COLS
+        );
+        // **桁を余らせない**（一番長い語が幅そのもの）＝ 語を短くしたら定数も下がる
+        assert_eq!(
+            widths.iter().copied().max(),
+            Some(State::TITLE_COLS),
+            "the column is wider than the longest state word"
+        );
     }
 
     /// claude の `status` の写し先。**`shell` を `idle` と同じに畳むのは意図した判断**で、

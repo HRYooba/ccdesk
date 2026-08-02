@@ -3,135 +3,92 @@
 A session manager TUI for Claude Code — see, switch, and drive all your sessions in
 one terminal.
 
-ccdesk embeds the official `claude` CLI in a PTY pane and keeps a session list in a
-persistent sidebar. Each pane **is** a foreground `claude` session that ccdesk owns,
-and the list itself lives in `~/.ccdesk/sessions.json`, so closing ccdesk ends the
-processes while the rows stay — reopen one and it resumes from its transcript.
+Each pane **is** a real foreground `claude` session. The list outlives them: closing
+ccdesk ends the processes but keeps the rows, and reopening one resumes the
+conversation. OpenAI's `codex` CLI works the same way — [opt in](#codex-opt-in).
 
 ![ccdesk](screenshots/screenshot.png)
 
 ## Features
 
-- **Persistent sidebar** — every session ccdesk knows about, across all projects,
-  grouped by state (Waiting / Working / Completed / Stopped) or by directory
-- **Foreground sessions ccdesk owns** — a row starts or resumes a real `claude`
-  process in the pane; `stop` ends the process and keeps the row, `close` drops the
-  row. Your transcripts in `~/.claude/projects/` are never removed
-- **Persistent projects** — a directory stays in the directory grouping even after its
-  last session is gone, so the way back in is never lost
-- **Names that match what claude shows** — a row is named from its transcript and
-  derived on every draw, so `/rename` in the pane is the only rename there is.
-  **ccdesk never writes to claude's files**
-- **Live status, never stored** — a row's state comes from claude's hooks each time the
-  sidebar is drawn, so a row can never claim a state its process no longer has
-- **Unread and pinned rows** — `●` marks a row claude spoke on while you were looking
-  elsewhere; pinned rows move to a section at the top of the list
-- **Version rows** for ccdesk and claude at the top of the sidebar — click one to update
-  (verified by SHA-256). Once ccdesk's update lands the row turns into `restart` —
-  click it to relaunch on the new build; claude applies on its next launch
-- **Account line** in the footer showing the signed-in Claude account. Display only —
-  switch accounts with `/login` inside a session
-- **Mouse-first, keyboard-light** — click to switch or focus, the `=` at the right end of
-  a row for everything you can do to it. ccdesk reserves exactly two keys —
-  `Alt+←/→` pane focus and `Ctrl+Q` quit — so **every other key passes through to
-  claude untouched**
-- **New-session screen** with a folder browser, editable path field, and an optional
-  first prompt
+- **One list for every session**, across all projects — group it by state, by
+  directory, or by agent
+- **Start, stop, and resume from the sidebar** — `stop` ends the process and keeps the
+  row, `close` drops the row. Your transcripts are never touched
+- **Folders stay** in the directory grouping after their last session is gone, so the
+  way back in is never lost
+- **Rows are named by the agent**, not by ccdesk — rename with `/rename` in the pane
+- **Status you can trust** — each row shows what its process is actually doing right
+  now (Waiting / Working / Idle / Stopped)
+- **Unread marks and pinning** — `●` for rows that spoke while you were elsewhere;
+  pinned rows sit at the top
+- **In-place updates** for ccdesk and each agent, from rows at the top of the sidebar
+- **Mouse-first, keyboard-light** — click to switch, the `=` at the end of a row for
+  everything else. ccdesk reserves two keys — `Alt+←/→` and `Ctrl+Q` — and **every
+  other key goes to the agent untouched**
+- **ccdesk never modifies your agent's config or files.** It installs its status hooks
+  per session only, and sessions you open outside ccdesk are unaffected
 
 ## Requirements
 
-- Windows 10/11 (ConPTY). Linux/macOS are untested.
+- Windows 10/11. Linux/macOS are untested.
 - [Claude Code](https://claude.com/claude-code) CLI on `PATH`
-- Rust toolchain (for installation from source)
+- [Codex](https://developers.openai.com/codex/cli) CLI on `PATH` — only with codex on
+- Rust toolchain (to install from source)
 
 ## Install
-
-### With cargo
 
 ```sh
 cargo install --git https://github.com/HRYooba/ccdesk
 ```
 
-### From Releases (no Rust required)
-
-1. Download `ccdesk-x86_64-pc-windows-msvc.exe` from the
-   [Releases](https://github.com/HRYooba/ccdesk/releases) page — a bare
-   executable, no archive to unpack.
-2. Rename it to `ccdesk.exe` (optional) and place it somewhere on your `PATH`.
-3. Run `ccdesk`.
-
-Each release also ships `ccdesk-x86_64-pc-windows-msvc.exe.sha256` in
-`sha256sum` format, so you can verify the download with
-`sha256sum -c ccdesk-x86_64-pc-windows-msvc.exe.sha256` (or compare
-`certutil -hashfile ccdesk-x86_64-pc-windows-msvc.exe SHA256` by eye).
-Asset names carry no version, so `ccdesk update` can build the URL itself.
-
-(Developers working from a clone: `cargo install --path .`)
+Or grab `ccdesk-x86_64-pc-windows-msvc.exe` from
+[Releases](https://github.com/HRYooba/ccdesk/releases) and put it on your `PATH`.
+Each release ships a matching `.sha256`.
 
 ## Commands
 
 ```sh
 ccdesk            # launch the TUI
-ccdesk doctor     # diagnose the environment (claude CLI, account, config dir, terminal)
+ccdesk doctor     # diagnose the environment
 ccdesk logs       # print the path and tail of the error log
-ccdesk update     # download the latest release, verify its SHA-256, and install it
-ccdesk --version  # print version
-ccdesk --help     # show usage
+ccdesk update     # update to the latest release
+ccdesk --version
+ccdesk --help
 ```
 
-Settings (grouping, opt-ins) live in `~/.ccdesk/config.json`; window state
-(sidebar width, last screen, last folder, registered projects) in `~/.ccdesk/state.json`.
-Errors and panics are appended to `~/.ccdesk/error.log`.
-An earlier build stored account credentials in `~/.ccdesk/accounts.json`; that
-feature is gone, and ccdesk deletes the file (and its lock) once at startup,
-noting it in the error log.
+Settings are in `~/.ccdesk/config.json`, errors in `~/.ccdesk/error.log`. Both
+optional features are one line each:
 
-ccdesk passes the official `--settings` flag to the `claude` sessions it starts
-to install turn-level hooks that report each session's state (waiting / working /
-completed / stopped) back to ccdesk — that is what the sidebar shows. The hooks
-run `ccdesk hook <event>`, so no external scripts are installed, and they write
-only to `~/.ccdesk/hook-states.json`. **`hooks` is the only key ccdesk injects**:
-Claude Code merges hooks across settings sources, so yours keep running, and no
-other setting of yours is replaced for that session. Sessions opened outside
-ccdesk are unaffected.
+```json
+{ "codex": "on", "usage_display": "on" }
+```
+
+## Codex (opt-in)
+
+Turn it on and codex sessions join the same list — same rows, same menu, same states —
+and `agent` becomes a third way to group. A folder's menu asks which agent to start,
+so it never launches something you did not pick.
+
+It is off by default so that people without codex installed never pay for it. Turning
+it off later hides your codex rows without deleting them.
+
+Two things come from codex itself, not ccdesk:
+
+- A codex row has no name until you send your first prompt.
+- Codex prints a trust warning on every launch. ccdesk takes the warning rather than
+  write hook settings into your `~/.codex/config.toml`.
 
 ## Usage display (opt-in)
 
-Add `"usage_display": "on"` to `~/.ccdesk/config.json` to show your Claude
-rate-limit usage at the bottom right: the 5-hour window, the 7-day window, and
-each per-model weekly window, with time until reset. Narrow terminals drop the
-reset times first, then the per-model windows.
+Shows your rate-limit usage at the bottom right, one line per agent: the 5-hour
+window, the 7-day window, and each per-model weekly window, with time until reset.
+It stays current on its own, and you can click it to refresh now.
 
-It refreshes **when a session finishes a turn** — the moment the numbers actually
-move — so nothing runs while you are idle. **Click it to refresh right away** —
-the rings spin while that fetch is in flight. A slow 15-minute poll backs that up,
-because two things no event can report: the 5-hour window resetting on a timer,
-and usage from outside ccdesk (another terminal, claude.ai, another device).
-Bursts of finished turns collapse into one fetch. If a fetch ever succeeded and a
-later one can't reach your rate limits (you signed out, for instance), ccdesk
-keeps showing the last numbers and keeps polling, so signing back in brings the
-gauge back on its own. Only an account with no rate-limit concept at all (API
-key, Bedrock, Vertex) — one that has never once returned numbers — stops polling
-entirely; a click still re-checks it, in case you switched accounts.
-
-ccdesk gets the numbers by running the official `claude` CLI headless for a
-moment and sending one `get_usage` request over the Agent SDK control channel.
-No model runs, so no tokens and no rate-limit quota are consumed.
-
-It is opt-in because this is the one thing ccdesk does that reaches Anthropic's
-servers while you are not there — everything else it polls is local. Consumer
-Terms §3 permits automated access to the Services via an API key "or where we
-otherwise explicitly permit it", and running a documented feature of the
-official CLI against your own subscription, for yourself, reads as permitted,
-but that is a reading and not a ruling. Leave the setting out and the fetch
-thread never starts.
-
-`ccdesk doctor` reports what the probe returns on your machine, and runs even
-with the setting off so you can look before turning it on. A failed fetch shows
-as `usage —` rather than a silent blank; a reading old enough that the backup
-poll must have missed (20 minutes) is dimmed; an account that has never once
-had rate-limit windows (API key, Bedrock, Vertex) hides the gauge instead of
-warning forever.
+It is opt-in because it is the only thing ccdesk does that reaches the provider's
+servers while you are away — everything else it watches is local. It consumes no
+tokens and no rate-limit quota. `ccdesk doctor` shows what it would report on your
+machine, so you can look before turning it on.
 
 ## License
 

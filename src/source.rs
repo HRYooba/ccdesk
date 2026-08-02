@@ -11,11 +11,13 @@
 //! demo 実装が何も起こさないので、ネットワーク・プロセス起動・ファイル読みは
 //! 呼び出し側の `if !demo` ではなく構造として止まる。
 
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use ccdesk::{same_dir, save_setting, save_state, update_state_list, LockExt};
 
+use crate::backend::Kind;
 use crate::hooks::HookStates;
 use crate::poll::{
     spawn_agents_poller, spawn_footer_poller, AccountStatus, AgentSnapshot, FooterInfo, Grouping,
@@ -47,19 +49,19 @@ const DEFAULT_SIDEBAR_WIDTH: u16 = 34;
 /// 内側（枠の中）に収めたいものは 2 つ。桁数は文字数ではなくセルの表示幅で数える
 /// （区切りの記号は 1 文字が 1 桁とは限らない）:
 ///
-/// 1. セッション行 `<行頭><名前><menu>`。前後の固定桁は [`crate::ui::HEAD_COLS`] +
-///    [`crate::ui::MENU_COLS`]（手でこの桁数を数え直さない。テストもそちらを読む）で、
-///    [`demo_rows`] の最長は "add dark mode toggle"(20)
+/// 1. セッション行。名前に使える桁は [`crate::ui::name_cols`] が答える
+///    （行頭・行末のメニュー・行末ブロックを引いた残り）。**手で数え直さない**ので、
+///    行の桁割りが変わればこの幅の検査も一緒に動く。[`demo_rows`] の最長は
+///    "fix login form validation"(25)
 /// 2. 集計行 `1 waiting · 2 working · 2 idle · 1 stopped` ＝ 42 桁。
-///    語の途中で切れると画像が壊れて見えるので、こちらが実際の下限になる
+///    語の途中で切れると画像が壊れて見える
 ///
-/// List は枠の内側（幅 - 2）で切るので 42 + 2 = 44 桁。右ペインを削らないよう
-/// これ以上は広げない。状態はドットの色で語るので行に文字は乗らない
-/// （行末の要約・経過時間はもう出ない）。
+/// 名前が切れた画像は README の売り（行の名前が agent と一致する）を裏切るので、
+/// **1 の方を下限にする**。右ペインを削らないようこれ以上は広げない。
 /// **実データではこの幅を要求しない**（集計行は 0 件の項目を出さないので、
 /// 4 種すべてが揃っている撮影データが最も長い）。
 /// 根拠は `demo_sidebar_width_fits_the_sidebar_rows` が固定する
-const DEMO_SIDEBAR_WIDTH: u16 = 44;
+const DEMO_SIDEBAR_WIDTH: u16 = 47;
 
 /// 撮影用の new session 画面の初期フォルダ（実フォルダを出さない）
 const DEMO_CWD: &str = "C:\\dev\\shop-app";
@@ -175,15 +177,15 @@ pub(crate) trait DataSource: Send + Sync {
     /// live はポーラーが後から埋めるので既定値でよい
     fn footer(&self) -> FooterInfo;
 
-    /// 使用率（5h 枠 / 7d 枠 / モデル別週次）。**まだ答えが無いなら
-    /// [`Usage::Unknown`]**（「まだ分からない」と「取れなかった」を混ぜない）
-    fn usage(&self) -> Usage;
+    /// その agent の使用率。**まだ答えが無いなら [`Usage::Unknown`]**
+    /// （「まだ分からない」と「取れなかった」を混ぜない）
+    fn usage(&self, kind: Kind) -> Usage;
 
     /// 使用率をその場で取り直す（フッターの使用率をクリックしたとき）。
     /// **実際に取り直しを頼んだかを返す**: 呼び手はこれで取得中スピナーを
     /// 始めるので、取得しない供給元（撮影用）が true を返すと永遠に回る。
     /// 取得しない供給元では何もしない ＝ false
-    fn refresh_usage(&self) -> bool {
+    fn refresh_usage(&self, _kind: Kind) -> bool {
         false
     }
 
@@ -193,6 +195,14 @@ pub(crate) trait DataSource: Send + Sync {
 
     /// 起動時に復元するウィンドウ状態
     fn window_state(&self) -> WindowState;
+
+    /// 画面に出す agent。**設定を読むのは live 側だけ** ＝ 撮影
+    /// （[`DemoSource`]）は開発者の `config.json` に左右されない。
+    ///
+    /// ここを通さず [`crate::backend::Kind::enabled`] を直に呼ぶと、`--demo` の
+    /// 見た目が撮る人の設定で変わる（撮影データは半分が codex なので、
+    /// codex を切っている環境では 3 行消えた画面が撮れてしまう）
+    fn kinds(&self) -> Vec<Kind>;
 
     /// ウィンドウ状態の保存（demo は書かない）
     fn save_window(&self, item: WindowItem<'_>);
@@ -336,7 +346,7 @@ pub(crate) struct LiveSource {
     /// opt-in を要求する理由は資源ではなく、これが ccdesk で唯一「無人で Anthropic の
     /// サーバーへ出る」経路だから（判断とその根拠は [`crate::main`] にある）。
     /// **切っている人の環境では claude プロセスが 1 つも増えない**
-    usage: Option<(UsageSlot, UsageRefresh)>,
+    usage: Option<BTreeMap<Kind, (UsageSlot, UsageRefresh)>>,
     /// 「ディスク上の登録プロジェクトはこうなっている」とこのインスタンスが最後に
     /// 判断した一覧。**書き込みのマージの基準**（[`merge_projects`]）で、
     /// 起動時の読み込みと、**実際にディスクへ書いた内容**で更新する
@@ -345,6 +355,9 @@ pub(crate) struct LiveSource {
     /// 保つ必要があるため（基準はストアの中にある。[`SessionStore`]）。
     /// ホームが取れない環境では None ＝ 一覧を持たない（読みは空・保存は素通し）
     sessions: Option<SessionStore>,
+    /// ポーリングして回る agent（[`Kind::enabled`]）。**切った agent の
+    /// プロセスは 1 回も起こさない** ＝ off が「表示だけ消える」に留まらない
+    kinds: Vec<Kind>,
 }
 
 impl LiveSource {
@@ -352,8 +365,9 @@ impl LiveSource {
     /// `usage_fetching` はクリック起点の取得が進行中か（スピナーの材料）
     pub(crate) fn new(
         usage_display: bool,
+        kinds: Vec<Kind>,
         usage_dirty: Arc<std::sync::atomic::AtomicBool>,
-        usage_fetching: Arc<std::sync::atomic::AtomicBool>,
+        usage_fetching: BTreeMap<Kind, Arc<std::sync::atomic::AtomicBool>>,
     ) -> Self {
         // 前回の異常終了が残した書きかけの `.tmp`（ウィンドウ状態・設定・
         // セッション一覧・hook の受け渡し）を 1 回の走査でまとめて回収する。
@@ -361,17 +375,33 @@ impl LiveSource {
         // という約束を「今 demo か」の分岐を足さずに守れる置き場所
         ccdesk::reap_startup_leftovers();
         let sessions = SessionStore::detect();
-        // **opt-in の分岐はここ 1 箇所。** off なら取得スレッドを起こさない
+        // **opt-in の分岐はここ 1 箇所。** off なら取得スレッドを起こさない。
+        // **出す agent ごとに 1 本ずつ**（[`Kind::enabled`] が絞った一覧）＝
+        // 切った agent のためにスレッドもプロセスも起こさない
         let usage = usage_display.then(|| {
-            let slot: UsageSlot = Arc::new(Mutex::new(Usage::default()));
-            let refresh =
-                crate::usage::spawn_poller(Arc::clone(&slot), usage_dirty, usage_fetching);
-            (slot, refresh)
+            kinds
+                .iter()
+                .copied()
+                .map(|kind| {
+                    let slot: UsageSlot = Arc::new(Mutex::new(Usage::default()));
+                    let refresh = crate::usage::spawn_poller(
+                        kind,
+                        Arc::clone(&slot),
+                        Arc::clone(&usage_dirty),
+                        usage_fetching
+                            .get(&kind)
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
+                    (kind, (slot, refresh))
+                })
+                .collect()
         });
         Self {
             usage,
             projects_baseline: Mutex::new(Vec::new()),
             sessions,
+            kinds,
         }
     }
 }
@@ -413,24 +443,34 @@ impl DataSource for LiveSource {
         FooterInfo::default() // 実値は spawn_footer_poller が書く
     }
 
-    fn usage(&self) -> Usage {
-        // opt-in していなければスロットが無い ＝ 取得もしないし何も描かない
-        self.usage.as_ref().map_or(Usage::Unknown, |(slot, _)| {
-            slot.lock_recover()
-                .clone()
-        })
+    /// 起動時に設定から組んだ一覧をそのまま返す（ポーラーへ渡したものと同じ）
+    fn kinds(&self) -> Vec<Kind> {
+        self.kinds.clone()
     }
 
-    fn refresh_usage(&self) -> bool {
-        if let Some((_, refresh)) = &self.usage {
-            refresh.request();
-            return true;
-        }
-        false
+    fn usage(&self, kind: Kind) -> Usage {
+        // opt-in していなければスロットが無い ＝ 取得もしないし何も描かない
+        self.usage
+            .as_ref()
+            .and_then(|slots| slots.get(&kind))
+            .map_or(Usage::Unknown, |(slot, _)| slot.lock_recover().clone())
+    }
+
+    /// **押した行の agent だけを取り直す**（使用率の行は agent ごとに 1 本ずつ
+    /// 出ていて、それぞれが自分の取得を持つ）
+    fn refresh_usage(&self, kind: Kind) -> bool {
+        let Some((_, refresh)) = self.usage.as_ref().and_then(|slots| slots.get(&kind)) else {
+            return false;
+        };
+        refresh.request();
+        true
     }
 
     fn note_turn_finished(&self) {
-        if let Some((_, refresh)) = &self.usage {
+        let Some(slots) = &self.usage else {
+            return;
+        };
+        for (_, refresh) in slots.values() {
             refresh.note_turn_finished();
         }
     }
@@ -527,6 +567,7 @@ impl DataSource for LiveSource {
         // 版行 2 本（claude / ccdesk）の更新チェックは**同じポーラーの同じゲート**で
         // 回す（周期を分けると片方だけ別の規則へ流れる。[`VersionSinks`]）
         spawn_footer_poller(
+            self.kinds.clone(),
             VersionSinks {
                 claude: sinks.footer,
                 claude_dirty: sinks.footer_dirty,
@@ -584,7 +625,7 @@ impl DataSource for DemoSource {
         demo_footer()
     }
 
-    fn usage(&self) -> Usage {
+    fn usage(&self, _kind: Kind) -> Usage {
         Usage::Ready(demo_usage())
     }
 
@@ -619,6 +660,12 @@ impl DataSource for DemoSource {
         // ファイル監視のスレッドは 1 本も起こさない
     }
 
+    /// **撮影は常に全 agent**（設定を読まない）。撮影データは半分が codex なので、
+    /// ここで設定を見ると撮る人の環境しだいで行が消えた画面が残る
+    fn kinds(&self) -> Vec<Kind> {
+        Kind::ORDER.to_vec()
+    }
+
     fn titles(&self) -> Titles {
         // 撮影は transcript も `~/.claude` も読まない（固定表だけを返す）
         Titles::fixed(
@@ -646,18 +693,19 @@ fn demo_sessions() -> Vec<SessionRow> {
 /// ので、撮影は [`Titles::fixed`] と [`DataSource::fixed_states`] へ渡す表として持つ。
 /// 状態が None の行は**動かしている実行が無い** ＝ Stopped
 fn demo_rows() -> Vec<(SessionRow, String, Option<State>)> {
-    let rows: [(&str, Option<State>, &str); 6] = [
-        ("fix login form validation", Some(State::Working), "C:\\dev\\shop-app"),
-        ("add dark mode toggle", Some(State::Waiting), "C:\\dev\\shop-app"),
-        ("refactor api client", Some(State::Working), "C:\\dev\\api"),
-        ("write onboarding docs", Some(State::Idle), "C:\\dev\\docs"),
-        ("optimize image pipeline", Some(State::Idle), "C:\\dev\\api"),
-        ("migrate to vite", None, "C:\\dev\\shop-app"),
+    // **agent を混ぜる**（同じフォルダに claude と codex が並ぶ形が撮れる）
+    let rows: [(&str, Option<State>, &str, Kind); 6] = [
+        ("fix login form validation", Some(State::Working), "C:\\dev\\shop-app", Kind::Claude),
+        ("add dark mode toggle", Some(State::Waiting), "C:\\dev\\shop-app", Kind::Codex),
+        ("refactor api client", Some(State::Working), "C:\\dev\\api", Kind::Claude),
+        ("write onboarding docs", Some(State::Idle), "C:\\dev\\docs", Kind::Codex),
+        ("optimize image pipeline", Some(State::Idle), "C:\\dev\\api", Kind::Claude),
+        ("migrate to vite", None, "C:\\dev\\shop-app", Kind::Codex),
     ];
     let now = ccdesk::now_ms();
     rows.iter()
         .enumerate()
-        .map(|(i, (title, state, cwd))| {
+        .map(|(i, (title, state, cwd, kind))| {
             let minutes = (i as u64 + 1) * 7;
             let updated = now.saturating_sub(minutes * 60_000);
             // 架空の UUID（実セッションの ID を出さない）
@@ -665,6 +713,10 @@ fn demo_rows() -> Vec<(SessionRow, String, Option<State>)> {
             (
                 SessionRow {
                     updated_at: updated,
+                    kind: *kind,
+                    // 撮影でも会話を持たせる（表示名は固定表から出るが、行が会話を
+                    // 持たない状態は撮影で見せたい姿ではない）
+                    conversation: crate::sessions::Conversation::Observed(id.to_string()),
                     ..SessionRow::new(id, *cwd, updated)
                 },
                 (*title).to_string(),
@@ -681,10 +733,33 @@ fn demo_rows() -> Vec<(SessionRow, String, Option<State>)> {
 /// `latest` は None なので更新マーカーと動詞は出ない = 最新の見た目で撮れる
 fn demo_footer() -> FooterInfo {
     FooterInfo {
-        // 撮影は `claude auth status` を叩かないので、アカウント行は架空のラベル
-        account: AccountStatus::LoggedIn("you · Acme, Inc.".to_string()),
-        current: "2.1.220".to_string(),
-        latest: None,
+        // 撮影は agent を 1 つも起こさないので、アカウントも架空のラベル
+        accounts: Kind::ORDER
+            .into_iter()
+            .map(|kind| {
+                (
+                    kind,
+                    AccountStatus::LoggedIn(match kind {
+                        Kind::Claude => "you · Acme, Inc.".to_string(),
+                        Kind::Codex => "you@acme.example".to_string(),
+                    }),
+                )
+            })
+            .collect(),
+        // 撮影は agent を 1 つも起こさないので版も架空（`latest` は None なので
+        // 更新マーカーと動詞は出ない = 最新の見た目で撮れる）
+        versions: [(Kind::Claude, "2.1.220"), (Kind::Codex, "0.146.0")]
+            .into_iter()
+            .map(|(kind, current)| {
+                (
+                    kind,
+                    crate::backend::AgentVersion {
+                        current: current.to_string(),
+                        latest: None,
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
@@ -721,18 +796,42 @@ mod tests {
     /// 中身そのもので固定する（描画側はこの値をそのまま出す）
     #[test]
     fn demo_source_yields_fixed_fake_data() {
+        // **agent ごとに別のアカウント**（片方の名前をもう片方の行へ出さない）
         assert_eq!(
-            DemoSource.footer().account,
+            DemoSource.footer().account(Kind::Claude),
             AccountStatus::LoggedIn("you · Acme, Inc.".to_string())
         );
-        // claude 版行は架空の版で埋める。更新マーカーは出さない（最新の見た目で撮る）
-        assert_eq!(DemoSource.footer().current, "2.1.220");
-        assert!(
-            DemoSource.footer().latest.is_none(),
-            "demo does not show an update marker"
+        assert_ne!(
+            DemoSource.footer().account(Kind::Codex),
+            DemoSource.footer().account(Kind::Claude),
+            "both agents show the same account"
         );
+        // **撮影は常に全 agent。** 撮影データは半分が codex の行なので、ここが
+        // 設定（`"codex": "on"`）を読むと、切っている環境で 3 行消えた画面が
+        // README に残る。撮る人の `config.json` で結果が変わってはいけない
+        assert_eq!(
+            DemoSource.kinds(),
+            Kind::ORDER,
+            "the screenshot would depend on whoever runs it"
+        );
+        let shown = DemoSource.kinds();
+        for (row, _, _) in demo_rows() {
+            assert!(
+                shown.contains(&row.kind),
+                "a demo row's agent is not among the ones demo draws"
+            );
+        }
+        // agent の版行は架空の版で埋める。更新マーカーは出さない（最新の見た目で撮る）
+        for kind in Kind::ORDER {
+            let version = DemoSource.footer().version(kind);
+            assert!(!version.current.is_empty(), "{kind:?} has no version to draw");
+            assert!(
+                version.latest.is_none(),
+                "demo does not show an update marker"
+            );
+        }
 
-        let Usage::Ready(usage) = DemoSource.usage() else {
+        let Usage::Ready(usage) = DemoSource.usage(Kind::Claude) else {
             panic!("usage gauge is always present in demo data");
         };
         assert_eq!(usage.five.as_ref().map(|w| w.pct), Some(34.0));
@@ -1045,10 +1144,10 @@ mod tests {
         const DEMO_HEADER: &str = "1 waiting · 2 working · 2 idle · 1 stopped";
 
         let inner = usize::from(DEMO_SIDEBAR_WIDTH - 2);
-        // 行が名前の前後で固定して食う桁。**正本は `crate::ui` の定数**（ここで
-        // 手で数え直さない ＝ 行頭・行末の桁を変えたらこの予算も自動でずれる）。
-        // 状態は文字では乗らない（ドットの色で語る）ので、名前の他に足す桁は無い
-        let fixed_cols = crate::ui::HEAD_COLS + crate::ui::MENU_COLS;
+        // 名前に使える桁は**描画と同じ導出**（[`crate::ui::name_cols`]）から取る。
+        // 行頭とメニューだけを手で引いていた頃は、行末に状態語と agent を足しても
+        // この検査が気づかず、名前が切れた画像が README に残った
+        let name_cols = crate::ui::name_cols(inner as u16);
         let mut widest = DEMO_HEADER.width();
         let mut counts = std::collections::BTreeMap::<&str, usize>::new();
         for (_, title, state) in demo_rows() {
@@ -1058,13 +1157,12 @@ mod tests {
                 None => crate::poll::State::Stopped,
             };
             *counts.entry(view.title()).or_default() += 1;
-            let need = fixed_cols + title.width();
             assert!(
-                need <= inner,
-                "{:?} needs {need} cols (inner is {inner} cols)",
-                title
+                title.width() <= name_cols,
+                "{title:?} is {} cols but the name budget is {name_cols}",
+                title.width()
             );
-            widest = widest.max(need);
+            widest = widest.max(inner - name_cols + title.width());
         }
         // ヘッダー行の文面（= 上の DEMO_HEADER）が demo データと合っていること。
         // **語も件数もここで固定する**（撮影データと集計行がずれない）

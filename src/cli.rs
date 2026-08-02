@@ -1,6 +1,6 @@
 //! CLI サブコマンド（doctor / logs / update）。
 
-use crate::poll::{fetch_account, AccountStatus};
+use crate::poll::{fetch_claude_account, AccountStatus};
 use crate::update;
 
 /// 使い方の本文。**出力先は呼び手が決める**（[`print_usage`] / [`print_usage_error`]）
@@ -106,6 +106,9 @@ pub(crate) fn run_doctor() -> anyhow::Result<()> {
 
     check_claude_cli().report(&mut failed);
     check_agents().report(&mut failed);
+    check_codex_cli().report(&mut failed);
+    check_codex_account().report(&mut failed);
+    check_codex_usage().report(&mut failed);
     check_account().report(&mut failed);
     check_usage().report(&mut failed);
     check_ccdesk_dir().report(&mut failed);
@@ -129,6 +132,49 @@ fn check_claude_cli() -> Check {
     }
 }
 
+/// codex CLI が PATH にあるか。**無いのは FAIL ではない**:
+/// ccdesk は claude だけでも動く（codex の行を作ろうとしたときに初めて困る）
+fn check_codex_cli() -> Check {
+    let program = crate::backend::Kind::Codex.backend().update_program();
+    match crate::poll::out(program, &["--version"]) {
+        Some(ver) if !ver.trim().is_empty() => {
+            Check::Ok(format!("codex CLI on PATH: {}", ver.trim()))
+        }
+        _ => Check::Warn(
+            "codex CLI not found on PATH (codex sessions cannot be started)".to_string(),
+        ),
+    }
+}
+
+/// codex のアカウントが取れるか（`codex app-server` の `account/read`）。
+/// **本番と同じ経路**を通す（別経路だと doctor が嘘の ok を出す）
+fn check_codex_account() -> Check {
+    match crate::backend::Kind::Codex.backend().account() {
+        AccountStatus::LoggedIn(label) => Check::Ok(format!("codex account: {label}")),
+        AccountStatus::LoggedOut => {
+            Check::Warn("codex account: not logged in (run `codex login`)".to_string())
+        }
+        AccountStatus::Unknown => Check::Warn("codex account: could not be read".to_string()),
+    }
+}
+
+/// codex の使用率が取れるか（`codex app-server` へ 1 往復）。
+/// **本番と同じ経路**を通す（別経路だと doctor が嘘の ok を出す）
+fn check_codex_usage() -> Check {
+    match crate::backend::Kind::Codex.backend().usage() {
+        crate::usage::Usage::Ready(info) => Check::Ok(format!(
+            "codex usage: {}",
+            info.windows()
+                .map(|(label, w)| format!("{label} {:.0}%", w.pct))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        )),
+        // 取れないのは codex が入っていない・未ログイン・形が変わった、のどれか。
+        // どれも ccdesk 自体は動くので Warn
+        other => Check::Warn(format!("codex usage: not available ({other:?})")),
+    }
+}
+
 /// 前景セッションの生存記録（`~/.claude/sessions/`）が読めるか。**本番のポーラーと
 /// 同じ [`crate::poll::fetch_agents`]** を通す（別経路だと poll 側だけ解釈を
 /// 変えたときに doctor が嘘の ok を出す）
@@ -145,7 +191,7 @@ fn check_agents() -> Check {
 /// サイドバー下部に出るアカウント行。表示が実際どうなるかをここで確認できる
 /// （未ログインは FAIL ではない = ccdesk 自体は動く。ログインを促すだけ）
 fn check_account() -> Check {
-    match fetch_account() {
+    match fetch_claude_account() {
         AccountStatus::LoggedIn(label) => Check::Ok(format!("claude account: {label}")),
         AccountStatus::LoggedOut => Check::Warn(
             "claude account: not logged in (run /login in a claude session)".to_string(),

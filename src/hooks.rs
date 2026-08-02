@@ -35,9 +35,6 @@ use serde_json::{json, Value};
 
 use ccdesk::{lock_path_for, now_ms, write_json_atomically, Lock, LOCK_STALE};
 
-// hook のイベント名と入力 JSON は**公式**（文書化されている）が、pid を渡す
-// 環境変数は非公開なので綴りは [`crate::claude_format`] が持つ
-use crate::claude_format::CLAUDE_PID_ENV;
 use crate::poll::State;
 use crate::sessions::{SessionId, SessionRow};
 
@@ -80,17 +77,17 @@ const ATTENTION_MATCHER: &str =
 
 /// 注入する hook 1 件。**`--settings` の生成（[`inject_settings`]）と受け口
 /// （[`run_hook`]）が同じ表を読む**ので、片方だけ増えた状態にならない。
-struct HookEvent {
-    event: &'static str,
+pub(crate) struct HookEvent {
+    pub(crate) event: &'static str,
     /// 発火を絞る matcher。None は全発火を拾う（そのイベント自体が 1 つの意味しか
     /// 持たないもの）
-    matcher: Option<&'static str>,
+    pub(crate) matcher: Option<&'static str>,
     /// この hook が意味する state。**要約文は持たない**（行に出るのは状態だけ）
-    state: State,
+    pub(crate) state: State,
     /// この hook が**ユーザーの見るべき新しい出来事**か（未読 `●` の材料）。
     /// 状態と未読を同じ時刻で判定していた頃は、`SessionEnd` の記録が
     /// 「claude が何か言った」に数えられ、stop しただけの行が再起動後に未読になった
-    activity: bool,
+    pub(crate) activity: bool,
 }
 
 /// 注入する hook の表。同じイベント名を複数載せてよい（matcher で発火を分ける形を
@@ -107,7 +104,7 @@ struct HookEvent {
 /// ものを除いた 1 回だけ）。turn より頻繁になり得るのは事実だが、頻度の実体は
 /// 「ユーザーへの割り込み」であって「道具の呼び出し」ではないので、この原則が
 /// 避けたい害（turn の何倍もプロセスを起こす）には当たらない
-const HOOK_EVENTS: [HookEvent; 7] = [
+pub(crate) const HOOK_EVENTS: [HookEvent; 7] = [
     // 起動直後・再開直後は**プロンプトで待機している**（claude は動いておらず、
     // ユーザーへの要求も無い）。ユーザー自身の操作なので未読にはしない。
     //
@@ -167,8 +164,10 @@ const STATES_KEY: &str = "states";
 /// 項目のキー。**読みと書きで同じ定数を使う**（片側だけ直した状態を作らない）
 const STATE_KEY: &str = "state";
 const AT_KEY: &str = "at";
-const PID_KEY: &str = "pid";
 const ACTIVITY_AT_KEY: &str = "activity_at";
+/// その hook が名乗った**会話 ID**（payload の `session_id`）。保管のキー ＝
+/// ccdesk の行とは別物で、ペインの中の `/clear` `/resume` でこちらだけが変わる
+const CONVERSATION_KEY: &str = "conversation";
 
 
 /// 受けた state を保つ期間。**動いているセッションは毎 turn 書き直す**ので、
@@ -203,16 +202,19 @@ struct Entry {
     state: State,
     /// 受けた時刻（epoch ms）。**書き手（[`record`]）と同じ時計**
     at: u64,
-    /// その hook を呼んだ claude のプロセス ID（[`CLAUDE_PID_ENV`]）。
-    /// 取れない環境では None ＝ pid での引き当て（[`HookStates::session_of`]）に
-    /// 出てこないだけで、state の受け渡しには影響しない
-    pid: Option<u32>,
     /// **ユーザーの見るべき新しい出来事**が最後に起きた時刻（未読 `●` の材料）。
     /// activity を持たない hook（[`HookEvent::activity`] が false）は前回の値を
     /// 引き継ぐ ＝ `Stop(idle)` の後に `SessionEnd(stopped)` が来ても
     /// 「まだ見ていない完了」の記録は消えない。None は一度も起きていない
     /// （旧形式の保管を含む）
     activity_at: Option<u64>,
+    /// その hook が名乗った**会話 ID**（payload の `session_id`）。
+    ///
+    /// **キーとは別物。** 保管のキーは ccdesk の行 ID（`CCDESK_ROW`）で、
+    /// 会話 ID は agent 側の世界の値。ペインの中で `/clear` `/resume` すると
+    /// 同じ行の記録のままこちらだけが変わる ＝ **行の会話追随の唯一の材料**
+    /// （[`crate::app`] の `adopt_conversations`）
+    conversation: Option<String>,
 }
 
 /// hook が書いた state の写し（`session_id` → [`Entry`]）
@@ -240,6 +242,19 @@ impl HookStates {
     pub(crate) fn get(&self, id: &SessionId, launched: Option<u64>) -> Option<(State, u64)> {
         let entry = self.0.get(id)?;
         (entry.at >= launched?).then_some((entry.state, entry.at))
+    }
+
+    /// その行が**最後に名乗った会話**。
+    ///
+    /// 再開先（`claude -r <id>` / `codex resume <id>`）であり、ペインの中で
+    /// `/clear` `/resume` `/new` を打ったときに行が追随する先でもある
+    /// （[`crate::app`] の `adopt_conversations`）。
+    ///
+    /// **`launched` で絞らない**のが [`Self::get`] との違い: 状態は「前回の実行の
+    /// 残骸」を捨てる必要があるが、会話は ccdesk の再起動をまたいで在り続けるので、
+    /// 古い記録でも再開先として正しい
+    pub(crate) fn conversation(&self, id: &SessionId) -> Option<&str> {
+        self.0.get(id)?.conversation.as_deref()
     }
 
     /// 前回の写しと比べて、**新しく手が空いた行があるか**（使用率取得の合図）。
@@ -283,24 +298,6 @@ impl HookStates {
             .is_some_and(|at| at > row.last_opened_at)
     }
 
-    /// **その claude プロセスが今動かしているセッション。** hook はどのイベントでも
-    /// 「その時点の `session_id`」と「呼び出した claude の pid」を一緒に書くので、
-    /// その pid で一番新しい記録が答えになる。
-    ///
-    /// `launched` は**その pid の窓を起こした時刻**。それより古い記録は前回の実行
-    /// （pid の使い回しを含む）なので採らない ＝ 判断の材料は [`Self::get`] と同じ。
-    ///
-    /// **ペイン内の `/resume` `/clear` に周期を待たずに気づく口**がこれで、
-    /// ライブ状態のポーリング（2 秒周期。[`crate::poll::spawn_agents_poller`]）を
-    /// 待たずに済む
-    pub(crate) fn session_of(&self, pid: u32, launched: u64) -> Option<&SessionId> {
-        self.0
-            .iter()
-            .filter(|(_, entry)| entry.pid == Some(pid) && entry.at >= launched)
-            .max_by_key(|(_, entry)| entry.at)
-            .map(|(id, _)| id)
-    }
-
     /// テスト用の組み立て。**activity_at は at と同じ値**で入る（「その hook が
     /// 未読の材料でもある」素朴な形。区別が要るテストは [`record`] を通して作る）
     #[cfg(test)]
@@ -310,21 +307,22 @@ impl HookStates {
         Self::from_records(entries.into_iter().map(|(id, state, at)| (id, state, at, None)))
     }
 
+    /// テスト用: 会話 ID まで指定した組み立て
     #[cfg(test)]
     pub(crate) fn from_records<'a>(
-        entries: impl IntoIterator<Item = (&'a str, State, u64, Option<u32>)>,
+        entries: impl IntoIterator<Item = (&'a str, State, u64, Option<&'a str>)>,
     ) -> Self {
         Self(
             entries
                 .into_iter()
-                .map(|(id, state, at, pid)| {
+                .map(|(id, state, at, conversation)| {
                     (
                         SessionId::new(id),
                         Entry {
                             state,
                             at,
-                            pid,
                             activity_at: Some(at),
+                            conversation: conversation.map(str::to_string),
                         },
                     )
                 })
@@ -399,11 +397,18 @@ pub(crate) fn run_hook(event: &str, state: Option<&str>) -> anyhow::Result<()> {
     use std::io::Read as _;
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
-    let Some((session_id, state, activity, pid)) = hook_entry(event, state, &input) else {
+    let Some(entry) = hook_entry(event, state, &input) else {
         return Ok(());
     };
     if let Some(path) = ccdesk::hook_states_path() {
-        record(&path, &session_id, state, activity, now_ms(), pid);
+        record(
+            &path,
+            &entry.row,
+            entry.state,
+            entry.activity,
+            now_ms(),
+            Some(entry.conversation.as_str()),
+        );
     }
     Ok(())
 }
@@ -412,31 +417,58 @@ pub(crate) fn run_hook(event: &str, state: Option<&str>) -> anyhow::Result<()> {
 /// **[`run_hook`] が持つ判断はこれだけ**で、残りはファイルの読み書き ＝
 /// 環境から pid を拾う経路も含めて、保管を触らずに検査できる。
 ///
-/// 知らないイベント / 表に無い (event, state) / `session_id` が読めない入力は
-/// None（何も書かない）
-fn hook_entry(
-    event: &str,
-    state: Option<&str>,
-    input: &str,
-) -> Option<(SessionId, State, bool, Option<u32>)> {
+/// 知らないイベント / 表に無い (event, state) / `session_id` が読めない入力 /
+/// **`CCDESK_ROW` が無い**呼び出しは None（何も書かない）
+fn hook_entry(event: &str, state: Option<&str>, input: &str) -> Option<HookRecord> {
     let (state, activity) = resolve(event, state)?;
-    let session_id = session_id_of(input)?;
-    Some((session_id, state, activity, claude_pid()))
+    let conversation = session_id_of(input)?;
+    // **行を名指しできるのは env だけ。** payload が運ぶのは会話 ID で、行 ID は
+    // どこにも出さない（[`ROW_ENV`]）。**payload へ落ちるフォールバックは持たない**:
+    // 落ちれば行ではなく会話をキーにした記録ができ、その行は状態も未読も付かない
+    // まま「動いているのに何も起きない」状態になる ＝ env の立て忘れが無音で
+    // 効く。立て忘れは 1 箇所（[`crate::backend::Kind::spawn_command`]）でしか
+    // 起こり得ないので、ここは黙らずに落とす
+    let Some(row) = row_env() else {
+        ccdesk::log_error(&format!(
+            "hook {event} ran without {ROW_ENV}; the row it belongs to is unknown"
+        ));
+        return None;
+    };
+    Some(HookRecord {
+        row,
+        conversation,
+        state,
+        activity,
+    })
 }
 
-/// この hook を呼んだ claude の pid（[`CLAUDE_PID_ENV`]）。
-/// **読めなければ None**（記録は載るが pid での引き当てには出てこない）
-fn claude_pid() -> Option<u32> {
-    std::env::var(CLAUDE_PID_ENV).ok()?.trim().parse().ok()
+/// hook 1 回ぶんの記録。**行と会話を分けて持つ**のが要点で、この 2 つが
+/// 違い得ること（そして両方の agent で違うこと）が今の設計の核心（[`ROW_ENV`]）
+#[derive(Debug, PartialEq, Eq)]
+struct HookRecord {
+    /// 保管のキー ＝ ccdesk の行
+    row: SessionId,
+    /// その時点で agent が動かしている会話（再開に使う）
+    conversation: String,
+    state: State,
+    activity: bool,
 }
 
-/// hook 入力から `session_id` を取る。**読みは寛容**（形が変わっても落ちない:
-/// 取れなければ何も書かないだけ）
-fn session_id_of(input: &str) -> Option<SessionId> {
-    let value = serde_json::from_str::<Value>(input).ok()?;
+/// ccdesk が起動時に立てた行 ID（[`ROW_ENV`]）。**空文字は無いものとして扱う**
+/// （env が中途半端に立っている環境で、空のキーの記録を作らない）
+fn row_env() -> Option<SessionId> {
+    let value = std::env::var(ROW_ENV).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| SessionId::new(value))
+}
+
+/// hook 入力から `session_id` を取る。**これは会話 ID であって行 ID ではない**
+/// （だから [`SessionId`] にしない ＝ 型で取り違えを止める）。
+/// **読みは寛容**（形が変わっても落ちない: 取れなければ何も書かないだけ）
+fn session_id_of(input: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(input).ok()?;
     let id = value.get("session_id").and_then(Value::as_str)?;
-    let id = SessionId::new(id);
-    (!id.is_empty()).then_some(id)
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 /// 1 件の state を保管へ載せる。**ロックの内側で読み直してから置く**
@@ -448,7 +480,14 @@ fn session_id_of(input: &str) -> Option<SessionId> {
 ///
 /// 古い項目はここで落とす（[`KEEP`]）。掃除の契機を別に持たないのは、
 /// 書くのがこの 1 箇所だけで、**書くたびに掃除すれば積もらない**ため
-fn record(path: &Path, session_id: &SessionId, state: State, activity: bool, now: u64, pid: Option<u32>) {
+fn record(
+    path: &Path,
+    session_id: &SessionId,
+    state: State,
+    activity: bool,
+    now: u64,
+    conversation: Option<&str>,
+) {
     let Ok(_guard) = Lock::acquire(&lock_path_for(path), LOCK_WAIT, LOCK_STALE) else {
         return;
     };
@@ -459,13 +498,19 @@ fn record(path: &Path, session_id: &SessionId, state: State, activity: bool, now
     } else {
         entries.get(session_id).and_then(|entry| entry.activity_at)
     };
+    // **取れなかったら前回の値を残す**（1 回でも拾えていれば再開できる）
+    let conversation = conversation.map(str::to_string).or_else(|| {
+        entries
+            .get(session_id)
+            .and_then(|entry| entry.conversation.clone())
+    });
     entries.insert(
         session_id.clone(),
         Entry {
             state,
             at: now,
-            pid,
             activity_at,
+            conversation,
         },
     );
     let document = json!({
@@ -474,8 +519,8 @@ fn record(path: &Path, session_id: &SessionId, state: State, activity: bool, now
             .map(|(id, entry)| (id.to_string(), json!({
                 STATE_KEY: entry.state.as_str(),
                 AT_KEY: entry.at,
-                PID_KEY: entry.pid,
                 ACTIVITY_AT_KEY: entry.activity_at,
+                CONVERSATION_KEY: entry.conversation,
             })))
             .collect::<serde_json::Map<_, _>>()
     });
@@ -508,22 +553,22 @@ fn read_entries(path: &Path, now: u64) -> BTreeMap<SessionId, Entry> {
             // state を持たない項目は捨てる（state が無い項目は何も答えられない）。
             // 時刻は既定 0 で読む ＝ 次の書き込みで古い項目として落ちる
             let at = entry.get(AT_KEY).and_then(Value::as_u64).unwrap_or(0);
-            // pid は桁が u32 に収まる値だけ採る（読めなければ pid 無しの記録として扱う）
-            let pid = entry
-                .get(PID_KEY)
-                .and_then(Value::as_u64)
-                .and_then(|pid| u32::try_from(pid).ok());
             // 旧形式の保管（キーが無い）は None で読む ＝ 未読は付かない。
             // 移行データ（KEEP=7日）としてそのまま許容する
             let activity_at = entry.get(ACTIVITY_AT_KEY).and_then(Value::as_u64);
+            let conversation = entry
+                .get(CONVERSATION_KEY)
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
             (!id.is_empty() && at <= horizon).then(|| {
                 (
                     SessionId::new(id.clone()),
                     Entry {
                         state,
                         at,
-                        pid,
                         activity_at,
+                        conversation,
                     },
                 )
             })
@@ -564,18 +609,45 @@ pub(crate) fn states_stamp() -> Option<(u64, std::time::SystemTime)> {
 /// hook と併存する（claude は設定ソースごとの hook を合成する。公式に文書化）。
 /// スカラーのキーは併存せず上書きになるので、**hook 以外は載せない**
 /// （[`settings_document`] のテストがそれを固定する）
-pub(crate) fn inject_settings() -> Option<PathBuf> {
+pub(crate) fn inject_settings() -> Option<Injection> {
     // 内容は exe パスにしか依存せず、走っているプロセスの `current_exe()` は
     // 自己更新でも変わらない ＝ **1 プロセス 1 回書けば足りる**。
     // 失敗はキャッシュしない（次のセッション起動で再試行する）
-    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    if let Some(path) = PATH.get() {
-        return Some(path.clone());
+    static DONE: std::sync::OnceLock<Injection> = std::sync::OnceLock::new();
+    if let Some(done) = DONE.get() {
+        return Some(done.clone());
     }
-    let path = write_inject_settings()?;
-    let _ = PATH.set(path.clone());
-    Some(path)
+    let done = write_inject_settings()?;
+    let _ = DONE.set(done.clone());
+    Some(done)
 }
+
+/// 書き出し済みの hook 注入。**agent ごとに使う部分が違う**
+/// （claude は `settings`、codex は `exe`。載せ方は
+/// [`crate::backend::Backend::command`]）。
+///
+/// どちらも同じ 1 つの事実（ccdesk 実行ファイルの場所）から導かれるが、claude 側は
+/// ファイルの書き出しを伴うので、書けたパスを一緒に運ぶ
+#[derive(Clone)]
+pub(crate) struct Injection {
+    /// ccdesk 実行ファイル（`/` 区切り）
+    pub(crate) exe: String,
+    /// claude が `--settings` で読むファイル
+    pub(crate) settings: PathBuf,
+}
+
+/// hook の子プロセスへ**行の identity を渡す**環境変数。
+///
+/// **行 ID がこの env 以外のどこにも出ないのが今の設計。** argv にも
+/// transcript 名にも会話 ID にも出さないので、hook が「どの行の出来事か」を
+/// 知る口はここ 1 本しかない。env は agent を経由して hook の子プロセスまで
+/// 継承される（**claude・codex とも実測**）。
+///
+/// **両方の agent で立てる。** claude では「渡した UUID がそのまま payload の
+/// `session_id` になる」ので要らない時期があったが、それは行 ID と会話 ID が
+/// 同じ値だった頃の話で、ペインの中の `/clear` で崩れる前提だった。
+/// 立てるのは共通の口 1 箇所（[`crate::backend::Kind::spawn_command`]）
+pub(crate) const ROW_ENV: &str = "CCDESK_ROW";
 
 /// 注入ファイルの実書き込み。
 ///
@@ -585,7 +657,7 @@ pub(crate) fn inject_settings() -> Option<PathBuf> {
 /// state hook が黙って消える。
 /// 失敗も黙らない: hooks 無しで起動すると行の状態が縮退するので、ログに 1 行残す
 /// （呼び手は None を受けて下部バーにも出す。[`crate::app`]）
-fn write_inject_settings() -> Option<PathBuf> {
+fn write_inject_settings() -> Option<Injection> {
     let exe = std::env::current_exe().ok()?;
     let dir = ccdesk::ccdesk_dir()?;
     let exe_fwd = exe.to_string_lossy().replace('\\', "/");
@@ -594,7 +666,10 @@ fn write_inject_settings() -> Option<PathBuf> {
         ccdesk::log_error(&format!("could not write the hook settings: {e}"));
         return None;
     }
-    Some(path)
+    Some(Injection {
+        exe: exe_fwd,
+        settings: path,
+    })
 }
 
 /// 注入する hook 1 本あたりのタイムアウト（秒）。claude 側の既定は 600 秒だが、
@@ -610,7 +685,7 @@ fn write_inject_settings() -> Option<PathBuf> {
 /// （どのイベントも同じ 1 プロセス起動＋ JSON 書き込みだけ）ので、`HookEvent` に
 /// フィールドを足して行ごとに持たせるより、注入する側でまとめて出す方が
 /// 構造が増えない
-const HOOK_TIMEOUT_SECS: u64 = 5;
+pub(crate) const HOOK_TIMEOUT_SECS: u64 = 5;
 
 /// 注入ファイルの中身（[`inject_settings`] の判断だけを取り出したもの。
 /// ファイルを書かずに検査できる）
@@ -1124,82 +1199,65 @@ mod tests {
         assert!(!states_at(&temp.path()).unread(&row), "a legacy entry created an unread mark");
     }
 
-    /// **pid は claude が hook の子へ渡す環境変数から読む**（実測: v2.1.220 の
-    /// hook は `CLAUDE_PID=<claude の pid>` を持つ子として走る）。
+    /// **記録の鍵は行（`CCDESK_ROW`）、載る値は会話（payload の `session_id`）。**
+    ///
+    /// この 2 つを取り違えると、ペインの中で `/clear` を打った行が「別の行」に
+    /// なる（会話を鍵にした記録ができる）か、再開先が行 ID になって
+    /// `No conversation found` になる。
+    ///
+    /// **`CCDESK_ROW` が無ければ何も書かない。** payload の値へ落ちるフォールバックを
+    /// 持つと、env の立て忘れが**無音で**効く（行に状態も未読も付かないだけ）。
     ///
     /// **親のプロセス環境を一時的に触る**（そうしないと、この名前が居ない環境で
     /// 検査が空振りする）。触るのはこの 1 つだけで、復元は読み取りの直後に行う
     #[test]
-    fn the_pid_comes_from_the_environment_claude_gives_the_hook() {
-        let input = r#"{"session_id":"s-1","source":"clear"}"#;
-        unsafe { std::env::set_var(CLAUDE_PID_ENV, " 4242 ") };
+    fn a_record_is_keyed_by_the_row_and_carries_the_conversation() {
+        let input = r#"{"session_id":"conv-1","source":"clear"}"#;
+        unsafe { std::env::set_var(ROW_ENV, " row-1 ") };
         let padded = hook_entry("SessionStart", None, input);
-        let bare = claude_pid();
-        unsafe { std::env::set_var(CLAUDE_PID_ENV, "not a number") };
-        let broken = hook_entry("SessionStart", None, input);
-        unsafe { std::env::remove_var(CLAUDE_PID_ENV) };
+        unsafe { std::env::set_var(ROW_ENV, "  ") };
+        let blank = hook_entry("SessionStart", None, input);
+        unsafe { std::env::remove_var(ROW_ENV) };
         let missing = hook_entry("SessionStart", None, input);
 
-        // **記録に pid まで載る**（載らないと pid での引き当てが黙って効かなくなる）
-        assert_eq!(
-            padded,
-            Some((id("s-1"), IDLE, false, Some(4242))),
-            "the pid did not reach the record"
-        );
-        assert_eq!(bare, Some(4242), "the pid is not read from the environment");
-        assert_eq!(
-            broken,
-            Some((id("s-1"), IDLE, false, None)),
-            "built a pid out of something that is not a number"
-        );
-        assert_eq!(
-            missing,
-            Some((id("s-1"), IDLE, false, None)),
-            "answered with a pid when the variable is not set"
-        );
+        let record = padded.expect("no record was built");
+        // 前後の空白は落とす（env が中途半端に立っている環境で空のキーを作らない）
+        assert_eq!(record.row, id("row-1"), "the row id did not come from the environment");
+        assert_eq!(record.conversation, "conv-1", "the conversation did not reach the record");
+        assert_eq!(blank, None, "an all-blank row id was accepted");
+        assert_eq!(missing, None, "fell back to the payload when the row id is missing");
+
         // 知らないイベント / 読めない入力は何も書かない
+        unsafe { std::env::set_var(ROW_ENV, "row-1") };
         assert_eq!(hook_entry("PreToolUse", None, input), None);
         assert_eq!(hook_entry("SessionStart", None, "not json"), None);
+        unsafe { std::env::remove_var(ROW_ENV) };
     }
 
-    /// **pid は保管を往復する。** ここが落ちると、ペイン内の `/resume` `/clear` に
-    /// 気づく口（[`HookStates::session_of`]）が黙って効かなくなる
+    /// **会話は保管を往復する。** ここが落ちると、ペイン内の `/clear` `/resume`
+    /// に行が追随する口（[`HookStates::conversation`]）が黙って効かなくなり、
+    /// 再開先も失われる
     #[test]
-    fn the_pid_of_the_calling_claude_survives_a_round_trip() {
-        let temp = TempStore::new("the_pid_of_the_calling_claude_survives_a_round_trip");
-        record(&temp.path(), &id("s"), WORKING, true, 1_000, Some(4242));
+    fn the_conversation_survives_a_round_trip() {
+        let temp = TempStore::new("the_conversation_survives_a_round_trip");
+        record(&temp.path(), &id("row"), WORKING, true, 1_000, Some("conv-1"));
         assert_eq!(
             states_at(&temp.path()),
-            HookStates::from_records([("s", WORKING, 1_000, Some(4242))])
+            HookStates::from_records([("row", WORKING, 1_000, Some("conv-1"))])
         );
-        // pid の無い記録も読める（環境変数が取れなかった場合）
-        record(&temp.path(), &id("s"), IDLE, true, 2_000, None);
-        assert_eq!(
-            states_at(&temp.path()),
-            HookStates::from_records([("s", IDLE, 2_000, None)])
-        );
-    }
+        assert_eq!(states_at(&temp.path()).conversation(&id("row")), Some("conv-1"));
 
-    /// **その pid が今動かしているセッション ＝ その pid の一番新しい記録。**
-    ///
-    /// `/clear` は「古いセッションの `SessionEnd`」と「新しいセッションの
-    /// `SessionStart`」を同じ pid で続けて書く（実測）ので、新しい方を採らないと
-    /// 張り替え先が前のセッションのままになる
-    #[test]
-    fn the_newest_record_of_a_pid_names_the_session_it_is_running() {
-        let states = HookStates::from_records([
-            ("old", STOPPED, 2_000, Some(7)),
-            ("new", WAITING, 2_001, Some(7)),
-            ("other-process", WORKING, 9_000, Some(8)),
-            ("no-pid", WORKING, 9_000, None),
-        ]);
-        assert_eq!(states.session_of(7, 1_000), Some(&id("new")));
-        assert_eq!(states.session_of(8, 1_000), Some(&id("other-process")));
-        // 窓の起動より古い記録は前回の実行のもの（pid の使い回しを含む）
-        assert_eq!(states.session_of(7, 2_001), Some(&id("new")));
-        assert_eq!(states.session_of(7, 2_002), None);
-        // 知らない pid には答えない
-        assert_eq!(states.session_of(9, 0), None);
+        // **同じ行の会話が差し替わる**（ペインの中の `/clear`）。行は増えない
+        record(&temp.path(), &id("row"), IDLE, true, 2_000, Some("conv-2"));
+        let states = states_at(&temp.path());
+        assert_eq!(states.conversation(&id("row")), Some("conv-2"));
+        assert_eq!(states, HookStates::from_records([("row", IDLE, 2_000, Some("conv-2"))]));
+
+        // **取れなかった回は前の値を残す**（1 回でも拾えていれば再開できる）
+        record(&temp.path(), &id("row"), STOPPED, false, 3_000, None);
+        assert_eq!(states_at(&temp.path()).conversation(&id("row")), Some("conv-2"));
+        // 一度も名乗っていない行には答えない
+        assert_eq!(states_at(&temp.path()).conversation(&id("other")), None);
     }
 
     /// **保管の見え方は中身を読まずに取れる**（run ループが毎周見る合図）。
@@ -1213,9 +1271,9 @@ mod tests {
                 .map(|m| (m.len(), m.modified().ok()))
         };
         assert_eq!(stamp(&temp.path()), None, "answered for a missing file");
-        record(&temp.path(), &id("s"), WORKING, true, 1_000, Some(1));
+        record(&temp.path(), &id("s"), WORKING, true, 1_000, None);
         let before = stamp(&temp.path()).expect("no stamp after a write");
-        record(&temp.path(), &id("s-2"), WAITING, true, 2_000, Some(2));
+        record(&temp.path(), &id("s-2"), WAITING, true, 2_000, None);
         assert_ne!(stamp(&temp.path()), Some(before), "the stamp did not move");
     }
 
@@ -1304,8 +1362,8 @@ mod tests {
     #[test]
     fn the_session_id_comes_from_the_hook_input() {
         assert_eq!(
-            session_id_of(r#"{"session_id":"8a1c0f52","cwd":"C:\\dev"}"#),
-            Some(id("8a1c0f52"))
+            session_id_of(r#"{"session_id":"8a1c0f52","cwd":"C:\\dev"}"#).as_deref(),
+            Some("8a1c0f52")
         );
         for broken in [
             "",

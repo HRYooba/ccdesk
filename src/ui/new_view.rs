@@ -10,6 +10,7 @@ use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 
 use crate::app::{start_new_session, App, RightView};
+use crate::backend::Kind;
 use crate::theme::{ui, C_OK, C_WORKING, FOCUS_BORDER, MUTED_FG};
 use crate::ui::text_field::TextField;
 use crate::ui::{border_style, pane_fallback_pos, FrameCursor};
@@ -17,6 +18,8 @@ use crate::ui::{border_style, pane_fallback_pos, FrameCursor};
 /// New 画面のフォーカス対象フィールド
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum NewFocus {
+    /// AGENT 切替行（←→ / Tab で claude ⇄ codex）
+    Agent,
     Prompt,  // 下部のプロンプト入力（初期フォーカス。Enter で起動）
     Browser, // フォルダ一覧（↑↓ で行移動・→← で潜る/上がる。Enter は選択行の実行）
     Path,    // Folder 行のテキストフィールド
@@ -65,13 +68,31 @@ pub(crate) struct NewState {
     /// （送ったメッセージは取り消せない）。作り直しで立て、明示的な選択移動
     /// （↑↓・ホイール・選択を動かすクリック）で倒す
     pub(crate) selection_from_rebuild: bool,
+    /// 起こす agent。**この画面の選択が正本**で、起動はこの値を読む
+    pub(crate) kind: Kind,
 }
 
 impl NewState {
+    /// 次の agent へ回す（`kinds` ＝ 今出す agent の並びで巡回）。
+    /// **数を書き写さない**ので、agent を足しても切替の実装は変わらない。
+    ///
+    /// 切った agent を渡されない限りそこへは回らない ＝ off の agent を
+    /// この画面から起こせない。今の選択が一覧に無ければ先頭へ戻す
+    /// （設定を変えた後の最初の起動で、選択が消えた agent に残らない）
+    pub(crate) fn cycle_kind(&mut self, kinds: &[Kind]) {
+        let Some(&first) = kinds.first() else { return };
+        let at = kinds.iter().position(|k| *k == self.kind);
+        self.kind = match at {
+            Some(at) => kinds[(at + 1) % kinds.len()],
+            None => first,
+        };
+    }
+
     pub(crate) fn browse(dir: &str) -> Self {
         let mut path = TextField::default();
         path.set_text(dir);
         Self {
+            kind: Kind::default(),
             cur_dir: dir.to_string(),
             filter: String::new(),
             entries: Self::list_entries(dir),
@@ -202,13 +223,23 @@ impl NewState {
     /// ヒットテストは描画と同じ [`NewLayout`]。戻り値の [`NewAction::Launch`] は
     /// 「選択済みの起動ボタンを再クリックした」で、起動の実行（`start_new_session`）は
     /// App を持つ呼び手が行う
-    pub(crate) fn handle_mouse(&mut self, pane: Rect, mouse: &MouseEvent) -> Option<NewAction> {
+    pub(crate) fn handle_mouse(
+        &mut self,
+        pane: Rect,
+        mouse: &MouseEvent,
+        kinds: &[Kind],
+    ) -> Option<NewAction> {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let layout = NewLayout::compute(pane);
                 let box_bottom = layout.prompt_box.y + layout.prompt_box.height;
                 if !layout.ok {
                     // ペインが小さすぎて未描画。フィールド判定はしない
+                } else if mouse.row == layout.agent_y {
+                    // AGENT 行はクリックで次の agent へ回す（項目ごとの当たり判定を
+                    // 持たない ＝ 桁の計算を描画と 2 箇所で持たない）
+                    self.focus = NewFocus::Agent;
+                    self.cycle_kind(kinds);
                 } else if mouse.row >= layout.folder_hd_y && mouse.row <= layout.sep_y {
                     // FOLDER セクション（見出し・パス値・┄ 区切り）クリック → パスフィールド。
                     // パス値の行ならカーソルも移動、他はカーソル位置維持
@@ -411,6 +442,8 @@ pub(crate) enum NewAction {
 
 /// 「選択 → 再クリックで実行」の 2 段階（判定は [`NewState::click_activates`]）
 pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Result<()> {
+    // 画面より先に控える（`right_view` を可変で借りると `app` を読めなくなる）
+    let kinds = app.kinds.clone();
     let RightView::New(state) = &mut app.right_view else {
         return Ok(());
     };
@@ -418,7 +451,8 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
     match key.code {
         KeyCode::Tab => {
             state.focus = match state.focus {
-                NewFocus::Prompt => NewFocus::Path,
+                NewFocus::Prompt => NewFocus::Agent,
+                NewFocus::Agent => NewFocus::Path,
                 NewFocus::Path => NewFocus::Browser,
                 NewFocus::Browser => NewFocus::Prompt,
             };
@@ -441,6 +475,15 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
         _ => {}
     }
     match state.focus {
+        // ←→ / Enter / Space のどれでも次の agent へ回す（打鍵を覚えさせない）
+        NewFocus::Agent => {
+            if matches!(
+                key.code,
+                KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
+            ) {
+                state.cycle_kind(&kinds);
+            }
+        }
         NewFocus::Path => {
             if key.code == KeyCode::Enter {
                 state.apply_path_input();
@@ -480,6 +523,7 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
 /// term_height-4 等）をここへ集約する。値はすべて絶対スクリーン座標（Rect と同じ原点）。
 pub(crate) struct NewLayout {
     pub(crate) inner: Rect,       // 枠の内側
+    pub(crate) agent_y: u16,      // AGENT 切替行
     pub(crate) folder_hd_y: u16,  // "FOLDER" セクション見出し
     pub(crate) path_y: u16,       // パス値の行
     pub(crate) sep_y: u16,        // FOLDER セクションの ┄ 区切り
@@ -499,8 +543,8 @@ impl NewLayout {
     const MARGIN: u16 = 2;
     /// 入力枠内の先頭 " ❯ "（先頭スペース + ❯ + スペース）の表示幅
     const INPUT_LEAD: u16 = 3;
-    /// ヘッダー行数（上パディング + FOLDER 見出し + パス値 + ┄ 区切り）
-    const HEAD_ROWS: u16 = 4;
+    /// ヘッダー行数（上パディング + AGENT 行 + FOLDER 見出し + パス値 + ┄ 区切り）
+    const HEAD_ROWS: u16 = 5;
     /// フッター行数（spacer + PROMPT 見出し + 枠上 + 入力 + 枠下 + 空行 + ヒント）
     const FOOT_ROWS: u16 = 7;
 
@@ -515,10 +559,11 @@ impl NewLayout {
             height: pane.height.saturating_sub(2),
         };
         let bottom = inner.y + inner.height; // 内側の下端（排他）
-        // 上から: 空行 / FOLDER 見出し / パス値 / ┄ 区切り / 一覧…
-        let folder_hd_y = inner.y + 1;
-        let path_y = inner.y + 2;
-        let sep_y = inner.y + 3;
+        // 上から: 空行 / AGENT / FOLDER 見出し / パス値 / ┄ 区切り / 一覧…
+        let agent_y = inner.y + 1;
+        let folder_hd_y = inner.y + 2;
+        let path_y = inner.y + 3;
+        let sep_y = inner.y + 4;
         let list_top = inner.y + Self::HEAD_ROWS;
         // 下から: ヒント / 空行 / 枠下 / 入力 / 枠上 / PROMPT 見出し / spacer
         let hint_y = bottom.saturating_sub(1);
@@ -536,6 +581,7 @@ impl NewLayout {
         };
         NewLayout {
             inner,
+            agent_y,
             folder_hd_y,
             path_y,
             sep_y,
@@ -593,6 +639,8 @@ pub(crate) fn new_view_cursor(
     let inner = layout.inner;
     let prompt_inner = layout.prompt_inner();
     let (pos, in_field) = match focus {
+        // 入力欄ではないのでカーソルは出さない（位置だけ確定させる）
+        NewFocus::Agent => (Position::new(inner.x, layout.agent_y), false),
         NewFocus::Path => (
             Position::new(
                 layout
@@ -650,6 +698,7 @@ fn list_rows_for_message(no_folder_rows: bool, list_height: u16) -> usize {
 /// **出さない**（効かないキーを案内しない）
 fn new_view_hint(focus: NewFocus, can_leave: bool) -> &'static str {
     match focus {
+        NewFocus::Agent => "Tab: next field · ←→: switch agent",
         NewFocus::Prompt if can_leave => "Tab: next field · Enter: start · Esc: back to sessions",
         NewFocus::Prompt => "Tab: next field · Enter: start",
         // Path の Esc は戻る先に関係なく編集の取り消し（一覧へは戻らない）
@@ -722,6 +771,31 @@ pub(crate) fn draw_new_view(
     };
     let margin = NewLayout::MARGIN as usize;
     let pad = " ".repeat(margin);
+
+    // AGENT 切替行。**選んだものだけ強調**（記号は使わない理由は [`Kind::title`]）
+    let agent_focused = state.focus == NewFocus::Agent;
+    let mut agent_spans = vec![
+        Span::raw(pad.clone()),
+        Span::styled("AGENT ", heading_style(agent_focused)),
+    ];
+    for kind in Kind::ORDER {
+        let chosen = kind == state.kind;
+        agent_spans.push(Span::raw(" "));
+        agent_spans.push(Span::styled(
+            kind.title().to_string(),
+            if chosen {
+                Style::default()
+                    .fg(ui().emph)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(MUTED_FG)
+            },
+        ));
+    }
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(Line::from(agent_spans)),
+        Rect::new(inner.x, layout.agent_y, inner.width, 1),
+    );
 
     // FOLDER セクション見出し
     frame.render_widget(
@@ -1176,8 +1250,9 @@ mod tests {
         state.refresh_from_input();
         assert!(state.no_folder_rows());
 
-        // 一覧に 1 行だけ割ける最小の高さ
-        let pane = Rect::new(0, 0, 40, 14);
+        // 一覧に 1 行だけ割ける最小の高さ（ヘッダーとフッターの行数から導く ＝
+        // AGENT 行のような行が増減しても、この test が測る条件は変わらない）
+        let pane = Rect::new(0, 0, 40, NewLayout::HEAD_ROWS + NewLayout::FOOT_ROWS + 3);
         assert_eq!(NewLayout::compute(pane).list_height, 1);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(pane.width, pane.height))

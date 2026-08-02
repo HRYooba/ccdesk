@@ -1,10 +1,8 @@
 //! 前景セッションの PTY。**この PTY がセッションそのもの**で、実体は ccdesk の
 //! 子プロセスになる（窓を閉じる = プロセスを終わらせる）。
 //!
-//! 起動は新規なら `claude --session-id <uuid> [prompt]`、再開なら
-//! `claude -r <session-id>`。渡した UUID がそのまま transcript の `sessionId` に
-//! なるので、一覧の行（[`crate::sessions::SessionRow`]）と claude 側の記録が
-//! 同じ鍵で結びつく。
+//! **どう起こすかは持たない。** コマンドラインは agent ごとに違うので
+//! [`crate::backend`] が組む（ここは組み上がったものを PTY で走らせるだけ）。
 //!
 //! **一覧の行とは別物**: ここは「今開いている端末」、[`crate::sessions`] は
 //! 「一覧に載る行」。プロセスが死んでも行は残る。
@@ -13,13 +11,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
 
 use ccdesk::{new_parser, now_ms, LockExt, Parser};
 
 // 継承させない環境変数の一覧は claude の非公開な形なので
 // [`crate::claude_format`] が持つ（外れたときに直す場所を 1 つにするため）
-use crate::claude_format::INHERITED_MARKERS;
 use crate::poll::PtyHint;
 use crate::sessions::SessionId;
 use crate::theme::HOST_COLORS;
@@ -205,70 +202,18 @@ pub(crate) struct Session {
     updating: Arc<AtomicBool>,
 }
 
-/// 起動の種類。**新規と再開でコマンドラインが違う**ことだけをここに持たせる
-/// （どちらを使うかを決めるのは呼び出し側 ＝ transcript があるか）
-pub(crate) enum Launch<'a> {
-    /// 新規セッション。`prompt` は最初のメッセージ（空なら渡さない）
-    New { prompt: &'a str },
-    /// 既存セッションの再開（`claude -r`）。**cwd の一致が必須**（別 cwd からは
-    /// `No conversation found` になる ＝ transcript が在る作業ツリーで開く。
-    /// 判断は [`crate::title::Titles::resume_cwd`]）。
-    /// **transcript が無い行には使えない**（会話が無いので `-r` が見つけられない）
-    Resume,
-}
-
-/// 起こす claude のコマンドライン。**PTY を開かずに組める形にしてある**ので、
-/// 引数と環境変数の除去をテストで固定できる（どちらも失敗が静かに効く:
-/// 引数を間違えれば起動が落ち、除去を落とせば transcript が保存されない）
-fn build_command(
-    session_id: &SessionId,
-    cwd: &str,
-    launch: Launch<'_>,
-    settings: Option<&std::path::Path>,
-) -> CommandBuilder {
-    let mut cmd = CommandBuilder::new("claude");
-    cmd.cwd(cwd);
-    // 継承した親セッションの印を落とす（落とさないと transcript が保存されない）
-    for key in INHERITED_MARKERS {
-        cmd.env_remove(key);
-    }
-    // state を戻す hook の注入（中身は [`crate::hooks::inject_settings`]）
-    if let Some(path) = settings {
-        cmd.arg("--settings");
-        cmd.arg(path);
-    }
-    match launch {
-        // **`-n <title>` は渡さない。** claude は `-n` で渡した名前を transcript の
-        // `custom-title` として残す（実測）ので、ccdesk が組んだ名前を渡すと
-        // 「ユーザーが付けた名前」の位置が埋まる ＝ 表示名がそこで凍る
-        // （プロンプト無しなら "new session" のまま・claude 側の AI 生成名も付かない）。
-        // 表示名は transcript から導く（[`crate::title`]）ので、渡す必要も無い
-        Launch::New { prompt } => {
-            cmd.arg("--session-id");
-            cmd.arg(session_id.as_str());
-            // 空プロンプトは渡さない（"idle — プロンプト待ち" で始まる）
-            if !prompt.is_empty() {
-                cmd.arg(prompt);
-            }
-        }
-        Launch::Resume => {
-            cmd.arg("-r");
-            cmd.arg(session_id.as_str());
-        }
-    }
-    cmd
-}
-
 impl Session {
     /// 前景セッションを PTY で起こす。**セッションの実体はこの子プロセス**
-    /// （ccdesk を閉じると終わる。行は `sessions.json` に残る）
+    /// （ccdesk を閉じると終わる。行は `sessions.json` に残る）。
+    ///
+    /// **コマンドは組み立て済みで受ける**（[`crate::backend::Kind::spawn_command`]）。
+    /// 組み立てには「どの会話に載るか」の答えが付いてきて、それを行へ記録するのは
+    /// 呼び手の仕事 ＝ ここが会話のことを知る必要が無い
     pub(crate) fn spawn(
         session_id: &SessionId,
-        cwd: &str,
+        cmd: portable_pty::CommandBuilder,
         rows: u16,
         cols: u16,
-        launch: Launch<'_>,
-        settings: Option<&std::path::Path>,
     ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -277,9 +222,7 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        let child = pair
-            .slave
-            .spawn_command(build_command(session_id, cwd, launch, settings))?;
+        let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
         let parser = Arc::new(Mutex::new(new_parser(rows, cols, SCROLLBACK)));
@@ -515,107 +458,6 @@ mod tests {
         assert_eq!(pty_hint(true, BUSY_QUIET), PtyHint::Quiet);
     }
 
-    /// 組み立てたコマンドラインの引数（先頭のプログラム名は落とす）
-    fn argv(cmd: &CommandBuilder) -> Vec<String> {
-        cmd.get_argv()
-            .iter()
-            .skip(1)
-            .map(|a| a.to_string_lossy().to_string())
-            .collect()
-    }
-
-    fn id() -> SessionId {
-        SessionId::new("8a1c0f52-0b3e-4a6d-9f11-2c7d5e8b0a34")
-    }
-
-    /// 新規は `--session-id <uuid> [prompt]`。**空プロンプトは渡さない**
-    /// （渡すと空メッセージを送ったセッションになる）。
-    ///
-    /// **`-n <title>` は 1 つも渡さない**: claude は `-n` の名前を transcript の
-    /// `custom-title` として残すので、ccdesk が組んだ名前を渡すと表示名が
-    /// そこで凍る（`new session` のまま張り付く実害があった）
-    #[test]
-    fn a_new_session_passes_its_uuid_and_prompt_but_never_a_name() {
-        let cmd = build_command(
-            &id(),
-            "C:\\dev\\app",
-            Launch::New {
-                prompt: "fix login form validation",
-            },
-            None,
-        );
-        assert_eq!(
-            argv(&cmd),
-            ["--session-id", id().as_str(), "fix login form validation"]
-        );
-        assert_eq!(
-            cmd.get_cwd().map(|c| c.to_string_lossy().to_string()),
-            Some("C:\\dev\\app".to_string()),
-            "cwd is not passed through"
-        );
-
-        // プロンプト無しは UUID だけ（`claude --session-id <uuid>`）
-        let cmd = build_command(&id(), "C:\\dev\\app", Launch::New { prompt: "" }, None);
-        assert_eq!(argv(&cmd), ["--session-id", id().as_str()]);
-        assert!(
-            !argv(&cmd).contains(&"-n".to_string()),
-            "the name argument came back: {:?}",
-            argv(&cmd)
-        );
-    }
-
-    /// 再開は `-r <session-id>` だけ（`--session-id` は新規採番の指定なので混ぜない）
-    #[test]
-    fn resuming_passes_only_the_session_id() {
-        let cmd = build_command(&id(), "C:\\dev\\app", Launch::Resume, None);
-        assert_eq!(argv(&cmd), ["-r", id().as_str()]);
-    }
-
-    /// 注入する settings（state を戻す hook）は起動の種類に関係なく前に付く
-    #[test]
-    fn the_injected_settings_are_passed_before_the_launch_arguments() {
-        let path = std::path::Path::new("C:\\Users\\me\\.ccdesk\\inject-settings.json");
-        let cmd = build_command(&id(), "C:\\dev\\app", Launch::Resume, Some(path));
-        assert_eq!(
-            argv(&cmd),
-            [
-                "--settings",
-                path.to_string_lossy().as_ref(),
-                "-r",
-                id().as_str(),
-            ]
-        );
-    }
-
-    /// **継承した親セッションの印は 1 つ残らず落とす。**
-    ///
-    /// 残すと子の claude が「別セッションの子」だと誤認して transcript を保存しない
-    /// （実測。[`INHERITED_MARKERS`]）。`env_clear` ではなく個別除去なので、
-    /// **PATH 等の通常の環境変数は残っている**ことも併せて固定する。
-    ///
-    /// **親のプロセス環境を一時的に触る**（そうしないと CI のように印が居ない環境で
-    /// 検査が空振りする）。触るのはこの一覧の名前だけで、他のテストが読む変数
-    /// （`USERPROFILE` 等）とは重ならない。復元は組み立ての直後に行い、
-    /// アサートが失敗しても残さない
-    #[test]
-    fn the_inherited_session_markers_are_removed_but_the_rest_of_the_env_is_kept() {
-        for key in INHERITED_MARKERS {
-            unsafe { std::env::set_var(key, "1") };
-        }
-        let cmd = build_command(&id(), "C:\\dev\\app", Launch::Resume, None);
-        for key in INHERITED_MARKERS {
-            unsafe { std::env::remove_var(key) };
-        }
-        for key in INHERITED_MARKERS {
-            assert_eq!(cmd.get_env(key), None, "{key} is inherited by the child");
-        }
-        // 個別除去なので、通常の環境変数は落ちない（env_clear ではない）
-        assert!(
-            cmd.iter_full_env_as_str().any(|(k, _)| k.eq_ignore_ascii_case("PATH")),
-            "PATH was dropped too — claude cannot start"
-        );
-    }
-
     /// **症状の素**を固定する。子の 1 回の再描画が複数の読み取りに分かれると、
     /// その途中でカーソル位置を読んだ側は中間の位置を掴む。
     ///
@@ -719,3 +561,4 @@ mod tests {
         ));
     }
 }
+

@@ -24,6 +24,8 @@ use serde_json::{json, Value};
 
 use ccdesk::{lock_path_for, write_json_atomically, Lock, LockExt, LOCK_STALE};
 
+use crate::backend::Kind;
+
 /// 保管ファイルのトップレベルキー（`{"sessions": [ … ]}`）
 const SESSIONS_KEY: &str = "sessions";
 /// 行 1 件のキー。**読みと書きで同じ定数を使う**（片側だけ直した状態を作らない）
@@ -31,6 +33,15 @@ const ID_KEY: &str = "session_id";
 const CWD_KEY: &str = "cwd";
 const TRANSCRIPT_KEY: &str = "transcript";
 const PINNED_KEY: &str = "pinned";
+const KIND_KEY: &str = "kind";
+/// 行が今動かしている会話（[`Conversation`]）。**空文字が「まだ分からない」**で、
+/// キーそのものは常に書く ＝ [`LEGACY_AGENT_ID_KEY`] しか知らない古い行と、
+/// 新しい形式で「分からない」と書かれた行が保存の形で区別できる
+const CONVERSATION_KEY: &str = "conversation";
+/// 0.11 以前が書いた会話 ID（**読み専用**）。当時は codex の行にしか載らず、
+/// claude の行は「行 ID ＝ 会話 ID」だったので何も書かれていない
+/// （移行は [`SessionRow::from_json`]）
+const LEGACY_AGENT_ID_KEY: &str = "agent_id";
 const LAST_OPENED_AT_KEY: &str = "last_opened_at";
 const CREATED_AT_KEY: &str = "created_at";
 const UPDATED_AT_KEY: &str = "updated_at";
@@ -81,6 +92,81 @@ impl std::fmt::Display for SessionId {
     }
 }
 
+/// **その行が今動かしている会話。** 行の identity（[`SessionId`]）とは別物。
+///
+/// # なぜ別物なのか
+///
+/// **1 ペイン = 1 行**なので、ペインの中で `/clear` `/resume` `/new` を打って
+/// 会話が変わっても行は変わらない（サイドバーに行は増えない）。行が固定なぶん、
+/// 「今どの会話か」は行が持つしかない。
+///
+/// # なぜ 3 状態なのか
+///
+/// **渡した ID と、agent が名乗った ID は違う意味を持つ。** 渡しただけの ID で
+/// `claude -r` を打つと、まだ 1 ターンも終わっていない会話では
+/// `No conversation found` になる。codex に至っては渡す手段が無く
+/// （`--session-id` 相当が無い）、ID は codex が採番して hook で名乗るまで
+/// 存在しない。**だから「確かめた」だけを再開に使う**（[`Self::observed`]）。
+///
+/// claude と codex はこの型の上では同じ 1 本の経路を通る:
+/// claude は起動時に UUID を採番して [`Self::Assigned`] から始まり、
+/// codex は [`Self::Unknown`] から始まる。どちらも hook が名乗った時点で
+/// [`Self::Observed`] へ移る（[`Self::observe`]）
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Conversation {
+    /// 会話が分からない。codex を起こした直後（codex が採番する）と、
+    /// hook が 1 度も届いていない行がここに居る
+    #[default]
+    Unknown,
+    /// 起動時に渡した ID。**agent がまだ名乗っていない**ので再開には使わない
+    Assigned(String),
+    /// hook が名乗った ID。**再開に使えるのはこれだけ**
+    Observed(String),
+}
+
+impl Conversation {
+    /// 分かっている限りの会話 ID（確かめたかは問わない）。
+    /// **表示名の引き当てに使う**（transcript の場所は ID だけで決まる）
+    pub(crate) fn id(&self) -> Option<&str> {
+        match self {
+            Self::Unknown => None,
+            Self::Assigned(id) | Self::Observed(id) => Some(id),
+        }
+    }
+
+    /// **確かめた**会話 ID。再開（`claude -r <id>` / `codex resume <id>`）に
+    /// 渡してよいのはこれだけ
+    pub(crate) fn observed(&self) -> Option<&str> {
+        match self {
+            Self::Observed(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// 起動時に渡した ID を記録する（None ＝ 渡していない ＝ codex の新規）。
+    ///
+    /// **同じ会話を確かめ済みなら格を下げない**: 再開（`Observed` の ID を
+    /// 渡し直す）で `Assigned` へ落ちると、hook が名乗り直すまでの数秒だけ
+    /// その行が「再開できない行」に見える
+    pub(crate) fn assign(&mut self, id: Option<String>) {
+        match id {
+            Some(id) if self.id() == Some(id.as_str()) => {}
+            Some(id) => *self = Self::Assigned(id),
+            None => *self = Self::Unknown,
+        }
+    }
+
+    /// hook が名乗った ID を記録する。**変わったときだけ true**
+    /// （呼び手が保存の要否に使う ＝ 毎周 `sessions.json` を書き直さない）
+    pub(crate) fn observe(&mut self, id: &str) -> bool {
+        if self.observed() == Some(id) {
+            return false;
+        }
+        *self = Self::Observed(id.to_string());
+        true
+    }
+}
+
 /// 一覧に載る 1 行。**プロセスが死んでも残る**のがライブ状態（`~/.claude/sessions/`）
 /// との違い。
 ///
@@ -114,6 +200,12 @@ impl std::fmt::Display for SessionId {
 pub(crate) struct SessionRow {
     /// 行の identity（[`SessionId`]）
     pub(crate) session_id: SessionId,
+    /// どの agent の行か。**保存値が無い行は claude**（[`Kind`] の既定）:
+    /// この項目より前に作られた行は全部 claude なので、既定が移行の答えになる
+    pub(crate) kind: Kind,
+    /// **その行が今動かしている会話**（[`Conversation`]）。行の ID とは別物で、
+    /// ペインの中の `/clear` `/resume` `/new` でこちらだけが変わる
+    pub(crate) conversation: Conversation,
     pub(crate) cwd: String,
     /// **解決済みの transcript の場所。** cwd から毎回導かない理由は、cwd が
     /// 動く値だから（セッションは走行中に git worktree へ移れる）。不変であるはずの
@@ -135,6 +227,12 @@ impl SessionRow {
     pub(crate) fn new(session_id: SessionId, cwd: impl Into<String>, now: u64) -> Self {
         Self {
             session_id,
+            // **既定は claude。** codex の行は起こす側が明示する
+            // （`crate::app` の `start_foreground`）
+            kind: Kind::default(),
+            // **起こす前の行は会話を持たない。** claude は起動時に採番した UUID を
+            // `assign` し、codex は hook が名乗るまで Unknown のまま
+            conversation: Conversation::Unknown,
             cwd: cwd.into(),
             transcript: None,
             pinned: false,
@@ -149,6 +247,13 @@ impl SessionRow {
         json!({
             ID_KEY: self.session_id.as_str(),
             CWD_KEY: self.cwd,
+            KIND_KEY: self.kind.as_str(),
+            // **確かめた会話だけを保存する。** 渡しただけの ID（[`Conversation::Assigned`]）は
+            // 次の起動では何も指さない（その会話は 1 ターンも終わっていない）ので、
+            // 残すと再起動後に存在しない会話を再開しに行く。
+            // **キーは常に書く**（空文字 ＝ 分からない）: 書かないと、0.11 以前の
+            // 行（[`LEGACY_AGENT_ID_KEY`] しか持たない）と区別できなくなる
+            CONVERSATION_KEY: self.conversation.observed().unwrap_or_default(),
             // 解決できていない行はキーごと出さない（「まだ解決していない」と
             // 「解決したが空だった」を保存の形で作り分けない）
             TRANSCRIPT_KEY: self.transcript.as_ref().map(|p| p.to_string_lossy()),
@@ -176,8 +281,13 @@ impl SessionRow {
         if session_id.is_empty() {
             return None;
         }
+        // 知らない綴り（未来の版が書いた agent）は既定へ倒す ＝ 行が消えるより
+        // claude として出る方が、少なくとも一覧から辿れる
+        let kind = Kind::parse(&text(KIND_KEY)).unwrap_or_default();
         Some(Self {
+            conversation: conversation_of(value, &session_id, kind),
             session_id,
+            kind,
             cwd: text(CWD_KEY),
             transcript: value
                 .get(TRANSCRIPT_KEY)
@@ -189,6 +299,43 @@ impl SessionRow {
             created_at: ms(CREATED_AT_KEY),
             updated_at: ms(UPDATED_AT_KEY),
         })
+    }
+}
+
+/// 保存された行から会話を読む。**0.11 以前の行の移行がここ 1 箇所**。
+///
+/// 当時は「行 ID ＝ claude の会話 ID」で（ccdesk が `--session-id` で採番を
+/// 強制していた）、会話 ID を別に持つのは codex の行だけだった。行 ID と会話を
+/// 切り離した今、その前提のまま読むと **claude の既存行が会話を失う**
+/// （transcript が引けず名前が `new session` へ戻り、再開もできなくなる）。
+///
+/// 段は 3 つで、上から順に:
+///
+/// | 保存の形 | 書いたのは | 読み |
+/// |:--|:--|:--|
+/// | `conversation` が空でない | 今の形式 | 確かめた会話 |
+/// | `conversation` が空 | 今の形式 | まだ分からない |
+/// | `conversation` が無い | 0.11 以前 | codex は `agent_id`、claude は行 ID |
+fn conversation_of(value: &Value, session_id: &SessionId, kind: Kind) -> Conversation {
+    let text = |key: &str| value.get(key).and_then(Value::as_str);
+    if let Some(stored) = text(CONVERSATION_KEY) {
+        return match stored.is_empty() {
+            true => Conversation::Unknown,
+            false => Conversation::Observed(stored.to_string()),
+        };
+    }
+    // ここから下は 0.11 以前が書いた行。**`Observed` として読む**のは、
+    // どちらの値も「その会話が実在した」ことが確かめられている値だから
+    // （codex の `agent_id` は hook が名乗った値、claude の行 ID は
+    // ccdesk が押し付けて transcript にそのまま載っていた値）
+    if let Some(legacy) = text(LEGACY_AGENT_ID_KEY).filter(|id| !id.is_empty()) {
+        return Conversation::Observed(legacy.to_string());
+    }
+    match kind {
+        Kind::Claude => Conversation::Observed(session_id.as_str().to_string()),
+        // 会話 ID を持たない codex の行は当時も再開できなかった（行メニューの
+        // `open` が無効化されていた）ので、失うものは無い
+        Kind::Codex => Conversation::Unknown,
     }
 }
 
@@ -589,10 +736,98 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 last_opened_at: 0,
+                // 0.11 以前の claude 行として読まれる（[`conversation_of`]）
+                conversation: Conversation::Observed("s".to_string()),
                 ..SessionRow::new(SessionId::new("s"), "", 0)
             }],
             "a state stored by an older build came back"
         );
+    }
+
+    /// **0.11 以前の行が会話を失わない。**
+    ///
+    /// 当時は「行 ID ＝ claude の会話 ID」で、会話 ID を別に持つのは codex の行
+    /// （`agent_id`）だけだった。前提のまま読むと claude の既存行が会話を失い、
+    /// transcript が引けず名前が `new session` へ戻り、再開もできなくなる。
+    ///
+    /// **新しい形式の「まだ分からない」と混ざらない**ことも同時に固定する:
+    /// 区別できるのは `conversation` キーを空文字でも必ず書いているからで、
+    /// 書かない実装に戻すと新しい claude 行が行 ID を会話として名乗り始める
+    #[test]
+    fn rows_written_before_the_row_id_was_split_keep_their_conversation() {
+        let temp = TempStore::new("rows_written_before_the_row_id_was_split");
+        let conversation = |text: &str| {
+            std::fs::write(temp.path(), format!(r#"{{"sessions":[{text}]}}"#)).unwrap();
+            temp.store().list()[0].conversation.clone()
+        };
+        // 0.11 以前: claude の行は会話 ID を持たない ＝ 行 ID がそれだった
+        assert_eq!(
+            conversation(r#"{"session_id":"legacy-claude"}"#),
+            Conversation::Observed("legacy-claude".to_string())
+        );
+        // 0.11 以前: codex の行だけが `agent_id` を持っていた
+        assert_eq!(
+            conversation(r#"{"session_id":"row","kind":"codex","agent_id":"cx-1"}"#),
+            Conversation::Observed("cx-1".to_string())
+        );
+        // 0.11 以前: 会話 ID を取れていない codex の行（当時も再開できなかった）
+        assert_eq!(conversation(r#"{"session_id":"row","kind":"codex"}"#), Conversation::Unknown);
+        // 今の形式: 空文字は「まだ分からない」（行 ID を会話に流用しない）
+        assert_eq!(
+            conversation(r#"{"session_id":"row","conversation":""}"#),
+            Conversation::Unknown,
+            "a new-format row fell through to the legacy backfill"
+        );
+        assert_eq!(
+            conversation(r#"{"session_id":"row","conversation":"conv-1","agent_id":"stale"}"#),
+            Conversation::Observed("conv-1".to_string()),
+            "the legacy key won over the current one"
+        );
+    }
+
+    /// **保存されるのは確かめた会話だけ。** 渡しただけの ID（[`Conversation::Assigned`]）は
+    /// 次の起動では何も指さない（その会話は 1 ターンも終わっていない）ので、
+    /// 残すと再起動後に存在しない会話を再開しに行く
+    #[test]
+    fn only_an_observed_conversation_is_stored() {
+        let temp = TempStore::new("only_an_observed_conversation_is_stored");
+        let round_trip = |conversation: Conversation| {
+            temp.store().store(&[SessionRow {
+                conversation,
+                ..SessionRow::new(SessionId::new("s"), "C:\\dev\\app", 1)
+            }]);
+            temp.store().list()[0].conversation.clone()
+        };
+        assert_eq!(
+            round_trip(Conversation::Observed("conv-1".to_string())),
+            Conversation::Observed("conv-1".to_string())
+        );
+        assert_eq!(round_trip(Conversation::Assigned("conv-2".to_string())), Conversation::Unknown);
+        assert_eq!(round_trip(Conversation::Unknown), Conversation::Unknown);
+    }
+
+    /// **確かめ済みの会話を渡し直しても格を下げない。** 下げると、hook が名乗り
+    /// 直すまでの数秒だけその行が「再開できない行」に見える
+    #[test]
+    fn assigning_the_conversation_that_is_already_observed_changes_nothing() {
+        let mut conversation = Conversation::Observed("conv-1".to_string());
+        conversation.assign(Some("conv-1".to_string()));
+        assert_eq!(conversation, Conversation::Observed("conv-1".to_string()));
+
+        // 別の会話を渡したら差し替わる（確かめ直しは hook が受け持つ）
+        conversation.assign(Some("conv-2".to_string()));
+        assert_eq!(conversation, Conversation::Assigned("conv-2".to_string()));
+        assert_eq!(conversation.id(), Some("conv-2"));
+        assert_eq!(conversation.observed(), None, "an unconfirmed id offered itself for resume");
+
+        // 何も渡さない起動（codex の新規・ピッカー）は会話を持たない
+        conversation.assign(None);
+        assert_eq!(conversation, Conversation::Unknown);
+
+        // hook が名乗ったら Observed へ。**変わった回だけ true**
+        assert!(conversation.observe("conv-3"));
+        assert!(!conversation.observe("conv-3"), "reported a change that did not happen");
+        assert_eq!(conversation.observed(), Some("conv-3"));
     }
 
     /// 壊れた / 想定外の形でも読みは失敗しない（＝起動が止まらない）。
