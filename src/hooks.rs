@@ -1047,8 +1047,9 @@ mod tests {
             !HOOK_EVENTS.iter().any(|row| row.event == "SessionStart" && row.state == WAITING),
             "SessionStart still asks for input"
         );
-        // 画面に出る語（手が要らない側）
-        assert_eq!(IDLE.title(), "Idle");
+        // 画面に出る語は保管の綴りと同じ（[`crate::poll::State::title`]）ので、
+        // 語をここへ書き写さない ＝ 綴りを変えたときにこの検査だけが古くならない
+        assert_eq!(IDLE.title(), IDLE.as_str());
     }
 
     /// 受けた state は保管へ載り、TUI 側の読みで同じ値が返る

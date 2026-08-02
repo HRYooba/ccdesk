@@ -32,9 +32,11 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const LIVE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// イベント待ちの上限（＝ 何も起きないときの周回間隔）
 const POLL_IDLE: Duration = Duration::from_millis(33);
-/// 何かが動いている間の描き直し間隔（ドットの点滅周期 400ms の半周期 ＝
-/// これより短くしても見た目は変わらず、フレームが増えるだけ）
-const ANIMATION_REDRAW: Duration = Duration::from_millis(200);
+/// 何かが動いている間の描き直し間隔。**明滅 1 コマの長さ**
+/// （[`crate::theme::BLINK_TICK_MS`]）そのもの ＝ これより短くしても同じコマを
+/// 描き直すだけで見た目は変わらない。数字を 2 箇所に持たないので、コマを増やしても
+/// フレームは増えない（明滅の段階数は 1 周のコマ数で決まり、間隔は変わらない）
+const ANIMATION_REDRAW: Duration = Duration::from_millis(crate::theme::BLINK_TICK_MS);
 /// 何も動いていないときの描き直す間隔。残るのは通知の期限切れ等の低頻度な変化
 /// だけなので、これより短い周期は**前フレームと同一の出力**を組み直すだけ
 const IDLE_REDRAW: Duration = Duration::from_secs(1);

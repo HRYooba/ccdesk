@@ -57,11 +57,13 @@ const DEFAULT_SIDEBAR_WIDTH: u16 = 34;
 ///    語の途中で切れると画像が壊れて見える
 ///
 /// 名前が切れた画像は README の売り（行の名前が agent と一致する）を裏切るので、
-/// **1 の方を下限にする**。右ペインを削らないようこれ以上は広げない。
+/// どちらも切らない幅を採る。右ペインを削らないようこれ以上は広げない。
+/// **今の下限は 2 の方**: agent の綴りが行末から消えて（形が答えるようになって）
+/// 名前の予算が 7 桁戻ったので、行より集計行の方が長くなった。
 /// **実データではこの幅を要求しない**（集計行は 0 件の項目を出さないので、
 /// 4 種すべてが揃っている撮影データが最も長い）。
 /// 根拠は `demo_sidebar_width_fits_the_sidebar_rows` が固定する
-const DEMO_SIDEBAR_WIDTH: u16 = 47;
+const DEMO_SIDEBAR_WIDTH: u16 = 44;
 
 /// 撮影用の new session 画面の初期フォルダ（実フォルダを出さない）
 const DEMO_CWD: &str = "C:\\dev\\shop-app";
@@ -1169,10 +1171,10 @@ mod tests {
         assert_eq!(
             counts,
             std::collections::BTreeMap::from([
-                ("Waiting", 1),
-                ("Working", 2),
-                ("Idle", 2),
-                ("Stopped", 1),
+                (crate::poll::State::Waiting.title(), 1),
+                (crate::poll::State::Working.title(), 2),
+                (crate::poll::State::Idle.title(), 2),
+                (crate::poll::State::Stopped.title(), 1),
             ])
         );
         assert!(

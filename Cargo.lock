@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "ccdesk"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -152,6 +152,7 @@ dependencies = [
  "ratatui",
  "serde_json",
  "terminal-colorsaurus",
+ "terminal-trx",
  "tui-term",
  "unicode-width",
  "uuid",

@@ -264,13 +264,30 @@ fn check_terminal_colors() -> Check {
             (c[2] >> 8) as u8
         )
     };
-    match crate::theme::query_host_colors() {
-        (Some(fg), Some(bg)) => {
-            Check::Ok(format!("terminal color query: fg {} bg {}", hex(fg), hex(bg)))
-        }
-        _ => Check::Warn(
+    let host = crate::theme::query_host_colors();
+    let (Some(fg), Some(bg)) = host else {
+        return Check::Warn(
             "terminal color query failed; theme forwarding falls back to dark".to_string(),
-        ),
+        );
+    };
+    // パレット（OSC 4）は fg/bg が取れた端末にだけ聞く ＝ 本番と同じ順序・同じ条件。
+    // 取れなければ状態色は ANSI 名前色へ落ちる（テーマ追従は保たれ、明滅の段階だけ減る）
+    match crate::theme::query_palette(host) {
+        Some(p) => Check::Ok(format!(
+            "terminal color query: fg {} bg {} · palette {} {} {} {}",
+            hex(fg),
+            hex(bg),
+            hex(p.red),
+            hex(p.green),
+            hex(p.yellow),
+            hex(p.bright_red)
+        )),
+        None => Check::Warn(format!(
+            "terminal color query: fg {} bg {}; palette query (OSC 4) unanswered, \
+             state colors fall back to the ANSI palette",
+            hex(fg),
+            hex(bg)
+        )),
     }
 }
 

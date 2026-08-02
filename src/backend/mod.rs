@@ -142,19 +142,14 @@ impl Kind {
 
     /// 幅に余裕のある場所（版行・使用率行・grouping の見出し）に出す名前。
     ///
-    /// **記号は使わない。** claude 公式の印は `✻`（1 桁）、codex 公式の印は `>_`
+    /// **公式の印は使わない。** claude 公式の印は `✻`（1 桁）、codex 公式の印は `>_`
     /// （2 桁）で幅が揃わず、列が崩れる。両方を 1 画面に並べる慣習も見当たらない。
-    /// 加えて ccdesk は状態アイコン（かつての `✻`/`✽`/`∙`）を廃止した経緯があり、
-    /// 同じ記号を別の意味で復活させると読み手の中で衝突する
+    /// セッション行が agent を表すのに使っている記号は公式の印ではなく、
+    /// **幅の揃う丸と菱**（[`crate::ui`] の `dot_glyph`）で、綴りとの対応は
+    /// 版行がこの `title` と並べて出す
     pub(crate) fn title(self) -> &'static str {
         self.as_str()
     }
-
-    /// [`Self::title`] を縦に揃えるための桁。**サイドバーの行末がこれで揃う**
-    /// （状態語の右に agent 名が並ぶので、揃っていないと行の右端がガタつく）。
-    /// 値は綴りから導くのではなく固定し、`every_title_fits_its_column` が
-    /// 全 kind の収まりを見る
-    pub(crate) const TITLE_COLS: usize = 6;
 
     /// この kind の実装。**`&'static` にしてある**ので、行やコマンドを組む側は
     /// 寿命を気にせず持ち回せる
@@ -390,21 +385,6 @@ pub(crate) mod tests {
         // キーは agent の綴りそのもの（`"codex"`）＝ 設定の綴りを別に持たない
         let by_key = |key: &str| (key == Kind::Codex.as_str()).then(|| ON.to_string());
         assert_eq!(Kind::enabled(by_key), Kind::ORDER);
-    }
-
-    /// 表示名は**サイドバーの行末で縦に揃える**ので、桁に収まらないと
-    /// 右隣の状態語の開始位置が行ごとにずれる
-    #[test]
-    fn every_title_fits_its_column() {
-        let widths: Vec<usize> = Kind::ORDER
-            .iter()
-            .map(|k| unicode_width::UnicodeWidthStr::width(k.title()))
-            .collect();
-        assert!(
-            widths.iter().all(|w| *w <= Kind::TITLE_COLS),
-            "a title does not fit in {} columns: {widths:?}",
-            Kind::TITLE_COLS
-        );
     }
 
     /// **行 ID は `CCDESK_ROW` にしか出ない。** hook はこの env でしか
