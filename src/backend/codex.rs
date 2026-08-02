@@ -48,6 +48,15 @@ const SUPPORTED_EVENTS: [&str; 5] = [
 /// 代償: ペインに警告が毎回出る。ユーザー自身の hook も無審査で走る
 const BYPASS_TRUST: &str = "--dangerously-bypass-hook-trust";
 
+/// `SessionEnd` の hook に codex が許すタイムアウトの上限（秒）。
+///
+/// **超えると codex が黙って詰めたうえで警告を 1 行出す**（実測:
+/// `clamping SessionEnd hook timeout to 3s in …`）。ccdesk の hook は実測
+/// 170〜190ms なので 3 秒で足り、警告を出させる理由が無い。
+/// **セッションを閉じる経路なので codex 側が短く切っているのは妥当**
+/// （ここで待たされると終了が遅れる）
+const SESSION_END_TIMEOUT_SECS: u64 = 3;
+
 pub(crate) struct Codex;
 
 impl Backend for Codex {
@@ -145,8 +154,14 @@ fn hook_toml(exe: &str) -> Option<String> {
         .iter()
         .filter(|row| SUPPORTED_EVENTS.contains(&row.event))
     {
+        // SessionEnd だけ codex 側の上限が短い（[`SESSION_END_TIMEOUT_SECS`]）
+        let timeout = if row.event == "SessionEnd" {
+            HOOK_TIMEOUT_SECS.min(SESSION_END_TIMEOUT_SECS)
+        } else {
+            HOOK_TIMEOUT_SECS
+        };
         by_event.entry(row.event).or_default().push(format!(
-            "{{hooks=[{{type='command',command='\"{exe}\" hook {} {}',timeout={HOOK_TIMEOUT_SECS}}}]}}",
+            "{{hooks=[{{type='command',command='\"{exe}\" hook {} {}',timeout={timeout}}}]}}",
             row.event,
             row.state.as_str(),
         ));
@@ -266,6 +281,24 @@ mod tests {
             "a double-quoted TOML string slipped in: {toml}"
         );
         assert!(toml.contains("type='command'"), "{toml}");
+    }
+
+    /// **codex が詰め直す形で渡さない。** 上限を超えると codex は黙って詰めたうえで
+    /// 警告を 1 行出し、それがセッションのたびにペインへ残る（実測:
+    /// `clamping SessionEnd hook timeout to 3s in …`）
+    #[test]
+    fn the_session_end_hook_stays_within_the_timeout_codex_allows() {
+        let toml = hook_toml("C:/ccdesk.exe").expect("no hooks were built");
+        let at = toml.find("SessionEnd=").expect("SessionEnd is not injected");
+        assert!(
+            toml[at..].contains(&format!("timeout={SESSION_END_TIMEOUT_SECS}")),
+            "SessionEnd asks for a timeout codex will clamp: {}",
+            &toml[at..]
+        );
+        assert!(
+            SESSION_END_TIMEOUT_SECS < HOOK_TIMEOUT_SECS,
+            "this clamp only matters while it is shorter than the shared timeout"
+        );
     }
 
     /// リテラル文字列にエスケープは無い。**組めないなら hook 無しで起動する**
