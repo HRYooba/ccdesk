@@ -434,10 +434,12 @@ pub(crate) struct App {
     /// **クリック起点の**取得が進行中か（リングをスピナーに変える材料）。
     /// 自動取得（保険の周期・ターン完了）では立たない ＝ 押していないのに回らない。
     /// 立てるのはクリック（即時）と取得スレッド、降ろすのは取得スレッドだけ
-    pub(crate) usage_fetching: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) usage_fetching: BTreeMap<Kind, Arc<std::sync::atomic::AtomicBool>>,
     /// マウスが使用率ゲージの上にいるか（押せることを帯で示す）。
     /// 一覧の行ではないので [`Self::hovered`]（[`SidebarPos`]）では表せない
-    pub(crate) usage_hovered: bool,
+    /// マウスが乗っている使用率の行（**どの agent の行か**。無ければ None）。
+    /// 行ごとに取り直せるので、乗っている 1 行だけを帯にする
+    pub(crate) usage_hovered: Option<Kind>,
     // 画面に出す値の供給元（実データ / 撮影用の固定データ）。起動時に 1 度だけ選ばれ、
     // 以降ここを通る限り「今 demo か」を問う必要が無い
     pub(crate) source: Arc<dyn DataSource>,
@@ -529,8 +531,8 @@ impl Default for App {
             ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             usage: BTreeMap::new(),
             usage_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            usage_fetching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            usage_hovered: false,
+            usage_fetching: agent_updating_flags(),
+            usage_hovered: None,
             // 撮影用の供給元は state.json / config.json を書かないので、
             // テストが開発者の設定を踏まない
             source: Arc::new(crate::source::DemoSource),
@@ -1753,8 +1755,8 @@ fn resize_terminal(app: &mut App, w: u16, h: u16) {
 /// 表示を変えるので常に描く
 fn mouse_needs_redraw(
     kind: MouseEventKind,
-    prev_hover: (Option<SidebarPos>, bool),
-    hover: (Option<SidebarPos>, bool),
+    prev_hover: (Option<SidebarPos>, Option<Kind>),
+    hover: (Option<SidebarPos>, Option<Kind>),
 ) -> bool {
     !matches!(kind, MouseEventKind::Moved) || prev_hover != hover
 }
@@ -1807,18 +1809,23 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
     // 右ペインの列範囲に描かれるため、後回しにするとペインのクリックに食われる。
     // 当たり判定は描画と同じ導出（[`crate::ui::usage_hit`]）なので、
     // 出していないとき（notice 表示中・狭い端末・使用率を切っている）は当たらない
-    let on_usage = crate::ui::usage_hit(app)
-        .is_some_and(|hit| hit.rows.contains(&mouse.row) && hit.columns.contains(&mouse.column));
+    // **行ごとに当たる**（押した行の agent だけを取り直す）
+    let on_usage = crate::ui::usage_hits(app).into_iter().find(|hit| {
+        hit.row == mouse.row && hit.columns.contains(&mouse.column)
+    });
     // 乗っている間は帯で「押せる」ことを示す（一覧の行のホバーと同じ手段）
-    app.usage_hovered = on_usage;
-    if on_usage && let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+    app.usage_hovered = on_usage.as_ref().map(|hit| hit.kind);
+    if let Some(hit) = on_usage
+        && let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+    {
         // 取り直しを実際に頼めたときだけスピナーを始める（撮影用の供給元は
         // 取得しない ＝ 降ろす者がいない旗を立てない）。ここで立てるのは
         // クリック直後のフレームから回すため（取得スレッド任せだと最初の
         // 描き直しまで押した反応が出ない）
-        if app.source.refresh_usage() {
-            app.usage_fetching
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+        if app.source.refresh_usage(hit.kind)
+            && let Some(flag) = app.usage_fetching.get(&hit.kind)
+        {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         return Ok(false);
     }
@@ -2565,27 +2572,84 @@ mod tests {
         (app, refreshes)
     }
 
+    /// テスト用供給元が記録した「取り直しを頼まれた agent」の並び
+    fn usage_asked() -> Arc<Mutex<Vec<Kind>>> {
+        USAGE_ASKED.with(|slot| Arc::clone(&slot.borrow()))
+    }
+
+    thread_local! {
+        /// [`TestSource::for_usage`] が作った記録の写し（テストから引くため）
+        static USAGE_ASKED: std::cell::RefCell<Arc<Mutex<Vec<Kind>>>> =
+            std::cell::RefCell::new(Arc::new(Mutex::new(Vec::new())));
+    }
+
     /// **右下の使用率を押すとその場で取り直す**（周期を待たない）。
     /// 当たり判定は描画と同じ導出（`ui::usage_hit`）なので、見えている場所と
     /// 押せる場所がずれない
     #[test]
     fn clicking_the_usage_gauge_refetches_it() {
         let (mut app, refreshes) = usage_app();
-        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
+        let hits = crate::ui::usage_hits(&app);
+        // **行は agent ごとに 1 本ずつ**（数も並びも [`Kind::ORDER`] が決める）
         assert_eq!(
-            hit.rows,
-            TERM.1 - crate::ui::BOTTOM_BAR_ROWS..TERM.1,
-            "the gauge is not on the bottom bar"
+            hits.iter().map(|h| h.kind).collect::<Vec<_>>(),
+            Kind::ORDER.to_vec(),
+            "the gauge does not have one row per agent"
+        );
+        let top = TERM.1 - crate::ui::BOTTOM_BAR_ROWS;
+        assert_eq!(
+            hits.iter().map(|h| h.row).collect::<Vec<_>>(),
+            vec![top, top + 1]
         );
 
         // 領域の左端・右端どちらを押しても当たる
+        let hit = &hits[0];
         for column in [hit.columns.start, hit.columns.end - 1] {
             let before = refreshes.load(std::sync::atomic::Ordering::Relaxed);
-            handle_mouse(&mut app, &click(column, hit.rows.start)).unwrap();
+            handle_mouse(&mut app, &click(column, hit.row)).unwrap();
             assert_eq!(
                 refreshes.load(std::sync::atomic::Ordering::Relaxed),
                 before + 1,
                 "clicking column {column} did not refetch"
+            );
+        }
+    }
+
+    /// **押した行の agent だけを取り直す。** 行をまたいで取りに行くと、
+    /// 見てもいない agent のプロセスが起きる
+    #[test]
+    fn clicking_one_usage_row_refetches_only_that_agent() {
+        let (mut app, refreshes) = usage_app();
+        let asked = usage_asked();
+        for hit in crate::ui::usage_hits(&app) {
+            let before = refreshes.load(std::sync::atomic::Ordering::Relaxed);
+            handle_mouse(&mut app, &click(hit.columns.start, hit.row)).unwrap();
+            assert_eq!(
+                refreshes.load(std::sync::atomic::Ordering::Relaxed),
+                before + 1,
+                "one click asked for more than one refetch"
+            );
+            assert_eq!(
+                asked.lock_recover().last().copied(),
+                Some(hit.kind),
+                "the click on row {} went to the wrong agent",
+                hit.row
+            );
+        }
+    }
+
+    /// **帯が乗るのは乗っている 1 行だけ**（押せる場所と光る場所を 1 対 1 にする）
+    #[test]
+    fn hovering_one_usage_row_marks_only_that_row() {
+        let (mut app, _) = usage_app();
+        let hits = crate::ui::usage_hits(&app);
+        for hit in &hits {
+            handle_mouse(&mut app, &moved(hit.columns.start, hit.row)).unwrap();
+            assert_eq!(
+                app.usage_hovered,
+                Some(hit.kind),
+                "row {} marked the wrong agent",
+                hit.row
             );
         }
     }
@@ -2595,9 +2659,10 @@ mod tests {
     #[test]
     fn clicking_outside_the_usage_gauge_does_not_refetch() {
         let (mut app, refreshes) = usage_app();
-        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
+        let hits = crate::ui::usage_hits(&app);
+        let hit = hits.first().expect("the gauge is on screen");
         // 領域の 1 桁左、そして同じ列の 1 行上
-        for (column, row) in [(hit.columns.start - 1, hit.rows.start), (hit.columns.start, hit.rows.start - 1)] {
+        for (column, row) in [(hit.columns.start - 1, hit.row), (hit.columns.start, hit.row - 1)] {
             handle_mouse(&mut app, &click(column, row)).unwrap();
         }
         assert_eq!(refreshes.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -2609,12 +2674,13 @@ mod tests {
     #[test]
     fn hovering_the_usage_gauge_lights_it_up_and_redraws_once() {
         let (mut app, _) = usage_app();
-        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
+        let hits = crate::ui::usage_hits(&app);
+        let hit = hits.first().expect("the gauge is on screen");
 
         // 乗った ＝ 点く + 描き直す
         let prev = (app.hovered, app.usage_hovered);
-        handle_mouse(&mut app, &moved(hit.columns.start, hit.rows.start)).unwrap();
-        assert!(app.usage_hovered, "the gauge is not marked as hovered");
+        handle_mouse(&mut app, &moved(hit.columns.start, hit.row)).unwrap();
+        assert!(app.usage_hovered.is_some(), "the gauge is not marked as hovered");
         assert!(
             mouse_needs_redraw(MouseEventKind::Moved, prev, (app.hovered, app.usage_hovered)),
             "entering the gauge must ask for a redraw"
@@ -2622,15 +2688,15 @@ mod tests {
 
         // 乗ったまま動いた ＝ 描き直さない
         let prev = (app.hovered, app.usage_hovered);
-        handle_mouse(&mut app, &moved(hit.columns.end - 1, hit.rows.start)).unwrap();
+        handle_mouse(&mut app, &moved(hit.columns.end - 1, hit.row)).unwrap();
         assert!(
             !mouse_needs_redraw(MouseEventKind::Moved, prev, (app.hovered, app.usage_hovered)),
             "moving inside the gauge must not ask for a redraw"
         );
 
         // 外れた ＝ 消える（1 桁左はゲージの外）
-        handle_mouse(&mut app, &moved(hit.columns.start - 1, hit.rows.start)).unwrap();
-        assert!(!app.usage_hovered, "the mark stays after the mouse left");
+        handle_mouse(&mut app, &moved(hit.columns.start - 1, hit.row)).unwrap();
+        assert!(app.usage_hovered.is_none(), "the mark stays after the mouse left");
     }
 
     /// **押した瞬間からスピナーが回る。** 旗はクリック側が立てる（取得スレッド任せ
@@ -2640,10 +2706,10 @@ mod tests {
     fn a_click_starts_the_spinner_only_when_a_fetch_was_requested() {
         // 取り直しを頼めた ＝ 回し始める
         let (mut app, _) = usage_app();
-        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
-        handle_mouse(&mut app, &click(hit.columns.start, hit.rows.start)).unwrap();
+        let hit = crate::ui::usage_hits(&app).remove(0);
+        handle_mouse(&mut app, &click(hit.columns.start, hit.row)).unwrap();
         assert!(
-            app.usage_fetching.load(std::sync::atomic::Ordering::Relaxed),
+            app.usage_fetching[&hit.kind].load(std::sync::atomic::Ordering::Relaxed),
             "the spinner did not start on click"
         );
 
@@ -2653,10 +2719,10 @@ mod tests {
             .into_iter()
             .map(|k| (k, crate::usage::sample_ready(Vec::new())))
             .collect();
-        let hit = crate::ui::usage_hit(&app).expect("the gauge is on screen");
-        handle_mouse(&mut app, &click(hit.columns.start, hit.rows.start)).unwrap();
+        let hit = crate::ui::usage_hits(&app).remove(0);
+        handle_mouse(&mut app, &click(hit.columns.start, hit.row)).unwrap();
         assert!(
-            !app.usage_fetching.load(std::sync::atomic::Ordering::Relaxed),
+            !app.usage_fetching[&hit.kind].load(std::sync::atomic::Ordering::Relaxed),
             "a spinner started that no one will stop"
         );
     }
@@ -2667,16 +2733,19 @@ mod tests {
     fn a_hidden_usage_gauge_has_no_hit_area() {
         let app = test_app(34, TERM);
         assert!(app.usage.is_empty(), "the fixture's premise broke");
-        assert!(crate::ui::usage_hit(&app).is_none());
+        assert!(crate::ui::usage_hits(&app).is_empty());
     }
 
     /// notice を出している間は下部バーが notice に置き換わるので、当たり判定も無い
     #[test]
     fn a_notice_takes_the_bottom_bar_and_the_hit_area_with_it() {
         let (mut app, _) = usage_app();
-        assert!(crate::ui::usage_hit(&app).is_some(), "the fixture's premise broke");
+        assert!(
+            !crate::ui::usage_hits(&app).is_empty(),
+            "the fixture's premise broke"
+        );
         app.notice = Some(("something happened".to_string(), std::time::Instant::now()));
-        assert!(crate::ui::usage_hit(&app).is_none());
+        assert!(crate::ui::usage_hits(&app).is_empty());
     }
 
     /// プロジェクトメニューが指すフォルダ
@@ -3454,9 +3523,12 @@ mod tests {
         /// [`WindowItem::LastView`] として保存された値の記録（**保存された回数まで
         /// 見たい**ので Vec）。実ファイル（`~/.ccdesk/state.json`）は書かない
         views: Arc<Mutex<Vec<String>>>,
-        /// [`DataSource::refresh_usage`] が呼ばれた回数（claude は起こさない）。
+        /// [`DataSource::refresh_usage`] が呼ばれた回数（agent は起こさない）。
         /// **回数まで見る**のは、押していないのに取り直す経路が生えたら気づくため
         usage_refreshes: Arc<std::sync::atomic::AtomicUsize>,
+        /// 取り直しを頼まれた agent の並び。**どの行を押したかが正しく届いたか**を
+        /// 見る（回数だけだと、別の agent を取りに行っても気づけない）
+        usage_asked: Arc<Mutex<Vec<Kind>>>,
         /// [`DataSource::usage`] が返す値（当たり判定は「今出ているか」で決まるので、
         /// 出ている状態を作れる必要がある）
         usage: Usage,
@@ -3489,17 +3561,22 @@ mod tests {
                 hooks: HookStates::default(),
                 views: Arc::new(Mutex::new(Vec::new())),
                 usage_refreshes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                usage_asked: Arc::new(Mutex::new(Vec::new())),
                 usage: Usage::Unknown,
             }
         }
 
         /// 使用率が出ている供給元（クリック当たり判定の検査）
         fn for_usage(usage: Usage, usage_refreshes: Arc<std::sync::atomic::AtomicUsize>) -> Self {
-            Self {
+            let source = Self {
                 usage,
                 usage_refreshes,
                 ..Self::plain()
-            }
+            };
+            // 記録の写しをテストから引けるようにする（供給元は Arc<dyn> の裏に
+            // 隠れるので、ダウンキャストせずに済ませる）
+            USAGE_ASKED.with(|slot| *slot.borrow_mut() = Arc::clone(&source.usage_asked));
+            source
         }
 
         /// プロジェクト側だけを見る供給元
@@ -3569,7 +3646,8 @@ mod tests {
             self.usage.clone()
         }
 
-        fn refresh_usage(&self) -> bool {
+        fn refresh_usage(&self, kind: Kind) -> bool {
+            self.usage_asked.lock_recover().push(kind);
             self.usage_refreshes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true

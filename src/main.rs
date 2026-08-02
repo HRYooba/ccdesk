@@ -100,7 +100,8 @@ fn main() -> anyhow::Result<()> {
     // 使用率の更新を run ループへ伝える旗と、クリック起点の取得が進行中か。
     // 供給元と App が同じものを持つ
     let usage_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let usage_fetching = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // 取得中スピナーの旗は agent ごと（押した行だけが回る）
+    let usage_fetching = app::agent_updating_flags();
     // demo / 実データの選択はこの 1 箇所だけ。以降のコードは供給元を通すので
     // 「今 demo か」を問う分岐を持たない（＝分岐の書き漏らしで実データが漏れない）
     let source: Arc<dyn DataSource> = if demo {
@@ -109,7 +110,7 @@ fn main() -> anyhow::Result<()> {
         Arc::new(LiveSource::new(
             usage_display,
             Arc::clone(&usage_dirty),
-            Arc::clone(&usage_fetching),
+            usage_fetching.clone(),
         ))
     };
     // セッション一覧・フッター・ウィンドウ状態はすべて供給元から受け取る
@@ -212,7 +213,7 @@ fn main() -> anyhow::Result<()> {
             .collect(),
         usage_dirty,
         usage_fetching,
-        usage_hovered: false,
+        usage_hovered: None,
         input_gate: None,
         notice: None,
         grouping: window.grouping,

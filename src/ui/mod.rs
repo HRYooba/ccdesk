@@ -325,10 +325,14 @@ fn usage_footer(app: &App) -> Vec<Vec<Span<'static>>> {
     if app.notice.is_some() {
         return Vec::new();
     }
-    let fetching = app.usage_fetching.load(std::sync::atomic::Ordering::Relaxed);
+    let fetching = |kind: Kind| {
+        app.usage_fetching
+            .get(&kind)
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+    };
     // 各行は「agent 名 + アカウント + 枠」。**アカウントはここにしか出ない**
     // （サイドバーのフッターは廃止した ＝ 同じことを 2 箇所に出さない）
-    let mut lines: Vec<Vec<Span<'static>>> = Kind::ORDER
+    let mut lines: Vec<(Kind, Vec<Span<'static>>)> = Kind::ORDER
         .into_iter()
         .map(|kind| {
             let mut spans = vec![Span::styled(
@@ -341,26 +345,28 @@ fn usage_footer(app: &App) -> Vec<Vec<Span<'static>>> {
                 app.usage.get(&kind).unwrap_or(&Usage::Unknown),
                 // キーヒントを押し出さないよう、使用率に渡すのは幅の半分まで
                 app.term_size.0 / 2,
-                fetching,
+                fetching(kind),
             ));
-            spans
+            (kind, spans)
         })
         .collect();
     // ブロックとして右端へ寄せるので、中は左揃えに整える
     // （agent 名とアカウントの桁が縦に揃う ＝ 2 行が 1 つの塊に見える）
-    let widest = lines.iter().map(|l| span_width(l)).max().unwrap_or(0);
-    for line in &mut lines {
+    let widest = lines.iter().map(|(_, l)| span_width(l)).max().unwrap_or(0);
+    for (kind, line) in &mut lines {
         let pad = widest.saturating_sub(span_width(line)) as usize;
         if pad > 0 {
             line.push(Span::raw(" ".repeat(pad)));
         }
-        if app.usage_hovered {
+        // **帯が乗るのは乗っている 1 行だけ**（行ごとに取り直せるので、
+        // 押せる場所と光る場所を 1 対 1 にする）
+        if app.usage_hovered == Some(*kind) {
             for span in line.iter_mut() {
                 span.style = span.style.bg(ui().hl_bg);
             }
         }
     }
-    lines
+    lines.into_iter().map(|(_, line)| line).collect()
 }
 
 /// 使用率行の左に置くアカウント表示。**未ログインは黄のまま**
@@ -375,16 +381,17 @@ fn account_cell(status: &AccountStatus) -> (String, Style) {
 
 /// 使用率のクリック当たり判定（右下の使用率を押すとその場で取り直す）
 pub(crate) struct UsageHit {
-    /// 使用率が占める行（下部バーの上端から下端まで）
-    pub(crate) rows: std::ops::Range<u16>,
+    /// その行が出している agent（押すとこの agent だけ取り直す）
+    pub(crate) kind: Kind,
+    pub(crate) row: u16,
     pub(crate) columns: std::ops::Range<u16>,
 }
 
 /// 使用率が今どこに描かれているか。出していないときは None ＝ 当たらない
-pub(crate) fn usage_hit(app: &App) -> Option<UsageHit> {
+pub(crate) fn usage_hits(app: &App) -> Vec<UsageHit> {
     let (width, height) = app.term_size;
     if height < BOTTOM_BAR_ROWS {
-        return None;
+        return Vec::new();
     }
     // **枠を 1 つも出していないなら当たらない。** アカウントだけの行は
     // 押しても取り直すものが無い（使用率は opt-in。[`crate::main`]）
@@ -392,16 +399,26 @@ pub(crate) fn usage_hit(app: &App) -> Option<UsageHit> {
         .into_iter()
         .any(|kind| !matches!(app.usage.get(&kind), None | Some(Usage::Unknown)))
     {
-        return None;
+        return Vec::new();
     }
     let lines = usage_footer(app);
     let drawn = lines.iter().map(|l| span_width(l)).max().unwrap_or(0);
-    (drawn > 0).then(|| UsageHit {
-        // 下部バーは画面の末尾 [`BOTTOM_BAR_ROWS`] 行（[`draw`] の縦分割と同じ）
-        rows: height - BOTTOM_BAR_ROWS..height,
-        // 右端に寄せて描くので、占めるのは末尾 `drawn` 列
-        columns: width.saturating_sub(drawn)..width,
-    })
+    if drawn == 0 {
+        return Vec::new();
+    }
+    // 下部バーは画面の末尾 [`BOTTOM_BAR_ROWS`] 行（[`draw`] の縦分割と同じ）。
+    // 行の並びは [`Kind::ORDER`] ＝ [`usage_footer`] が積む順と同じ
+    let top = height - BOTTOM_BAR_ROWS;
+    Kind::ORDER
+        .into_iter()
+        .zip(0..lines.len() as u16)
+        .map(|(kind, offset)| UsageHit {
+            kind,
+            row: top + offset,
+            // 右端に寄せて描くので、占めるのは末尾 `drawn` 列
+            columns: width.saturating_sub(drawn)..width,
+        })
+        .collect()
 }
 
 /// 下部バーの行数。**「右ペインはどこか」（[`pane_rect`]）もここから導く**ので、
@@ -1323,7 +1340,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     app.animating = data.iter().any(|d| d.group.blinks())
         || app
             .usage_fetching
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .values()
+            .any(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
 
     // ---- 描画 ----
     // 行の見え方の規則は [`Look`] 1 つ（帯 = 選択・ホバー / 印 = ペインに出ている）。
@@ -1850,15 +1868,24 @@ pub(crate) mod tests {
             "banded before the mouse arrived"
         );
 
-        app.usage_hovered = true;
-        let hovered = spans(&app);
-        assert!(
-            hovered.iter().all(|s| s.style.bg == Some(ui().hl_bg)),
-            "the hover puts no band on the gauge"
+        // **乗った 1 行だけが光る**（行ごとに取り直せるので、押せる場所と
+        // 光る場所を 1 対 1 にする）
+        app.usage_hovered = Some(Kind::Claude);
+        let banded: Vec<usize> = usage_footer(&app)
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.iter().any(|s| s.style.bg == Some(ui().hl_bg)))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            banded,
+            vec![0],
+            "the hover banded more than the row it is on"
         );
+        // **帯は背景だけ ＝ 幅を変えない**（乗った瞬間に当たり判定が動かない）
         assert_eq!(
             span_width(&plain),
-            span_width(&hovered),
+            span_width(&spans(&app)),
             "the band changed the width"
         );
     }
@@ -2181,7 +2208,7 @@ pub(crate) mod tests {
         use unicode_width::UnicodeWidthStr;
         let mut app = App {
             term_size: (60, 40),
-            sidebar_width: 34,
+            sidebar_width: 40,
             sessions: vec![named_session("a", "C:\\dev\\api", "some-session")],
             titles: fixed_titles(),
             ..Default::default()
@@ -4050,3 +4077,4 @@ pub(crate) mod tests {
         );
     }
 }
+

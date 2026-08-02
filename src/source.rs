@@ -187,7 +187,7 @@ pub(crate) trait DataSource: Send + Sync {
     /// **実際に取り直しを頼んだかを返す**: 呼び手はこれで取得中スピナーを
     /// 始めるので、取得しない供給元（撮影用）が true を返すと永遠に回る。
     /// 取得しない供給元では何もしない ＝ false
-    fn refresh_usage(&self) -> bool {
+    fn refresh_usage(&self, _kind: Kind) -> bool {
         false
     }
 
@@ -357,7 +357,7 @@ impl LiveSource {
     pub(crate) fn new(
         usage_display: bool,
         usage_dirty: Arc<std::sync::atomic::AtomicBool>,
-        usage_fetching: Arc<std::sync::atomic::AtomicBool>,
+        usage_fetching: BTreeMap<Kind, Arc<std::sync::atomic::AtomicBool>>,
     ) -> Self {
         // 前回の異常終了が残した書きかけの `.tmp`（ウィンドウ状態・設定・
         // セッション一覧・hook の受け渡し）を 1 回の走査でまとめて回収する。
@@ -377,7 +377,10 @@ impl LiveSource {
                         kind,
                         Arc::clone(&slot),
                         Arc::clone(&usage_dirty),
-                        Arc::clone(&usage_fetching),
+                        usage_fetching
+                            .get(&kind)
+                            .cloned()
+                            .unwrap_or_default(),
                     );
                     (kind, (slot, refresh))
                 })
@@ -436,16 +439,14 @@ impl DataSource for LiveSource {
             .map_or(Usage::Unknown, |(slot, _)| slot.lock_recover().clone())
     }
 
-    /// **全 agent へ流す。** クリックは「使用率を取り直せ」という 1 つの操作で、
-    /// どの行を押したかで片方だけ取り直す形にはしない
-    fn refresh_usage(&self) -> bool {
-        let Some(slots) = &self.usage else {
+    /// **押した行の agent だけを取り直す**（使用率の行は agent ごとに 1 本ずつ
+    /// 出ていて、それぞれが自分の取得を持つ）
+    fn refresh_usage(&self, kind: Kind) -> bool {
+        let Some((_, refresh)) = self.usage.as_ref().and_then(|slots| slots.get(&kind)) else {
             return false;
         };
-        for (_, refresh) in slots.values() {
-            refresh.request();
-        }
-        !slots.is_empty()
+        refresh.request();
+        true
     }
 
     fn note_turn_finished(&self) {
