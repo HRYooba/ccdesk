@@ -535,7 +535,7 @@ pub(crate) fn menu_zone(sidebar_cols: u16) -> std::ops::RangeInclusive<u16> {
 const UPDATE_MARK: &str = "⟳";
 
 /// バージョン行の更新状態。マーカー桁と右端の動詞はこれだけで決まる。
-/// ccdesk 側（[`SelfUpdate`]）と claude 側（`claude_updating` + `footer.latest`）で
+/// ccdesk 側（[`SelfUpdate`]）と agent 側（`agent_updating` + `FooterInfo::version`）で
 /// 進行状態の持ち方が違うので、表示の語彙をここに 1 つだけ置いて両方を寄せる
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum UpdateState {
@@ -774,10 +774,11 @@ fn ccdesk_update_state(app: &App) -> UpdateState {
 /// 最新表示へ戻るため。ネイティブインストールは既定で自動更新するので、
 /// 何もしなくてもこの行が消えることもある（公式仕様）
 fn agent_update_state(app: &App, kind: Kind) -> UpdateState {
-    // **進行中は全 agent で共有する 1 本の旗**（同時に 2 つ走らせない）
+    // **旗は agent ごと**（片方の更新中にもう片方の行まで止めない）
     if app
-        .claude_updating
-        .load(std::sync::atomic::Ordering::Relaxed)
+        .agent_updating
+        .get(&kind)
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
     {
         UpdateState::Running
     } else if app.footer.version(kind).latest.is_some() {
@@ -3897,6 +3898,25 @@ pub(crate) mod tests {
         (0..w).filter(|x| buffer[(*x, y)].bg == ui().hl_bg).collect()
     }
 
+
+    /// **更新中の旗は agent ごと。** 共有にすると、片方を更新している間に
+    /// もう片方の版行まで Running になって押せなくなる（実機で踏んだ）
+    #[test]
+    fn updating_one_agent_leaves_the_other_agents_row_pressable() {
+        let app = App {
+            agent_updating: crate::app::agent_updating_flags(),
+            ..Default::default()
+        };
+        // claude だけ更新中にする
+        app.agent_updating[&Kind::Claude].store(true, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(agent_update_state(&app, Kind::Claude), UpdateState::Running);
+        assert_ne!(
+            agent_update_state(&app, Kind::Codex),
+            UpdateState::Running,
+            "the other agent's row was frozen by an update that is not its own"
+        );
+    }
 
     /// **更新の無い版行も、触れれば他の行と同じ帯が出る。** 以前は動作の無い行を
     /// 区切り線と同じ扱いにしていたので、選択もホバーもハイライトも全部から漏れていた。

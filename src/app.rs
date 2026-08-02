@@ -409,8 +409,11 @@ pub(crate) struct App {
     pub(crate) footer_shared: Arc<Mutex<FooterInfo>>,
     pub(crate) footer_dirty: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) footer_refresh: Arc<std::sync::atomic::AtomicBool>,
-    // claude update 実行中（行の連打防止と "updating…" 表示）
-    pub(crate) claude_updating: Arc<std::sync::atomic::AtomicBool>,
+    /// `<agent> update` 実行中の旗（行の連打防止と "updating…" 表示）。
+    ///
+    /// **agent ごとに 1 本。** 共有にすると片方の更新中にもう片方の版行まで
+    /// Running になり、押せなくなる（実機で踏んだ）
+    pub(crate) agent_updating: BTreeMap<Kind, Arc<std::sync::atomic::AtomicBool>>,
     // ccdesk 自身の更新の進行状態（版行の表示と多重起動防止の正本）
     pub(crate) ccdesk_update: Arc<Mutex<SelfUpdate>>,
     // 版行の restart で立った再起動要求（起こす exe のパス）。run ループは
@@ -518,7 +521,7 @@ impl Default for App {
             footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
             footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            agent_updating: agent_updating_flags(),
             ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
             restart_to: None,
             ccdesk_latest: None,
@@ -2221,19 +2224,29 @@ fn request_restart(app: &mut App) {
     app.restart_to = Some(exe);
 }
 
-/// claude 本体の更新を実行する（公式 `claude update`）。
+/// agent ごとの更新中の旗。**作るのはここ 1 箇所**なので、agent が増えても
+/// 旗を作り忘れた kind ができない（[`Kind::ORDER`] から導く）
+pub(crate) fn agent_updating_flags(
+) -> BTreeMap<Kind, Arc<std::sync::atomic::AtomicBool>> {
+    Kind::ORDER
+        .into_iter()
+        .map(|kind| (kind, Arc::new(std::sync::atomic::AtomicBool::new(false))))
+        .collect()
+}
+
+/// agent 本体の更新を実行する（`<agent> update`）。
 /// 公式仕様: 更新は次回起動時から有効で、実行中セッションは現行版のまま動き続ける。
 /// 完了後はフッターを再取得し、最新化されれば版行は最新表示へ戻る
 fn start_agent_update(app: &mut App, kind: Kind) {
-    if app
-        .claude_updating
-        .swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
-        return; // 実行中の多重起動を防ぐ
+    let Some(flag) = app.agent_updating.get(&kind).cloned() else {
+        return;
+    };
+    if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return; // その agent の更新が走っている間の連打を防ぐ
     }
     // **どのコマンドを叩くかは agent が答える**（[`crate::backend`]）
     let program = kind.backend().update_program();
-    let updating = app.claude_updating.clone();
+    let updating = flag;
     let refresh = app.footer_refresh.clone();
     let dirty = app.footer_dirty.clone();
     std::thread::spawn(move || {
@@ -5253,3 +5266,4 @@ mod tests {
         assert!(app.popup.is_none(), "a removed shortcut opened a menu");
     }
 }
+

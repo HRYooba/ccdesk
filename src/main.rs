@@ -198,7 +198,7 @@ fn main() -> anyhow::Result<()> {
         footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
         footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        claude_updating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        agent_updating: app::agent_updating_flags(),
         ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
         restart_to: None,
         ccdesk_latest: None,
