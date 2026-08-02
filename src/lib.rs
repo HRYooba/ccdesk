@@ -470,6 +470,47 @@ fn alive_impl(_pid: u32) -> bool {
     true
 }
 
+/// 空白を含まない別名（Windows の 8.3 短縮名）。取れなければ None。
+///
+/// **引用符を使えない場所へパスを埋めるためにある。** codex の hook は
+/// コマンドを 1 本の文字列で受けるが、その文字列に二重引用符を入れると
+/// npm の `.cmd` シムを通る間に `""` へ化ける（実測 2026-08-02。
+/// 詳細は [`crate::backend::codex`]）。引用符を使わずに済ませるには、
+/// パス自体に空白が無いことが要る。
+///
+/// **無効なボリュームでは長いパスがそのまま返る**（8.3 は既定で有効だが
+/// `fsutil 8dot3name` で切れる）。呼び手は結果に空白が残っていないか必ず見ること
+pub fn short_path(path: &str) -> Option<String> {
+    short_path_impl(path)
+}
+
+#[cfg(windows)]
+fn short_path_impl(path: &str) -> Option<String> {
+    unsafe extern "system" {
+        fn GetShortPathNameW(long: *const u16, short: *mut u16, len: u32) -> u32;
+    }
+    // API は区切りを選ばないが、返る値に合わせて `\` で渡し、呼び手の綴り（`/`）へ戻す
+    let wide: Vec<u16> = path
+        .replace('/', "\\")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: 入力は終端付きの UTF-16、出力は自前の可変長バッファで、長さも渡す
+    let written = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    // 0 ＝ 失敗、バッファ超え ＝ 必要な長さが返る（どちらも諦める）
+    if written == 0 || written as usize >= buf.len() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..written as usize]).replace('\\', "/"))
+}
+
+#[cfg(not(windows))]
+fn short_path_impl(_path: &str) -> Option<String> {
+    // 8.3 は Windows だけの概念（他所は引用符が素直に通るのでそもそも要らない）
+    None
+}
+
 /// 現在時刻の epoch ms。**行の時刻・hook の時刻はすべてこの単位**
 /// （`SessionRow` と `hook-states.json` が同じ物差しを使う）
 pub fn now_ms() -> u64 {
@@ -1121,6 +1162,38 @@ pub fn dir_key(path: &str) -> String {
 //
 // 経由していた `claude agents --json` はこのディレクトリの劣化コピーで、
 // 新旧裁定に要る `statusUpdatedAt` を落とす（詳細は `crate::claude_format`）。
+
+#[cfg(windows)]
+#[cfg(test)]
+mod short_path_tests {
+    use super::short_path;
+
+    /// **空白が消えること**が唯一の用途（引用符を使えない場所へ埋めるため）。
+    /// 8.3 が無効なボリュームでは長いパスがそのまま返るので、
+    /// 「短縮できたなら空白は無い」だけを固定する
+    #[test]
+    fn a_shortened_path_has_no_space_left_in_it() {
+        let dir = std::env::temp_dir().join("ccdesk short path test");
+        std::fs::create_dir_all(&dir).expect("mkdir failed");
+        let file = dir.join("probe.exe");
+        std::fs::write(&file, b"stub").expect("write failed");
+        let long = file.to_string_lossy().replace('\\', "/");
+
+        let short = short_path(&long);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let short = short.expect("8.3 is disabled on this volume; nothing to check");
+        assert!(!short.contains(' '), "the space survived: {short}");
+        // 呼び手の綴り（`/`）で返す ＝ 埋め込む側が区切りを直さなくてよい
+        assert!(!short.contains('\\'), "a backslash leaked out: {short}");
+    }
+
+    /// 実在しないパスは短縮できない（呼び手はここで諦める）
+    #[test]
+    fn a_path_that_does_not_exist_has_no_short_name() {
+        assert_eq!(short_path("C:/no such dir at all/nope.exe"), None);
+    }
+}
 
 #[cfg(test)]
 mod process_alive_tests {

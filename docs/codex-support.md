@@ -107,6 +107,26 @@ ccdesk が起動時に立てた環境変数が、codex を経由して hook の�
 
 これが行の相関（§2.1）の土台になる。
 
+### 1.6 hook のコマンドに二重引用符を入れられない
+
+`-c hooks={…}` の `command` は 1 本の文字列で渡す。そこに二重引用符を入れると、
+**npm の `.cmd` シムを通る間に `""` へ二重化される**。実測:
+
+```
+ccdesk が渡す:  command='"C:/…/ccdesk.exe" hook SessionStart idle'
+codex に届く:   command='""C:/…/ccdesk.exe"" hook SessionStart idle'
+```
+
+codex はその名前のプログラムを起こそうとして失敗する。画面には
+`hook exited with code 1` が並び、**hook は 1 度も起動されない**（＝ 状態も
+`agent_id` も記録されないので、色・rename・resume が丸ごと死ぬ）。
+
+`codex exec` を PowerShell から叩くと通ってしまうので、**ペインの中でしか再現しない**。
+
+argv 配列で渡す逃げ道は無い（`invalid type: sequence, expected a string`）。
+囲めない以上パスに空白があってはならず、あるときは 8.3 短縮名へ落とす
+（[`ccdesk::short_path`]）。落とせなければ hook を注入しない。
+
 ---
 
 ## 2. 設計

@@ -154,15 +154,14 @@ impl Backend for Codex {
 /// `-c` に渡す hook の定義（TOML）。**注入できない形なら None**（hook 無しで
 /// 起動する ＝ 行の状態が縮退するだけで、セッション自体は動く）。
 ///
-/// **TOML のリテラル文字列（`'…'`）で組む。** 二重引用符を使うと
+/// **TOML のリテラル文字列（`'…'`）で組む。** 二重引用符で囲むと
 /// npm shim → cmd → exe のどこかで食われ、値が TOML として解釈されず
 /// 「ただの文字列」として渡る（実測。codex は
 /// `invalid type: string …, expected struct HooksToml` で落ちる）。
 /// リテラル文字列にはエスケープが無いので、パスに `'` を含む環境では組めない
 fn hook_toml(exe: &str) -> Option<String> {
-    if exe.contains('\'') {
-        return None;
-    }
+    let exe = command_word(exe)?;
+    let exe = exe.as_str();
     // イベント名をキーに配列へ足し込む（同名イベントが 2 枚あっても後着が
     // 前着を潰さない。並びを固定するため BTreeMap を使う ＝ 同じ入力で同じ文字列）
     let mut by_event: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -177,7 +176,7 @@ fn hook_toml(exe: &str) -> Option<String> {
             HOOK_TIMEOUT_SECS
         };
         by_event.entry(row.event).or_default().push(format!(
-            "{{hooks=[{{type='command',command='\"{exe}\" hook {} {}',timeout={timeout}}}]}}",
+            "{{hooks=[{{type='command',command='{exe} hook {} {}',timeout={timeout}}}]}}",
             row.event,
             row.state.as_str(),
         ));
@@ -191,6 +190,26 @@ fn hook_toml(exe: &str) -> Option<String> {
         .collect::<Vec<_>>()
         .join(",");
     Some(format!("hooks={{{body}}}"))
+}
+
+/// hook のコマンド行の先頭に**裸で**置ける形の exe パス。置けなければ None。
+///
+/// **二重引用符で囲めない。** 囲むと npm の `.cmd` シムを通る間に `""` へ
+/// 二重化され（実測 2026-08-02 / codex 0.146.0）、codex はその名前の
+/// プログラムを起こそうとして失敗する（ペインに
+/// `hook exited with code 1` が並び、hook は 1 度も起動されない）。
+/// codex 側は配列（argv）も受けない（`invalid type: sequence, expected a string`）。
+///
+/// 囲めない以上、パスに空白があってはいけない。空白があるときは Windows の
+/// 8.3 短縮名へ落とす（[`ccdesk::short_path`]）。それでも残るなら諦める ＝
+/// hook 無しで起動する（行の状態が縮退するだけで、セッションは動く）。
+/// `'` はリテラル文字列を閉じてしまうので同じく諦める
+fn command_word(exe: &str) -> Option<String> {
+    let usable = |path: &str| !path.contains(' ') && !path.contains('\'');
+    if usable(exe) {
+        return Some(exe.to_string());
+    }
+    ccdesk::short_path(exe).filter(|short| usable(short))
 }
 
 #[cfg(test)]
@@ -286,17 +305,54 @@ mod tests {
         }
     }
 
-    /// 二重引用符で組むと npm shim → cmd → exe のどこかで食われ、値が TOML として
-    /// 解釈されない（実測）。**外側はリテラル文字列**でなければならない
+    /// **注入する値に二重引用符を 1 つも出さない。**
+    ///
+    /// 理由が 2 つあり、どちらも実測:
+    ///
+    /// 1. TOML の構文として使うと、npm shim → cmd → exe のどこかで食われて値が
+    ///    文字列として渡り、codex が `invalid type: string …` で落ちる
+    /// 2. exe を囲む用途で使うと、`.cmd` のシムを通る間に `""` へ二重化され、
+    ///    codex はその名前のプログラムを起こそうとして失敗する（ペインに
+    ///    `hook exited with code 1` が並び、hook は 1 度も起動されない）
+    ///
+    /// 「構文としては使っていない」では 2 を防げないので、**1 つも出さない**で固定する
     #[test]
-    fn the_injected_value_never_relies_on_double_quotes_as_toml_syntax() {
+    fn the_injected_value_contains_no_double_quote_at_all() {
         let toml = hook_toml("C:/ccdesk.exe").expect("no hooks were built");
-        // 二重引用符が出てよいのは exe を囲む中身だけ（TOML の構文としては使わない）
         assert!(
-            !toml.contains("=\"") && !toml.contains("{\""),
-            "a double-quoted TOML string slipped in: {toml}"
+            !toml.contains('"'),
+            "a double quote slipped in; the .cmd shim doubles it: {toml}"
         );
         assert!(toml.contains("type='command'"), "{toml}");
+        assert!(toml.contains("command='C:/ccdesk.exe hook "), "{toml}");
+    }
+
+    /// **空白のある exe パスを裸で置かない。** 囲む手段が無い以上、置けば
+    /// コマンドが途中で切れて別のプログラムを起こそうとする。
+    /// 8.3 短縮名へ落とせなければ注入ごと諦める（[`command_word`]）
+    #[test]
+    fn a_path_with_a_space_is_never_emitted_as_it_is() {
+        // 実在しないパスは短縮名も取れない ＝ 注入しない
+        assert_eq!(hook_toml("C:/no such dir/ccdesk.exe"), None);
+        // 実在して空白を含むパスは、空白の無い別名になって初めて出る
+        if let Some(short) = ccdesk::short_path(&spaced_exe()) {
+            let toml = hook_toml(&spaced_exe()).expect("a shortenable path was refused");
+            assert!(!toml.contains(' ') || toml.contains(&short), "{toml}");
+            assert!(
+                !toml.contains("/ccdesk with space/"),
+                "the raw path with a space was emitted: {toml}"
+            );
+        }
+    }
+
+    /// 空白を含む実在のパス（8.3 が無効なボリュームでは短縮名が取れない ＝
+    /// そのときこのテストは注入を諦める側だけを見る）
+    fn spaced_exe() -> String {
+        let dir = std::env::temp_dir().join("ccdesk with space");
+        let _ = std::fs::create_dir_all(&dir);
+        let exe = dir.join("ccdesk.exe");
+        let _ = std::fs::write(&exe, b"stub");
+        exe.to_string_lossy().replace('\\', "/")
     }
 
     /// **codex が詰め直す形で渡さない。** 上限を超えると codex は黙って詰めたうえで
@@ -313,10 +369,11 @@ mod tests {
         );
     }
 
-    /// リテラル文字列にエスケープは無い。**組めないなら hook 無しで起動する**
-    /// （壊れた TOML を渡して codex ごと起動不能にしない）
+    /// リテラル文字列にエスケープは無い（`'` は文字列を閉じてしまう）。
+    /// **組めないなら hook 無しで起動する**（壊れた TOML を渡して codex ごと
+    /// 起動不能にしない）
     #[test]
-    fn a_path_that_cannot_be_quoted_drops_the_injection_instead_of_breaking_it() {
+    fn a_path_that_cannot_be_placed_bare_drops_the_injection_instead_of_breaking_it() {
         assert_eq!(hook_toml("C:/it's here/ccdesk.exe"), None);
         let inject = Inject {
             exe: "C:/it's here/ccdesk.exe",
