@@ -58,7 +58,7 @@ impl Backend for Codex {
         launch: Launch<'_>,
         inject: Option<&Inject>,
     ) -> CommandBuilder {
-        let mut cmd = CommandBuilder::new(PROGRAM);
+        let mut cmd = crate::backend::program(PROGRAM);
         cmd.cwd(cwd);
         // **行の相関はここだけ。** codex が採番する ID を ccdesk は前もって知れないので、
         // 自分の行 ID を env で渡し、hook 側が payload の session_id と一緒に記録する

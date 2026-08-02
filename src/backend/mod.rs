@@ -116,6 +116,19 @@ impl Kind {
     }
 }
 
+/// 起こす実行ファイルの [`CommandBuilder`]。
+///
+/// **PATH の解決を自前でやる**（[`ccdesk::resolve_program`]）。portable-pty も
+/// PATH を探すが、npm が並べて置く拡張子なしのシム（`codex`）を先に掴んで
+/// `CreateProcessW` が落ちる（実機で踏んだ）。解決できなければ名前のまま渡す
+/// ＝ 従来どおりの挙動へ落ちる
+fn program(name: &str) -> CommandBuilder {
+    match ccdesk::resolve_program(name) {
+        Some(path) => CommandBuilder::new(path),
+        None => CommandBuilder::new(name),
+    }
+}
+
 /// agent ごとに違う振る舞い。
 ///
 /// **メソッドを足すと全 agent が実装を要求される**（それがこの trait の目的）。
@@ -228,8 +241,15 @@ pub(crate) mod tests {
                 Launch::New { prompt: "" },
                 None,
             );
-            let program = cmd.get_argv()[0].to_string_lossy().to_string();
-            assert_eq!(program, kind.as_str(), "{kind:?} launches the wrong program");
+            // **拡張子とディレクトリは環境で変わる**（PATH の解決を通すので、
+            // 入っていれば `C:\…\codex.cmd`、入っていなければ `codex`）。
+            // 見るのは「どの名前の実行ファイルを起こすか」だけ
+            let program = std::path::PathBuf::from(cmd.get_argv()[0].to_string_lossy().to_string());
+            let stem = program
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            assert_eq!(stem, kind.as_str(), "{kind:?} launches the wrong program");
         }
     }
 }

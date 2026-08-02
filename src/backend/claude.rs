@@ -27,7 +27,7 @@ impl Backend for Claude {
         launch: Launch<'_>,
         inject: Option<&Inject>,
     ) -> CommandBuilder {
-        let mut cmd = CommandBuilder::new(PROGRAM);
+        let mut cmd = crate::backend::program(PROGRAM);
         cmd.cwd(cwd);
         // 継承した親セッションの印を落とす（落とさないと transcript が保存されない）
         for key in INHERITED_MARKERS {
