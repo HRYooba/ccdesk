@@ -81,7 +81,7 @@ impl std::fmt::Display for SessionId {
     }
 }
 
-/// 一覧に載る 1 行。**プロセスが死んでも残る**のがライブ状態（`claude agents --json`）
+/// 一覧に載る 1 行。**プロセスが死んでも残る**のがライブ状態（`~/.claude/sessions/`）
 /// との違い。
 ///
 /// # 行が持たないもの

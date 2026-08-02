@@ -1106,6 +1106,21 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, app: &App) {
 /// （`App::pane_size`）・New 画面のヒットテスト・マウス転送の座標変換
 /// （`keys::forward_mouse`）が全部ここから導く。別々の式で持つと、下部バーの
 /// 行数や枠を変えたときに「見えている場所と押せる場所」が黙ってずれる
+/// その行の**今のライブ状態**と、**claude がそれを書いた時刻**（`~/.claude/sessions/`
+/// の interactive エントリ）。載っていなければ `("", 0)` ＝ 未観測。
+///
+/// **対で返すことがこの関数の存在理由。** かつて時刻の側だけを ccdesk 自身の観測時刻
+/// （[`App::agents_observed_at`]）で埋めていた。その値は常に「今」なので
+/// **status が hook に必ず勝ち**、陳腐化した `busy` を新しい `idle` hook で
+/// 降ろせない ＝ 行が赤のまま固着した（実機で観測）。引数に観測時刻を渡さない形に
+/// してあるので、同じ取り違えをもう一度書くことができない
+fn live_status<'a>(agents: &'a [crate::poll::AgentInfo], id: &SessionId) -> (&'a str, u64) {
+    agents
+        .iter()
+        .find(|a| a.is_interactive() && a.session_id == id.as_str())
+        .map_or(("", 0), |a| (a.status.as_str(), a.status_at))
+}
+
 pub(crate) fn pane_rect(app: &App) -> Rect {
     let (w, h) = (app.term_size.0, app.term_size.1);
     let sidebar = sidebar_cols(app).min(w);
@@ -1126,7 +1141,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
 
     // サイドバー: **行の正本は `~/.ccdesk/sessions.json`**（`app.sessions`）。
     // 生死は自分の子プロセス（`child.try_wait()`）が、生きている行のライブ状態は
-    // `claude agents --json` の `status` が答える。
+    // `~/.claude/sessions/` の `status` が答える。
     // Working の点滅位相もここで取る時刻（`ccdesk::now_ms`）から決める
     let now_ms = ccdesk::now_ms();
 
@@ -1163,23 +1178,17 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             .iter()
             .enumerate()
             .find(|(_, w)| w.session_id == row.session_id);
-        // 生きている行のライブ状態は `agents --json` の interactive エントリが答える
-        let status = app
-            .agents
-            .iter()
-            .find(|a| a.is_interactive() && a.session_id == row.session_id.as_str())
-            .map(|a| a.status.as_str())
-            .unwrap_or_default();
+        let (status, status_at) = live_status(&app.agents, &row.session_id);
         // **その行を動かしている実行**。自分の窓（＝ ccdesk の子プロセス）が
         // 生きている行が主で、無ければ撮影用の固定表、それも無ければ
-        // `agents --json` が拾っている前景セッション（＝ 別インスタンスや
+        // ライブ状態が拾っている前景セッション（＝ 別インスタンスや
         // ccdesk の外で動いている実行）を実行として扱う
         let run = window
             .filter(|(_, w)| w.alive)
             .map(|(_, w)| Run {
                 hook: app.hook_states.get(&row.session_id, Some(w.launched_at)),
                 status,
-                status_at: app.agents_observed_at,
+                status_at,
                 pty: Some(w.pty),
             })
             .or_else(|| {
@@ -1197,7 +1206,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 // open で `claude -r` を起こすので、嘘の Stopped は二重再開の入口になる）。
                 // hook の記録は起動時刻で新旧を判断できない（他人の窓）ので使わない。
                 //
-                // **ただし、ccdesk 自身がこの行を止めた直後は例外。** `agents --json`
+                // **ただし、ccdesk 自身がこの行を止めた直後は例外。** ライブ状態
                 // の観測は最大 2 秒古く、今 kill したばかりの自分のセッションがまだ
                 // 載っていることがある。観測時刻（[`App::agents_observed_at`]）が
                 // 停止時刻（[`App::stopped_at`]）より新しくなるまでは、この救済を
@@ -1208,7 +1217,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 (!status.is_empty() && app.agents_observed_at > stopped_at).then_some(Run {
                     hook: None,
                     status,
-                    status_at: app.agents_observed_at,
+                    status_at,
                     // 他インスタンスの実行 ＝ こちらに窓が無い（材料は status）
                     pty: None,
                 })
@@ -2188,6 +2197,8 @@ pub(crate) mod tests {
         // 観測の方が新しい → 観測が勝つ
         assert_eq!(view(Some((WORKING, 1_000)), "idle", 2_000), "Idle");
         assert_eq!(view(Some((IDLE, 1_000)), "busy", 2_000), "Working");
+        // **赤の固着そのもの**: 陳腐化した busy より新しい idle hook が勝つ
+        assert_eq!(view(Some((IDLE, 2_000)), "busy", 1_000), "Idle");
         assert_eq!(view(Some((State::Idle, 1_000)), "waiting", 2_000), "Waiting");
         // hook の方が新しい（または同時刻）→ hook が勝つ
         assert_eq!(view(Some((WORKING, 1_000)), "idle", 999), "Working");
@@ -2195,6 +2206,44 @@ pub(crate) mod tests {
         // 片方しか無いときはある方
         assert_eq!(view(Some((WAITING, 1_000)), "", 2_000), "Waiting");
         assert_eq!(view(None, "busy", 2_000), "Working");
+    }
+
+    /// **行に渡す時刻は claude が status を書いた時刻**で、ccdesk がそれを読んだ
+    /// 時刻ではない。読んだ時刻を渡していた頃は、その値が常に「今」なので status が
+    /// hook に必ず勝ち、陳腐化した `busy` を新しい `idle` hook で降ろせなかった
+    /// （＝ 行が赤のまま固着した）
+    #[test]
+    fn a_rows_live_status_carries_the_time_claude_wrote_it() {
+        let agents = vec![
+            crate::poll::AgentInfo {
+                session_id: "mine".to_string(),
+                kind: crate::claude_format::AGENT_KIND_INTERACTIVE.to_string(),
+                status: "busy".to_string(),
+                status_at: 1_000,
+                ..Default::default()
+            },
+            // 前景でないエントリは行の答えにしない
+            crate::poll::AgentInfo {
+                session_id: "bg".to_string(),
+                kind: "background".to_string(),
+                status: "busy".to_string(),
+                status_at: 9_999,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            live_status(&agents, &crate::sessions::SessionId::new("mine")),
+            ("busy", 1_000)
+        );
+        assert_eq!(
+            live_status(&agents, &crate::sessions::SessionId::new("bg")),
+            ("", 0),
+            "a background entry answered for a row"
+        );
+        assert_eq!(
+            live_status(&agents, &crate::sessions::SessionId::new("absent")),
+            ("", 0)
+        );
     }
 
     /// **観測は、閉じるイベントが来なかった hook を必ず治す。**
@@ -2293,7 +2342,7 @@ pub(crate) mod tests {
 
     /// **ccdesk が今止めたセッションの残像は、次の観測が届くまで実行として拾わない。**
     ///
-    /// stop 直後は `agents --json` の観測が最大 2 秒古く、kill したばかりの
+    /// stop 直後はライブ状態の観測が最大 2 秒古く、kill したばかりの
     /// 自分のセッションがまだ busy 等で載っている。ここを「別インスタンスの実行」
     /// （run の 3 つ目の分岐）と誤認すると、Stopped になるはずの行が一瞬 Waiting
     /// 等を経由してから Stopped になってしまう（今回のバグ）。観測時刻が

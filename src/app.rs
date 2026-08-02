@@ -318,29 +318,28 @@ pub(crate) struct App {
     pub(crate) windows: Vec<Session>,
     /// 表示中のウィンドウ（[`Self::windows`] の添字）
     pub(crate) active: usize,
-    // claude agents --json のライブ状態（正規 IF。バックグラウンドスレッドが更新）
+    // 生きている前景セッションのライブ状態（`~/.claude/sessions/` 由来。
+    // バックグラウンドスレッドが更新）
     pub(crate) agents: Vec<AgentInfo>,
     /// [`Self::agents`] の**取得を始めた時刻**（ms）。**status の観測時刻**として
-    /// hook の記録時刻と新旧を比べる材料（[`crate::poll::row_state`]）。
+    /// **ccdesk が `~/.claude/sessions/` を最後に読めた時刻**（ms）。
     ///
-    /// **取り込みの瞬間（run ループの swap）を刻まない。** `agents --json` は
-    /// 1 回 ~900ms かかる（[`crate::poll::spawn_agents_poller`]）ので、取得完了後の
-    /// 時刻を付けると「取得を始める前のスナップショットに、取得完了後の時刻」が付く
-    /// ＝ 実際より最大 900ms 新しい観測を信じてしまう（kill 直前の busy 残像に
-    /// kill より後の時刻が付いて `stopped_at` のガードを素通りする・許可プロンプト
-    /// より前の busy が waiting hook を覆す、の 2 つの実バグを引いた）。
-    /// ここへ取り込むのは [`Self::agents_fetch_started`]（ポーラーが `fetch_agents()`
-    /// を呼ぶ直前に刻んだ値）で、run ループ自身は時計を読まない
+    /// 用途は [`Self::stopped_at`] との比較 1 つだけ ＝「自分が止めた後に見たか」。
+    /// **行の状態の新旧裁定には使わない**（それは claude 自身が書いた
+    /// [`crate::poll::AgentInfo::status_at`]）。ここを裁定に使っていた頃は、値が
+    /// 常に「今」なので status が hook に必ず勝ち、陳腐化した `busy` を新しい
+    /// `idle` hook で降ろせなかった。
+    ///
+    /// **取り込みの瞬間（run ループの swap）を刻まない**: 取得と一緒に運ばれてきた
+    /// 時刻をそのまま読む（[`crate::poll::AgentSnapshot`]）ので、取得に失敗した
+    /// 周回でこの値が進むことがない
     pub(crate) agents_observed_at: u64,
-    pub(crate) agents_shared: Arc<Mutex<Vec<AgentInfo>>>,
+    pub(crate) agents_shared: Arc<Mutex<crate::poll::AgentSnapshot>>,
     pub(crate) agents_dirty: Arc<std::sync::atomic::AtomicBool>,
-    /// [`Self::agents_observed_at`] の取得元。ポーラーが書き、run ループは
-    /// swap のたびにここを読むだけ（詳細は [`crate::source::PollSinks::agents_fetch_started`]）
-    pub(crate) agents_fetch_started: Arc<std::sync::atomic::AtomicU64>,
     /// ccdesk がその窓を閉じた時刻（ms）。**「自分が今止めたセッション」だけを覚える**。
     /// 刻む場所は [`remove_window`] 1 箇所（窓を外す経路が増えても刻み忘れが起きない）。
     ///
-    /// `agents --json` の観測は最大 [`LIVE_SCAN_INTERVAL`] 分古いことがあるので、
+    /// ライブ状態の観測は最大 [`LIVE_SCAN_INTERVAL`] 分古いことがあるので、
     /// kill した直後は「たった今殺した自分の前景セッション」がまだ busy 等として
     /// 載っている。この残像を[`crate::ui`]の別インスタンス救済（窓が無い行を
     /// 他インスタンスの実行として拾う分岐）が実行と誤認すると、Stopped になるはずの
@@ -354,7 +353,7 @@ pub(crate) struct App {
     pub(crate) sessions: Vec<SessionRow>,
     /// hook（`--settings` で注入した公式 hook）が書いた state の写し。
     /// **行の state・未読はどれもここから導く**（行に保存しない）。
-    /// hook が一度も来ていない行だけ `agents --json` の `status` へ落ちる
+    /// hook が一度も来ていない行だけ `~/.claude/sessions/` の `status` へ落ちる
     /// （[`crate::hooks`]）
     pub(crate) hook_states: HookStates,
     /// 撮影用の固定 state（`session_id` → state）。**実データでは必ず空**で、
@@ -484,9 +483,8 @@ impl Default for App {
             active: 0,
             agents: Vec::new(),
             agents_observed_at: 0,
-            agents_shared: Arc::new(Mutex::new(Vec::new())),
+            agents_shared: Arc::new(Mutex::new(crate::poll::AgentSnapshot::default())),
             agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            agents_fetch_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             stopped_at: std::collections::HashMap::new(),
             sessions: Vec::new(),
             hook_states: HookStates::default(),
@@ -573,7 +571,6 @@ impl App {
         PollSinks {
             agents: self.agents_shared.clone(),
             agents_dirty: self.agents_dirty.clone(),
-            agents_fetch_started: self.agents_fetch_started.clone(),
             footer: self.footer_shared.clone(),
             footer_dirty: self.footer_dirty.clone(),
             footer_refresh: self.footer_refresh.clone(),
@@ -895,22 +892,17 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 .clone();
             force_draw = true;
         }
-        // agents --json のライブ状態を取り込む（state 変化の即時反映）。
+        // 前景セッションのライブ状態を取り込む（state 変化の即時反映）。
         // **生死はここでは見ない**（前景セッションは自分の子なので `try_wait` が真実）
         if app
             .agents_dirty
             .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            app.agents = app
-                .agents_shared
-                .lock_recover()
-                .clone();
-            // 観測時刻は**取得を始めた時刻**（ポーラーが `fetch_agents()` の直前に
-            // 刻んだ値）を読むだけ。ここで `now_ms()` を刻むと、~900ms かかる取得の
-            // 分だけ実際より新しい時刻が付いてしまう（[`App::agents_observed_at`] 参照）
-            app.agents_observed_at = app
-                .agents_fetch_started
-                .load(std::sync::atomic::Ordering::Relaxed);
+            // **値と時刻を一緒に受け取る。** run ループ自身は時計を読まない
+            // （[`App::agents_observed_at`]）
+            let snapshot = app.agents_shared.lock_recover().clone();
+            app.agents = snapshot.agents;
+            app.agents_observed_at = snapshot.observed_at;
             force_draw = true;
         }
         // claude が画面を作り替えている最中は掴まない（[`Session::holds_frame`]）。
@@ -1327,7 +1319,7 @@ fn hook_store_changed(
 ///   `CLAUDE_PID` を渡すので、記録は「どの claude が」「どのセッションで」起きたかを
 ///   持っている。**turn が動いた瞬間に届く**ので、`/resume` `/clear` の張り替えを
 ///   周期で待たない
-/// - **`claude agents --json`**（`~/.claude/sessions/<pid>.json` 由来）: hook を
+/// - **ライブ状態**（`~/.claude/sessions/<pid>.json`）: hook を
 ///   注入できていないセッションのための従経路。2 秒周期のプロセス起動で届く
 ///
 /// pid が分からない / どちらにもエントリが無い / `sessionId` が空なら None
@@ -2086,7 +2078,7 @@ fn close_window_of(app: &mut App, id: &SessionId) {
 /// スキャンが拾っていない窓」）が、**行を動かす窓が無くなったという事実は
 /// 3 つとも同じ**なので、刻む理由も同じ。以前はこの関数を経由しない自然死の
 /// 経路（生死スキャン）だけ刻み忘れており、`/exit` や外部からの kill の直後に
-/// 最大 [`LIVE_SCAN_INTERVAL`] 秒ぶん古い `agents --json` の観測が素通りして、
+/// 最大 [`LIVE_SCAN_INTERVAL`] 秒ぶん古いライブ状態の観測が素通りして、
 /// 行が数秒 Working/Waiting に見えてから Stopped になっていた（実機で観測されたバグ）。
 /// ここへ一本化したことで、経路を増やしても刻み忘れが起きない
 fn remove_window(app: &mut App, idx: usize) {
@@ -2395,7 +2387,7 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
     }
     // **別のインスタンス（または ccdesk の外）で動いているセッションを
     // `claude -r` で二重に起こさない**: 同じ会話を 2 プロセスが同時に更新する。
-    // 判定材料は `agents --json`（生きている前景セッションだけが載る）。
+    // 判定材料はライブ状態（生きている前景セッションだけが載る）。
     // 観測は 2 秒周期なので、止めた直後の自分のセッションが最大 2 秒ほど
     // 残って見えることがある（その間の open は 1 度空振りするだけで、壊れない）
     if app
@@ -3861,7 +3853,7 @@ mod tests {
     }
 
     /// **別インスタンス（や ccdesk の外）で動いているセッションを `claude -r` で
-    /// 二重に起こさない。** `agents --json` に interactive で載っている ＝
+    /// 二重に起こさない。** ライブ状態に interactive で載っている ＝
     /// どこかで生きて動いている ＝ 二重に開くと同じ会話を 2 プロセスが同時更新する
     #[test]
     fn opening_a_session_running_elsewhere_does_not_double_resume() {
@@ -3872,6 +3864,7 @@ mod tests {
             kind: "interactive".to_string(),
             status: "busy".to_string(),
             pid: Some(4242),
+            ..AgentInfo::default()
         }];
         assert!(
             !open_session(&mut app, &SessionId::new("s")),
@@ -4103,7 +4096,7 @@ mod tests {
     /// ペインの中で `/resume` `/clear` すると claude は新しいセッションの
     /// `SessionStart` をその場で撃つので、受け渡しファイルの見え方が変わったことが
     /// 「一覧に新しい行を出す合図」になる。**変わっていない周は何もしない**ので、
-    /// 毎周 `claude agents --json` を起こし直すことにはならない
+    /// 毎周一覧を読み直すことにはならない
     #[test]
     fn a_hook_write_pulls_the_next_list_refresh_forward() {
         let older = std::time::SystemTime::UNIX_EPOCH;
@@ -4141,7 +4134,7 @@ mod tests {
             agent(Some(12), "bg", "a-background-job"),
             agent(Some(13), "interactive", ""),
         ];
-        // hook が何も知らない間は `agents --json` が答える（従経路）
+        // hook が何も知らない間はライブ状態が答える（従経路）
         let none = HookStates::default();
         let of = |pid, hooks: &HookStates| live_session_of(pid, 0, hooks, &agents);
         assert_eq!(of(Some(10), &none), Some(SessionId::new("after-resume")));
@@ -4152,7 +4145,7 @@ mod tests {
         assert_eq!(of(Some(13), &none), None, "an empty id became a row");
 
         // **hook が主。** 同じ pid について hook が別のセッションを知っていれば
-        // そちらを採る（hook は turn の瞬間に届くので `agents --json` より新しい）
+        // そちらを採る（hook は turn の瞬間に届くのでライブ状態より新しい）
         let hooks = HookStates::from_records([("just-cleared", crate::poll::State::Waiting, 5_000, Some(10))]);
         assert_eq!(of(Some(10), &hooks), Some(SessionId::new("just-cleared")));
         // 窓の起動より古い hook は前回の実行のもの ＝ 従経路へ落ちる
@@ -4160,7 +4153,7 @@ mod tests {
             live_session_of(Some(10), 5_001, &hooks, &agents),
             Some(SessionId::new("after-resume"))
         );
-        // hook しか知らない pid にも答える（`agents --json` が pid を載せない環境）
+        // hook しか知らない pid にも答える（ライブ状態が pid を載せない環境）
         let only_hook = HookStates::from_records([("hook-only", crate::poll::State::Working, 1, Some(77))]);
         assert_eq!(of(Some(77), &only_hook), Some(SessionId::new("hook-only")));
     }
@@ -5166,6 +5159,7 @@ mod tests {
             kind: "interactive".to_string(),
             status: "busy".to_string(),
             pid: Some(4242),
+            ..AgentInfo::default()
         }];
         app.sidebar_rows = vec![SidebarRow::Action(RowAction::Open(SessionId::new("s")))];
         app.sidebar_header_rows = 1;
