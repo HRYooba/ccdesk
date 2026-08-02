@@ -100,7 +100,7 @@ impl Backend for Codex {
         cmd
     }
 
-    /// **要る。** codex に `agents --json` 相当のライブ状態は無く、Esc 中断では
+    /// **要る。** codex に claude の `status` 相当のライブ状態は無く、Esc 中断では
     /// `Stop` が発火しない（[#22858](https://github.com/openai/codex/issues/22858)。
     /// 2026-08-02 時点で OPEN）。補正しないと中断した行が Working のまま固着する。
     ///

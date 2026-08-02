@@ -87,7 +87,7 @@ fn main() -> anyhow::Result<()> {
     // 使用率表示の opt-in（`~/.ccdesk/config.json` の `"usage_display": "on"`）。
     //
     // **既定で取らないのは資源の話ではない。** 取得は課金ゼロ・枠を消費せず、周期 2 分は
-    // 既存の `claude agents --json`（2 秒ごと）の 1/60 なので、負荷を理由に切る意味は無い。
+    // 既存のライブ状態のポーリング（2 秒ごと）の 1/60 なので、負荷を理由に切る意味は無い。
     // 切ってあるのは、これが **ccdesk で唯一「無人で Anthropic のサーバーへ出る」経路**
     // だから（他のポーリングはローカルのファイルとプロセスしか見ない）。Consumer Terms
     // 第 3 節は API キー以外での自動アクセスを禁じており、公式 CLI の文書化された機能を
@@ -166,9 +166,8 @@ fn main() -> anyhow::Result<()> {
         active: 0,
         agents: Vec::new(),
         agents_observed_at: 0,
-        agents_shared: Arc::new(Mutex::new(Vec::new())),
+        agents_shared: Arc::new(Mutex::new(poll::AgentSnapshot::default())),
         agents_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        agents_fetch_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         stopped_at: std::collections::HashMap::new(),
         sessions,
         hook_states,
@@ -224,7 +223,7 @@ fn main() -> anyhow::Result<()> {
         source,
     };
     // バックグラウンド取得の起動。**起動列の重い処理（埋め戻し・transcript の
-    // 初回読み）より先に起こす**: ポーラーが取りに行くもの（agents --json 約 900ms・
+    // 初回読み）より先に起こす**: ポーラーが取りに行くもの（ライブ状態・
     // バージョン）は起動列と独立なので、後回しにすると初回のライブ状態と
     // アカウント行の表示がその分だけ遅れる。撮影用の供給元は 1 本も起こさないので、
     // ここに `if !demo` は要らない

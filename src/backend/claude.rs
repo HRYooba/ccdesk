@@ -61,7 +61,7 @@ impl Backend for Claude {
         cmd
     }
 
-    /// **要らない。** claude は `agents --json` の `status` を遷移のたびに書き直す
+    /// **要らない。** claude は `~/.claude/sessions/` の `status` を遷移のたびに書き直す
     /// ので、hook を取り逃しても次の観測（2 秒周期）で必ず正しくなる。
     /// PTY の無音まで材料にすると、考え込んで出力が止まっている間を
     /// 「手が空いた」と誤って読む

@@ -175,15 +175,16 @@ fn check_codex_usage() -> Check {
     }
 }
 
-/// `claude agents --json --all` が読めるか。**本番のポーラーと同じ
-/// [`crate::poll::fetch_agents`]** を通す（別経路だと poll 側だけ引数や解釈を
+/// 前景セッションの生存記録（`~/.claude/sessions/`）が読めるか。**本番のポーラーと
+/// 同じ [`crate::poll::fetch_agents`]** を通す（別経路だと poll 側だけ解釈を
 /// 変えたときに doctor が嘘の ok を出す）
 fn check_agents() -> Check {
     match crate::poll::fetch_agents() {
-        Some(items) => Check::Ok(format!("claude agents --json: {} session(s)", items.len())),
-        None => Check::Fail(
-            "claude agents --json: failed to run or did not return a JSON array".to_string(),
-        ),
+        Some(snapshot) => Check::Ok(format!(
+            "~/.claude/sessions: {} live session(s)",
+            snapshot.agents.len()
+        )),
+        None => Check::Fail("~/.claude/sessions: could not be listed".to_string()),
     }
 }
 

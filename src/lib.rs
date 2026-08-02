@@ -415,6 +415,61 @@ mod resolve_program_tests {
     }
 }
 
+/// その pid のプロセスが今も生きているか。
+///
+/// **`~/.claude/sessions/<pid>.json` を読む側に必ず要る。** claude 自身は死んだ
+/// pid のファイルを掃除するが（実測 2026-08-02: 偽のファイルを置いて
+/// `claude agents --json` を叩くと消えた）、掃除が走るのは **claude が動いたとき**
+/// だけ。ccdesk が claude を起こさずにファイルを直接読むようになると、
+/// 「ccdesk が子を kill した直後」から「次に誰かが claude を起こす」までの間、
+/// 掃除前の残骸が残る。それをそのまま読むと **止めた行が `status: "busy"` の
+/// まま Working で描かれる**（Stopped にならない）。
+///
+/// 判定手段が無い環境は**生きている扱い**にする: 行が消えるより、止まった行が
+/// 残る方が害が小さい（Windows と Linux 以外は CI にも配布にも無い）
+pub fn process_alive(pid: u32) -> bool {
+    alive_impl(pid)
+}
+
+/// **ハンドルが開けただけでは生存の証明にならない**（終了済みでも誰かが握って
+/// いる間はハンドルが残る）ので、終了コードまで見る
+#[cfg(windows)]
+fn alive_impl(pid: u32) -> bool {
+    /// PROCESS_QUERY_LIMITED_INFORMATION。終了コードを読むのに足りる最小の権限
+    const QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    /// まだ動いているプロセスの「終了コード」
+    const STILL_ACTIVE: u32 = 259;
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn GetExitCodeProcess(handle: *mut core::ffi::c_void, code: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    // SAFETY: 3 つとも Win32 の素の呼び出しで、渡すのは値と自分のスタック上の
+    // 変数だけ。ハンドルは取得できたときにだけ閉じる
+    unsafe {
+        let handle = OpenProcess(QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // 開けない ＝ 居ない（権限不足でも同じ答えになるが、読む対象は
+            // 同じユーザーが起こした claude なので実際には起こらない）
+            return false;
+        }
+        let mut code = 0u32;
+        let read = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        read && code == STILL_ACTIVE
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn alive_impl(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).is_dir()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn alive_impl(_pid: u32) -> bool {
+    true
+}
+
 /// 現在時刻の epoch ms。**行の時刻・hook の時刻はすべてこの単位**
 /// （`SessionRow` と `hook-states.json` が同じ物差しを使う）
 pub fn now_ms() -> u64 {
@@ -1054,9 +1109,56 @@ pub fn dir_key(path: &str) -> String {
     }
 }
 
-// 注: 旧実装（~/.claude/sessions レジストリ読み・roster.json・JSONL transcript パース・
-// プロセス親子関係の遡り）は監査指摘により削除した。ライブ状態は正規の
-// `claude agents --json` を唯一のソースとする。
+// 注: 旧実装（~/.claude/sessions をセッション**一覧**として読む・roster.json・
+// JSONL transcript パース・プロセス親子関係の遡り）は監査指摘により削除した。
+//
+// **`~/.claude/sessions` を読むこと自体が戻ったわけではない**（[`crate::poll`] の
+// `read_sessions`）。戻したのは「今どの状態か」1 点だけで、旧実装と違うのは:
+//
+// - **一覧の正本は `~/.ccdesk/sessions.json` のまま**（あちらから行を生やさない）
+// - 読むのは 4 項目だけ（sessionId / kind / status / statusUpdatedAt）
+// - **死んだ pid を自分で弾く**（[`process_alive`]）
+//
+// 経由していた `claude agents --json` はこのディレクトリの劣化コピーで、
+// 新旧裁定に要る `statusUpdatedAt` を落とす（詳細は `crate::claude_format`）。
+
+#[cfg(test)]
+mod process_alive_tests {
+    use super::process_alive;
+
+    #[test]
+    fn the_process_asking_the_question_is_alive() {
+        assert!(process_alive(std::process::id()));
+    }
+
+    /// **kill した直後に生きていると答えないこと**が要点（これを取り違えると、
+    /// 止めた行が `status: "busy"` の残骸を読んで Working のまま残る）
+    #[test]
+    fn a_process_that_has_been_reaped_is_not_alive() {
+        let program = if cfg!(windows) { "cmd" } else { "sh" };
+        let args: [&str; 2] = if cfg!(windows) {
+            ["/c", "exit"]
+        } else {
+            ["-c", "exit"]
+        };
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("could not spawn a throwaway process");
+        let pid = child.id();
+        child.wait().expect("the throwaway process never exited");
+        assert!(!process_alive(pid));
+    }
+
+    /// 0 は「プロセスを名指ししていない」印。生きていると答えると、pid を
+    /// 持たないエントリが全部生存扱いになる
+    #[test]
+    fn pid_zero_is_not_alive() {
+        assert!(!process_alive(0));
+    }
+}
 
 #[cfg(test)]
 mod tests {

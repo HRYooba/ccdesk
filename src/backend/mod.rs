@@ -151,7 +151,7 @@ pub(crate) trait Backend: Send + Sync {
     /// **hook を取り逃したとき、PTY の無音を「手が空いた」と読んでよいか。**
     ///
     /// hook はイベントなので取りこぼすと自己修復しない。claude にはライブ状態
-    /// （`agents --json` の `status`）があり、次の観測で必ず正しくなるので補正は
+    /// （`~/.claude/sessions/` の `status`）があり、次の観測で必ず正しくなるので補正は
     /// 要らない。codex にはそれが無く、実際に Esc 中断では `Stop` が発火しない
     /// （[openai/codex#22858](https://github.com/openai/codex/issues/22858)）ので、
     /// 補正しないと Working（赤）が固着する

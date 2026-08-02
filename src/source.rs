@@ -12,7 +12,7 @@
 //! 呼び出し側の `if !demo` ではなく構造として止まる。
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use ccdesk::{same_dir, save_setting, save_state, update_state_list, LockExt};
@@ -20,7 +20,7 @@ use ccdesk::{same_dir, save_setting, save_state, update_state_list, LockExt};
 use crate::backend::Kind;
 use crate::hooks::HookStates;
 use crate::poll::{
-    spawn_agents_poller, spawn_footer_poller, AccountStatus, AgentInfo, FooterInfo, Grouping,
+    spawn_agents_poller, spawn_footer_poller, AccountStatus, AgentSnapshot, FooterInfo, Grouping,
     State, VersionSinks,
 };
 use crate::usage::{Usage, UsageInfo, UsageRefresh, UsageSlot, UsageWindow};
@@ -116,13 +116,11 @@ pub(crate) enum WindowItem<'a> {
 
 /// バックグラウンド取得の書き込み先（ポーラーが書き、run ループが dirty で取り込む）
 pub(crate) struct PollSinks {
-    pub(crate) agents: Arc<Mutex<Vec<AgentInfo>>>,
+    /// **値と観測時刻を 1 つの箱で運ぶ**（時刻だけを別の atomic で送っていた頃は、
+    /// 取得に失敗したときに古い値へ新しい時刻が付いた。理由は
+    /// [`crate::poll::AgentSnapshot`]）
+    pub(crate) agents: Arc<Mutex<AgentSnapshot>>,
     pub(crate) agents_dirty: Arc<AtomicBool>,
-    /// `fetch_agents()` を**呼ぶ直前**にポーラーが刻む時刻（ms）。**取り込み側
-    /// （run ループ）はここを読むだけで、自分では `now_ms()` を刻まない**:
-    /// `agents --json` は 1 回 ~900ms かかるので、取り込み時刻（swap の瞬間）を
-    /// 刻むと「取得を始める前のスナップショットに、取得が終わった後の時刻」が付いてしまう
-    pub(crate) agents_fetch_started: Arc<AtomicU64>,
     pub(crate) footer: Arc<Mutex<FooterInfo>>,
     pub(crate) footer_dirty: Arc<AtomicBool>,
     pub(crate) footer_refresh: Arc<AtomicBool>,
@@ -156,7 +154,7 @@ pub(crate) trait DataSource: Send + Sync {
 
     /// hook（子の claude へ `--settings` で注入したもの）が書いた state の写し。
     /// **生きている行の state はこれが主**で、hook が一度も来ていない行だけ
-    /// `claude agents --json` の `status` へ落ちる（[`crate::hooks`]）
+    /// `~/.claude/sessions/` の `status` へ落ちる（[`crate::hooks`]）
     fn hook_states(&self) -> HookStates;
 
     /// **窓を持たない行に与える固定の state**（`session_id` → state）。
@@ -546,7 +544,7 @@ impl DataSource for LiveSource {
     }
 
     fn spawn_pollers(&self, sinks: PollSinks) {
-        spawn_agents_poller(sinks.agents, sinks.agents_dirty, sinks.agents_fetch_started);
+        spawn_agents_poller(sinks.agents, sinks.agents_dirty);
         // 版行 2 本（claude / ccdesk）の更新チェックは**同じポーラーの同じゲート**で
         // 回す（周期を分けると片方だけ別の規則へ流れる。[`VersionSinks`]）
         spawn_footer_poller(

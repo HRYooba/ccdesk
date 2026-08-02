@@ -1,4 +1,4 @@
-//! バックグラウンド取得（agents --json / フッター）と状態分類。
+//! バックグラウンド取得（前景セッションのライブ状態 / フッター）と状態分類。
 //!
 //! 使用率は [`crate::usage`] が取得から解釈まで一手に持つ（取得の作法をここと
 //! 2 箇所に分けない）。
@@ -13,21 +13,20 @@ use ccdesk::LockExt;
 
 use crate::backend::{AgentVersion, Kind};
 
-// `agents --json` の項目の綴りは文書化されていないので
+// 生存記録（`~/.claude/sessions/<pid>.json`）の項目の綴りは文書化されていないので
 // [`crate::claude_format`] が持つ（外れたときに直す場所を 1 つにするため）
 use crate::claude_format::{
     AGENT_KIND, AGENT_KIND_INTERACTIVE, AGENT_PID, AGENT_SESSION_ID, AGENT_STATUS,
-    AGENT_STATUS_BUSY, AGENT_STATUS_IDLE, AGENT_STATUS_SHELL, AGENT_STATUS_WAITING,
+    AGENT_STATUS_BUSY, AGENT_STATUS_IDLE, AGENT_STATUS_SHELL, AGENT_STATUS_UPDATED_AT,
+    AGENT_STATUS_WAITING, SESSIONS_DIR,
 };
 use crate::theme::{ui, C_ATTENTION, C_OK, C_WORKING};
 
-/// `claude agents --json --all` の 1 エントリ（公式のスクリプト向けライブデータ）。
+/// 生きている前景セッション 1 つ（`~/.claude/sessions/<pid>.json` 1 ファイル）。
 ///
-/// **前景移行後に読むのは前景セッションを名指しできる項目だけ。** `sessionId` が
-/// ccdesk の行（[`crate::sessions::SessionRow`]）と同じ鍵で、`status` が前景
-/// セッションの生きた状態（`~/.claude/sessions/<pid>.json` に書かれる現在値。
-/// 値の一覧は [`crate::claude_format`]）。bg 専用の `id`（short）・`state`・要約は読まない
-/// ＝ 非公開の内部形式に依存する経路をここで断つ
+/// **読むのは前景セッションを名指しできる項目だけ。** `sessionId` が ccdesk の行
+/// （[`crate::sessions::SessionRow`]）と同じ鍵で、`status` が生きた状態。
+/// 項目の綴りと値の一覧は [`crate::claude_format`] が正本
 #[derive(Clone, Default)]
 pub(crate) struct AgentInfo {
     /// transcript の `sessionId`（＝ `claude --session-id` へ渡した UUID）
@@ -37,7 +36,14 @@ pub(crate) struct AgentInfo {
     /// 前景セッションが書くライブ状態の生値（値の一覧と決定条件は
     /// [`crate::claude_format`]、語彙への翻訳は [`state_of_status`]）
     pub(crate) status: String,
-    /// そのセッションを動かしているプロセス（文書化: 生存中のみ pid が載る）。
+    /// **claude が [`Self::status`] を書いた時刻**（ms）。0 ＝ 時刻が読めなかった。
+    ///
+    /// hook（イベント）とどちらが新しいかを見るのはこの値で、**ccdesk 自身が
+    /// 観測した時刻ではない**（[`row_state`]）。観測時刻で代用すると、その値は
+    /// 常に「今」なので status が hook に必ず勝ち、陳腐化した `busy` を新しい
+    /// `idle` hook で降ろせなくなる
+    pub(crate) status_at: u64,
+    /// そのセッションを動かしているプロセス。
     ///
     /// **`sessionId` と対で読むのが要点**: ペインの中で `/resume` すると
     /// 同じプロセスが別の `sessionId` に移るので、ccdesk が自分の子（pid は
@@ -53,73 +59,118 @@ impl AgentInfo {
     }
 }
 
-/// `claude agents --json --all` を 1 回叩いて解釈する。
-/// None ＝ 起動できなかった、または応答が JSON 配列でない。
+/// 生きている前景セッションを 1 回読む（`~/.claude/sessions/`）。
+/// None ＝ ディレクトリを列挙できなかった（＝ 呼び手は前回の観測を保つ）。
 ///
 /// **ポーラーと `ccdesk doctor` が同じこの経路を通る**: doctor は
 /// 「実際どう見えるか」を確かめる道具なので、本番と別の実装を持つと
-/// こちらだけ引数や解釈を変えたときに doctor が嘘の ok を出す
-pub(crate) fn fetch_agents() -> Option<Vec<AgentInfo>> {
-    let json = out("claude", &["agents", "--json", "--all"])?;
-    let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(&json)
-    else {
-        return None;
-    };
-    let parsed = items
-        .iter()
-        .map(|v| {
-            let s = |k: &str| {
-                v.get(k)
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default()
-                    .to_string()
-            };
-            AgentInfo {
-                session_id: s(AGENT_SESSION_ID),
-                kind: s(AGENT_KIND),
-                status: s(AGENT_STATUS),
-                // 桁が u32 に収まらない値は pid として使わない
-                pid: v
-                    .get(AGENT_PID)
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|pid| u32::try_from(pid).ok()),
-            }
-        })
-        .collect();
-    Some(parsed)
+/// こちらだけ解釈を変えたときに doctor が嘘の ok を出す
+pub(crate) fn fetch_agents() -> Option<AgentSnapshot> {
+    read_sessions(&ccdesk::claude_dir()?.join(SESSIONS_DIR))
 }
 
-/// 取得 1 回ぶん。**`fetch_started` を実際に取得する前に刻む**のが要点で、
-/// 取得後（完了後）に刻むと 900ms 前のスナップショットに取得完了時刻が
-/// 付いてしまい、取り込み側（run ループ）の新旧裁定が実際より新しい観測だと
-/// 錯覚する（[`crate::source::PollSinks::agents_fetch_started`] のコメント参照）。
+/// 1 回ぶんの観測。**「読めた時刻」を値と一緒に運ぶ**のが要点で、時刻だけが
+/// 別経路で進むと古い値に新しい時刻が付く（[`poll_agents_once`]）
+#[derive(Clone, Default)]
+pub(crate) struct AgentSnapshot {
+    pub(crate) agents: Vec<AgentInfo>,
+    /// このディレクトリを読み始めた時刻（ms）。**個々の `status` の新しさでは
+    /// ない**（それは [`AgentInfo::status_at`]）。使い道は「ccdesk が止めた後に
+    /// 見たか」の判定 1 つだけ（[`crate::app::App::agents_observed_at`]）
+    pub(crate) observed_at: u64,
+}
+
+/// [`fetch_agents`] の本体。**ディレクトリを引数で受ける**ので、テストが実ユーザーの
+/// `~/.claude` を読まずに済む（[`crate::testutil`]）
+pub(crate) fn read_sessions(dir: &std::path::Path) -> Option<AgentSnapshot> {
+    let observed_at = ccdesk::now_ms();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // **まだ 1 度も claude が起きていない ＝ セッションは 0**（読めなかった
+        // のではないので、前回の観測を残すとそちらの方が嘘になる）
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Some(AgentSnapshot { agents: Vec::new(), observed_at });
+        }
+        Err(_) => return None,
+    };
+    let agents = entries
+        .flatten()
+        .filter_map(|entry| read_session_file(&entry.path()))
+        .collect();
+    Some(AgentSnapshot { agents, observed_at })
+}
+
+/// 1 ファイル → 1 エントリ。**読めない・死んでいるものは黙って落とす**
+/// （1 つの壊れたファイルで観測全体を失わない）
+fn read_session_file(path: &std::path::Path) -> Option<AgentInfo> {
+    let value = ccdesk::read_json(path)?;
+    let s = |k: &str| {
+        value
+            .get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let num = |k: &str| value.get(k).and_then(serde_json::Value::as_u64);
+    // 桁が u32 に収まらない値は pid として使わない
+    let pid = num(AGENT_PID).and_then(|pid| u32::try_from(pid).ok())?;
+    // **死んだ pid の残骸を読まない。** これを落とすと、止めた行が残骸の
+    // `busy` を読んで Working のまま残る（理由は [`ccdesk::process_alive`]）
+    if !ccdesk::process_alive(pid) {
+        return None;
+    }
+    Some(AgentInfo {
+        session_id: s(AGENT_SESSION_ID),
+        kind: s(AGENT_KIND),
+        status: s(AGENT_STATUS),
+        // 時刻の項目が無い版のために、ファイルの更新時刻へ落とす。0 のままに
+        // すると hook が必ず勝ち、hook を取り逃した行を status で直せなくなる
+        status_at: num(AGENT_STATUS_UPDATED_AT).unwrap_or_else(|| modified_ms(path)),
+        pid: Some(pid),
+    })
+}
+
+/// ファイルの更新時刻（ms）。読めなければ 0
+fn modified_ms(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// 取得 1 回ぶん。**値と観測時刻を 1 つの [`AgentSnapshot`] として入れ替える**のが
+/// 要点で、失敗したときは丸ごと前回のまま残る。
+///
+/// 以前は時刻だけを別の atomic で運び、しかも取得の**前**に無条件で刻んでいた。
+/// 取得が失敗すると**古い値に新しい時刻が付く**ので、陳腐化した `busy` が
+/// 「たった今の観測」を名乗って hook に勝ち続ける（＝ 赤が固着して直らない）。
+/// 2 つを 1 つの値へ束ねると、この食い違いが型として作れなくなる。
 ///
 /// **取得そのものを引数で受ける**（`fetch_agents` を直接呼ばない）。
-/// スレッドを起こさず、かつ**取得に時間がかかる場合を模して**この順序を
-/// テストできるようにするため（`fetch` に時間のかかる関数を渡し、刻んだ時刻が
-/// 開始側に寄っていることを見る。実装を `fetch_agents` に固定すると、
-/// 呼び出し前後どちらで刻んでも「速すぎて差が測れない」テストになってしまう）
+/// 失敗しても入れ替わらないことを、実ファイルを用意せずに確かめられるようにするため
 fn poll_agents_once(
-    shared: &Mutex<Vec<AgentInfo>>,
+    shared: &Mutex<AgentSnapshot>,
     dirty: &std::sync::atomic::AtomicBool,
-    fetch_started: &std::sync::atomic::AtomicU64,
-    fetch: impl FnOnce() -> Option<Vec<AgentInfo>>,
+    fetch: impl FnOnce() -> Option<AgentSnapshot>,
 ) {
-    fetch_started.store(ccdesk::now_ms(), std::sync::atomic::Ordering::Relaxed);
     if let Some(parsed) = fetch() {
         *shared.lock_recover() = parsed;
         dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// agents --json は 1 回 ~900ms かかるためバックグラウンドスレッドで回す
+/// 前景セッションの観測をバックグラウンドで回す。
+///
+/// **1 周期は ~1ms**（`~/.claude/sessions/` を読むだけ）。`claude agents --json` を
+/// 起こしていた頃は 1 回 ~900ms かかっていた
 pub(crate) fn spawn_agents_poller(
-    shared: Arc<Mutex<Vec<AgentInfo>>>,
+    shared: Arc<Mutex<AgentSnapshot>>,
     dirty: Arc<std::sync::atomic::AtomicBool>,
-    fetch_started: Arc<std::sync::atomic::AtomicU64>,
 ) {
     std::thread::spawn(move || loop {
-        poll_agents_once(&shared, &dirty, &fetch_started, fetch_agents);
+        poll_agents_once(&shared, &dirty, fetch_agents);
         std::thread::sleep(Duration::from_secs(2));
     });
 }
@@ -721,7 +772,7 @@ impl State {
     }
 }
 
-/// `agents --json` の `status`（claude 自身が書く**現在値**）を [`State`] へ写す。
+/// `~/.claude/sessions/` の `status`（claude 自身が書く**現在値**）を [`State`] へ写す。
 /// `None` ＝ **まだ観測できていない**（空文字。値が載らないセッションも実在するので、
 /// 呼び手はこの経路を必ず持つ）。
 ///
@@ -745,14 +796,14 @@ pub(crate) fn state_of_status(status: &str) -> Option<State> {
 }
 
 /// その行を**今動かしている実行**の観測。窓 1 つが実行 1 つで、他インスタンスの
-/// 実行は `agents --json` の status 経由で、撮影用の供給元は固定表で名乗る
+/// 実行は `~/.claude/sessions/` の status 経由で、撮影用の供給元は固定表で名乗る
 /// （材料をどこから集めるかは描画側 ＝ [`crate::ui`] が持つ）
 pub(crate) struct Run<'a> {
     /// その実行が hook で報告した最新の (state, 記録時刻)（一度も来ていなければ None）。
     /// 前回の実行の残骸を捨てる判断は [`crate::hooks::HookStates::get`] が
     /// 窓の起動時刻で済ませてあるので、ここへ来るのは今の実行が書いたものだけ
     pub(crate) hook: Option<(State, u64)>,
-    /// `agents --json` の `status` の生値（空 ＝ ポーラーがまだ拾っていない、
+    /// `~/.claude/sessions/` の `status` の生値（空 ＝ ポーラーがまだ拾っていない、
     /// または値を載せないセッション）。語彙への翻訳は [`state_of_status`]
     pub(crate) status: &'a str,
     /// `status` を観測した時刻（ms）。hook の記録時刻とどちらが新しいかを見る。
@@ -862,43 +913,152 @@ pub(crate) fn row_state(run: Option<Run<'_>>) -> State {
 mod tests {
     use super::*;
 
-    /// **観測時刻は取得完了ではなく取得開始で刻む。**
+    use crate::testutil::TempDir;
+
+    /// **取得に失敗した周回は、値も観測時刻も動かさない。**
     ///
-    /// `agents --json` は 1 回 ~900ms かかる。以前は取り込み側（run ループ）が
-    /// 取得完了後に `now_ms()` を刻んでいたため、取得を始める前のスナップショットに
-    /// 取得完了後の時刻が付いていた（kill 直前の busy 残像に kill より後の時刻が
-    /// 付いて `stopped_at` のガードを素通りする・許可プロンプトより前の busy 観測が
-    /// `waiting` hook を覆す、の 2 つの実バグを引いた）。
+    /// これが赤の固着の正体だった: かつて観測時刻は値と別の atomic で運ばれ、
+    /// しかも取得の**前**に無条件で刻まれていた。取得が失敗すると古い値に新しい
+    /// 時刻が付き、陳腐化した `busy` が「たった今の観測」を名乗って hook に勝ち
+    /// 続ける ＝ 新しい `idle` hook では二度と降ろせない。
     ///
-    /// **取得に時間がかかる状況を模して**証明する: `fetch` に `sleep` を挟んだ
-    /// 偽の取得を渡し、刻まれた時刻が sleep の**前**（開始）に寄っていて、
-    /// sleep の**後**（完了）には寄っていないことを見る。本物の `fetch_agents` を
-    /// 直接呼ぶ形だと、`claude` の有無や応答速度で所要時間が環境依存になり、
-    /// 前後どちらで刻んでも差が測れない（測れてもその環境でしか通らない）
-    /// テストになってしまうため、ここでは所要時間を固定して確実に測る
+    /// 今は 1 つの [`AgentSnapshot`] を丸ごと入れ替える形なので食い違いを作れない。
+    /// **時刻の経路をもう一度分けたらここが落ちる**のがこのテストの役目
     #[test]
-    fn poll_agents_once_stamps_the_start_time_before_fetching_not_after() {
-        let shared = Mutex::new(Vec::new());
-        let dirty = std::sync::atomic::AtomicBool::new(false);
-        let fetch_started = std::sync::atomic::AtomicU64::new(0);
-        let before = ccdesk::now_ms();
-        poll_agents_once(&shared, &dirty, &fetch_started, || {
-            std::thread::sleep(Duration::from_millis(200));
-            None
+    fn a_failed_read_moves_neither_the_value_nor_its_timestamp() {
+        let shared = Mutex::new(AgentSnapshot {
+            agents: vec![AgentInfo {
+                session_id: "kept".to_string(),
+                status: AGENT_STATUS_BUSY.to_string(),
+                ..AgentInfo::default()
+            }],
+            observed_at: 1_000,
         });
-        let after = ccdesk::now_ms();
-        let stamped = fetch_started.load(std::sync::atomic::Ordering::Relaxed);
+        let dirty = std::sync::atomic::AtomicBool::new(false);
+
+        poll_agents_once(&shared, &dirty, || None);
+
+        let after = shared.lock_recover();
+        assert_eq!(after.observed_at, 1_000, "a failed read advanced the clock");
+        assert_eq!(after.agents.len(), 1, "a failed read dropped the last value");
         assert!(
-            after - before >= 200,
-            "test precondition broke: the fake fetch did not actually take time"
+            !dirty.load(std::sync::atomic::Ordering::Relaxed),
+            "a failed read asked for a redraw"
         );
-        // 刻まれた時刻は sleep の前（開始）側の狭い窓に収まる。sleep の後
-        // （完了）に刻んでいれば `after` の近くに寄ってしまうはず
+    }
+
+    /// 1 ファイル置く（`pid` は呼び手が決める ＝ 生存判定を効かせられる）
+    fn write_session(dir: &TempDir, name: &str, body: serde_json::Value) {
+        std::fs::write(dir.join(name), body.to_string()).expect("could not write a session file");
+    }
+
+    /// **status を書いた時刻は claude が書いた値を使う**（ccdesk の観測時刻ではない）。
+    /// ここを観測時刻に戻すと、値は常に「今」になって hook に必ず勝つ
+    #[test]
+    fn the_status_carries_the_time_claude_wrote_it() {
+        let dir = TempDir::new("poll", "status-time");
+        write_session(
+            &dir,
+            "1.json",
+            serde_json::json!({
+                AGENT_PID: std::process::id(),
+                AGENT_SESSION_ID: "s1",
+                AGENT_KIND: AGENT_KIND_INTERACTIVE,
+                AGENT_STATUS: AGENT_STATUS_BUSY,
+                AGENT_STATUS_UPDATED_AT: 1_700_000_000_123u64,
+            }),
+        );
+        let snapshot = read_sessions(dir.path()).expect("the directory could not be listed");
+        let agent = snapshot.agents.first().expect("no session was read");
+        assert_eq!(agent.session_id, "s1");
+        assert_eq!(agent.status, AGENT_STATUS_BUSY);
+        assert_eq!(agent.status_at, 1_700_000_000_123);
+    }
+
+    /// 時刻の項目が無い版のために、ファイルの更新時刻へ落とす。
+    /// 0 のままにすると hook が必ず勝ち、hook を取り逃した行を status で直せない
+    #[test]
+    fn a_status_without_a_time_falls_back_to_the_files_own() {
+        let dir = TempDir::new("poll", "status-time-fallback");
+        write_session(
+            &dir,
+            "1.json",
+            serde_json::json!({
+                AGENT_PID: std::process::id(),
+                AGENT_SESSION_ID: "s1",
+                AGENT_KIND: AGENT_KIND_INTERACTIVE,
+                AGENT_STATUS: AGENT_STATUS_IDLE,
+            }),
+        );
+        let snapshot = read_sessions(dir.path()).expect("the directory could not be listed");
+        let agent = snapshot.agents.first().expect("no session was read");
         assert!(
-            stamped < after - 100,
-            "the start time ({stamped}) is stamped near completion ({after}), not near the start \
-             ({before}); fetch_started must be stored before the fetch runs, not after"
+            agent.status_at > 0,
+            "a status with no timestamp was left at 0, so the hook can never lose to it"
         );
+    }
+
+    /// **死んだ pid の残骸を読まない。** 読むと、止めた行が残骸の `busy` を
+    /// 拾って Working のまま残る（Stopped にならない）
+    #[test]
+    fn the_leftovers_of_a_dead_process_are_not_read() {
+        let dir = TempDir::new("poll", "dead-pid");
+        write_session(
+            &dir,
+            "1.json",
+            serde_json::json!({
+                AGENT_PID: std::process::id(),
+                AGENT_SESSION_ID: "alive",
+                AGENT_KIND: AGENT_KIND_INTERACTIVE,
+                AGENT_STATUS: AGENT_STATUS_IDLE,
+            }),
+        );
+        write_session(
+            &dir,
+            "2.json",
+            serde_json::json!({
+                AGENT_PID: u32::MAX,
+                AGENT_SESSION_ID: "dead",
+                AGENT_KIND: AGENT_KIND_INTERACTIVE,
+                AGENT_STATUS: AGENT_STATUS_BUSY,
+            }),
+        );
+        let snapshot = read_sessions(dir.path()).expect("the directory could not be listed");
+        let read: Vec<&str> = snapshot
+            .agents
+            .iter()
+            .map(|a| a.session_id.as_str())
+            .collect();
+        assert_eq!(read, ["alive"]);
+    }
+
+    /// **1 つの壊れたファイルで観測を丸ごと失わない**（読めないものだけ落とす）
+    #[test]
+    fn a_file_that_cannot_be_read_only_costs_its_own_entry() {
+        let dir = TempDir::new("poll", "broken-file");
+        std::fs::write(dir.join("1.json"), b"{ not json").expect("could not write");
+        write_session(
+            &dir,
+            "2.json",
+            serde_json::json!({
+                AGENT_PID: std::process::id(),
+                AGENT_SESSION_ID: "ok",
+                AGENT_KIND: AGENT_KIND_INTERACTIVE,
+            }),
+        );
+        let snapshot = read_sessions(dir.path()).expect("one broken file lost the whole read");
+        assert_eq!(snapshot.agents.len(), 1);
+    }
+
+    /// **まだ 1 度も claude が起きていない ＝ セッションは 0**。
+    /// ここを「読めなかった」（None）にすると、前回の観測が残り続ける
+    #[test]
+    fn a_directory_that_does_not_exist_means_no_sessions() {
+        let dir = TempDir::new("poll", "missing-dir");
+        let snapshot =
+            read_sessions(&dir.join("not-here")).expect("a missing directory read as a failure");
+        assert!(snapshot.agents.is_empty());
+        assert!(snapshot.observed_at > 0, "the read was not stamped");
     }
 
     /// **綴りそのものを固定する。** これは保存（`hook-states.json`）と hook の

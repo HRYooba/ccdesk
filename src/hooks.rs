@@ -8,7 +8,7 @@
 //! 書き方（advisory lock と tmp → rename）は lib 側の 1 実装を使う
 //! （[`ccdesk::Lock`] / [`ccdesk::write_json_atomically`]）。
 //!
-//! **hook はイベント、`claude agents --json` の `status` は現在値。**
+//! **hook はイベント、`~/.claude/sessions/` の `status` は現在値。**
 //! 行の状態は 2 つを同じ語彙へ揃えたうえで**新しい方**を採る
 //! （[`crate::poll::row_state`]）。hook の取り柄は 0 遅延、`status` の取り柄は
 //! 取りこぼしても次の観測で必ず正しくなること ＝ どちらが欠けても縮退で済む。
@@ -310,7 +310,8 @@ impl HookStates {
     /// （pid の使い回しを含む）なので採らない ＝ 判断の材料は [`Self::get`] と同じ。
     ///
     /// **ペイン内の `/resume` `/clear` に周期を待たずに気づく口**がこれで、
-    /// `claude agents --json`（1 回 ~900ms のプロセス起動）を待たずに済む
+    /// ライブ状態のポーリング（2 秒周期。[`crate::poll::spawn_agents_poller`]）を
+    /// 待たずに済む
     pub(crate) fn session_of(&self, pid: u32, launched: u64) -> Option<&SessionId> {
         self.0
             .iter()
