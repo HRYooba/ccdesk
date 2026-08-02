@@ -36,6 +36,13 @@ fn index_path() -> Option<PathBuf> {
     Some(codex_home()?.join("session_index.jsonl"))
 }
 
+/// `$CODEX_HOME/auth.json` の指紋（大きさと更新時刻）。
+/// **読めなければ None**（周期フォールバックだけが効く）
+pub(crate) fn auth_fingerprint() -> crate::poll::CredentialsFp {
+    let meta = std::fs::metadata(codex_home()?.join("auth.json")).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
 /// codex が自分で書いた更新チェックの結果（`version.json` の `latest_version`）。
 ///
 /// **自前で配布エンドポイントを叩かない。** codex は起動時に自分で確認して

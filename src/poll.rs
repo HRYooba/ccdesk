@@ -158,7 +158,8 @@ pub(crate) enum AccountStatus {
 /// 書き写すと、変えたときに片方だけ古いままになる）
 #[derive(Clone, Default)]
 pub(crate) struct FooterInfo {
-    pub(crate) account: AccountStatus, // ログイン状態 + 表示ラベル
+    /// agent ごとのログイン状態 + 表示ラベル。**agent ごとに別のアカウント**
+    pub(crate) accounts: BTreeMap<Kind, AccountStatus>,
     /// agent ごとの版（[`crate::backend::Kind::ORDER`] と同じ並び）。
     /// **kind ごとに 1 本ずつ**なので、agent を足すと版行も自動で増える
     pub(crate) versions: BTreeMap<Kind, AgentVersion>,
@@ -168,6 +169,11 @@ impl FooterInfo {
     /// その agent の版（まだ取れていなければ既定 ＝ 現行版が空）
     pub(crate) fn version(&self, kind: Kind) -> AgentVersion {
         self.versions.get(&kind).cloned().unwrap_or_default()
+    }
+
+    /// その agent のアカウント（まだ取れていなければ [`AccountStatus::Unknown`]）
+    pub(crate) fn account(&self, kind: Kind) -> AccountStatus {
+        self.accounts.get(&kind).cloned().unwrap_or_default()
     }
 }
 
@@ -315,7 +321,7 @@ pub(crate) fn out(cmd: &str, args: &[&str]) -> Option<String> {
 ///
 /// **内容のハッシュではない。** 見たいのは「アカウント行を取り直す契機があるか」
 /// だけなので、指紋の実体は [`ccdesk::file_stamp`]（変化検出の型を 1 つに保つ）
-type CredentialsFp = Option<(u64, std::time::SystemTime)>;
+pub(crate) type CredentialsFp = Option<(u64, std::time::SystemTime)>;
 
 /// ポーラーが見張る認証情報ファイル。**パスの解決は 1 起動につき 1 回**
 /// （指紋読みは毎秒走るので、毎ティックで環境変数からパスを組み直さない）。
@@ -394,8 +400,14 @@ impl AccountFetcher {
 
 /// アカウント行の 1 回取得（`ccdesk doctor` 用。ポーラーと同じ経路で
 /// 「今どう表示されるか」を出す）
-pub(crate) fn fetch_account() -> AccountStatus {
+pub(crate) fn fetch_claude_account() -> AccountStatus {
     AccountFetcher::default().fetch()
+}
+
+/// claude の認証情報ファイルの指紋（[`AuthWatch`]）。**解決は 1 起動 1 回**
+pub(crate) fn claude_auth_fingerprint() -> CredentialsFp {
+    static WATCH: std::sync::OnceLock<AuthWatch> = std::sync::OnceLock::new();
+    WATCH.get_or_init(AuthWatch::detect).fingerprint()
 }
 
 /// アカウントの周期フォールバック（秒）。認証ファイルを見られない環境や、
@@ -512,29 +524,30 @@ pub(crate) fn spawn_footer_poller(
         ccdesk_dirty,
     } = versions;
     std::thread::spawn(move || {
-        let mut account = AccountPollState::new();
-        let mut fetcher = AccountFetcher::default();
-        // **ループの外で 1 度だけ解決する**（理由は [`AuthWatch`]）
-        let auth = AuthWatch::detect();
-        // 共有側へ最後に書いたアカウント。書き手はこのスレッドだけなので、
-        // 毎秒ロックを取らずに手元の写しと比べられる
-        let mut shown = AccountStatus::default();
+        // **agent ごとに 1 本ずつ**（アカウントは agent ごとに別物）。
+        // 共有側へ最後に書いた値も手元に持つ ＝ 毎秒ロックを取らずに比べられる
+        let mut accounts: BTreeMap<Kind, (AccountPollState, AccountStatus)> = Kind::ORDER
+            .into_iter()
+            .map(|kind| (kind, (AccountPollState::new(), AccountStatus::default())))
+            .collect();
         let mut version_age = u64::MAX / 2; // 初回は即取得
         loop {
             let forced = refresh.swap(false, std::sync::atomic::Ordering::Relaxed);
             let mut updated = false;
 
-            if let Some(next) = account_step(
-                &mut account,
-                &shown,
-                forced,
-                || auth.fingerprint(),
-                || fetcher.fetch(),
-            ) {
-                shown = next.clone();
-                shared
-                    .lock_recover()
-                    .account = next;
+            for (kind, (state, shown)) in accounts.iter_mut() {
+                let backend = kind.backend();
+                let Some(next) = account_step(
+                    state,
+                    shown,
+                    forced,
+                    || backend.auth_fingerprint(),
+                    || backend.account(),
+                ) else {
+                    continue;
+                };
+                *shown = next.clone();
+                shared.lock_recover().accounts.insert(*kind, next);
                 updated = true;
             }
 
@@ -577,7 +590,9 @@ pub(crate) fn spawn_footer_poller(
                 dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             std::thread::sleep(Duration::from_secs(1));
-            account.tick();
+            for (state, _) in accounts.values_mut() {
+                state.tick();
+            }
             version_age += 1;
         }
     });

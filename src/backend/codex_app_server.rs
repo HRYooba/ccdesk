@@ -19,6 +19,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
+use crate::poll::AccountStatus;
 use crate::usage::{UsageInfo, UsageWindow};
 
 /// 応答を待つ上限。**待ち切りにしない**（応答しない版へ当たっても、使用率が
@@ -34,9 +35,36 @@ const RPC_ID: i64 = 2;
 const FIVE_HOUR_MINS: u64 = 5 * 60;
 const SEVEN_DAY_MINS: u64 = 7 * 24 * 60;
 
+/// 今サインインしているアカウント。**取れなければ [`AccountStatus::Unknown`]**
+/// （「まだ分からない」と「ログインしていない」を混ぜない ＝ 一時的な失敗で
+/// 表示が "not logged in" へ化けない）
+pub(crate) fn account(program: &str) -> AccountStatus {
+    let Some(result) = ask(program, "account/read") else {
+        return AccountStatus::Unknown;
+    };
+    parse_account(&result)
+}
+
+/// 応答 → アカウント。**claude と違って表示名を持たない**ので、身元として
+/// 出せるのはメールアドレス。プランは身元ではないので添えない
+fn parse_account(result: &Value) -> AccountStatus {
+    let Some(account) = result.get("account") else {
+        // `account` ごと無い ＝ ログインしていない（実測: 未ログインでも
+        // メソッド自体は成功する）
+        return AccountStatus::LoggedOut;
+    };
+    match account.get("email").and_then(Value::as_str) {
+        Some(email) if !email.trim().is_empty() => {
+            AccountStatus::LoggedIn(email.trim().to_string())
+        }
+        // 形が変わって読めない ＝ 誤情報を出さない
+        _ => AccountStatus::Unknown,
+    }
+}
+
 /// 現在の使用率。**取れなければ None**（呼び手が Failed へ倒す）
 pub(crate) fn rate_limits(program: &str, now: u64) -> Option<UsageInfo> {
-    let value = ask(program)?;
+    let value = ask(program, "account/rateLimits/read")?;
     parse(&value, now)
 }
 
@@ -44,7 +72,7 @@ pub(crate) fn rate_limits(program: &str, now: u64) -> Option<UsageInfo> {
 ///
 /// **応答が返るまで stdin を開いたままにする**（閉じるとサーバーが即終了して
 /// 何も返さない。実測 327ms で無応答終了した）
-fn ask(program: &str) -> Option<Value> {
+fn ask(program: &str, method: &str) -> Option<Value> {
     // `.cmd` のシムでも起こせるように絶対パスへ解決する（[`ccdesk::resolve_program`]）
     let mut child = Command::new(ccdesk::resolve_program(program)?)
         .arg("app-server")
@@ -63,11 +91,12 @@ fn ask(program: &str) -> Option<Value> {
             "\n",
             r#"{{"jsonrpc":"2.0","method":"initialized","params":{{}}}}"#,
             "\n",
-            r#"{{"jsonrpc":"2.0","id":{},"method":"account/rateLimits/read","params":{{}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":{},"method":"{}","params":{{}}}}"#,
             "\n",
         ),
         env!("CARGO_PKG_VERSION"),
         RPC_ID,
+        method,
     );
     let wrote = stdin.write_all(request.as_bytes()).and_then(|_| stdin.flush());
 

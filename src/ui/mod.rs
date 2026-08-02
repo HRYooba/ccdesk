@@ -339,7 +339,7 @@ fn usage_footer(app: &App) -> Vec<Vec<Span<'static>>> {
                 format!(" {} ", kind.title()),
                 Style::default().fg(MUTED_FG),
             )];
-            let (label, style) = account_cell(&app.footer.account);
+            let (label, style) = account_cell(&app.footer.account(kind));
             spans.push(Span::styled(label, style));
             spans.extend(usage_line(
                 app.usage.get(&kind).unwrap_or(&Usage::Unknown),
@@ -1843,6 +1843,53 @@ pub(crate) mod tests {
             usage_text(&Usage::Failed, 80).contains("usage"),
             "a failed fetch must be visible"
         );
+    }
+
+    /// **使用率の行はその agent のアカウントを出す。** claude と codex は別の
+    /// アカウントで、片方の名前をもう片方の行へ出すと誰の枠か分からなくなる
+    /// （実際に claude の名前が codex の行にも出ていた）
+    #[test]
+    fn each_usage_row_shows_its_own_account() {
+        let labels = [(Kind::Claude, "alice-cc"), (Kind::Codex, "alice-cx@example")];
+        let app = App {
+            usage: Kind::ORDER
+                .into_iter()
+                .map(|k| (k, crate::usage::sample_ready(Vec::new())))
+                .collect(),
+            footer: crate::poll::FooterInfo {
+                accounts: labels
+                    .iter()
+                    .map(|(kind, label)| {
+                        (*kind, AccountStatus::LoggedIn((*label).to_string()))
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            term_size: (140, 30),
+            ..Default::default()
+        };
+        let lines: Vec<String> = usage_footer(&app)
+            .iter()
+            .map(|line| line.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(lines.len(), labels.len(), "one line per agent: {lines:?}");
+        for (i, (kind, label)) in labels.iter().enumerate() {
+            assert!(
+                lines[i].contains(label),
+                "{kind:?} row does not show its own account: {:?}",
+                lines[i]
+            );
+            // 他の agent の名前が紛れ込んでいない
+            for (other, other_label) in &labels {
+                if other != kind {
+                    assert!(
+                        !lines[i].contains(other_label),
+                        "{kind:?} row shows {other:?}'s account: {:?}",
+                        lines[i]
+                    );
+                }
+            }
+        }
     }
 
     /// **使用率はマウスが乗っている間だけ帯が乗る**（押せることを示す。

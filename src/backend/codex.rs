@@ -137,6 +137,18 @@ impl Backend for Codex {
             None => crate::usage::Usage::Failed,
         }
     }
+
+    /// app-server の `account/read`（使用率と同じ経路）。**claude と違って
+    /// 表示名を持たない**ので、身元として出せるのはメールアドレス
+    fn account(&self) -> crate::poll::AccountStatus {
+        codex_app_server::account(PROGRAM)
+    }
+
+    /// `$CODEX_HOME/auth.json` の指紋。ログイン・ログアウト・トークン更新で
+    /// 書き換わる（実測でも `last_refresh` が載る）
+    fn auth_fingerprint(&self) -> crate::poll::CredentialsFp {
+        codex_index::auth_fingerprint()
+    }
 }
 
 /// `-c` に渡す hook の定義（TOML）。**注入できない形なら None**（hook 無しで

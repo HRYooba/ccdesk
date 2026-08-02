@@ -102,6 +102,14 @@ impl Backend for Claude {
     fn usage(&self) -> crate::usage::Usage {
         crate::usage::fetch_claude()
     }
+
+    fn account(&self) -> crate::poll::AccountStatus {
+        crate::poll::fetch_claude_account()
+    }
+
+    fn auth_fingerprint(&self) -> crate::poll::CredentialsFp {
+        crate::poll::claude_auth_fingerprint()
+    }
 }
 
 #[cfg(test)]

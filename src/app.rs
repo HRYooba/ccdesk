@@ -3711,7 +3711,10 @@ mod tests {
         use crate::poll::AccountStatus;
         App {
             footer: FooterInfo {
-                account: AccountStatus::LoggedIn("taro".to_string()),
+                accounts: Kind::ORDER
+                    .into_iter()
+                    .map(|kind| (kind, AccountStatus::LoggedIn("taro".to_string())))
+                    .collect(),
                 ..FooterInfo::default()
             },
             ..test_app(34, TERM)

@@ -709,8 +709,19 @@ fn demo_rows() -> Vec<(SessionRow, String, Option<State>)> {
 /// `latest` は None なので更新マーカーと動詞は出ない = 最新の見た目で撮れる
 fn demo_footer() -> FooterInfo {
     FooterInfo {
-        // 撮影は `claude auth status` を叩かないので、アカウント行は架空のラベル
-        account: AccountStatus::LoggedIn("you · Acme, Inc.".to_string()),
+        // 撮影は agent を 1 つも起こさないので、アカウントも架空のラベル
+        accounts: Kind::ORDER
+            .into_iter()
+            .map(|kind| {
+                (
+                    kind,
+                    AccountStatus::LoggedIn(match kind {
+                        Kind::Claude => "you · Acme, Inc.".to_string(),
+                        Kind::Codex => "you@acme.example".to_string(),
+                    }),
+                )
+            })
+            .collect(),
         // 撮影は agent を 1 つも起こさないので版も架空（`latest` は None なので
         // 更新マーカーと動詞は出ない = 最新の見た目で撮れる）
         versions: [(Kind::Claude, "2.1.220"), (Kind::Codex, "0.146.0")]
@@ -761,9 +772,15 @@ mod tests {
     /// 中身そのもので固定する（描画側はこの値をそのまま出す）
     #[test]
     fn demo_source_yields_fixed_fake_data() {
+        // **agent ごとに別のアカウント**（片方の名前をもう片方の行へ出さない）
         assert_eq!(
-            DemoSource.footer().account,
+            DemoSource.footer().account(Kind::Claude),
             AccountStatus::LoggedIn("you · Acme, Inc.".to_string())
+        );
+        assert_ne!(
+            DemoSource.footer().account(Kind::Codex),
+            DemoSource.footer().account(Kind::Claude),
+            "both agents show the same account"
         );
         // agent の版行は架空の版で埋める。更新マーカーは出さない（最新の見た目で撮る）
         for kind in Kind::ORDER {

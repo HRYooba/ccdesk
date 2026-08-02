@@ -170,6 +170,17 @@ pub(crate) trait Backend: Send + Sync {
     /// 使用率（枠の残り）。**取得の作法は agent ごとに違う**が、どちらも
     /// ターンを起こさず・課金せず・記録を残さない経路を通る
     fn usage(&self) -> crate::usage::Usage;
+
+    /// 今サインインしているアカウント。**agent ごとに別のアカウント**なので、
+    /// 使用率の行もそれぞれ自分のものを出す（claude の名前を codex の行に
+    /// 出していた時期があった）
+    fn account(&self) -> crate::poll::AccountStatus;
+
+    /// 認証情報ファイルの指紋（安価な変化 signal）。
+    ///
+    /// **これが変わったときだけ [`Self::account`] を叩く**（取得はプロセス起動を
+    /// 伴うので毎周は回さない）。読めない環境では None ＝ 周期フォールバックだけが効く
+    fn auth_fingerprint(&self) -> crate::poll::CredentialsFp;
 }
 
 /// agent 1 つぶんの版。**「新しい版があるときだけ Some」**という形は
