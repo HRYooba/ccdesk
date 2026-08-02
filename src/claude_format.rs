@@ -145,20 +145,38 @@ pub(crate) const INHERITED_MARKERS: [&str; 8] = [
 pub(crate) const CLAUDE_PID_ENV: &str = "CLAUDE_PID";
 
 // ---------------------------------------------------------------------------
-// `claude agents --json --all` の出力（**半公式**: サブコマンドは `--help` に
-// あるが、項目の綴りは文書化されていない）
+// 前景セッションの生存記録 `~/.claude/sessions/<pid>.json`（**非公開の内部形式**。
+// claude が起動時に置き、状態が変わるたびに上書きし、終了時に消す。死んだ pid の
+// 残骸は claude が動いたときに掃除される）
+//
+// **`claude agents --json --all` はこのファイルの劣化コピー**（実測 2026-08-02 /
+// claude 2.1.220: 返るのはこのディレクトリの中身そのままで、`statusUpdatedAt` が
+// 落ち、1 回 ~900ms かかり、起動に失敗し得る）。ccdesk は直接読む: 正しい新旧
+// 比較に要る [`AGENT_STATUS_UPDATED_AT`] がサブコマンド経由では取れないため。
+// 代わりに **死んだ pid を弾く責任がこちらへ来る**（[`ccdesk::process_alive`]）。
 //
 // 縮退: 読めないと行の状態は hook が書いた state と出力ヒューリスティックだけに
-// なる（[`crate::poll::classify`]）。一覧そのものは `sessions.json` が正本なので
+// なる（[`crate::poll::row_state`]）。一覧そのものは `sessions.json` が正本なので
 // 行は消えない。
 // ---------------------------------------------------------------------------
 
+/// 生存記録を置くディレクトリ（`~/.claude/sessions`）。ファイル名は `<pid>.json`
+/// だが、pid は中身の [`AGENT_PID`] からも読めるのでファイル名は解釈しない
+pub(crate) const SESSIONS_DIR: &str = "sessions";
 /// transcript の `sessionId`（＝ `claude --session-id` へ渡した UUID）
 pub(crate) const AGENT_SESSION_ID: &str = "sessionId";
 /// `"interactive"` | `"background"` 等
 pub(crate) const AGENT_KIND: &str = "kind";
 /// 前景セッションが書くライブ状態（[`AGENT_STATUS_BUSY`] 以下の 4 値）
 pub(crate) const AGENT_STATUS: &str = "status";
+/// [`AGENT_STATUS`] を書いた時刻（ms）。
+///
+/// **これが直読みへ移った理由。** hook（イベント）と status（現在値）のどちらが
+/// 新しいかを決めるのに要るが、`claude agents --json` はこの項目を落とす。
+/// 無いと ccdesk 自身のポーリング時刻で代用するしかなく、その時刻は常に「今」
+/// なので **status が hook に必ず勝つ** ＝ 陳腐化した `busy` を新しい `idle` hook で
+/// 降ろせない（赤の固着）
+pub(crate) const AGENT_STATUS_UPDATED_AT: &str = "statusUpdatedAt";
 /// そのセッションを動かしているプロセス（生存中のみ載る）
 pub(crate) const AGENT_PID: &str = "pid";
 /// 前景セッションを表す [`AGENT_KIND`] の値

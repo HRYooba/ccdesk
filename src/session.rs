@@ -59,7 +59,7 @@ fn hold_frame(updating: bool, since_output: Duration, since_draw: Duration) -> b
 /// 「まだ出力が続いている」と見なす、最後の出力からの猶予
 const BUSY_QUIET: Duration = Duration::from_secs(2);
 
-/// 出力変化ヒューリスティック。**hook も `agents --json` の status も無い行の
+/// 出力変化ヒューリスティック。**hook もライブ状態の status も無い行の
 /// 最後の手段**（[`crate::poll::row_state`]）で、精度は低い（フォーカスの出入りや
 /// 再描画でも動く）。
 ///
@@ -189,7 +189,7 @@ pub(crate) struct Session {
     /// （[`crate::hooks::HookStates::get`]）。
     ///
     /// **正本をここに置く理由**: 前景セッションの実体はこの子プロセスなので、
-    /// 「いつ起こしたか」を正確に知っているのはここだけ。`claude agents --json` の
+    /// 「いつ起こしたか」を正確に知っているのはここだけ。ライブ状態の
     /// `startedAt` は 2 秒周期の観測で、再開直後は前回の実行の値が残っているうえ、
     /// 自分の子の pid が載らない環境（npm 版）では値そのものが来ない
     pub(crate) started_at: u64,
@@ -465,7 +465,7 @@ impl Session {
     }
 
     /// 出力変化ヒューリスティック: 直近 2 秒に出力があれば「動いているらしい」
-    /// （hook も `agents --json` の status も無い行の最後の手段）。
+    /// （hook もライブ状態の status も無い行の最後の手段）。
     /// **生死は見ない**: 生死の観測（try_wait）は呼び手が別に持っていて、
     /// ここでも呼ぶと同じ syscall が 1 フレームに 2 回走る。
     ///
