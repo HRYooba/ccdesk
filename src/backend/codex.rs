@@ -57,6 +57,10 @@ const BYPASS_TRUST: &str = "--dangerously-bypass-hook-trust";
 /// （ここで待たされると終了が遅れる）
 const SESSION_END_TIMEOUT_SECS: u64 = 3;
 
+/// この詰めが意味を持つのは共通のタイムアウトより短い間だけ。
+/// **コンパイル時に固定する**（共通側を 3 秒以下へ下げたらここは要らなくなる）
+const _: () = assert!(SESSION_END_TIMEOUT_SECS < HOOK_TIMEOUT_SECS);
+
 pub(crate) struct Codex;
 
 impl Backend for Codex {
@@ -294,10 +298,6 @@ mod tests {
             toml[at..].contains(&format!("timeout={SESSION_END_TIMEOUT_SECS}")),
             "SessionEnd asks for a timeout codex will clamp: {}",
             &toml[at..]
-        );
-        assert!(
-            SESSION_END_TIMEOUT_SECS < HOOK_TIMEOUT_SECS,
-            "this clamp only matters while it is shorter than the shared timeout"
         );
     }
 
