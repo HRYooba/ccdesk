@@ -11,7 +11,7 @@ use ratatui::Frame;
 
 use crate::app::{start_new_session, App, RightView};
 use crate::backend::Kind;
-use crate::theme::{ui, C_OK, C_WORKING, FOCUS_BORDER, MUTED_FG};
+use crate::theme::{ui, FOCUS_BORDER, MUTED_FG};
 use crate::ui::text_field::TextField;
 use crate::ui::{border_style, pane_fallback_pos, FrameCursor};
 
@@ -772,7 +772,11 @@ pub(crate) fn draw_new_view(
     let margin = NewLayout::MARGIN as usize;
     let pad = " ".repeat(margin);
 
-    // AGENT 切替行。**選んだものだけ強調**（記号は使わない理由は [`Kind::title`]）
+    // AGENT 切替行。**選んだものだけ強調**。
+    //
+    // 記号（[`crate::ui::agent_glyph`]）を綴りに添えるのは、**セッションを作るたびに
+    // 一覧のドットとの対応が目に入る**ようにするため。凡例の正本は版行だが、
+    // それは画面の上端にあり、一覧を見ている間は視線が届かない
     let agent_focused = state.focus == NewFocus::Agent;
     let mut agent_spans = vec![
         Span::raw(pad.clone()),
@@ -782,7 +786,7 @@ pub(crate) fn draw_new_view(
         let chosen = kind == state.kind;
         agent_spans.push(Span::raw(" "));
         agent_spans.push(Span::styled(
-            kind.title().to_string(),
+            format!("{} {}", crate::ui::agent_glyph(kind), kind.title()),
             if chosen {
                 Style::default()
                     .fg(ui().emph)
@@ -856,7 +860,7 @@ pub(crate) fn draw_new_view(
         let base = if is_launch && starting {
             ui().dim
         } else if is_launch {
-            C_OK
+            ui().ok
         } else if browser_focused {
             MUTED_FG
         } else {
@@ -914,7 +918,7 @@ pub(crate) fn draw_new_view(
         Line::from(vec![
             Span::raw(" "),
             Span::styled("❯ ", marker_style),
-            Span::styled("starting session…", Style::default().fg(C_WORKING)),
+            Span::styled("starting session…", Style::default().fg(ui().working)),
         ])
     } else if state.prompt.text.is_empty() {
         Line::from(vec![

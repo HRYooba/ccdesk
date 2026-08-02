@@ -3,7 +3,7 @@ pub(crate) mod new_view;
 pub(crate) mod text_field;
 
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem};
 use ratatui::Frame;
@@ -19,7 +19,7 @@ use crate::backend::Kind;
 use crate::poll::{row_state, AccountStatus, State, Grouping, Run};
 use crate::sessions::SessionId;
 use crate::theme::{
-    ui, usage_color, C_ATTENTION, C_FAIL, C_WORKING, FOCUS_BORDER, MUTED_FG,
+    ui, usage_color, FOCUS_BORDER, MUTED_FG,
 };
 use crate::ui::new_view::draw_new_view;
 use crate::usage::{Usage, UsageInfo, UsageWindow};
@@ -32,22 +32,29 @@ use crate::usage::{Usage, UsageInfo, UsageWindow};
 /// 「この行はどうか」なので、行を縦に流し読みするときに 1 つの桁へ揃っている方が
 /// 拾える（名前の後ろに置くと名前の長さで印の位置が毎行変わる）。
 ///
-/// 2 桁目は**ドット 1 つに 3 つの直交チャンネルを持たせた印**（組み立ては
+/// 2 桁目は**ドット 1 つに 4 つの直交チャンネルを持たせた印**（組み立ては
 /// [`session_row_line`] に閉じる）:
 ///
 /// | チャンネル | 表すもの | 値 |
 /// |:--|:--|:--|
-/// | 塗り | 未読（見ていない間にその行が動いた） | [`DOT_FILLED`] ＝ 未読 / [`DOT_HOLLOW`] ＝ 既読 |
+/// | 形 | どの agent の行か | 丸（[`DOT_FILLED`]/[`DOT_HOLLOW`]）＝ claude / 菱（[`DIAMOND_FILLED`]/[`DIAMOND_HOLLOW`]）＝ codex |
+/// | 塗り | 未読（見ていない間にその行が動いた） | 塗り ＝ 未読 / 中空 ＝ 既読 |
 /// | 色 | 状態（[`crate::poll::State`]） | Waiting/Working/Idle/Stopped の 4 色 |
-/// | 明滅 | Working だけ | 400ms 周期で状態色 ↔ [`crate::theme::UiTheme::dim`]（淡色テキストと同じ色）を往復 |
+/// | 明滅 | Working だけ | [`crate::theme::UiTheme::blink`] のコマを順に引く |
 ///
-/// 3 つを同じ 1 桁へ載せるのは、行を縦に流し読みするときに「未読か」「どの状態か」
-/// 「動いているか」を 1 箇所で拾えるようにするため（別々の桁に分けると視線が散る）。
-/// **状態アイコン（かつての `✻`/`✽`/`∙`）は廃止したまま。**
+/// 4 つを同じ 1 桁へ載せるのは、行を縦に流し読みするときに「どの agent か」
+/// 「未読か」「どの状態か」「動いているか」を 1 箇所で拾えるようにするため
+/// （別々の桁に分けると視線が散る）。**状態アイコン（かつての `✻`/`✽`/`∙`）は
+/// 廃止したまま**で、ここで復活したのは形そのものではなく「形 = agent」という割当。
 ///
-/// **形は使わない。** かつて Stopped だけ一回り小さい丸にしていたのは、明滅の谷が
-/// `dim` ＝ Stopped の色と一致して色では区別できなかったため。今は状態語が
-/// 行末に出る（[`row_tail_spans`]）ので、その区別を形に肩代わりさせる必要が無い。
+/// **形が agent を指すので、状態は形に乗せられない。** かつて Stopped だけ一回り
+/// 小さい丸にしていた（明滅の谷が `dim` ＝ Stopped の色と一致していたため）が、
+/// 谷は背景側へ延ばした赤になって灰色の Stopped と混ざらなくなり、加えて状態語が
+/// 行末に出る（[`row_tail_spans`]）ので、形に肩代わりさせる必要が無い。
+///
+/// **agent を色にしなかった理由**: 状態が既に色を使っている。同じ 1 桁で色を
+/// 2 つの意味に割ることはできないので、空いていた形へ回した。**記号の対応は
+/// 版行が凡例になる**（[`version_rows`] が `● claude` / `◆ codex` と並べる）。
 ///
 /// **ピン留めはここに印を持たない**: pin した行は [`PINNED_TITLE`] の節へ移るので、
 /// 節に入っていること自体が表示になる（同じ知識を印と並びの 2 箇所に持たない）。
@@ -56,22 +63,38 @@ use crate::usage::{Usage, UsageInfo, UsageWindow};
 /// 測るのは `unicode-width` の既定 ＝ East Asian Ambiguous を 1 桁と数える側で、
 /// ratatui の桁計算もこれと同じものを使うので、描画と予算の答えは必ず一致する。
 ///
-/// **ドットの丸（`●○•`）は Ambiguous を承知で使っている**（`width_cjk` は 2 を返す）。
-/// 同じ意味を持つ Ambiguous でない丸が Unicode に無いため、代わりが無い。
+/// **ドットの丸と菱（`●○◆◇`）は Ambiguous を承知で使っている**（`width_cjk` は
+/// 2 を返す）。同じ意味を持つ Ambiguous でない字形が Unicode に無いため、代わりが無い。
 /// CJK ロケールで Ambiguous を 2 桁に描く端末では行がずれる ＝ 既知の制約。
 /// 選べる場面（[`MENU_MARK`] のように ASCII で足りるところ）では Ambiguous を避ける。
 ///
 /// 1 桁目: **その行が今ペインに出ているか**（`❯` U+276F ＝ ペインが指している行）
 const OPEN_MARK: &str = "❯";
 const CLOSED_MARK: &str = " ";
-/// ドットの塗り。**塗りが答えるのは未読だけ**（色と明滅は状態が決める）
+/// claude の行のドット。**塗りが答えるのは未読だけ**（色と明滅は状態が決める）
 const DOT_FILLED: &str = "●";
 const DOT_HOLLOW: &str = "○";
+/// codex の行のドット。**丸と対になる塗り/中空の組**なので、未読のチャンネルが
+/// agent によって欠けることがない
+const DIAMOND_FILLED: &str = "◆";
+const DIAMOND_HOLLOW: &str = "◇";
 
-/// ドットのグリフ。**形は 1 種類で、塗りが「未読か」だけ**を表す。
-/// 色（状態）と明滅（Working）は [`session_row_line`] が別のチャンネルとして載せる
-fn dot_glyph(unread: bool) -> &'static str {
-    mark(unread, DOT_FILLED, DOT_HOLLOW)
+/// ドットのグリフ。**形が agent、塗りが未読**。色（状態）と明滅（Working）は
+/// [`session_row_line`] が別のチャンネルとして載せる。
+///
+/// 4 グリフの対応を知るのはここ 1 箇所なので、版行の凡例（[`agent_glyph`]）も
+/// 同じ表を引く ＝ 一覧の記号と凡例の記号が食い違うことがない
+fn dot_glyph(kind: Kind, unread: bool) -> &'static str {
+    match kind {
+        Kind::Claude => mark(unread, DOT_FILLED, DOT_HOLLOW),
+        Kind::Codex => mark(unread, DIAMOND_FILLED, DIAMOND_HOLLOW),
+    }
+}
+
+/// 凡例に出す agent の記号（版行・new session 画面）。**一覧のドットの塗り側**を
+/// 使う: 中空だと「既読」という別のチャンネルの値を凡例が名乗ってしまう
+pub(crate) fn agent_glyph(kind: Kind) -> &'static str {
+    dot_glyph(kind, true)
 }
 
 /// ピン留めした行を集める節の見出し。**グルーピング（state / directory）に
@@ -88,10 +111,10 @@ pub(crate) const HEAD_COLS: usize = 3;
 
 /// 名前に最低限残す桁（詰め切ったサイドバーでも行を見分けられる下限）。
 ///
-/// **agent の接頭辞ぶんはもう要らない。** かつては行頭に `[cc]` / `[cx]` を
-/// 置いており、その 5 桁が名前の予算に乗っていた。agent は行末へ綴りで移したので、
-/// その桁は名前へ戻っている。**行末ブロックはこの下限を割ってまで出さない**
-/// （[`tail_cols`]）ので、[`MIN_ROW_COLS`] はこの値のままでよい
+/// **agent はもう桁を食わない。** かつては行頭に `[cc]` / `[cx]`（5 桁）、
+/// 次に行末へ綴りで（7 桁）出していたが、今はドットの形が答えるので 0 桁。
+/// **行末ブロックはこの下限を割ってまで出さない**（[`tail_cols`]）ので、
+/// [`MIN_ROW_COLS`] はこの値のままでよい
 const MIN_NAME_COLS: usize = 9;
 
 /// **セッション行 1 本が要る内側の桁数**（行頭 + 名前の下限 + 行末のメニュー）。
@@ -184,7 +207,7 @@ fn usage_line(usage: &Usage, max_width: u16, fetching: bool) -> Vec<Span<'static
             return vec![
                 Span::styled(" usage ", Style::default().fg(ui().dim)),
                 // 取れていない状態のクリック（再挑戦）にも押した反応を返す
-                Span::styled(spin.unwrap_or("—"), Style::default().fg(C_FAIL)),
+                Span::styled(spin.unwrap_or("—"), Style::default().fg(ui().fail)),
                 Span::raw(" "),
             ]
         }
@@ -602,16 +625,28 @@ impl UpdateState {
     fn style(self) -> Style {
         match self {
             Self::Current => Style::default().fg(ui().dim),
-            Self::Running => Style::default().fg(C_WORKING),
+            Self::Running => Style::default().fg(ui().working),
             Self::Available | Self::Restart => Style::default().fg(MUTED_FG),
         }
     }
 }
 
-/// バージョン行 1 本の文面。`<マーカー> <名前> v<版>` を左に、動詞を右端へ寄せる。
+/// バージョン行 1 本の文面。`<マーカー> <記号> <名前> v<版>` を左に、動詞を右端へ寄せる。
+///
+/// `glyph` は agent の記号（[`agent_glyph`]）。**ccdesk の行は空白 1 桁**を置くので、
+/// 4 つの [`UpdateState`] のどれでも、agent 行でも ccdesk 行でも名前の開始桁が動かない。
+///
+/// **この桁が一覧の凡例を兼ねる。** セッション行のドットは形で agent を表すが、
+/// 形と綴りが並ぶ場所はここしかない（一覧の行に綴りを戻すと名前の桁を食う）。
 ///
 /// 版が未取得（起動直後・CLI 失敗）なら番号を出さない ＝ 誤情報を出さない
-fn version_row(name: &str, version: &str, state: UpdateState, inner_width: u16) -> String {
+fn version_row(
+    glyph: &str,
+    name: &str,
+    version: &str,
+    state: UpdateState,
+    inner_width: u16,
+) -> String {
     use unicode_width::UnicodeWidthStr;
     let mark = if state == UpdateState::Current {
         " " // マーカー桁を空白で確保する（更新が出ても名前の桁が動かない）
@@ -619,9 +654,9 @@ fn version_row(name: &str, version: &str, state: UpdateState, inner_width: u16) 
         UPDATE_MARK
     };
     let left = if version.is_empty() {
-        format!("{mark} {name}")
+        format!("{mark} {glyph} {name}")
     } else {
-        format!("{mark} {name} v{version}")
+        format!("{mark} {glyph} {name} v{version}")
     };
     let verb = state.verb();
     if verb.is_empty() {
@@ -648,16 +683,30 @@ fn version_rows(
     agents: &[(Kind, String, UpdateState)],
     inner_width: u16,
 ) -> Vec<(String, Style, SidebarRow)> {
+    // ccdesk 自身は agent ではないので記号を持たない（桁だけ空白で確保する）
     let mut rows = vec![(
-        version_row("ccdesk", env!("CARGO_PKG_VERSION"), ccdesk, inner_width),
+        version_row(
+            " ",
+            "ccdesk",
+            env!("CARGO_PKG_VERSION"),
+            ccdesk,
+            inner_width,
+        ),
         ccdesk.style(),
         ccdesk.action(RowAction::UpdateCcdesk, Some(RowAction::RestartCcdesk)),
     )];
     // **agent ごとに 1 行。** 1 行へ詰めると横に長くなり、更新導線も行単位で
-    // 押せなくなる（どちらの更新かを行が名乗れない）
+    // 押せなくなる（どちらの更新かを行が名乗れない）。
+    // 記号と綴りが 1 行に並ぶので、この行がそのまま一覧のドットの凡例になる
     rows.extend(agents.iter().map(|(kind, version, state)| {
         (
-            version_row(kind.title(), version, *state, inner_width),
+            version_row(
+                agent_glyph(*kind),
+                kind.title(),
+                version,
+                *state,
+                inner_width,
+            ),
             state.style(),
             state.action(RowAction::UpdateAgent(*kind), None),
         )
@@ -906,26 +955,18 @@ struct RowData {
 /// 帯（選択・ホバー）と印（ペインに出ている・ドット）の重なり方も含めて
 /// [`Frame`] を用意せずに検査できる。
 ///
-/// `blink_lit` は今このフレームが明滅の「点灯」位相か（[`State::blinks`] な
-/// 行だけに効く）。**時計を直接読まず引数で受ける**ので、位相を固定してテストできる
-/// （[`draw`] は 1 フレームぶんの全行に同じ位相を渡す）
-fn session_row_line(d: &RowData, look: Look, inner_width: u16, blink_lit: bool) -> Line<'static> {
-    // 明滅の谷は淡色テキストと同じ [`crate::theme::UiTheme::dim`]。**画面に既にある
-    // 淡さへ揃える**ので、谷の深さを決めるためだけの色を別に持たない。
-    // 代価だった「谷の Working が Stopped と同色になる」は、**行末に状態語が
-    // 出るようになったので語が答える**（かつて形で肩代わりしていた区別は不要）
-    let dot_color = if d.group.blinks() && !blink_lit {
-        ui().dim
-    } else {
-        d.group.color()
-    };
+/// `blink_tick` は明滅の通し番号（[`crate::theme::BLINK_TICK_MS`] 刻み。
+/// [`State::blinks`] な行だけに効く）。**時計を直接読まず引数で受ける**ので、
+/// 位相を固定してテストできる（[`draw`] は 1 フレームぶんの全行に同じ番号を渡す）
+fn session_row_line(d: &RowData, look: Look, inner_width: u16, blink_tick: u64) -> Line<'static> {
+    let color = row_state_color(d.group, blink_tick);
     // 行頭のペイン印 + ドット + 空白（消えている側も同じ幅を取る）
     let mut spans = vec![
         Span::styled(
             mark(look.open, OPEN_MARK, CLOSED_MARK),
             Style::default().fg(ui().emph).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(dot_glyph(d.unread), Style::default().fg(dot_color)),
+        Span::styled(dot_glyph(d.kind, d.unread), Style::default().fg(color)),
         Span::raw(" "),
     ];
     let name_style = if look.open {
@@ -933,12 +974,12 @@ fn session_row_line(d: &RowData, look: Look, inner_width: u16, blink_lit: bool) 
     } else {
         Style::default()
     };
-    // **名前は名前だけ。** どの agent の行かは行末に綴りで出るので、行頭の略記
-    // （かつての `[cc]` / `[cx]`）は無くなった
+    // **名前は名前だけ。** どの agent の行かはドットの形が答えるので、
+    // 行頭の略記（かつての `[cc]` / `[cx]`）も行末の綴りも要らない
     let (name, gap) = row_name_and_gap(&d.label, inner_width);
     spans.push(Span::styled(name, name_style));
     spans.push(Span::raw(gap));
-    spans.extend(row_tail_spans(d, inner_width));
+    spans.extend(row_tail_spans(d, inner_width, blink_tick));
     // 行末のメニュー記号（当たり判定は [`menu_zone`] が同じ桁から導く）
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
@@ -948,55 +989,51 @@ fn session_row_line(d: &RowData, look: Look, inner_width: u16, blink_lit: bool) 
     Line::from(spans).style(look.band(Style::default()))
 }
 
-/// 行末ブロック（状態語と agent）が食う桁。前の空白 1 桁を含む
-const TAIL_FULL_COLS: usize = 1 + State::TITLE_COLS + 1 + Kind::TITLE_COLS;
-/// agent を落として状態語だけを残したときの桁
+/// 行末ブロック（状態語）が食う桁。前の空白 1 桁を含む。
+/// **agent はここに居ない**（ドットの形が答えるので、綴りで場所を取らない）
 const TAIL_STATE_COLS: usize = 1 + State::TITLE_COLS;
 
 /// この幅で行末ブロックに何桁使うか（`body` ＝ 行頭とメニューを除いた予算）。
 ///
-/// **落とす順は agent → 状態語。** agent の綴りは 2 つ、状態は 4 つなので
-/// 情報量が違う。両方落ちても**ドットの色が状態を語り続ける**ので、
+/// 落ちるのは状態語だけ。落ちても**ドットの色が状態を語り続ける**ので、
 /// 一番狭いサイドバーで状態が読めなくなることはない。
 /// **名前の予算とブロックの中身が同じこの関数を読む**ので、桁が食い違わない
 fn tail_cols(body: usize) -> usize {
-    if body >= MIN_NAME_COLS + TAIL_FULL_COLS {
-        TAIL_FULL_COLS
-    } else if body >= MIN_NAME_COLS + TAIL_STATE_COLS {
+    if body >= MIN_NAME_COLS + TAIL_STATE_COLS {
         TAIL_STATE_COLS
     } else {
         0
     }
 }
 
-/// 行末ブロックの中身（**状態語が先、agent が後**）。状態語は状態色、agent は弱色。
+/// この状態の行が今このコマで使う色。**ドットと状態語が同じここを読む**ので、
+/// 片方だけ明滅する（＝ 行の中で 2 つのものが別々のリズムで動く）ことがない。
 ///
-/// **状態を先に置くのは、落ちる側を右端に寄せるため**（幅が足りないと agent が
-/// 消えるので、消える要素が端にある方がブロックの形が崩れて見えない）。
-///
-/// **状態を文字で出すのがここ 1 箇所。** 色は [`State::color`] と同じ 1 箇所から
-/// 引くので、語と色が食い違わない。どちらも固定桁で左詰めするのは、
-/// 揃えないと右隣の開始桁が行ごとにずれるため
-fn row_tail_spans(d: &RowData, inner_width: u16) -> Vec<Span<'static>> {
-    let body = (inner_width as usize).saturating_sub(HEAD_COLS + MENU_COLS);
-    let cols = tail_cols(body);
-    if cols == 0 {
-        return Vec::new();
+/// 明滅するのは Working だけ（[`State::blinks`]）。コマ列は
+/// [`crate::theme::UiTheme::blink`] が持つ ＝ 谷の深さも段階数もテーマ側の 1 箇所で決まる
+fn row_state_color(group: State, blink_tick: u64) -> Color {
+    if group.blinks() {
+        ui().blink(blink_tick)
+    } else {
+        group.color()
     }
-    let state = Span::styled(
-        format!("{:<width$}", d.group.title(), width = State::TITLE_COLS),
-        Style::default().fg(d.group.color()),
-    );
-    if cols == TAIL_STATE_COLS {
-        return vec![Span::raw(" "), state];
+}
+
+/// 行末ブロックの中身（状態語だけ）。
+///
+/// **状態を文字で出すのがここ 1 箇所。** 色は [`row_state_color`] と同じ 1 箇所から
+/// 引くので、語と色（と明滅の位相）が食い違わない。固定桁で左詰めするのは、
+/// 揃えないと右端のメニュー記号の手前が行ごとにガタつくため
+fn row_tail_spans(d: &RowData, inner_width: u16, blink_tick: u64) -> Vec<Span<'static>> {
+    let body = (inner_width as usize).saturating_sub(HEAD_COLS + MENU_COLS);
+    if tail_cols(body) == 0 {
+        return Vec::new();
     }
     vec![
         Span::raw(" "),
-        state,
-        Span::raw(" "),
         Span::styled(
-            format!("{:<width$}", d.kind.title(), width = Kind::TITLE_COLS),
-            Style::default().fg(MUTED_FG),
+            format!("{:<width$}", d.group.title(), width = State::TITLE_COLS),
+            Style::default().fg(row_state_color(d.group, blink_tick)),
         ),
     ]
 }
@@ -1039,7 +1076,7 @@ fn account_row(status: &AccountStatus) -> (String, Style) {
         // 出すのはラベル（`alice` または `alice · Acme, Inc.`）
         AccountStatus::LoggedIn(label) => (label.clone(), Style::default().fg(ui().dim)),
         AccountStatus::LoggedOut => {
-            (LOGGED_OUT_ROW.to_string(), Style::default().fg(C_ATTENTION))
+            (LOGGED_OUT_ROW.to_string(), Style::default().fg(ui().attention))
         }
         // 未取得（起動直後・CLI 失敗）は誤情報を出さないため空行にする
         AccountStatus::Unknown => (String::new(), Style::default().fg(ui().dim)),
@@ -1196,7 +1233,7 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, app: &App) {
     if let Some((msg, _)) = &app.notice {
         frame.render_widget(
             ratatui::widgets::Paragraph::new(Line::from(format!(" {msg}")))
-                .style(Style::default().fg(C_FAIL)),
+                .style(Style::default().fg(ui().fail)),
             area,
         );
         return;
@@ -1219,7 +1256,7 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, app: &App) {
     if app.input_gate.is_some() && !matches!(app.right_view, RightView::New(_)) {
         hint_spans.push(Span::styled(
             "  starting session…",
-            Style::default().fg(C_WORKING),
+            Style::default().fg(ui().working),
         ));
     }
     // 右端: 使用率（opt-in）。中身は [`crate::usage`] が取ったもので、
@@ -1332,9 +1369,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         })
         .collect();
     let active = app.active;
-    // Working の明滅の位相（400ms 周期）。**時計を読むのはここ 1 箇所**にして、
-    // 1 フレームぶんの全行へ同じ位相を配る（[`session_row_line`] は時計を読まない）
-    let blink_lit = (now_ms / 400).is_multiple_of(2);
+    // Working の明滅のコマ番号。**時計を読むのはここ 1 箇所**にして、1 フレームぶんの
+    // 全行へ同じ番号を配る（[`session_row_line`] は時計を読まない）。
+    // コマ列の長さ（＝ 何段階で何秒周期か）はテーマが持つので、ここは刻むだけ
+    let blink_tick = now_ms / crate::theme::BLINK_TICK_MS;
 
     // ---- 行データを先に組み立てる（State / Directory 両グルーピング対応）----
     //
@@ -1438,7 +1476,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     let push_data_row = |items: &mut Vec<ListItem>, rows: &mut Vec<SidebarRow>, d: &RowData| {
         let cur = rows.len();
         let look = Look::at(app, SidebarPos::Row(cur), d.is_active_window);
-        items.push(ListItem::new(session_row_line(d, look, inner_width, blink_lit)));
+        items.push(ListItem::new(session_row_line(d, look, inner_width, blink_tick)));
         rows.push(SidebarRow::Action(d.action.clone()));
     };
     // セッション行以外の 1 行を積む。**items と rows が 1:1 であること**と
@@ -1503,8 +1541,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         Style::default().fg(ui().dim),
         SidebarRow::Action(RowAction::ToggleGroup),
     );
-    // 集計行。**語は節の見出しの小文字**（[`State::title`] が唯一の綴り）なので、
-    // 見出し・行ラベル・集計で別の語が出ることがない。
+    // 集計行。**語は [`State::title`] をそのまま出す**（唯一の綴り）ので、
+    // 見出し・行ラベル・集計で別の語が出ることがない。綴りが小文字になった今、
+    // ここで大小を変換する必要は無くなった（変換が残っていると「同じ語の 2 つ目の姿」を
+    // この行だけが持ち続けることになる）。
     //
     // **0 件の項目は出さない。** 語が 4 つになって行が長くなったので、
     // `0 stopped` のような情報を持たない項目で幅を使わない（1 本も無ければ空行）
@@ -1515,7 +1555,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             counts
                 .iter()
                 .filter(|(_, n)| *n > 0)
-                .map(|(group, n)| format!("{n} {}", group.title().to_lowercase()))
+                .map(|(group, n)| format!("{n} {}", group.title()))
                 .collect::<Vec<_>>()
                 .join(" · "),
         ),
@@ -2421,14 +2461,13 @@ pub(crate) mod tests {
                 pty: Some(pty),
                 quiet_means_idle,
             }))
-            .title()
         };
         // 補正する agent（codex）: 無音になったら降りる
-        assert_eq!(view(true, PtyHint::Quiet), "Idle");
-        assert_eq!(view(true, PtyHint::Writing), "Working");
-        assert_eq!(view(true, PtyHint::Starting), "Working");
+        assert_eq!(view(true, PtyHint::Quiet), IDLE);
+        assert_eq!(view(true, PtyHint::Writing), WORKING);
+        assert_eq!(view(true, PtyHint::Starting), WORKING);
         // 補正しない agent（claude）: 無音でも hook のまま
-        assert_eq!(view(false, PtyHint::Quiet), "Working");
+        assert_eq!(view(false, PtyHint::Quiet), WORKING);
     }
 
     /// 補正がかかるのは Working だけ。**Waiting を無音で降ろすと、許可待ちの行が
@@ -2442,7 +2481,7 @@ pub(crate) mod tests {
             pty: Some(PtyHint::Quiet),
             quiet_means_idle: true,
         }));
-        assert_eq!(state.title(), "Waiting");
+        assert_eq!(state, WAITING);
     }
 
     /// **行の状態は hook（イベント）と `status`（現在値）の新しい方で決まる。**
@@ -2453,20 +2492,20 @@ pub(crate) mod tests {
     #[test]
     fn the_newer_of_the_hook_and_the_live_status_decides_the_row() {
         let view = |hook, status, status_at| {
-            row_state(Some(Run { hook, status, status_at, pty: None, quiet_means_idle: false })).title()
+            row_state(Some(Run { hook, status, status_at, pty: None, quiet_means_idle: false }))
         };
         // 観測の方が新しい → 観測が勝つ
-        assert_eq!(view(Some((WORKING, 1_000)), "idle", 2_000), "Idle");
-        assert_eq!(view(Some((IDLE, 1_000)), "busy", 2_000), "Working");
+        assert_eq!(view(Some((WORKING, 1_000)), "idle", 2_000), IDLE);
+        assert_eq!(view(Some((IDLE, 1_000)), "busy", 2_000), WORKING);
         // **赤の固着そのもの**: 陳腐化した busy より新しい idle hook が勝つ
-        assert_eq!(view(Some((IDLE, 2_000)), "busy", 1_000), "Idle");
-        assert_eq!(view(Some((State::Idle, 1_000)), "waiting", 2_000), "Waiting");
+        assert_eq!(view(Some((IDLE, 2_000)), "busy", 1_000), IDLE);
+        assert_eq!(view(Some((State::Idle, 1_000)), "waiting", 2_000), WAITING);
         // hook の方が新しい（または同時刻）→ hook が勝つ
-        assert_eq!(view(Some((WORKING, 1_000)), "idle", 999), "Working");
-        assert_eq!(view(Some((WORKING, 1_000)), "idle", 1_000), "Working");
+        assert_eq!(view(Some((WORKING, 1_000)), "idle", 999), WORKING);
+        assert_eq!(view(Some((WORKING, 1_000)), "idle", 1_000), WORKING);
         // 片方しか無いときはある方
-        assert_eq!(view(Some((WAITING, 1_000)), "", 2_000), "Waiting");
-        assert_eq!(view(None, "busy", 2_000), "Working");
+        assert_eq!(view(Some((WAITING, 1_000)), "", 2_000), WAITING);
+        assert_eq!(view(None, "busy", 2_000), WORKING);
     }
 
     /// **行に渡す時刻は claude が status を書いた時刻**で、ccdesk がそれを読んだ
@@ -2511,14 +2550,14 @@ pub(crate) mod tests {
     #[test]
     fn a_status_observation_heals_a_hook_whose_closing_event_never_came() {
         let view = |hook, status| {
-            row_state(Some(Run { hook, status, status_at: 2_000, pty: None, quiet_means_idle: false })).title()
+            row_state(Some(Run { hook, status, status_at: 2_000, pty: None, quiet_means_idle: false }))
         };
         // Esc 中断: working のまま固着していた行が、次の観測で赤を降りる
-        assert_eq!(view(Some((WORKING, 1_000)), "idle"), "Idle");
+        assert_eq!(view(Some((WORKING, 1_000)), "idle"), IDLE);
         // 許可した直後: waiting のまま固着していた行が、次の観測で動き出す
-        assert_eq!(view(Some((WAITING, 1_000)), "busy"), "Working");
+        assert_eq!(view(Some((WAITING, 1_000)), "busy"), WORKING);
         // ダイアログが開いたままなら黄のまま（claude 自身が waiting と言う）
-        assert_eq!(view(Some((WAITING, 1_000)), "waiting"), "Waiting");
+        assert_eq!(view(Some((WAITING, 1_000)), "waiting"), WAITING);
     }
 
     /// **バックグラウンド作業は「入力待ち」ではない。**
@@ -2530,14 +2569,14 @@ pub(crate) mod tests {
     #[test]
     fn background_shell_work_is_not_a_request_for_input() {
         let view = |hook, status| {
-            row_state(Some(Run { hook, status, status_at: 2_000, pty: None, quiet_means_idle: false })).title()
+            row_state(Some(Run { hook, status, status_at: 2_000, pty: None, quiet_means_idle: false }))
         };
         for status in ["idle", "shell"] {
-            assert_eq!(view(None, status), "Idle", "{status:?} asks for input");
-            assert_eq!(view(Some((WORKING, 1_000)), status), "Idle", "{status:?}");
+            assert_eq!(view(None, status), IDLE, "{status:?} asks for input");
+            assert_eq!(view(Some((WORKING, 1_000)), status), IDLE, "{status:?}");
         }
         // 知らない値だけは「動いているらしい」へ倒す（呼びつけるよりは害が小さい）
-        assert_eq!(view(None, "something-new"), "Working");
+        assert_eq!(view(None, "something-new"), WORKING);
     }
 
     /// **材料が 1 つも無い行の最後の手段は PTY の出力変化だけ。**
@@ -2545,11 +2584,11 @@ pub(crate) mod tests {
     /// 「入力待ち」と名乗ってユーザーを呼びつけない）
     #[test]
     fn a_row_with_no_hook_and_no_status_falls_back_to_the_pty_output() {
-        let view = |pty| row_state(Some(Run { hook: None, status: "", status_at: 0, pty: Some(pty), quiet_means_idle: false })).title();
+        let view = |pty| row_state(Some(Run { hook: None, status: "", status_at: 0, pty: Some(pty), quiet_means_idle: false }));
         // まだ端末を掴んでいない ＝ 起動中。**「もう終わった」ではない**
-        assert_eq!(view(PtyHint::Starting), "Working");
-        assert_eq!(view(PtyHint::Writing), "Working");
-        assert_eq!(view(PtyHint::Quiet), "Idle");
+        assert_eq!(view(PtyHint::Starting), WORKING);
+        assert_eq!(view(PtyHint::Writing), WORKING);
+        assert_eq!(view(PtyHint::Quiet), IDLE);
     }
 
     /// **動かしているものが無い行は、hook が何を言っていても Stopped。**
@@ -2561,9 +2600,7 @@ pub(crate) mod tests {
     /// `stop` / `/clear` / `/resume` のどれで止まっても同じ表示になるのも同じ理由
     #[test]
     fn a_row_with_no_run_is_stopped_whatever_the_hooks_say() {
-        let view = row_state(None);
-        assert_eq!(view.title(), "Stopped");
-        assert!(view == State::Stopped, "a stopped row is not in the last group");
+        assert_eq!(row_state(None), STOPPED);
         // かつては「Stopped なのに生存形（✻）」という矛盾を `alive` フィールドで
         // 検査していたが、状態はもう文字のアイコンで語らない（色だけ）ので、
         // その矛盾自体が作れなくなり検査ごと不要になった
@@ -2712,7 +2749,7 @@ pub(crate) mod tests {
             pty: None,
             quiet_means_idle: false,
         }));
-        assert_eq!(view.title(), "Stopped", "a fresh stopped was thrown away");
+        assert_eq!(view, STOPPED, "a fresh stopped was thrown away");
         // かつては「Stopped なのにアイコンが生存形（✻）」を `alive` フィールドで
         // 検査していたが、状態はもう色だけで語るのでその矛盾自体が作れなくなった
 
@@ -2770,10 +2807,10 @@ pub(crate) mod tests {
     /// 4 状態の文面。左端がマーカー桁、右端が動詞で、**新版の番号は出さない**
     #[test]
     fn version_row_spells_out_all_four_update_states() {
-        let row = |state| version_row("ccdesk", "0.5.0", state, DEFAULT_INNER);
-        // 最新: マーカー桁は空白、動詞なし
+        let row = |state| version_row(" ", "ccdesk", "0.5.0", state, DEFAULT_INNER);
+        // 最新: マーカー桁も記号桁も空白、動詞なし
         let current = row(UpdateState::Current);
-        assert_eq!(current, "  ccdesk v0.5.0");
+        assert_eq!(current, "    ccdesk v0.5.0");
         // 更新あり / 実行中 / 再起動待ち: ⟳ + 右端の動詞
         for (state, verb) in [
             (UpdateState::Available, "update"),
@@ -2788,24 +2825,49 @@ pub(crate) mod tests {
     }
 
     /// **最新のときもマーカー桁を確保する。** 更新が出た瞬間に名前が横へずれると、
-    /// 行が変わったこと自体に気づきにくい
+    /// 行が変わったこと自体に気づきにくい。
+    ///
+    /// **記号の桁も同じ扱い**: agent 行が `●`/`◆` を持ち ccdesk 行が空白でも、
+    /// 名前は同じ桁から始まる（凡例を足したせいで版行が階段状にならない）
     #[test]
     fn version_row_keeps_the_name_column_fixed_across_states() {
         use unicode_width::UnicodeWidthStr;
-        // 名前の前にある部分の表示幅（マーカー桁 + 区切りの空白）
-        let name_col = |text: &str| {
-            let at = text.find("ccdesk").expect("name is missing");
+        // 名前の前にある部分の表示幅（マーカー桁 + 記号桁 + 区切りの空白 2 つ）
+        let name_col = |text: &str, name: &str| {
+            let at = text.find(name).expect("name is missing");
             text[..at].width()
         };
-        let base = name_col(&version_row("ccdesk", "0.5.0", UpdateState::Current, DEFAULT_INNER));
-        assert_eq!(base, 2, "expected 1 marker column + 1 space column");
+        let base = name_col(
+            &version_row(" ", "ccdesk", "0.5.0", UpdateState::Current, DEFAULT_INNER),
+            "ccdesk",
+        );
+        assert_eq!(base, 4, "expected marker + glyph columns with a space each");
         for state in [
             UpdateState::Available,
             UpdateState::Running,
             UpdateState::Restart,
         ] {
-            let text = version_row("ccdesk", "0.5.0", state, DEFAULT_INNER);
-            assert_eq!(name_col(&text), base, "{state:?} shifted the name column: {text:?}");
+            let text = version_row(" ", "ccdesk", "0.5.0", state, DEFAULT_INNER);
+            assert_eq!(
+                name_col(&text, "ccdesk"),
+                base,
+                "{state:?} shifted the name column: {text:?}"
+            );
+            // 記号を持つ agent 行でも名前の開始桁は同じ
+            for kind in Kind::ORDER {
+                let text = version_row(
+                    agent_glyph(kind),
+                    kind.title(),
+                    "1.0.0",
+                    state,
+                    DEFAULT_INNER,
+                );
+                assert_eq!(
+                    name_col(&text, kind.title()),
+                    base,
+                    "{kind:?} shifted the name column: {text:?}"
+                );
+            }
         }
     }
 
@@ -2850,10 +2912,15 @@ pub(crate) mod tests {
     }
 
     /// 既定のサイドバー幅（34 桁 = 内側 32 桁）で切られない。
-    /// 版番号は現実的な桁数まで（claude は 3 パート、ccdesk は本ビルドの版）
+    /// 版番号は現実的な桁数まで（claude は 3 パート、ccdesk は本ビルドの版）。
+    /// **凡例の記号を足したぶんも含めて収まる**ことをここで見る
     #[test]
     fn version_rows_fit_the_default_sidebar_width() {
         use unicode_width::UnicodeWidthStr;
+        // ccdesk 行（記号なし）と agent 行（記号あり）の両方
+        let names: Vec<(&str, &str)> = std::iter::once((" ", "ccdesk"))
+            .chain(Kind::ORDER.into_iter().map(|k| (agent_glyph(k), k.title())))
+            .collect();
         for state in [
             UpdateState::Current,
             UpdateState::Available,
@@ -2861,8 +2928,8 @@ pub(crate) mod tests {
             UpdateState::Restart,
         ] {
             for version in ["", "0.5.0", "2.1.220", "10.20.300"] {
-                for name in ["ccdesk", "claude"] {
-                    let text = version_row(name, version, state, DEFAULT_INNER);
+                for (glyph, name) in &names {
+                    let text = version_row(glyph, name, version, state, DEFAULT_INNER);
                     assert!(
                         text.width() <= DEFAULT_INNER as usize,
                         "does not fit the default width: {text:?} ({} columns / inner {DEFAULT_INNER} columns)",
@@ -3450,14 +3517,14 @@ pub(crate) mod tests {
             .clone()
     }
 
-    /// **行の並びは「名前 → 状態語 → agent → メニュー記号」。**
+    /// **行の並びは「名前 → 状態語 → メニュー記号」。**
     ///
-    /// 名前の後ろに来るのはこの 2 つだけで、経過時間は出さない（廃止済み）。
-    /// agent は略記（かつての `[cc]` / `[cx]`）ではなく綴りで出る。
+    /// **agent は行末に居ない**（ドットの形が答えるので綴りで桁を食わない）。
+    /// 略記（かつての `[cc]` / `[cx]`）も綴りも出ないことをここで固定する。
     /// 状態が Stopped なのは、窓（PTY）を起こしていないので保管の hook が何であれ
     /// この行が止まっているため（[`a_stopped_row_is_drawn_as_stopped_and_not_as_needs_input`]）
     #[test]
-    fn the_row_ends_with_the_state_then_the_agent_then_the_menu_mark() {
+    fn the_row_ends_with_the_state_then_the_menu_mark() {
         let mut app = App {
             term_size: (120, 40),
             sidebar_width: 40,
@@ -3470,43 +3537,46 @@ pub(crate) mod tests {
         let after_name = &line[line.find("no-text-row").unwrap() + "no-text-row".len()..];
         assert_eq!(
             after_name.split_whitespace().collect::<Vec<_>>(),
-            [State::Stopped.title(), Kind::Claude.title(), MENU_MARK],
-            "the row tail is not state, agent, menu mark: {after_name:?}"
+            [State::Stopped.title(), MENU_MARK],
+            "the row tail is not state then menu mark: {after_name:?}"
         );
-        // 略記は残っていない（`[cc]` を消したのがこの作業の出発点）
+        // 略記も綴りも残っていない（agent が桁を食っていた形は 2 度とも消した）
         assert!(!line.contains("[cc]"), "the old agent tag is back: {line:?}");
+        assert!(
+            !line.contains(Kind::Claude.title()),
+            "the agent spelling is back in the row: {line:?}"
+        );
     }
 
     /// **行末ブロックは名前の下限を割ってまで出さない。**
-    /// 落とす順は agent → 状態語で、両方落ちてもドットの色が状態を語り続ける。
+    /// 落ちるのは状態語だけで、落ちてもドットの色が状態を語り続ける。
     ///
     /// **どの幅・どの kind・どの状態でも行はちょうど内側の幅を埋める**（メニュー記号が
     /// 常に右端に来る前提）。ここを 1 通りの組み合わせでしか見ないと、綴りが
-    /// たまたま桁ぴったりの `claude` だけで通ってしまう
+    /// たまたま桁ぴったりの状態だけで通ってしまう
     #[test]
     fn the_row_tail_gives_way_before_the_name_does() {
         let d = look_fixture();
         let tail_of = |inner: u16| -> String {
-            row_tail_spans(&d, inner)
+            row_tail_spans(&d, inner, 0)
                 .iter()
                 .map(|s| s.content.as_ref())
                 .collect::<String>()
         };
-        // 予算に余裕があれば agent と状態語の両方
+        // 予算に余裕があれば状態語が出る（agent はここに居ない）
         let wide = tail_of(DEFAULT_INNER);
-        assert!(wide.contains(Kind::Claude.title()), "no agent: {wide:?}");
         assert!(wide.contains(State::Waiting.title()), "no state: {wide:?}");
+        assert!(
+            !wide.contains(Kind::Claude.title()),
+            "the agent spelling came back to the tail: {wide:?}"
+        );
 
-        // agent が落ちる境目（名前の下限 + 状態語ぶんだけが残る幅）
+        // 状態語が残る一番狭い幅（名前の下限 + 状態語ぶん）
         let fixed = (HEAD_COLS + MENU_COLS + MIN_NAME_COLS) as u16;
         let state_only = tail_of(fixed + TAIL_STATE_COLS as u16);
         assert!(
-            !state_only.contains(Kind::Claude.title()),
-            "the agent did not give way first: {state_only:?}"
-        );
-        assert!(
             state_only.contains(State::Waiting.title()),
-            "the state word went before the agent: {state_only:?}"
+            "the state word went too early: {state_only:?}"
         );
         // 一番狭いサイドバーでは行末ブロックごと消える（名前が下限を割らない）
         assert_eq!(tail_of(fixed), "", "the tail squeezed the name below its floor");
@@ -3526,7 +3596,7 @@ pub(crate) mod tests {
                     let mut d = look_fixture();
                     d.kind = kind;
                     d.group = group;
-                    let tail: usize = row_tail_spans(&d, inner)
+                    let tail: usize = row_tail_spans(&d, inner, 0)
                         .iter()
                         .map(|s| s.content.width())
                         .sum();
@@ -3622,9 +3692,10 @@ pub(crate) mod tests {
 
     /// 見た目を比べるためのセッション行 1 本ぶんの材料。
     ///
-    /// **状態は特別扱いの無い `Waiting`**（明滅もせず、丸も小さくならない）にしてある。
-    /// ここを `Stopped` にすると、状態を上書きしないテストが黙って「止まった行だけの
-    /// 見た目」を検査することになる（状態別の見え方は各テストが自分で `group` を置く）
+    /// **状態は特別扱いの無い `Waiting`**（明滅しない ＝ 位相を変えても色が動かない）に
+    /// してある。ここを `Working` にすると、位相を上書きしないテストが黙って
+    /// 「あるコマだけの見た目」を検査することになる（明滅の見え方は各テストが
+    /// 自分で `group` と位相を置く）
     fn look_fixture() -> RowData {
         RowData {
             kind: Kind::Claude,
@@ -3655,10 +3726,10 @@ pub(crate) mod tests {
     /// 組んだセッション行を**2 段まとめて**「文字ごとの (文字, スタイル)」へ均す。
     /// 帯は 2 段の両方に掛かるので、見た目の比較は 2 段そろえて行う
     fn row_cells(d: &RowData, look: Look) -> Vec<(String, Style)> {
-        // 明滅の位相は点灯側で固定。位相を見たいテストは自分で
-        // [`session_row_line`] を呼ぶ（既定を谷にすると、位相に関心の無い
+        // 明滅の位相はコマ列の先頭（一番明るい側）で固定。位相を見たいテストは
+        // 自分で [`session_row_line`] を呼ぶ（既定を谷にすると、位相に関心の無い
         // テストが黙って「谷の見た目」を検査することになる）
-        cells(&session_row_line(d, look, DEFAULT_INNER, true))
+        cells(&session_row_line(d, look, DEFAULT_INNER, 0))
     }
 
     /// **選択・ホバー・ペインに出ている の 3 つが、重なっても見分けられる。**
@@ -3716,23 +3787,77 @@ pub(crate) mod tests {
         assert_eq!(drawn[1].0, DOT_FILLED);
     }
 
-    /// **未読行はドットが塗り（[`DOT_FILLED`]）、既読行は抜き（[`DOT_HOLLOW`]）。**
-    /// 塗りは 2 値だけで、色（状態）や明滅とは独立したチャンネル
+    /// **未読行はドットが塗り、既読行は抜き。** 塗りは 2 値だけで、
+    /// 形（agent）・色（状態）・明滅とは独立したチャンネル。
+    /// **agent が変わっても塗りのチャンネルは欠けない**（丸も菱も塗り/中空の対を持つ）
     #[test]
     fn the_dot_fill_marks_unread_rows() {
         let look = Look { band: false, selected: false, open: false };
         let mut d = look_fixture();
-        d.unread = false;
-        let read = row_cells(&d, look);
-        d.unread = true;
-        let unread = row_cells(&d, look);
-        assert_eq!(read[1].0, DOT_HOLLOW, "a read row does not show the hollow dot");
-        assert_eq!(unread[1].0, DOT_FILLED, "an unread row does not show the filled dot");
-        // 塗りは状態に反応しない（4 状態とも同じ 2 値）
-        for group in State::ORDER {
-            d.group = group;
+        for kind in Kind::ORDER {
+            d.kind = kind;
+            d.unread = false;
+            let read = row_cells(&d, look)[1].0.clone();
             d.unread = true;
-            assert_eq!(row_cells(&d, look)[1].0, DOT_FILLED, "{} changed the fill", group.title());
+            let unread = row_cells(&d, look)[1].0.clone();
+            assert_ne!(read, unread, "{kind:?} draws the same glyph read and unread");
+            assert_eq!(unread, dot_glyph(kind, true), "{kind:?} unread glyph");
+            assert_eq!(read, dot_glyph(kind, false), "{kind:?} read glyph");
+            // 塗りは状態に反応しない（4 状態とも同じ 2 値）
+            for group in State::ORDER {
+                d.group = group;
+                d.unread = true;
+                assert_eq!(
+                    row_cells(&d, look)[1].0,
+                    dot_glyph(kind, true),
+                    "{} changed the fill",
+                    group.title()
+                );
+            }
+            d.group = State::Waiting;
+        }
+    }
+
+    /// **ドットの形が agent を答える。** 4 グリフ（agent 2 × 塗り 2）はすべて別物で、
+    /// 状態が変わっても形は動かない ＝ 形と色が互いのチャンネルを侵さない。
+    ///
+    /// 対応表は [`dot_glyph`] から引くので、記号を手で書き写さない
+    #[test]
+    fn the_dot_shape_tells_the_agent_apart() {
+        let look = Look { band: false, selected: false, open: false };
+        let glyphs: Vec<&str> = Kind::ORDER
+            .into_iter()
+            .flat_map(|k| [dot_glyph(k, true), dot_glyph(k, false)])
+            .collect();
+        for i in 0..glyphs.len() {
+            for j in (i + 1)..glyphs.len() {
+                assert_ne!(glyphs[i], glyphs[j], "two dot glyphs collide: {glyphs:?}");
+            }
+        }
+        // 状態を変えても形は動かない（色だけが状態に反応する）
+        for kind in Kind::ORDER {
+            for group in State::ORDER {
+                let mut d = look_fixture();
+                d.kind = kind;
+                d.group = group;
+                d.unread = true;
+                assert_eq!(
+                    row_cells(&d, look)[1].0,
+                    dot_glyph(kind, true),
+                    "{kind:?} changed shape at {}",
+                    group.title()
+                );
+            }
+        }
+    }
+
+    /// **凡例（版行・new 画面）と一覧のドットは同じ表を引く。**
+    /// 凡例が中空（＝ 既読という別チャンネルの値）を名乗らないことも見る
+    #[test]
+    fn the_legend_glyph_is_the_one_the_rows_draw() {
+        for kind in Kind::ORDER {
+            assert_eq!(agent_glyph(kind), dot_glyph(kind, true), "{kind:?}");
+            assert_ne!(agent_glyph(kind), dot_glyph(kind, false), "{kind:?} legend is hollow");
         }
     }
 
@@ -3747,32 +3872,47 @@ pub(crate) mod tests {
             d.group = state;
             row_cells(&d, look)[1].1.fg
         };
-        assert_eq!(dot_color(WAITING), Some(C_ATTENTION), "Waiting");
-        assert_eq!(dot_color(WORKING), Some(C_WORKING), "Working");
-        assert_eq!(dot_color(IDLE), Some(crate::theme::C_OK), "Idle");
+        assert_eq!(dot_color(WAITING), Some(ui().attention), "Waiting");
+        assert_eq!(dot_color(WORKING), Some(ui().working), "Working");
+        assert_eq!(dot_color(IDLE), Some(ui().ok), "Idle");
         assert_eq!(dot_color(STOPPED), Some(ui().dim), "Stopped");
     }
 
-    /// **Working 中のドットは 400ms の位相で状態色と dim を往復する。**
+    /// **Working 中のドットはコマ列を往復する。**
     ///
-    /// 谷は淡色テキストと同じ [`ui().dim`]（谷の深さを決めるためだけの色を別に持たない）。
-    /// **谷が Stopped の色と一致するのは承知の上**で、区別は行末の状態語が引き受ける。
-    /// 明滅しない状態は位相に関係なく自分の色のまま
+    /// コマ列は [`crate::theme::UiTheme::blink`] が持つので、ここが見るのは
+    /// 「一周のうちに 2 つ以上の色が出る」「先頭コマは状態色そのもの」
+    /// 「一周して戻る」の 3 つ。段階数や谷の深さはテーマ側のテストが固定する。
+    ///
+    /// **谷が Stopped と同色にならない**ことも見る: 谷を `dim` まで落としていた頃は、
+    /// 位相しだいで止まった行と動いている行が同じ見た目になっていた
     #[test]
-    fn a_working_dot_blinks_between_its_color_and_dim() {
+    fn a_working_dot_blinks_through_its_ramp() {
         let look = Look { band: false, selected: false, open: false };
         let mut d = look_fixture();
         d.group = State::Working;
-        let fg = |d: &RowData, lit: bool| cells(&session_row_line(d, look, DEFAULT_INNER, lit))[1].1.fg;
-        assert_eq!(fg(&d, true), Some(State::Working.color()), "the lit phase lost the state color");
-        assert_eq!(fg(&d, false), Some(ui().dim), "the dark phase does not fall back to dim");
-        assert_ne!(fg(&d, true), fg(&d, false), "the dot does not blink");
+        let fg = |d: &RowData, tick: u64| {
+            cells(&session_row_line(d, look, DEFAULT_INNER, tick))[1].1.fg
+        };
+        let len = ui().blink_len() as u64;
+        let frames: Vec<_> = (0..len).map(|t| fg(&d, t)).collect();
+        assert_eq!(frames[0], Some(State::Working.color()), "the ramp does not start lit");
+        assert_eq!(fg(&d, len), frames[0], "the ramp does not come back around");
+        assert!(
+            frames.iter().collect::<std::collections::HashSet<_>>().len() >= 2,
+            "the dot does not blink: {frames:?}"
+        );
+        assert!(
+            frames.iter().all(|c| *c != Some(ui().dim)),
+            "a blink frame collides with the stopped color: {frames:?}"
+        );
 
         // 明滅しない状態は位相に関係なく自分の色のまま（色と明滅は同じ group から
         // 決まるので、「Working の色だが明滅しない」という行は型として作れない）
         d.group = State::Idle;
-        assert_eq!(fg(&d, true), fg(&d, false), "a non-blinking group changed with the phase");
-        assert_eq!(fg(&d, true), Some(State::Idle.color()), "the steady color is wrong");
+        for tick in 0..len {
+            assert_eq!(fg(&d, tick), Some(State::Idle.color()), "a steady group moved at {tick}");
+        }
     }
 
     /// **行末の状態語と色は同じ [`State`] から出る。** 4 状態それぞれで
@@ -3795,41 +3935,31 @@ pub(crate) mod tests {
                 "{} is not drawn in its own color",
                 state.title()
             );
-            // agent の綴りは状態色を borrow しない（弱色のまま）
-            let agent_at = text.find(d.kind.title()).expect("the agent name vanished");
-            assert_eq!(
-                drawn[text[..agent_at].chars().count()].1.fg,
-                Some(MUTED_FG),
-                "the agent name took a state color"
-            );
         }
     }
 
-    /// **agent は略記ではなく綴りで出る。** かつての `[cc]` / `[cx]` は
-    /// 行頭で名前の桁を食っていたので、綴りにして行末へ移した。
+    /// **状態語とドットは同じコマを引く。** 行の中で 2 つのものが別々のリズムで
+    /// 動くと、1 つの呼吸ではなく雑音に見える。
     ///
-    /// **agent の開始桁は状態語の綴りの長さに依らない**（[`State::TITLE_COLS`] で
-    /// 揃う）。揃えないと、状態が変わるたびに agent の綴りが左右に動く
+    /// 位相を一周させて、どのコマでもドットと語の色が一致することを見る
+    /// （片方だけ [`row_state_color`] を経由しなくなったら落ちる）
     #[test]
-    fn the_row_tail_spells_out_the_agent() {
-        let at = |kind: Kind, state: State, word: &str| {
-            let mut d = look_fixture();
-            d.kind = kind;
-            d.group = state;
-            let drawn = row_cells(&d, Look { band: false, selected: false, open: false });
+    fn the_state_word_blinks_in_step_with_the_dot() {
+        let look = Look { band: false, selected: false, open: false };
+        let mut d = look_fixture();
+        d.group = State::Working;
+        for tick in 0..ui().blink_len() as u64 {
+            let drawn = cells(&session_row_line(&d, look, DEFAULT_INNER, tick));
             let text: String = drawn.iter().map(|c| c.0.as_str()).collect();
-            text.find(word)
-                .unwrap_or_else(|| panic!("{word} is not on the row: {text:?}"))
-        };
-        for kind in Kind::ORDER {
-            assert!(at(kind, IDLE, kind.title()) > 0, "{} is missing", kind.title());
+            let at = text
+                .find(State::Working.title())
+                .unwrap_or_else(|| panic!("the state word is missing: {text:?}"));
+            assert_eq!(
+                drawn[text[..at].chars().count()].1.fg,
+                drawn[1].1.fg,
+                "the word and the dot are out of phase at tick {tick}"
+            );
         }
-        // 一番短い語（Idle）と一番長い語（Waiting）で agent の開始桁が同じ
-        assert_eq!(
-            at(Kind::Claude, IDLE, Kind::Claude.title()),
-            at(Kind::Claude, WAITING, Kind::Claude.title()),
-            "the agent name starts at a different column per state"
-        );
     }
 
     /// **4 状態の色は互いに異なる。** 2 つの状態が同じ色になると、
@@ -4208,7 +4338,7 @@ pub(crate) mod tests {
         assert!(text.contains("/login"), "the row does not say how to log back in: {text:?}");
         assert_eq!(
             style,
-            Style::default().fg(C_ATTENTION),
+            Style::default().fg(ui().attention),
             "a row that needs action is not in the attention color"
         );
     }

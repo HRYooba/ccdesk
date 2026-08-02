@@ -152,6 +152,7 @@ dependencies = [
  "ratatui",
  "serde_json",
  "terminal-colorsaurus",
+ "terminal-trx",
  "tui-term",
  "unicode-width",
  "uuid",

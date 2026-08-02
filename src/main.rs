@@ -35,7 +35,7 @@ use app::{open_session, run, App, Focus, RightView, SelfUpdate};
 use cli::{print_usage, print_usage_error, run_doctor, show_logs, update_self};
 use poll::FooterInfo;
 use source::{DataSource, DemoSource, LiveSource};
-use theme::HOST_COLORS;
+use theme::{HOST_COLORS, HOST_PALETTE};
 
 fn main() -> anyhow::Result<()> {
     // **エラーログの出力先を決めるのはここだけ。** 決めていないプロセス（＝ テスト）
@@ -136,9 +136,13 @@ fn main() -> anyhow::Result<()> {
     let footer = source.footer();
     let window = source.window_state();
 
-    // ホスト端末の実 fg/bg を OSC 10/11 で照会（raw mode に入る前。
-    // 照会の作法は theme 側の 1 実装 ＝ doctor と同じ経路を通る）
-    let _ = HOST_COLORS.set(theme::query_host_colors());
+    // ホスト端末の実 fg/bg を OSC 10/11 で、ANSI パレットを OSC 4 で照会
+    // （どちらも raw mode に入る前。照会の作法は theme 側の 1 実装 ＝
+    // doctor と同じ経路を通る）。**パレットは fg/bg が取れた端末にだけ聞く**
+    // ので、照会に答えない端末へ投げて待つことがない
+    let host = theme::query_host_colors();
+    let _ = HOST_COLORS.set(host);
+    let _ = HOST_PALETTE.set(theme::query_palette(host));
 
     let mut terminal = ratatui::init();
     // panic は ~/.ccdesk/error.log へ記録（TUI は画面ごと消えて panic 表示が読めない）。

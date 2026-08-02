@@ -20,7 +20,7 @@ use crate::claude_format::{
     AGENT_STATUS_BUSY, AGENT_STATUS_IDLE, AGENT_STATUS_SHELL, AGENT_STATUS_UPDATED_AT,
     AGENT_STATUS_WAITING, SESSIONS_DIR,
 };
-use crate::theme::{ui, C_ATTENTION, C_OK, C_WORKING};
+use crate::theme::ui;
 
 /// 生きている前景セッション 1 つ（`~/.claude/sessions/<pid>.json` 1 ファイル）。
 ///
@@ -740,14 +740,18 @@ impl State {
     }
 
     /// **この 4 語が画面に出る唯一の綴り**（行ラベル・節の見出し・集計）。
-    /// 集計行はこれを小文字にして使う ＝ 画面の 3 箇所で別の語が出ることが起き得ない
+    ///
+    /// **小文字なのは、出る 3 箇所を 1 つの綴りで賄うため。** かつては大文字始まりで
+    /// 持ち、集計行だけが `to_lowercase` を掛けていた ＝ 同じ語が 2 つの姿を持っていた。
+    /// ピン留めの節（[`crate::ui::PINNED_TITLE`]）が元から小文字なので、
+    /// 揃える先は小文字側になる。
+    ///
+    /// **綴りの実体は [`Self::as_str`]**（[`crate::backend::Kind::title`] と同じ作り）。
+    /// 小文字になった今、保存の綴りと画面の綴りは同じ語なので、表を 2 つ持つと
+    /// 片方だけ直したときに黙ってずれる。[`Self::parse`] も `as_str` を舐めるので、
+    /// 語を変えれば画面・保存・読み戻しが同時に動く
     pub(crate) fn title(self) -> &'static str {
-        match self {
-            Self::Waiting => "Waiting",
-            Self::Working => "Working",
-            Self::Idle => "Idle",
-            Self::Stopped => "Stopped",
-        }
+        self.as_str()
     }
 
     /// [`Self::title`] を縦に揃えるための桁。**サイドバーの行末がこれで揃う**
@@ -761,9 +765,11 @@ impl State {
     /// （以前は `StateView.color` が別に持っていて、食い違う値を作れてしまっていた）
     pub(crate) fn color(self) -> Color {
         match self {
-            Self::Waiting => C_ATTENTION,
-            Self::Working => C_WORKING,
-            Self::Idle => C_OK,
+            Self::Waiting => ui().attention,
+            // 明滅する行のドットと語は [`crate::theme::UiTheme::blink`] のコマを引く。
+            // ここが返すのはコマ列の一番明るい側 ＝ 節の見出しや集計が代表色として使う
+            Self::Working => ui().working,
+            Self::Idle => ui().ok,
             Self::Stopped => ui().dim,
         }
     }
