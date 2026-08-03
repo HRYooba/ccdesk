@@ -9,8 +9,6 @@
 
 use std::path::PathBuf;
 
-use serde_json::Value;
-
 /// 索引ファイルの項目キー。**読みはここ 1 箇所**（綴りを 2 箇所に持たない）
 const ID_KEY: &str = "id";
 const NAME_KEY: &str = "thread_name";
@@ -88,18 +86,6 @@ pub(crate) fn day_path(days: i64) -> Option<PathBuf> {
 pub(crate) fn auth_fingerprint() -> crate::poll::CredentialsFp {
     let meta = std::fs::metadata(codex_home()?.join("auth.json")).ok()?;
     Some((meta.len(), meta.modified().ok()?))
-}
-
-/// codex が自分で書いた更新チェックの結果（`version.json` の `latest_version`）。
-///
-/// **自前で配布エンドポイントを叩かない。** codex は起動時に自分で確認して
-/// この値を残すので、ccdesk はそれを読むだけで足りる（ネットワークへ出ない）。
-/// 非公開の内部ファイルなので、形が変われば「更新あり」が出なくなるだけ
-pub(crate) fn latest_version() -> Option<String> {
-    let path = codex_home()?.join("version.json");
-    let value: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    let latest = value.get("latest_version")?.as_str()?.trim();
-    (!latest.is_empty()).then(|| latest.to_string())
 }
 
 /// codex の会話名（会話 ID → 名前）。

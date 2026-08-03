@@ -130,7 +130,7 @@ pub(crate) fn run_doctor() -> anyhow::Result<()> {
 }
 
 /// claude CLI が PATH にあるか（バージョン文字列も表示）。
-/// 取得の作法は本番（`poll::fetch_version`）と同じ `poll::out`
+/// 取得の作法は本番（[`crate::backend::Backend::version`]）と同じ `poll::out`
 fn check_claude_cli() -> Check {
     match crate::poll::out("claude", &["--version"]) {
         Some(ver) if !ver.trim().is_empty() => {

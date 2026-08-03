@@ -192,13 +192,12 @@ pub(crate) enum AccountStatus {
     LoggedIn(String),
 }
 
-/// claude 側のアカウント・バージョン情報。アカウントはサイドバー下部の行、
-/// バージョンは上部の claude 版行に出る（`latest` は「更新がある」の有無だけを
+/// agent ごとのアカウント・バージョン情報。アカウントはサイドバー下部の行、
+/// バージョンは上部の版行に出る（`latest` は「更新がある」の有無だけを
 /// 決め、新しい番号そのものは幅の都合で表示しない）。
-/// アカウントは `claude auth status --json`（公式サブコマンド）、
-/// 現行版は `claude --version`、最新版は claude 本体の更新チェックと同じ
-/// 配布エンドポイント（**取得元の正本は [`fetch_version`]**。ここに URL を
-/// 書き写すと、変えたときに片方だけ古いままになる）
+///
+/// **どこから取るかの正本は [`crate::backend::Backend`]**（`account` / `version`）。
+/// ここにコマンド名や URL を書き写すと、変えたときに片方だけ古いままになる
 #[derive(Clone, Default)]
 pub(crate) struct FooterInfo {
     /// agent ごとのログイン状態 + 表示ラベル。**agent ごとに別のアカウント**
