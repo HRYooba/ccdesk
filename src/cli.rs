@@ -12,7 +12,16 @@ fn usage_text() -> String {
          \x20 ccdesk doctor     diagnose the environment (claude CLI, config dir, terminal)\n\
          \x20 ccdesk logs       print the path and tail of the error log\n\
          \x20 ccdesk update     download and install the latest release\n\
-         \x20 ccdesk --version  print version",
+         \x20 ccdesk --version  print version\n\n\
+         From inside a session (for the agent running there):\n\
+         \x20 ccdesk list                       this ccdesk's sessions, running or not\n\
+         \x20 ccdesk send <session> <text>      type text into another session and submit it\n\
+         \x20 ccdesk read <session> [-n <count>] [--screen]\n\
+         \x20                                   that session's last messages, or its screen\n\
+         \x20 ccdesk new [--agent <name>] [--cwd <dir>] [prompt]\n\
+         \x20                                   start another session and print its id\n\
+         \x20 ccdesk stop <session>             end its process, keep the row\n\
+         \x20 ccdesk close <session>            end its process and drop the row",
         env!("CARGO_PKG_VERSION")
     )
 }

@@ -20,6 +20,7 @@ mod git;
 mod hooks;
 mod keys;
 mod poll;
+mod relay;
 mod session;
 mod sessions;
 mod source;
@@ -63,6 +64,31 @@ fn main() -> anyhow::Result<()> {
             let state = std::env::args().nth(3);
             return hooks::run_hook(&event, state.as_deref());
         }
+        // セッション間の受け渡し（[`crate::relay`]）。**セッションの中の agent が叩く**
+        // 前提なので、TUI を起こさずここで終わる
+        Some("list") => return relay::run_list(),
+        Some("send") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let Some((target, text)) = args.split_first() else {
+                anyhow::bail!("usage: ccdesk send <session> <text>");
+            };
+            // **残りを全部 1 つの本文として繋ぐ。** 引用符を付け忘れた
+            // `ccdesk send docs run the tests` を「宛先 docs へ run the tests」と
+            // 読む（シェルの引用符の作法を agent に要求しない）
+            return relay::run_send(target, &text.join(" "));
+        }
+        Some("read") => return read_session(),
+        Some("new") => return new_session(),
+        Some(verb @ ("stop" | "close")) => {
+            let target = std::env::args()
+                .nth(2)
+                .ok_or_else(|| anyhow::anyhow!("usage: ccdesk {verb} <session>"))?;
+            return if verb == "stop" {
+                relay::run_stop(&target)
+            } else {
+                relay::run_close(&target)
+            };
+        }
         Some("update") => return update_self(),
         Some("--help" | "-h" | "help") => {
             print_usage();
@@ -77,6 +103,12 @@ fn main() -> anyhow::Result<()> {
         }
         None => {}
     }
+
+    // セッション間の受け渡しの残骸を掃除する（[`crate::relay`]）。
+    // **自分の pid ぶんを先に消す**: pid は再利用されるので、落ちた前回の
+    // 未消化の送信がこのインスタンスの窓へ打ち込まれるのを止める
+    relay::unpublish(std::process::id());
+    relay::reap();
 
     // 自己更新で退避した <exe>.old を掃除する。更新した当のプロセスが掴んでいる
     // 間は消せないので、掃除は次にプロセスを起こしたときになる（失敗は無視する）。
@@ -240,6 +272,9 @@ fn main() -> anyhow::Result<()> {
         popup: None,
         focus: Focus::Terminal,
         animating: false,
+        // 起動時は何も公開していない（run ループの 1 周目が必ず書く）
+        published_sessions: Vec::new(),
+        pending_submit: Vec::new(),
         source,
     };
     // バックグラウンド取得の起動。**起動列の重い処理（埋め戻し・transcript の
@@ -274,6 +309,9 @@ fn main() -> anyhow::Result<()> {
     // 終了時に子プロセスを残さない。**行は残す**（`sessions.json` はそのまま ＝
     // 次の起動で一覧に出て `claude -r` で再開できる）
     app::kill_sessions_on_exit(&mut app);
+    // 窓の公開をやめる。**pid は再利用される**ので、残すと次に同じ pid を得た
+    // プロセスの子が、死んだインスタンスの窓一覧を自分のものとして読む
+    relay::unpublish(std::process::id());
     let _ = crossterm::execute!(
         std::io::stdout(),
         DisableFocusChange,
@@ -297,4 +335,73 @@ fn main() -> anyhow::Result<()> {
         eprintln!("could not restart {}: {e} — run it again yourself", exe.display());
     }
     result
+}
+
+/// `ccdesk read <session> [-n <count>] [--screen]`。
+///
+/// **手で読む**のは他のサブコマンドと同じ作法（引数の解析に crate を足さない）。
+/// 知らない旗は黙って無視せず落とす: 打ち間違いが「既定で読めた」ように見えると、
+/// agent は `-n 100` を指定したつもりで 20 件しか見ていないことに気づけない
+fn read_session() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let mut target = None;
+    let mut last = relay::READ_DEFAULT;
+    let mut screen = false;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--screen" => screen = true,
+            "-n" | "--last" => {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("{arg} needs a count"))?;
+                last = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("`{value}` is not a count"))?;
+            }
+            other if other.starts_with('-') => anyhow::bail!("unknown option `{other}`"),
+            other if target.is_none() => target = Some(other.to_string()),
+            other => anyhow::bail!("unexpected argument `{other}`"),
+        }
+    }
+    let target = target
+        .ok_or_else(|| anyhow::anyhow!("usage: ccdesk read <session> [-n <count>] [--screen]"))?;
+    relay::run_read(&target, last, screen)
+}
+
+/// `ccdesk new [--agent <name>] [--cwd <dir>] [prompt]`。
+///
+/// **旗より後ろは全部プロンプト**（`ccdesk new write the release notes` が
+/// そのまま通る ＝ 引用符の作法を agent に要求しない）
+fn new_session() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let mut kind = None;
+    let mut cwd = None;
+    let mut prompt: Vec<String> = Vec::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        // **プロンプトが始まったら旗の解釈をやめる。** やめないと、プロンプトの中の
+        // `--cwd` のような語を旗として食う
+        if !prompt.is_empty() {
+            prompt.push(arg.clone());
+            continue;
+        }
+        match arg.as_str() {
+            "--agent" | "--cwd" => {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("{arg} needs a value"))?;
+                if arg == "--cwd" {
+                    cwd = Some(value.clone());
+                } else {
+                    kind = Some(backend::Kind::parse(value).ok_or_else(|| {
+                        anyhow::anyhow!("`{value}` is not an agent ccdesk knows")
+                    })?);
+                }
+            }
+            other if other.starts_with("--") => anyhow::bail!("unknown option `{other}`"),
+            other => prompt.push(other.to_string()),
+        }
+    }
+    relay::run_new(kind, cwd.as_deref(), &prompt.join(" "))
 }

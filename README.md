@@ -3,7 +3,7 @@
 A session manager TUI for Claude Code — see, switch, and drive all your sessions in
 one terminal.
 
-Each pane **is** a real foreground `claude` session. The list outlives them: closing
+Each row **is** a real foreground `claude` session. The list outlives them: closing
 ccdesk ends the processes but keeps the rows, and reopening one resumes the
 conversation. OpenAI's `codex` CLI works the same way — [opt in](#codex-opt-in).
 
@@ -17,7 +17,7 @@ conversation. OpenAI's `codex` CLI works the same way — [opt in](#codex-opt-in
   row, `close` drops the row. Your transcripts are never touched
 - **Folders stay** in the directory grouping after their last session is gone, so the
   way back in is never lost
-- **Rows are named by the agent**, not by ccdesk — rename with `/rename` in the pane
+- **Rows are named by the agent**, not by ccdesk — rename with `/rename` in the session
 - **Status you can trust** — each row shows what its process is actually doing right
   now (Waiting / Working / Idle / Stopped)
 - **Unread marks and pinning** — `●` for rows that spoke while you were elsewhere;
@@ -56,6 +56,41 @@ ccdesk update     # update to the latest release
 ccdesk --version
 ccdesk --help
 ```
+
+## Sessions talking to each other
+
+A few more commands exist **for the agent running inside a session**, not for you.
+They only work from a session, and they only reach sessions this same ccdesk started
+or stopped.
+
+```sh
+ccdesk list                        # the sessions this ccdesk knows, running or not
+ccdesk send <session> <text>       # type text into another session and submit it
+ccdesk read <session> [-n 20]      # that session's last messages
+ccdesk read <session> --screen     # what that session looks like right now
+ccdesk new [prompt]                # start another session and print its id
+ccdesk stop <session>              # end its process, keep the row
+ccdesk close <session>             # end its process and drop the row
+```
+
+`<session>` is the start of a name or of the id from `ccdesk list`; ambiguous names
+fail and print the candidates rather than pick one.
+
+- **`send` does not wait, and does not mark what it sends.** The text arrives exactly
+  as written — the agent there cannot tell it from something you typed. The answer is
+  something you go and `read`.
+- **`read` works after a session ends** — it opens the agent's own transcript, so the
+  conclusion of a helper session is still there to collect. It doesn't need ccdesk to
+  be responsive either. Only `--screen` asks the running ccdesk, and gives up after 5
+  seconds.
+- **A session that is no longer running still answers `read` and `close`**; `send`,
+  `stop`, and `read --screen` need a live process and say so rather than fail
+  silently. `ccdesk list` marks which is which.
+- **`new` prints the id it minted**, so the next command can address it. It takes
+  `--agent claude|codex` and `--cwd <dir>`, both defaulting to the caller's. It does
+  not steal the pane: what you were watching stays on screen.
+- **None of them can target the calling session.** `stop` and `close` would kill the
+  process running the command, which cannot then report what happened.
 
 Settings are in `~/.ccdesk/config.json`, errors in `~/.ccdesk/error.log`. Both
 optional features are one line each:

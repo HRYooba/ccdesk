@@ -177,6 +177,12 @@ impl Kind {
     ) -> Spawn {
         let mut spawn = self.backend().command(cwd, launch, inject);
         spawn.cmd.env(crate::hooks::ROW_ENV, row.as_str());
+        // **どの ccdesk の子か**（[`crate::relay::INSTANCE_ENV`]）。行 ID と対で
+        // 立てるので、立てる場所も同じ 1 箇所にする。`ccdesk send` はこの 2 つが
+        // 揃って初めて「自分は誰で、誰へ送れるか」を答えられる
+        spawn
+            .cmd
+            .env(crate::relay::INSTANCE_ENV, std::process::id().to_string());
         spawn
     }
 }
@@ -275,6 +281,34 @@ pub(crate) trait Backend: Send + Sync {
     /// 記録の外に agent 自身が持っている会話名の索引
     /// （None ＝ この agent は記録の中で名前を持つ）
     fn name_index(&self) -> Option<NameIndex>;
+
+    /// 記録の 1 行から**会話の 1 発言**を取り出す（None ＝ 発言ではない行）。
+    ///
+    /// **[`Self::title_records`] とは読む目的が違う。** あちらは会話 1 つに
+    /// 名前を 1 つ与える候補を探すので、拾えるのは特定の 1 種類でよく、
+    /// 範囲も絞れる（[`Span`]）。こちらは `ccdesk read` が会話の中身を並べる
+    /// ためのもので、**ユーザーと agent の両方**を、**出た順のまま**返す。
+    ///
+    /// **道具・思考・前置きは落とす。** 記録には tool の呼び出しと結果、
+    /// permissions の前置きなども同じ形で並ぶが、それらは「発言」ではない
+    /// （読んだ agent が会話として辿れることがこの関数の目的）
+    fn message(&self, value: &serde_json::Value) -> Option<Message>;
+}
+
+/// 会話の 1 発言。**agent の違いはここまでで吸収する**ので、
+/// [`crate::relay`] は claude と codex の記録の形を知らない
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Message {
+    /// 打った人か（false ＝ agent が答えた）
+    pub(crate) from_user: bool,
+    pub(crate) text: String,
+}
+
+impl Message {
+    /// 表示に出す話者。**綴りの正本はここ 1 箇所**
+    pub(crate) fn speaker(&self) -> &'static str {
+        if self.from_user { "user" } else { "agent" }
+    }
 }
 
 /// 会話に名前を与えうる記録が、その会話の記録ファイルの**どこに現れるか**。
