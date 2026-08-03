@@ -2608,16 +2608,29 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
     // `claude -r` で二重に起こさない**: 同じ会話を 2 プロセスが同時に更新する。
     // **照合は会話 ID**（ライブ状態が載せているのは会話の側で、ccdesk の行 ID は
     // どこにも出ない）。判定材料はライブ状態（生きている前景セッションだけが載る）。
-    // 観測は 2 秒周期なので、止めた直後の自分のセッションが最大 2 秒ほど
-    // 残って見えることがある（その間の open は 1 度空振りするだけで、壊れない）
-    let running = app
-        .row(id)
-        .and_then(|row| row.conversation.observed())
-        .is_some_and(|conversation| {
-            app.agents
-                .iter()
-                .any(|a| a.is_interactive() && a.session_id == conversation)
-        });
+    // **自分が止めた行の残像は数えない。** 観測は 2 秒周期なので、`stop` の直後は
+    // まだ「動いている」ものとして載っている。**観測が自分の停止より古いなら、
+    // その観測は停止を反映しようがない**ので、実行中の証拠として使わない
+    // （行の状態表示は同じ比較で既に避けている ＝ [`crate::ui`] の救済分岐。
+    // この判定だけが漏れており、**止めた直後にその行をクリックすると
+    // 「別のウィンドウで動いている」と言われて開けなかった**）。
+    //
+    // **自分が止めた行にだけ効かせる。** 止めた覚えの無い行は捨てる観測が無い
+    // （`stopped_at` に無い行まで「観測が古い」で弾くと、一度も観測していない
+    // 起動直後に二重起動の防止そのものが効かなくなる）
+    let afterimage = app
+        .stopped_at
+        .get(id)
+        .is_some_and(|stopped_at| app.agents_observed_at <= *stopped_at);
+    let running = !afterimage
+        && app
+            .row(id)
+            .and_then(|row| row.conversation.observed())
+            .is_some_and(|conversation| {
+                app.agents
+                    .iter()
+                    .any(|a| a.is_interactive() && a.session_id == conversation)
+            });
     if running {
         set_notice(
             app,
@@ -4097,6 +4110,62 @@ mod tests {
             "spawned a second claude for a session that is already running"
         );
         assert!(app.notice.is_some(), "the user was not told why nothing opened");
+    }
+
+    /// **自分で止めた行は、その直後にクリックしても開ける。**
+    ///
+    /// ライブ状態の観測は [`LIVE_SCAN_INTERVAL`] 周期なので、`stop` の直後は
+    /// 止めたばかりのセッションがまだ interactive として載っている。その残像を
+    /// 上のテストの状況（＝ 別のどこかで動いている）と同じに扱うと、**止めた行を
+    /// 押しても「別のウィンドウで動いている」と言われて開けない**（実機で踏んだ）。
+    ///
+    /// 観測（[`App::agents_observed_at`]）が自分の停止（[`App::stopped_at`]）より
+    /// 古い間は、その観測に停止が反映されているはずがない ＝ 実行中の証拠にしない
+    #[test]
+    fn opening_a_session_this_ccdesk_just_stopped_is_not_mistaken_for_a_double_resume() {
+        let mut app = test_app(35, TERM);
+        app.sessions = vec![SessionRow {
+            conversation: Conversation::Observed("conv-1".to_string()),
+            ..session_row("s", "C:\\dev\\api", 1)
+        }];
+        // 止めたばかり ＝ 観測はまだ止める前のもの
+        app.agents = vec![AgentInfo {
+            session_id: "conv-1".to_string(),
+            kind: "interactive".to_string(),
+            status: "busy".to_string(),
+            ..AgentInfo::default()
+        }];
+        app.agents_observed_at = 1_000;
+        app.stopped_at.insert(SessionId::new("s"), 2_000);
+        open_session(&mut app, &SessionId::new("s"));
+        assert!(
+            !app.notice.as_ref().is_some_and(|(msg, _)| msg.contains("already running")),
+            "the row this ccdesk just stopped was reported as running elsewhere"
+        );
+    }
+
+    /// 逆に、**停止より新しい観測で載っているなら本当に動いている**
+    /// （別インスタンスが起こし直した場合）ので、二重起動の防止は効いたまま
+    #[test]
+    fn a_stopped_row_seen_running_again_afterwards_still_blocks_a_double_resume() {
+        let mut app = test_app(36, TERM);
+        app.sessions = vec![SessionRow {
+            conversation: Conversation::Observed("conv-1".to_string()),
+            ..session_row("s", "C:\\dev\\api", 1)
+        }];
+        app.agents = vec![AgentInfo {
+            session_id: "conv-1".to_string(),
+            kind: "interactive".to_string(),
+            status: "busy".to_string(),
+            ..AgentInfo::default()
+        }];
+        app.stopped_at.insert(SessionId::new("s"), 1_000);
+        app.agents_observed_at = 2_000;
+        assert!(
+            !open_session(&mut app, &SessionId::new("s")),
+            "reported the session as opened"
+        );
+        assert!(app.windows.is_empty(), "spawned a second claude anyway");
     }
 
     /// **止めた行も公開に載る。** 載せないと、相手が終わった瞬間に宛先ごと消えて
