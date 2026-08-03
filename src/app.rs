@@ -4199,7 +4199,7 @@ mod tests {
             .map(|i| session_row(&format!("s{i}"), "C:\\dev\\api", 1))
             .collect();
         for i in 0..8 {
-            app.stopped_at.insert(SessionId::new(&format!("s{i}")), 1_000);
+            app.stopped_at.insert(SessionId::new(format!("s{i}")), 1_000);
         }
         let first = open_sessions(&app);
         assert_eq!(first.len(), 8, "not every stopped row was published");
