@@ -26,6 +26,14 @@ use crate::hooks::{HOOK_EVENTS, HOOK_TIMEOUT_SECS};
 
 const PROGRAM: &str = "codex";
 
+/// 最新版の取得先。**npm registry の dist-tag `latest`** を見る
+/// （`codex` は `@openai/codex` として配布され、`/latest` はその安定版 1 件を返す。
+/// alpha 版は別の dist-tag なのでここには出ない）。
+///
+/// GitHub の releases ではなくこちらを使うのは、返る値が `codex --version` と
+/// **同じ形**だから（GitHub のタグは `rust-v0.146.0` で、剥がし方が黙って腐る）
+const LATEST_VERSION_API: &str = "https://registry.npmjs.org/@openai/codex/latest";
+
 /// codex が持つ hook イベント。**[`HOOK_EVENTS`] の部分集合**で、State への対応も
 /// 同じ（実測 / codex 0.146.0）。
 ///
@@ -113,17 +121,22 @@ impl Backend for Codex {
         true
     }
 
-    /// **最新版は codex 自身が書いた更新チェックの結果を読む**
-    /// （`$CODEX_HOME/version.json` の `latest_version`）。claude のように
-    /// 配布エンドポイントを自前で叩かない ＝ ネットワークへ出ない。
+    /// 最新版は codex の配布元（npm registry の `@openai/codex`、dist-tag `latest`）
+    /// へ**毎回問い合わせる**。claude と同じ流儀で、取れなければ「更新あり」を出さない。
     ///
-    /// 非公開の内部ファイルなので、形が変われば「更新あり」が出なくなるだけ
+    /// **`$CODEX_HOME/version.json` は読まない。** あれは codex 自身が更新チェックを
+    /// した時刻の値で、codex を起こさない限り古いまま止まる ＝ 新しい版が出ても
+    /// 版行が黙る。鮮度を判定する材料（`last_checked_at`）を足すより、claude と
+    /// 同じく取得のたびにネットワークへ出るほうが知識源が 1 つで済む
     fn version(&self) -> AgentVersion {
         // 現行版: "codex-cli 0.146.0" の末尾トークン
         let current = crate::poll::out(PROGRAM, &["--version"])
             .and_then(|s| s.split_whitespace().last().map(str::to_string))
             .unwrap_or_default();
-        let latest = codex_index::latest_version()
+        // ネットワークへ出る作法（タイムアウト等）は [`crate::update::http_get`] が持つ
+        let latest = crate::update::http_get(LATEST_VERSION_API)
+            .as_deref()
+            .and_then(parse_latest_version)
             .filter(|l| !current.is_empty() && ccdesk::version_newer(l, &current));
         AgentVersion { current, latest }
     }
@@ -317,6 +330,21 @@ fn command_word(exe: &str) -> Option<String> {
         return Some(exe.to_string());
     }
     ccdesk::short_path(exe).filter(|short| usable(short))
+}
+
+/// [`LATEST_VERSION_API`] の応答から版番号を取り出す。
+///
+/// **3 パート以上の版番号だけを通す**（claude 側の同じ判定と揃える）。応答が
+/// エラー JSON・プロキシの HTML に化けたときに、それを「新しい版」として
+/// 版行へ出さないための入口の関門
+fn parse_latest_version(body: &str) -> Option<String> {
+    let version = serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("version")?
+        .as_str()?
+        .trim()
+        .to_string();
+    (version.split('.').count() >= 3).then_some(version)
 }
 
 #[cfg(test)]
@@ -521,6 +549,35 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"agent_message","message":"  "}}"#,
         ] {
             assert_eq!(message_of(line), None, "{line}");
+        }
+    }
+
+    /// 実際の registry 応答（`version` 以外に多くのキーを持つ）から版番号だけを拾う。
+    /// **`codex --version` と同じ形で返ること**が要点（前後に接頭辞が付かない）
+    #[test]
+    fn the_published_version_comes_out_shaped_like_codex_version() {
+        let body = r#"{"name":"@openai/codex","version":"0.146.0","bin":{"codex":"bin/codex.js"}}"#;
+        assert_eq!(parse_latest_version(body).as_deref(), Some("0.146.0"));
+        // 前後の空白は落とす（配布側が整形を変えても比較が壊れない）
+        assert_eq!(
+            parse_latest_version(r#"{"version":" 0.147.0 "}"#).as_deref(),
+            Some("0.147.0")
+        );
+    }
+
+    /// 版番号として読めない応答は通さない。通すと版行が「更新あり」を出し、
+    /// クリックすると要らない `codex update` が走る
+    #[test]
+    fn rejects_responses_that_are_not_a_version() {
+        for bad in [
+            "",
+            "<html>502 Bad Gateway</html>",
+            r#"{"error":"Not found"}"#,          // registry のエラー応答
+            r#"{"version":""}"#,                 // 空
+            r#"{"version":"0.146"}"#,            // パート不足
+            r#"{"version":{"latest":"0.146.0"}}"#, // 文字列でない
+        ] {
+            assert_eq!(parse_latest_version(bad), None, "input: {bad:?}");
         }
     }
 }
