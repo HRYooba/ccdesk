@@ -323,6 +323,18 @@ pub fn hook_states_path() -> Option<std::path::PathBuf> {
     Some(ccdesk_dir()?.join("hook-states.json"))
 }
 
+/// セッション間の受け渡しの置き場 ~/.ccdesk/ipc。
+///
+/// **ここに置くものは全部 pid で区切る**（`crate::relay` が名前の正本）。
+/// 区切るのは「送れる相手は自分と同じインスタンスの窓だけ」という規則を、
+/// 判定ではなく**置き場所で成り立たせる**ため: 別インスタンスのファイルは
+/// 読みに行かないので、宛先を間違えようがない
+pub fn ipc_dir() -> Option<std::path::PathBuf> {
+    let dir = ccdesk_dir()?.join("ipc");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
 /// PATH 上の実行ファイルを絶対パスへ解決する。
 ///
 /// **Windows で必要。** `std::process::Command::new("codex")` は `codex.cmd` を

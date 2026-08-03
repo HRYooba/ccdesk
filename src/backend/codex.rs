@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::backend::{
-    codex_app_server, codex_index, AgentVersion, Backend, Candidate, Inject, Launch, NameIndex,
-    Span, Spawn,
+    codex_app_server, codex_index, AgentVersion, Backend, Candidate, Inject, Launch, Message,
+    NameIndex, Span, Spawn,
 };
 use crate::hooks::{HOOK_EVENTS, HOOK_TIMEOUT_SECS};
 
@@ -210,6 +210,27 @@ impl Backend for Codex {
     fn name_index(&self) -> Option<NameIndex> {
         codex_index::name_index()
     }
+
+    /// `{"type":"event_msg","payload":{"type":"user_message"|"agent_message",
+    /// "message":"…"}}` から発言を取る。
+    ///
+    /// **`response_item` は見ない。** 表示名のときと同じ理由で、あちらには
+    /// AGENTS.md や permissions の前置き・道具の出入りが同じ形で並ぶ
+    /// （[`USER_MESSAGE`]）。`event_msg` は codex が画面に出した出来事なので、
+    /// ここに載るのは人が読む発言だけになる
+    fn message(&self, value: &serde_json::Value) -> Option<Message> {
+        let payload = value.get("payload")?;
+        let from_user = match payload.get("type").and_then(serde_json::Value::as_str)? {
+            USER_MESSAGE => true,
+            AGENT_MESSAGE => false,
+            _ => return None,
+        };
+        let text = payload.get("message").and_then(serde_json::Value::as_str)?;
+        (!text.trim().is_empty()).then(|| Message {
+            from_user,
+            text: text.to_string(),
+        })
+    }
 }
 
 /// 表示名の候補。**索引（`thread_name`）が上、これは下段**なので 1 つだけ
@@ -224,6 +245,10 @@ static TITLE_RECORDS: [Candidate; 1] = [Candidate {
 /// **`role: "user"` の `response_item` は使わない。** あちらには AGENTS.md や
 /// permissions の前置きも同じ形で入るので、名前にすると前置きが行に出る
 const USER_MESSAGE: &str = "user_message";
+
+/// codex の答えそのものを運ぶ行の型名。**表示名には使わない**（名前は最初の
+/// 打鍵から採る）が、会話を読むには要る（[`Backend::message`]）
+const AGENT_MESSAGE: &str = "agent_message";
 
 /// `{"type":"event_msg","payload":{"type":"user_message","message":"…"}}` から
 /// 打鍵を取り出す
@@ -453,5 +478,49 @@ mod tests {
             settings: std::path::Path::new("x"),
         };
         assert!(argv(&build(Launch::New { prompt: "" }, Some(&inject)).cmd).is_empty());
+    }
+
+    fn message_of(line: &str) -> Option<Message> {
+        Codex.message(&serde_json::from_str(line).expect("the test wrote invalid JSON"))
+    }
+
+    #[test]
+    fn both_sides_of_the_conversation_are_read() {
+        assert_eq!(
+            message_of(
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"run the tests","images":[]}}"#
+            ),
+            Some(Message { from_user: true, text: "run the tests".to_string() })
+        );
+        assert_eq!(
+            message_of(
+                r#"{"type":"event_msg","payload":{"type":"agent_message","message":"they pass"}}"#
+            ),
+            Some(Message { from_user: false, text: "they pass".to_string() })
+        );
+    }
+
+    /// **`response_item` は読まない。** ここには AGENTS.md や permissions の
+    /// 前置きが同じ `role: "user"` の形で入るので、発言として返すと会話の頭が
+    /// 前置きで埋まる（表示名がこれを避けているのと同じ理由）
+    #[test]
+    fn a_preamble_carried_as_a_response_item_is_not_a_message() {
+        assert_eq!(
+            message_of(
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"permissions preamble"}]}}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn other_events_are_not_messages() {
+        for line in [
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{}}}"#,
+            r#"{"type":"session_meta","payload":{"id":"019fc236"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"  "}}"#,
+        ] {
+            assert_eq!(message_of(line), None, "{line}");
+        }
     }
 }

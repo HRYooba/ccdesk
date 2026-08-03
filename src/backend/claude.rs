@@ -9,8 +9,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::backend::{AgentVersion, Backend, Candidate, Inject, Launch, NameIndex, Span, Spawn};
-use crate::claude_format::{AI_TITLE, CUSTOM_TITLE, INHERITED_MARKERS, LAST_PROMPT};
+use crate::backend::{
+    AgentVersion, Backend, Candidate, Inject, Launch, Message, NameIndex, Span, Spawn,
+};
+use crate::claude_format::{
+    AGENT_RECORD, AI_TITLE, CONTENT_KEY, CUSTOM_TITLE, INHERITED_MARKERS, LAST_PROMPT, MESSAGE_KEY,
+    TEXT_BLOCK, USER_RECORD,
+};
 
 /// 実行ファイル名。**PATH で解決する**（絶対パスを持たない: 自己更新で場所が
 /// 変わっても追随する）
@@ -173,6 +178,33 @@ impl Backend for Claude {
     fn name_index(&self) -> Option<NameIndex> {
         None
     }
+
+    /// `{"type":"user"|"assistant","message":{"content":…}}` から本文を取る。
+    ///
+    /// **`content` は文字列 1 本のことも、ブロックの配列のこともある。**
+    /// 配列のときは本文ブロック（[`TEXT_BLOCK`]）だけを繋ぐので、道具の結果を
+    /// 運ぶだけの `user` 行（`tool_result` しか持たない）はここで落ちる
+    fn message(&self, value: &serde_json::Value) -> Option<Message> {
+        let from_user = match value.get("type").and_then(serde_json::Value::as_str)? {
+            USER_RECORD => true,
+            AGENT_RECORD => false,
+            _ => return None,
+        };
+        let content = value.get(MESSAGE_KEY)?.get(CONTENT_KEY)?;
+        let text = match content {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(blocks) => blocks
+                .iter()
+                .filter(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) == Some(TEXT_BLOCK)
+                })
+                .filter_map(|block| block.get(TEXT_BLOCK).and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => return None,
+        };
+        (!text.trim().is_empty()).then_some(Message { from_user, text })
+    }
 }
 
 /// 表示名の候補（**この並びが優先順**）。
@@ -313,5 +345,62 @@ mod tests {
                 .any(|(k, _)| k.eq_ignore_ascii_case("PATH")),
             "PATH was dropped too — claude cannot start"
         );
+    }
+
+    fn message_of(line: &str) -> Option<Message> {
+        Claude.message(&serde_json::from_str(line).expect("the test wrote invalid JSON"))
+    }
+
+    #[test]
+    fn both_sides_of_the_conversation_are_read() {
+        assert_eq!(
+            message_of(r#"{"type":"user","message":{"content":"run the tests"}}"#),
+            Some(Message { from_user: true, text: "run the tests".to_string() })
+        );
+        assert_eq!(
+            message_of(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"they pass"}]}}"#
+            ),
+            Some(Message { from_user: false, text: "they pass".to_string() })
+        );
+    }
+
+    /// 道具の結果は `user` の行として並ぶ。**これを発言として返すと、会話が
+    /// コマンド出力で埋まって読めなくなる**（`ccdesk read` の値そのものが落ちる）
+    #[test]
+    fn a_tool_result_is_not_a_message() {
+        assert_eq!(
+            message_of(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#
+            ),
+            None
+        );
+    }
+
+    /// 思考と道具呼び出しが同じ配列に混ざっても、本文だけを繋ぐ
+    #[test]
+    fn only_the_text_blocks_are_kept() {
+        assert_eq!(
+            message_of(
+                r#"{"type":"assistant","message":{"content":[
+                   {"type":"thinking","thinking":"hmm"},
+                   {"type":"text","text":"first"},
+                   {"type":"tool_use","name":"Bash"},
+                   {"type":"text","text":"second"}]}}"#
+            ),
+            Some(Message { from_user: false, text: "first\nsecond".to_string() })
+        );
+    }
+
+    #[test]
+    fn other_records_are_not_messages() {
+        for line in [
+            r#"{"type":"summary","summary":"a recap"}"#,
+            r#"{"type":"ai-title","aiTitle":"a name"}"#,
+            r#"{"type":"assistant","message":{}}"#,
+            r#"{"type":"user","message":{"content":"   "}}"#,
+        ] {
+            assert_eq!(message_of(line), None, "{line}");
+        }
     }
 }

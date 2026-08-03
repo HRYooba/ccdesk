@@ -476,6 +476,13 @@ pub(crate) struct App {
     /// 速く描き直す必要があるか」という同じ問いに答えるので、
     /// 名前を「spinner」に寄せず両方を指せる名前にしてある
     pub(crate) animating: bool,
+    /// 最後に公開した「走っているセッション」の一覧（[`crate::relay`]）。
+    /// **前回との差だけが書く条件**で、窓の増減を契機にしない: 名前は transcript が
+    /// 伸びるたびに変わり得るので、契機で書くと `ccdesk list` に古い名前が残る
+    pub(crate) published_sessions: Vec<crate::relay::Open>,
+    /// 貼り付け済みで、まだ送信の `\r` を出していないセッション（[`SUBMIT_DELAY`]）。
+    /// 積んだ時刻を一緒に持つのは、期限が来たものだけを出すため
+    pub(crate) pending_submit: Vec<(SessionId, std::time::Instant)>,
 }
 
 /// テストの土台になる中立な `App`。各テストは関心のあるフィールドだけを
@@ -559,6 +566,8 @@ impl Default for App {
             // サイドバー側にしておく（set_focus が PTY へ通知を出さない）
             focus: Focus::Sidebar,
             animating: false,
+            published_sessions: Vec::new(),
+            pending_submit: Vec::new(),
         }
     }
 }
@@ -842,6 +851,10 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             app.last_scan = std::time::Instant::now();
             force_draw = true; // 並びが変わったら即描画（表示と行データのずれを残さない）
         }
+        // セッションの中の agent が使う口（`ccdesk send` / `read` / `list` / `new`）。
+        // **一覧と名前を確定させた後に置く**: 公開する名前は直前の
+        // `refresh_transcripts` の結果で、逆にすると 1 周古い名前を公開する
+        serve_relay(app);
         // 起こした子が端末を掴んだら門番を降ろす（前景では宛先は起動の時点で
         // 決まっているので、待つのは「子が入力を読める状態になるまで」だけ）
         if app.input_gate.is_some()
@@ -2082,6 +2095,218 @@ fn remove_window(app: &mut App, idx: usize) {
     }
 }
 
+/// 走っているセッションの公開と、溜まった要求の消化（[`crate::relay`]）。
+///
+/// **run ループから毎周呼ぶ。** 契機を「窓が増減したとき」に絞らないのは、
+/// 公開する内容に名前が含まれるから（名前は transcript が伸びるたびに変わり得る
+/// ので、契機で書くと `ccdesk list` に古い名前が残る）。実際に書くのは前回と
+/// 違う周だけで、要求の有無も `exists` 1 回で見る ＝ 何も起きていない周の代償は
+/// 小さい
+/// 貼り付けてから送信の `\r` を送るまで空ける間。
+///
+/// **0 にはできない（実機で確認）。** 貼り付けと `\r` を 1 回の書き込みに
+/// 載せると、codex は `\r` を**送信ではなく composer の改行**として扱い、
+/// 送った本文が入力欄に積み上がったまま返事が来ない（claude は送信する）。
+/// 人が操作するときは貼り付けと Enter が別のイベントとして届くので、
+/// **その形に揃えるのがこの間の意味**。
+///
+/// run ループは何も起きていなくても [`POLL_IDLE`] で回るので、実際に送信が
+/// 出るのはこの値の直後の周回になる（人には見えない遅れ）
+const SUBMIT_DELAY: Duration = Duration::from_millis(50);
+
+fn serve_relay(app: &mut App) {
+    let instance = std::process::id();
+    // **新しい要求を当てるより先に流す。** 逆にすると、同じ周で貼って同じ周で
+    // 送ることになり、間を空けた意味が無くなる
+    flush_submits(app);
+    publish_open(app, instance);
+    if !crate::relay::pending(instance) {
+        return;
+    }
+    // **答えは溜めてから返す。** 要求を当てると走っているセッションの顔ぶれが
+    // 変わる（`new` が増やし、`stop`/`close` が減らす）ので、先に答えを返すと
+    // **要求元が「まだ古い一覧」を読む**。`ccdesk new` が返した ID は次のコマンドの
+    // 宛先として通るべきなので、公開を答えより前に置く（実機で踏んだ:
+    // `new` の直後の `list` に、起こしたばかりのセッションが出なかった）
+    let answers: Vec<(u32, serde_json::Value)> = crate::relay::drain(instance)
+        .iter()
+        .filter_map(|request| apply_relay_request(app, request))
+        .collect();
+    publish_open(app, instance);
+    for (reply, value) in answers {
+        crate::relay::answer(reply, &value);
+    }
+}
+
+/// このインスタンスが面倒を見ているセッションを公開する（前回と違うときだけ書く）。
+///
+/// **供給元は 2 つ**: 走っている窓と、**このインスタンスが止めた行**
+/// （[`App::stopped_at`]）。止めた側を載せるのは、**終わったセッションの記録を
+/// 読めるようにするため**（走っているものだけに絞っていた頃は、相手が終わった
+/// 瞬間に宛先ごと消えて `ccdesk read` が届かなくなっていた）。
+///
+/// **止めた側は ID で整列する。** [`App::stopped_at`] は `HashMap` なので
+/// 並びが周回ごとに変わり得る ＝ 中身が同じでも「前回と違う」と見えて、
+/// 何も起きていない周にディスクへ書き続けることになる
+fn publish_open(app: &mut App, instance: u32) {
+    let open = open_sessions(app);
+    if open != app.published_sessions {
+        crate::relay::publish(instance, &open);
+        app.published_sessions = open;
+    }
+}
+
+/// 公開する一覧を組む。**書き出しから分けてある**ので、並びと顔ぶれの規則を
+/// ディスクを触らずに検査できる（テストが実ユーザーの `~/.ccdesk` を触らない
+/// というこの repo の約束がここに乗っている）
+fn open_sessions(app: &App) -> Vec<crate::relay::Open> {
+    let open_of = |id: &SessionId, running: bool| {
+        let row = app.row(id);
+        crate::relay::Open {
+            id: id.clone(),
+            // 名前の正本は一覧と同じ（[`crate::title`]）。行が読めない窓は
+            // 名前を持たないだけで、ID では指せる
+            name: row.map_or_else(|| crate::title::UNTITLED.to_string(), |row| app.titles.of(row)),
+            cwd: row.map(|row| row.cwd.clone()).unwrap_or_default(),
+            kind: row.map(|row| row.kind).unwrap_or_default(),
+            transcript: row.and_then(|row| row.transcript.clone()),
+            running,
+        }
+    };
+    let mut open: Vec<crate::relay::Open> = app
+        .windows
+        .iter()
+        .map(|window| open_of(&window.session_id, true))
+        .collect();
+    // **窓を持つ行は載せ直さない**（開き直した行が `stopped_at` に残っていても
+    // 二重に出ない ＝ 走っている側が勝つ）。行ごと消えたものも載せない
+    let mut stopped: Vec<&SessionId> = app
+        .stopped_at
+        .keys()
+        .filter(|id| app.window_index(id).is_none() && app.row(id).is_some())
+        .collect();
+    stopped.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    open.extend(stopped.into_iter().map(|id| open_of(id, false)));
+    open
+}
+
+/// 間の空いた送信（`\r`）を出す。**宛先が閉じていたら捨てる**（窓が無ければ
+/// 打つ先も無い）。
+///
+/// 並びは積んだ順のままで、期限の来たものだけを前から外す ＝ 同じセッションへ
+/// 続けて送っても、貼り付けと送信の対が入れ替わらない
+fn flush_submits(app: &mut App) {
+    let mut due = Vec::new();
+    app.pending_submit.retain(|(id, at)| {
+        if at.elapsed() < SUBMIT_DELAY {
+            return true;
+        }
+        due.push(id.clone());
+        false
+    });
+    for id in due {
+        if let Some(window) = app.windows.iter().find(|w| w.session_id == id) {
+            let _ = window.send(b"\r");
+        }
+    }
+}
+
+/// 要求 1 件を当てる。**宛先が閉じていたら黙って捨てる**（送り主は別プロセスで、
+/// ここから届く相手がもう居ない）。
+///
+/// **答えは返さずに戻す。** 応答を待つ要求には必ず答えが要る（返さないと要求元は
+/// 上限まで待つ）が、**いつ返すかは呼び手が決める**: 走っているセッションの
+/// 顔ぶれを公開し直してから返す必要がある（[`serve_relay`]）
+fn apply_relay_request(
+    app: &mut App,
+    request: &crate::relay::Request,
+) -> Option<(u32, serde_json::Value)> {
+    match request {
+        crate::relay::Request::Send { to, text } => {
+            let window = app.windows.iter().find(|w| &w.session_id == to)?;
+            // **打鍵と同じ経路で組む**（[`crate::keys::encode_paste`]）ので、
+            // 複数行の本文が途中で送信されない（bracketed paste の包み）
+            let bytes = crate::keys::encode_paste(text, &window.parser.lock_recover());
+            let _ = window.send(&bytes);
+            // **送信の `\r` は同じ書き込みに載せない**（[`SUBMIT_DELAY`]）
+            app.pending_submit
+                .push((to.clone(), std::time::Instant::now()));
+            None
+        }
+        crate::relay::Request::Screen { to, reply } => {
+            let screen = app
+                .windows
+                .iter()
+                .find(|w| &w.session_id == to)
+                .map(|window| window.parser.lock_recover().screen().contents());
+            Some((
+                *reply,
+                crate::relay::screen_answer(&screen.unwrap_or_default()),
+            ))
+        }
+        crate::relay::Request::New {
+            kind,
+            cwd,
+            prompt,
+            reply,
+        } => {
+            let started = start_unattended(app, *kind, cwd, prompt);
+            Some((*reply, crate::relay::started_answer(started)))
+        }
+        // **メニューの `stop` / `close` と同じ 1 実装を通す。** 別に書くと、
+        // 行の後始末（[`App::stopped_at`] の記録・保存）が片方だけ変わり得る
+        crate::relay::Request::Stop { to } => {
+            menu_stop(app, to);
+            None
+        }
+        crate::relay::Request::Close { to } => {
+            menu_close(app, to);
+            None
+        }
+    }
+}
+
+/// **押した人が居ない**セッションの起動（`ccdesk new`）。
+///
+/// [`start_foreground`] との違いは 2 つで、どちらも「誰も見ていないところで
+/// 起きた」ことから来る:
+///
+/// - **見ていた画面を奪わない。** 起こすと同時にペインがそちらを向くと、
+///   ユーザーが読んでいた出力が消える。入力途中の New 画面なら**打ちかけの
+///   プロンプトごと**消える（[`remove_window`] が同じ問題を避けている）
+/// - **入力の門番を立てない。** 門番（[`App::input_gate`]）は「今から打つ人」の
+///   打鍵を子が端末を掴むまで預かるものなので、押した人が居ないこの経路で
+///   立てると、**別のセッションを打っているユーザーの打鍵を飲む**
+///
+/// **出さない agent は起こさない**（codex を off にしている環境）。UI が
+/// 選ばせないものを、この口からだけ起こせる状態を作らない
+fn start_unattended(
+    app: &mut App,
+    kind: Kind,
+    cwd: &str,
+    prompt: &str,
+) -> Result<SessionId, String> {
+    if !app.kinds.contains(&kind) {
+        return Err(format!("{} is not enabled in this ccdesk", kind.as_str()));
+    }
+    // **添字で覚えておけるのは、窓が末尾にしか増えないから**（[`start_foreground`]
+    // は push する ＝ 既存の添字はずれない）
+    let watching = app.active;
+    let view = std::mem::replace(&mut app.right_view, RightView::Sessions);
+    let started = start_foreground(app, kind, cwd, prompt);
+    if !app.windows.is_empty() {
+        // 焦点の出入りを PTY へ正しく伝えるため、直接代入ではなく通常の経路で戻す
+        app.show_session(watching.min(app.windows.len() - 1));
+    }
+    app.right_view = view;
+    match started {
+        Ok(Some(id)) => Ok(id),
+        // 起こさない供給元（撮影用）＝「試していない」ので、失敗として返す
+        Ok(None) => Err("this ccdesk does not start sessions".to_string()),
+        Err(err) => Err(err),
+    }
+}
+
 /// サイドバーの選択を、**行の実体がある位置**へ上下に移動する
 /// （飾り ＝ [`SidebarRow::Decoration`] は飛ばす。押しても何も起きない行は止まる ＝
 /// 「触れる行」の集合はホバーと同じ [`SidebarRow::selectable`] 1 つで決まる）。
@@ -2367,7 +2592,7 @@ fn relaunch<'a>(
 pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
     if let Some(i) = app.window_index(id) {
         if app.windows[i].alive() {
-            // **ペインを開いた時点が既読の契機**（切替も再開も同じ）
+            // **その行を開いた時点が既読の契機**（切替も再開も同じ）
             mark_read(app, id);
             app.show_session(i);
             return true;
@@ -3865,13 +4090,53 @@ mod tests {
         }];
         assert!(
             !open_session(&mut app, &SessionId::new("s")),
-            "reported the pane as opened"
+            "reported the session as opened"
         );
         assert!(
             app.windows.is_empty(),
             "spawned a second claude for a session that is already running"
         );
         assert!(app.notice.is_some(), "the user was not told why nothing opened");
+    }
+
+    /// **止めた行も公開に載る。** 載せないと、相手が終わった瞬間に宛先ごと消えて
+    /// `ccdesk read` が記録へ届かなくなる（記録はディスクに在るのに指せない）
+    #[test]
+    fn a_row_this_ccdesk_stopped_is_still_published() {
+        let mut app = test_app(37, TERM);
+        app.sessions = vec![session_row("s", "C:\\dev\\api", 1)];
+        app.stopped_at.insert(SessionId::new("s"), 1_000);
+        let open = open_sessions(&app);
+        assert_eq!(open.len(), 1, "the stopped row was dropped: {open:?}");
+        assert!(!open[0].running, "a stopped row was published as running");
+        assert_eq!(open[0].cwd, "C:\\dev\\api", "the row's details were lost");
+    }
+
+    /// 行ごと消えたものは載せない（指す先が無い）
+    #[test]
+    fn a_stopped_row_that_no_longer_exists_is_not_published() {
+        let mut app = test_app(38, TERM);
+        app.stopped_at.insert(SessionId::new("gone"), 1_000);
+        assert!(open_sessions(&app).is_empty());
+    }
+
+    /// **並びが安定していること。** [`App::stopped_at`] は `HashMap` なので、
+    /// 整列しないと中身が同じでも周回ごとに並びが変わり、「前回と違う」と見えて
+    /// 何も起きていない周にディスクへ書き続けることになる
+    #[test]
+    fn the_published_order_does_not_change_between_identical_rounds() {
+        let mut app = test_app(39, TERM);
+        app.sessions = (0..8)
+            .map(|i| session_row(&format!("s{i}"), "C:\\dev\\api", 1))
+            .collect();
+        for i in 0..8 {
+            app.stopped_at.insert(SessionId::new(&format!("s{i}")), 1_000);
+        }
+        let first = open_sessions(&app);
+        assert_eq!(first.len(), 8, "not every stopped row was published");
+        for _ in 0..5 {
+            assert_eq!(open_sessions(&app), first, "the published order moved");
+        }
     }
 
     fn project(cwd: &str, has_sessions: bool) -> PopupKind {
@@ -4138,7 +4403,7 @@ mod tests {
     }
 
 
-    /// **ペインの中で会話が変わっても行は増えない**（1 ペイン = 1 行）。
+    /// **セッションの中で会話が変わっても行は増えない**（1 セッション = 1 行）。
     ///
     /// `/clear` `/resume` `/new` はどれも agent の内部で起きるので ccdesk は
     /// 関与しない。気づく口は hook 1 本で、記録の鍵が行（`CCDESK_ROW`）なぶん、
@@ -4148,7 +4413,7 @@ mod tests {
     /// たびにサイドバーへ行が生え、しかも会話 ID を採番しない codex では
     /// 行が作れなかった
     #[test]
-    fn a_switch_inside_the_pane_moves_the_rows_conversation_without_adding_a_row() {
+    fn a_switch_inside_the_session_moves_the_rows_conversation_without_adding_a_row() {
         let mut app = App {
             sessions: vec![
                 SessionRow {
@@ -4958,11 +5223,11 @@ mod tests {
         );
     }
 
-    /// **ペインを開いた時点で既読になる**（開き方は問わない ＝ [`mark_read`] の
+    /// **行を開いた時点で既読になる**（開き方は問わない ＝ [`mark_read`] の
     /// 1 箇所で済ませてある。`mark as read` と、ペインに出ている行へ hook が届いた
     /// ときも同じ関数）。消えた行を指しても何も起きない
     #[test]
-    fn opening_a_pane_marks_the_row_read() {
+    fn opening_a_session_marks_the_row_read() {
         let rows = [session_row("s", "C:\\dev\\api", 1)];
         let mut app = app_with_hooks(&rows, HookStates::from_entries([("s", crate::poll::State::Idle, 2)]));
         assert!(app.hook_states.unread(row_of(&app, "s")), "the premise (an unread row) broke");
