@@ -544,12 +544,13 @@ pub(crate) fn border_style(focused: bool) -> Style {
 /// 読む場所と押す場所が同じ桁に重なる。当たり判定は [`menu_zone`] が
 /// 描画と同じ桁から導く。
 ///
-/// **ASCII を選んだのは桁の曖昧さを消すため。** 以前使っていたハンバーガー記号
-/// （U+2630）は East Asian Ambiguous ＝ 幅の判定が端末とフォント設定で
-/// 1 桁にも 2 桁にもなる。
+/// **East Asian Ambiguous でない記号だけを選ぶ。** 以前使っていたハンバーガー記号
+/// （U+2630）は Ambiguous ＝ 幅の判定が端末とフォント設定で 1 桁にも 2 桁にもなる。
 /// ccdesk は 2 桁と実測して桁を数えていたので、1 桁と解釈する端末では
-/// **行全体が横へずれる**。`=` なら常に 1 桁で、前提そのものが消える
-const MENU_MARK: &str = "=";
+/// **行全体が横へずれる**。縦三点（U+22EE）は Ambiguous ではなく、
+/// `width` / `width_cjk` の両方が 1 を返す ＝ どのロケールでも 1 桁で確定する
+/// （満たしているかはテストが `width_cjk` で直接測る）
+const MENU_MARK: &str = "⋮";
 
 /// 行末のメニューが食う桁（記号 + その左の空白）。
 /// **左の空白まで数えるのは、記号 1 桁だけだと突きにくいため**で、
@@ -2372,7 +2373,8 @@ pub(crate) mod tests {
     /// メニュー記号は内側の右端に置く（当たり判定がその桁を指す）。どれかが
     /// 2 桁になると行全体が横へずれるので、幅はここで実測して固定する。
     /// East Asian Ambiguous な記号は端末とフォント設定で 1 桁にも 2 桁にもなるため
-    /// 選ばない（`=` が ASCII なのはこの前提を測らずに済ませるため）。
+    /// 選ばない。Ambiguous かどうかは `width_cjk`（Ambiguous を 2 と数える側）で
+    /// 測れるので、ASCII かどうかではなくその値そのものを固定する。
     ///
     /// **[`HEAD_COLS`] / [`MENU_COLS`] / [`MIN_SIDEBAR`] の足し算もここで検算する**
     /// ので、行頭や行末に何かを足したらこのテストが落ちる
@@ -2381,7 +2383,12 @@ pub(crate) mod tests {
         use unicode_width::UnicodeWidthStr;
         assert_eq!(UPDATE_MARK.width(), 1, "the update mark is not 1 column wide");
         assert_eq!(MENU_MARK.width(), 1, "the menu mark is not 1 column wide");
-        assert!(MENU_MARK.is_ascii(), "reverted to an ambiguous-width mark");
+        // Ambiguous なら `width_cjk` が 2 を返す ＝ CJK ロケールで行がずれる記号
+        assert_eq!(
+            MENU_MARK.width_cjk(),
+            1,
+            "the menu mark is East Asian Ambiguous: {MENU_MARK:?}"
+        );
         // ペインに出ているかの印は、消えている側も同じ 1 桁の空白
         assert_eq!(OPEN_MARK.width(), 1, "{OPEN_MARK:?} is not 1 column wide");
         assert_eq!(CLOSED_MARK.width(), 1, "{CLOSED_MARK:?} is not 1 column wide");
