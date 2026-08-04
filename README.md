@@ -62,6 +62,8 @@ ccdesk --version
 ccdesk --help
 ```
 
+Errors are logged to `~/.ccdesk/error.log`.
+
 ## Sessions talking to each other
 
 A few more commands exist **for the agent running inside a session**, not for you.
@@ -97,14 +99,15 @@ fail and print the candidates rather than pick one.
 - **None of them can target the calling session.** `stop` and `close` would kill the
   process running the command, which cannot then report what happened.
 
-Settings are in `~/.ccdesk/config.json`, errors in `~/.ccdesk/error.log`. Both
-optional features are one line each:
+## Optional features
+
+Both are off by default, and each is one line in `~/.ccdesk/config.json`:
 
 ```json
 { "codex": "on", "usage_display": "on" }
 ```
 
-## Codex (opt-in)
+### Codex
 
 Turn it on and codex sessions join the same list — same rows, same menu, same states —
 and `agent` becomes a third way to group. A folder's menu asks which agent to start,
@@ -119,7 +122,7 @@ Two things come from codex itself, not ccdesk:
 - Codex prints a trust warning on every launch. ccdesk takes the warning rather than
   write hook settings into your `~/.codex/config.toml`.
 
-## Usage display (opt-in)
+### Usage display
 
 Shows your rate-limit usage at the bottom right, one line per agent: the 5-hour
 window, the 7-day window, and each per-model weekly window, with time until reset.

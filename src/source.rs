@@ -46,24 +46,19 @@ const DEFAULT_SIDEBAR_WIDTH: u16 = 34;
 /// 幅が変わると同じ画像が撮れない。実測で 26 桁の保存値が拾われ、
 /// セッション名が全部切れた画像になっていた）。
 ///
-/// 内側（枠の中）に収めたいものは 2 つ。桁数は文字数ではなくセルの表示幅で数える
-/// （区切りの記号は 1 文字が 1 桁とは限らない）:
-///
-/// 1. セッション行。名前に使える桁は [`crate::ui::name_cols`] が答える
-///    （行頭・行末のメニュー・行末ブロックを引いた残り）。**手で数え直さない**ので、
-///    行の桁割りが変わればこの幅の検査も一緒に動く。[`demo_rows`] の最長は
-///    "fix login form validation"(25)
-/// 2. 集計行 `1 waiting · 2 working · 2 idle · 1 stopped` ＝ 42 桁。
-///    語の途中で切れると画像が壊れて見える
+/// 内側（枠の中）に収めたいものはセッション行 1 つ。桁数は文字数ではなくセルの
+/// 表示幅で数える（区切りの記号は 1 文字が 1 桁とは限らない）。名前に使える桁は
+/// [`crate::ui::name_cols`] が答える（行頭・行末のメニュー・行末ブロックを引いた
+/// 残り）。**手で数え直さない**ので、行の桁割りが変わればこの幅の検査も一緒に動く。
+/// [`demo_rows`] の最長は "fix login form validation"(25)。
 ///
 /// 名前が切れた画像は README の売り（行の名前が agent と一致する）を裏切るので、
-/// どちらも切らない幅を採る。右ペインを削らないようこれ以上は広げない。
-/// **今の下限は 2 の方**: agent の綴りが行末から消えて（形が答えるようになって）
-/// 名前の予算が 7 桁戻ったので、行より集計行の方が長くなった。
-/// **実データではこの幅を要求しない**（集計行は 0 件の項目を出さないので、
-/// 4 種すべてが揃っている撮影データが最も長い）。
+/// 切らない幅を採る。右ペインを削らないようこれ以上は広げない
+/// （状態ごとの件数を出すヘッダー行を撤去したので、下限は行の側だけになった）。
+/// **ちょうど収まる幅より 2 桁広い**: 最長の名前が行末の状態語と隙間なく
+/// 接すると、画像では 1 語に見えてしまう。
 /// 根拠は `demo_sidebar_width_fits_the_sidebar_rows` が固定する
-const DEMO_SIDEBAR_WIDTH: u16 = 44;
+const DEMO_SIDEBAR_WIDTH: u16 = 42;
 
 /// 撮影用の new session 画面の初期フォルダ（実フォルダを出さない）
 const DEMO_CWD: &str = "C:\\dev\\shop-app";
@@ -1219,23 +1214,13 @@ mod tests {
     fn demo_sidebar_width_fits_the_sidebar_rows() {
         use unicode_width::UnicodeWidthStr;
 
-        // 集計ヘッダー行（ui::draw が組む文面）。demo データではこの 1 通りに定まる
-        const DEMO_HEADER: &str = "1 waiting · 2 working · 2 idle · 1 stopped";
-
         let inner = usize::from(DEMO_SIDEBAR_WIDTH - 2);
         // 名前に使える桁は**描画と同じ導出**（[`crate::ui::name_cols`]）から取る。
         // 行頭とメニューだけを手で引いていた頃は、行末に状態語と agent を足しても
         // この検査が気づかず、名前が切れた画像が README に残った
         let name_cols = crate::ui::name_cols(inner as u16);
-        let mut widest = DEMO_HEADER.width();
-        let mut counts = std::collections::BTreeMap::<&str, usize>::new();
-        for (_, title, state) in demo_rows() {
-            // 固定 state を持つ行は「動いている実行がある」扱い（[`crate::ui`] の導出と同じ）
-            let view = match state {
-                Some(state) => state,
-                None => crate::poll::State::Stopped,
-            };
-            *counts.entry(view.title()).or_default() += 1;
+        let mut widest = 0;
+        for (_, title, _) in demo_rows() {
             assert!(
                 title.width() <= name_cols,
                 "{title:?} is {} cols but the name budget is {name_cols}",
@@ -1243,22 +1228,6 @@ mod tests {
             );
             widest = widest.max(inner - name_cols + title.width());
         }
-        // ヘッダー行の文面（= 上の DEMO_HEADER）が demo データと合っていること。
-        // **語も件数もここで固定する**（撮影データと集計行がずれない）
-        assert_eq!(
-            counts,
-            std::collections::BTreeMap::from([
-                (crate::poll::State::Waiting.title(), 1),
-                (crate::poll::State::Working.title(), 2),
-                (crate::poll::State::Idle.title(), 2),
-                (crate::poll::State::Stopped.title(), 1),
-            ])
-        );
-        assert!(
-            DEMO_HEADER.width() <= inner,
-            "summary header row gets truncated ({} cols / inner {inner} cols)",
-            DEMO_HEADER.width()
-        );
         // 右ペインを削らないよう、必要以上に広げない（余りは 2 桁まで）
         assert!(
             inner - widest <= 2,

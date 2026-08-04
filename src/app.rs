@@ -86,7 +86,7 @@ pub(crate) enum RowAction {
 /// キーボードの選択・マウスのホバー・描画のハイライトが同じ答えを読む
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum SidebarRow {
-    /// 区切り線・空行・グループ見出し・集計行 ＝ 画面を組む飾りで、行の実体が無い。
+    /// 区切り線・空行・グループ見出し ＝ 画面を組む飾りで、行の実体が無い。
     /// 選択もホバーもしない
     Decoration,
     /// 実体はある行だが、今は押しても何も起きない（更新の無い版行）。
@@ -441,8 +441,8 @@ pub(crate) struct App {
     pub(crate) term_size: (u16, u16), // (width, height)
     // サイドバーに積まれた行（draw で構築）。飾りと押せない行の区別は [`SidebarRow`]
     pub(crate) sidebar_rows: Vec<SidebarRow>,
-    // サイドバー上部の固定行数（版行・区切り線・+ new session・⊞ group・▦ layout・
-    // 集計行など）。**行の一覧をここに書き写さない**（足すたびに黙って古くなる）:
+    // サイドバー上部の固定行数（版行・区切り線・+ new session・⊞ group・▦ layout
+    // など）。**行の一覧をここに書き写さない**（足すたびに黙って古くなる）:
     // 正本は draw が積んだ行数そのもので、ヒットテストとスクロール計算は
     // sidebar_rows と同じく「最後に描いた値」を読む
     pub(crate) sidebar_header_rows: usize,
@@ -3703,7 +3703,7 @@ mod tests {
 
     /// **サイドバーに出る行の種類が 1 フレームで全部そろう `App`。**
     /// 版行（更新あり = ccdesk / 更新なし = claude）・区切り線・`+ new session`・
-    /// `⊞ group`・集計行・プロジェクト見出し・セッション行が積まれ、
+    /// `⊞ group`・プロジェクト見出し・セッション行が積まれ、
     /// フッターのアカウント行も描かれる。
     ///
     /// 行の一覧は**描画が積んだ結果**を読む（種類を書き写した表を持たない）

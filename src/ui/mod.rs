@@ -1455,14 +1455,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             pinned: row.pinned,
         });
     }
-    // 集計は表示行そのものから数える（分岐の複製をしない = 行数と必ず一致）。
-    // **節と同じ [`State::ORDER`] を回す**ので、並びと語が集計行とずれない
-    let counts: Vec<(State, usize)> = State::ORDER
-        .iter()
-        .map(|group| (*group, data.iter().filter(|d| d.group == *group).count()))
-        .collect();
     // 何か動いているか（run ループがアイドル時の描き直し間隔を選ぶ材料。
-    // [`crate::app::App::animating`]）。材料は 2 つ: 明滅する行（集計と同じ表示行から
+    // [`crate::app::App::animating`]）。材料は 2 つ: 明滅する行（表示行そのものから
     // 導く。[`State::blinks`]）と、使用率の取得中スピナー
     app.animating = data.iter().any(|d| d.group.blinks())
         || app
@@ -1557,27 +1551,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         Style::default().fg(ui().dim),
         SidebarRow::Action(RowAction::ToggleGroup),
     );
-    // 集計行。**語は [`State::title`] をそのまま出す**（唯一の綴り）ので、
-    // 見出し・行ラベル・集計で別の語が出ることがない。綴りが小文字になった今、
-    // ここで大小を変換する必要は無くなった（変換が残っていると「同じ語の 2 つ目の姿」を
-    // この行だけが持ち続けることになる）。
+    // **状態ごとの件数は出さない。** 数は節の見出しの下に並ぶ行そのもので見えており、
+    // 同じ知識をヘッダーにもう 1 本置くと幅を食うだけだった。
     //
-    // **0 件の項目は出さない。** 語が 4 つになって行が長くなったので、
-    // `0 stopped` のような情報を持たない項目で幅を使わない（1 本も無ければ空行）
-    push_row(
-        &mut items,
-        &mut rows,
-        Line::from(
-            counts
-                .iter()
-                .filter(|(_, n)| *n > 0)
-                .map(|(group, n)| format!("{n} {}", group.title()))
-                .collect::<Vec<_>>()
-                .join(" · "),
-        ),
-        Style::default().fg(ui().dim),
-        SidebarRow::Decoration,
-    );
     // ここまでが固定ヘッダー。積んだ数をそのまま正本にする
     // （ヒットテストとスクロール計算が読む。定数と二重管理にしない）
     let header_n = rows.len();
@@ -3457,9 +3433,6 @@ pub(crate) mod tests {
             !screen.iter().any(|t| t.contains("hidden")),
             "the codex session row is still listed: {screen:?}"
         );
-        let texts = sidebar_texts(&mut app);
-        // 集計もその 1 本だけ（隠した行が数に残らない）
-        assert_eq!(summary_row(&texts), "1 stopped", "the hidden row was still counted");
         // 下部バーは agent 1 行ぶん ＝ 空行がペインを削らない
         assert_eq!(bottom_bar_rows(&app), 1);
         // **行は消えていない**（`sessions.json` は触らない ＝ on に戻せば戻る）
@@ -3569,20 +3542,6 @@ pub(crate) mod tests {
         render_sidebar(app).into_iter().map(|(_, t)| t).collect()
     }
 
-    /// 集計行を探す。**語で探さない**（語を変えるたびにテストを直す形にしない）:
-    /// 集計行は「数字 + 空白 + 語」で始まる唯一の行
-    fn summary_row(texts: &[String]) -> String {
-        texts
-            .iter()
-            .find(|t| {
-                let mut chars = t.chars();
-                chars.next().is_some_and(|c| c.is_ascii_digit())
-                    && chars.next() == Some(' ')
-            })
-            .expect("the summary row is missing")
-            .clone()
-    }
-
     /// **行の並びは「名前 → 状態語 → メニュー記号」。**
     ///
     /// **agent は行末に居ない**（ドットの形が答えるので綴りで桁を食わない）。
@@ -3679,7 +3638,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// **止めた行は `Stopped`（行末の語も集計も Stopped）。**
+    /// **止めた行は `Stopped`（行末の語も Stopped）。**
     ///
     /// 実機では `stop` の直後に一瞬 `Stopped` になってから `Needs input` へ戻っていた
     /// （保管に残った停止前の hook が載り直していた）。**残骸の hook を持っていても**
@@ -3714,13 +3673,6 @@ pub(crate) mod tests {
         // 既読なのでドットは抜き（塗りのままでは未読の入力待ちと見紛う）
         assert!(line.starts_with(&format!("{CLOSED_MARK}{DOT_HOLLOW}")), "{line:?}");
         assert_eq!(dot, ui().dim, "a dead row does not use the Stopped color");
-        // 集計もその 1 本を Stopped として数える（0 件の項目は出さない）
-        let texts = sidebar_texts(&mut app);
-        let counts = summary_row(&texts);
-        assert_eq!(
-            counts, "1 stopped",
-            "a stopped row was counted as something else"
-        );
     }
 
     /// **狭い端末はサイドバーを縮めて描くが、ユーザーが選んだ幅を忘れない。**
@@ -4226,32 +4178,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// **集計は pin した行も数える。** pin は「隠す」操作ではなく「上へ寄せる」
-    /// 操作なので、数えないと一覧に見えている行と数が合わなくなる
-    #[test]
-    fn the_summary_counts_pinned_rows_too() {
-        let mut app = App {
-            // 集計行が切られない幅の端末（このテストの関心は数だけ）
-            term_size: (120, 40),
-            ..pinned_fixture(Grouping::State, true)
-        };
-        let texts = sidebar_texts(&mut app);
-        assert_eq!(
-            summary_row(&texts),
-            "3 stopped",
-            "the pinned row was not counted"
-        );
-    }
-
     /// **一覧に隠し区画は無い。** アーカイブを廃止したので、行はどちらの
-    /// グルーピングでも通常の一覧に出て集計にも数えられる（`close` が外すのは
-    /// 行だけなので、アーカイブとの差は「戻す導線があるか」しか残らず、
+    /// グルーピングでも通常の一覧に出る（`close` が外すのは行だけなので、
+    /// アーカイブとの差は「戻す導線があるか」しか残らず、
     /// 節を 1 つ増やす価値が無かった）
     #[test]
-    fn every_row_stays_in_the_normal_list_and_is_counted() {
+    fn every_row_stays_in_the_normal_list() {
         for grouping in [Grouping::State, Grouping::Directory] {
             let mut app = App {
-                // 集計行が切られない幅の端末（このテストの関心は行数と集計の一致）
                 term_size: (120, 40),
                 sidebar_width: 34,
                 grouping,
@@ -4273,12 +4207,6 @@ pub(crate) mod tests {
                     "{grouping:?}: {row} is missing from the list: {texts:?}"
                 );
             }
-            // 集計は一覧に出る行を全部数える（隠す行が無いので数と行数が一致する）
-            let counts = summary_row(&texts);
-            assert_eq!(
-                counts, "2 stopped",
-                "{grouping:?}: not every row is counted"
-            );
         }
     }
 

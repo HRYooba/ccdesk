@@ -682,7 +682,7 @@ impl Grouping {
 /// - **保存と CLI 引数**（[`Self::as_str`] / [`Self::parse`]）: hook は
 ///   `ccdesk hook <event> <state>` として飛び、`hook-states.json` に文字列で残る
 /// - **画面**（[`Self::title`] / [`Self::color`] / [`Self::blinks`]）: 行のドット・
-///   節の見出し・集計が同じここを読む
+///   節の見出しが同じここを読む
 /// - **並び**（[`Self::ORDER`] と [`Ord`]）: 上ほどユーザーがすることがある
 ///
 /// **表示用の型を別に持たない。** かつては `State`（hook の語彙）と `State`（節）が
@@ -717,7 +717,7 @@ pub(crate) enum State {
 }
 
 impl State {
-    /// 表示順（節の並びと集計の並び）＝ [`Ord`] と同じ順。
+    /// 表示順（節の並び）＝ [`Ord`] と同じ順。
     /// **[`Self::parse`] もこれを舐める**ので、語を足したら綴りも並びも同時に効く
     pub(crate) const ORDER: [Self; 4] = [Self::Waiting, Self::Working, Self::Idle, Self::Stopped];
 
@@ -738,10 +738,10 @@ impl State {
         Self::ORDER.into_iter().find(|state| state.as_str() == text)
     }
 
-    /// **この 4 語が画面に出る唯一の綴り**（行ラベル・節の見出し・集計）。
+    /// **この 4 語が画面に出る唯一の綴り**（行ラベル・節の見出し）。
     ///
-    /// **小文字なのは、出る 3 箇所を 1 つの綴りで賄うため。** かつては大文字始まりで
-    /// 持ち、集計行だけが `to_lowercase` を掛けていた ＝ 同じ語が 2 つの姿を持っていた。
+    /// **小文字なのは、出る箇所を 1 つの綴りで賄うため。** かつては大文字始まりで
+    /// 持ち、一部だけが `to_lowercase` を掛けていた ＝ 同じ語が 2 つの姿を持っていた。
     /// ピン留めの節（[`crate::ui::PINNED_TITLE`]）が元から小文字なので、
     /// 揃える先は小文字側になる。
     ///
@@ -759,14 +759,14 @@ impl State {
     /// 全状態の収まりを見る
     pub(crate) const TITLE_COLS: usize = 7;
 
-    /// この状態の色。**行のドット・行末の状態語・集計・節が同じこの 1 箇所を読む**
+    /// この状態の色。**行のドット・行末の状態語・節が同じこの 1 箇所を読む**
     /// ので、状態を増やしたときに色の対応を書き忘れる場所が増えない
     /// （以前は `StateView.color` が別に持っていて、食い違う値を作れてしまっていた）
     pub(crate) fn color(self) -> Color {
         match self {
             Self::Waiting => ui().attention,
             // 明滅する行のドットと語は [`crate::theme::UiTheme::blink`] のコマを引く。
-            // ここが返すのはコマ列の一番明るい側 ＝ 節の見出しや集計が代表色として使う
+            // ここが返すのはコマ列の一番明るい側 ＝ 節の見出しが代表色として使う
             Self::Working => ui().working,
             Self::Idle => ui().ok,
             Self::Stopped => ui().dim,
