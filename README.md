@@ -133,6 +133,9 @@ servers while you are away — everything else it watches is local. It consumes 
 tokens and no rate-limit quota. `ccdesk doctor` shows what it would report on your
 machine, so you can look before turning it on.
 
+Both usage endpoints are undocumented and unsupported — enabling this is at your own
+risk.
+
 ## License
 
 MIT

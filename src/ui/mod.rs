@@ -1242,6 +1242,12 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(" app:", Style::default().fg(MUTED_FG)),
         Span::raw(" Ctrl+Q quit · Alt+←→ focus"),
     ];
+    // スロット間の移動は**2 枚以上のときだけ出す**（1 枚では行き先が無く、
+    // 押しても何も起きないキーを案内すると嘘になる ＝ [`context_hint`] と同じ規準）。
+    // 枚数の正本は配置の側（[`crate::panes::Layout::slots`]）から引く
+    if app.layout.slots() > 1 {
+        hint_spans.push(Span::raw(" · Alt+Shift+←→↑↓ slot"));
+    }
     if let Some((label, keys)) = context_hint(app) {
         hint_spans.push(Span::styled(
             format!("  {label}:"),
@@ -4276,6 +4282,27 @@ pub(crate) mod tests {
             let bar = drawn_hint_bar(&mut app);
             assert!(bar.contains("Ctrl+Q quit · Alt+←→ focus"), "{focus:?}: {bar:?}");
         }
+    }
+
+    /// **スロット間の移動キーは 2 枚以上のときだけ案内する。**
+    /// 1 枚では行き先が無い（[`crate::panes::Layout::neighbor`] がどの向きでも
+    /// `None`）ので、出すと効かないキーを案内することになる
+    #[test]
+    fn the_slot_move_keys_are_only_offered_once_there_is_a_second_slot() {
+        let mut app = App {
+            term_size: (120, 30),
+            focus: Focus::Sidebar,
+            ..Default::default()
+        };
+        let bar = drawn_hint_bar(&mut app);
+        assert!(
+            !bar.contains("slot"),
+            "a one-slot layout still advertises the move keys: {bar:?}"
+        );
+
+        app.set_layout(crate::panes::Layout::Four);
+        let bar = drawn_hint_bar(&mut app);
+        assert!(bar.contains("Alt+Shift+←→↑↓ slot"), "{bar:?}");
     }
 
     /// 新規セッション画面は案内をペイン内に持つので、下部バーへは重ねない
