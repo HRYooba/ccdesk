@@ -1,8 +1,9 @@
 // ccdesk: Claude Code 用のセッション管理 TUI。portable-pty で claude を起動 →
 // vt100 でパース → tui-term で描画。
 // マウス主体の操作: クリックでセッション切替・フォーカス / 行頭の = で二次操作のメニュー /
-// 境界線ドラッグで幅変更。ターミナルフォーカス中のキーは PTY へ素通し。
-// 予約は Ctrl+Q（終了）と Alt+←→（ペインフォーカス移動）のみ
+// 境界線ドラッグで幅変更・スロットの十字移動。ターミナルフォーカス中のキーは PTY へ素通し。
+// 予約は Ctrl+Q（終了）、Alt+←→（サイドバー ⇄ メインビュー）、
+// Alt+Shift+←→↑↓（スロット間の移動）のみ
 
 use std::sync::{Arc, Mutex};
 
@@ -19,6 +20,7 @@ mod cli;
 mod git;
 mod hooks;
 mod keys;
+mod panes;
 mod poll;
 mod relay;
 mod session;
@@ -32,10 +34,10 @@ mod ui;
 mod update;
 mod usage;
 
-use app::{open_session, run, App, Focus, RightView, SelfUpdate};
+use app::{open_session, run, App, Focus, SelfUpdate};
 use cli::{print_usage, print_usage_error, run_doctor, show_logs, update_self};
 use poll::FooterInfo;
-use source::{DataSource, DemoSource, LiveSource};
+use source::{DataSource, DemoSource, LiveSource, SlotView};
 use theme::{HOST_COLORS, HOST_PALETTE};
 
 fn main() -> anyhow::Result<()> {
@@ -211,7 +213,11 @@ fn main() -> anyhow::Result<()> {
     let area = terminal.get_frame().area();
     let mut app = App {
         windows: Vec::new(),
-        active: 0,
+        layout: window.layout,
+        split: window.split,
+        // 中身は下の復元が入れる（長さは App::set_layout が保つ）
+        slots: Vec::new(),
+        focus_slot: 0,
         agents: Vec::new(),
         agents_observed_at: 0,
         agents_shared: Arc::new(Mutex::new(poll::AgentSnapshot::default())),
@@ -229,6 +235,7 @@ fn main() -> anyhow::Result<()> {
         // 狭い端末で一度起動しただけでユーザーの選んだ幅が失われない）
         sidebar_width: window.sidebar_width,
         dragging: false,
+        cross_drag: None,
         last_drag_resize: std::time::Instant::now(),
         term_size: (area.width, area.height),
         sidebar_rows: Vec::new(),
@@ -241,7 +248,6 @@ fn main() -> anyhow::Result<()> {
         // 起動時の復元でペインが指す行へは最初の描画で揃う（None ＝ まだ揃えていない）
         pane_shown: None,
         dispatch_cwd: window.dispatch_cwd,
-        right_view: RightView::Sessions,
         footer,
         footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
         footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -270,7 +276,11 @@ fn main() -> anyhow::Result<()> {
         kinds: source.kinds(),
         projects: window.projects,
         popup: None,
-        focus: Focus::Terminal,
+        // **復元の間はサイドバー側にしておく。** 端末側のまま復元すると、
+        // スロットを 1 枚開くたびにその窓へ focus in が飛び、最後の 1 枚以外は
+        // 「自分が端末を持っている」と思い込んだまま残る。
+        // 復元し終えてから `set_focus` で 1 枚だけに伝える（下の復元の直後）
+        focus: Focus::Sidebar,
         animating: false,
         // 起動時は何も公開していない（run ループの 1 周目が必ず書く）
         published_sessions: Vec::new(),
@@ -292,17 +302,32 @@ fn main() -> anyhow::Result<()> {
     // 全部の行が `new session` に見える。未記録の行の解決し直しも同じ 1 回で済む
     // （読む量は予算で有界。[`crate::title::SCAN_BUDGET`]）
     app::refresh_transcripts(&mut app);
-    // 前回開いていた画面を復元: セッションを見ていたなら `claude -r` で再開、
-    // それ以外は new session 画面
-    match window.last_view.map(sessions::SessionId::new) {
-        Some(id) if app.row(&id).is_some() => {
-            open_session(&mut app, &id);
-            if app.windows.is_empty() {
-                app.open_new_view(); // 再開に失敗したときのフォールバック
-            }
+    // 前回の並びを復元。**スロットごとに `focus_slot` を移してから開く**ので、
+    // 「開いたものはフォーカススロットへ入る」という規則 1 つで復元まで賄える
+    app.set_layout(window.layout);
+    for (at, view) in window.slots.into_iter().enumerate() {
+        if at >= app.slots.len() {
+            break;
         }
-        _ => app.open_new_view(),
+        app.focus_slot = at;
+        match view {
+            SlotView::Session(id) => {
+                let id = sessions::SessionId::new(id);
+                if app.row(&id).is_some() {
+                    open_session(&mut app, &id);
+                }
+            }
+            SlotView::New => app.open_new_view(),
+            SlotView::Empty => {}
+        }
     }
+    app.focus_slot = 0;
+    // 1 枚も開けなかった（初回起動 / 前回の行が全部消えている）ときの入口
+    if app.windows.is_empty() && !app.focus_is_new() {
+        app.open_new_view();
+    }
+    // 端末フォーカスを伝えるのはここ 1 回だけ（受け取るのはフォーカススロットの窓）
+    app.set_focus(Focus::Terminal);
 
     let result = run(&mut terminal, &mut app);
 

@@ -23,9 +23,14 @@ conversation. OpenAI's `codex` CLI works the same way — [opt in](#codex-opt-in
 - **Unread marks and pinning** — `●` for rows that spoke while you were elsewhere;
   pinned rows sit at the top
 - **In-place updates** for ccdesk and each agent, from rows at the top of the sidebar
+- **Up to four sessions side by side** — pick one of eight layouts from the
+  `▦ layout` row. Sessions are not split into panes, they are *placed* into slots:
+  choosing a row moves that session into the focused slot, and only that one moves —
+  the slot it came from goes empty. Nothing is ever killed by rearranging
 - **Mouse-first, keyboard-light** — click to switch, the `=` at the end of a row for
-  everything else. ccdesk reserves two keys — `Alt+←/→` and `Ctrl+Q` — and **every
-  other key goes to the agent untouched**
+  everything else, drag the cross between slots to resize. ccdesk reserves
+  `Ctrl+Q`, `Alt+←/→` (sidebar ⇄ main view) and `Alt+Shift+←/→/↑/↓` (move between
+  slots) — and **every other key goes to the agent untouched**
 - **ccdesk never modifies your agent's config or files.** It installs its status hooks
   per session only, and sessions you open outside ccdesk are unaffected
 

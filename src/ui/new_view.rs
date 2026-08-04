@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 
-use crate::app::{start_new_session, App, RightView};
+use crate::app::{start_new_session, App};
 use crate::backend::Kind;
 use crate::theme::{ui, FOCUS_BORDER, MUTED_FG};
 use crate::ui::text_field::TextField;
@@ -232,30 +232,39 @@ impl NewState {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let layout = NewLayout::compute(pane);
-                let box_bottom = layout.prompt_box.y + layout.prompt_box.height;
-                if !layout.ok {
-                    // ペインが小さすぎて未描画。フィールド判定はしない
-                } else if mouse.row == layout.agent_y {
+                // **行ごとに当てる**（範囲の算術ではなく）。縮退で行が落ちていても、
+                // 落ちた行は None のまま当たらないだけで済む
+                let row = mouse.row;
+                let in_box = layout
+                    .prompt_box
+                    .is_some_and(|b| row >= b.y && row < b.y + b.height);
+                if !layout.fits {
+                    // 必須行すら入らない大きさ。未描画なのでフィールド判定はしない
+                } else if Some(row) == layout.agent_y {
                     // AGENT 行はクリックで次の agent へ回す（項目ごとの当たり判定を
                     // 持たない ＝ 桁の計算を描画と 2 箇所で持たない）
                     self.focus = NewFocus::Agent;
                     self.cycle_kind(kinds);
-                } else if mouse.row >= layout.folder_hd_y && mouse.row <= layout.sep_y {
+                } else if Some(row) == layout.folder_hd_y
+                    || row == layout.path_y
+                    || Some(row) == layout.sep_y
+                {
                     // FOLDER セクション（見出し・パス値・┄ 区切り）クリック → パスフィールド。
                     // パス値の行ならカーソルも移動、他はカーソル位置維持
                     self.focus = NewFocus::Path;
-                    if mouse.row == layout.path_y {
+                    if row == layout.path_y {
                         let text_x = mouse.column.saturating_sub(layout.path_text_x);
                         self.path.click(text_x);
                     }
-                } else if mouse.row >= layout.prompt_hd_y && mouse.row < box_bottom {
-                    // PROMPT セクション（見出し + 入力枠 3 行）クリック → プロンプト欄
+                } else if Some(row) == layout.prompt_hd_y || row == layout.input_y || in_box {
+                    // PROMPT セクション（見出し + 入力枠）クリック → プロンプト欄
                     self.focus = NewFocus::Prompt;
-                    if mouse.row == layout.input_y {
+                    if row == layout.input_y {
                         let text_x = mouse.column.saturating_sub(layout.input_text_x);
                         self.prompt.click(text_x);
                     }
-                } else if mouse.row >= layout.list_top
+                } else if layout.list_height > 0
+                    && mouse.row >= layout.list_top
                     && mouse.row < layout.list_top + layout.list_height
                 {
                     // フォルダ一覧エリア（空白部分も含む）→ 一覧フォーカス。
@@ -442,9 +451,10 @@ pub(crate) enum NewAction {
 
 /// 「選択 → 再クリックで実行」の 2 段階（判定は [`NewState::click_activates`]）
 pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Result<()> {
-    // 画面より先に控える（`right_view` を可変で借りると `app` を読めなくなる）
+    // 画面より先に控える（スロットを可変で借りると `app` を読めなくなる）
     let kinds = app.kinds.clone();
-    let RightView::New(state) = &mut app.right_view else {
+    let can_leave = !app.windows.is_empty();
+    let Some(state) = app.focused_new() else {
         return Ok(());
     };
     // 共通キー
@@ -465,8 +475,9 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
                     state.cancel_path_edit();
                     state.focus = NewFocus::Prompt;
                 }
-                _ if !app.windows.is_empty() => {
-                    app.right_view = RightView::Sessions;
+                // 戻れる窓があるなら、このスロットを空へ戻す（no session 画面）
+                _ if can_leave => {
+                    app.leave_new_view();
                 }
                 _ => {}
             }
@@ -518,24 +529,103 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
     Ok(())
 }
 
+/// フォームを構成する 1 行。**この並びがそのまま表示順**で、
+/// **落とす優先度は行が自分で答える**（[`Self::drop_level`]）。
+///
+/// 落とす順の表を別に持たないのが要点: 欄を足す変更がこの enum 1 箇所で閉じ、
+/// 「順序表だけ古いまま」という形を作れない
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FormRow {
+    PadTop,
+    Agent,
+    FolderHead,
+    Path,
+    Sep,
+    /// フォルダ一覧。**唯一の伸縮行**で、固定行が取った残りを全部使う（0 行になり得る）
+    List,
+    Spacer,
+    PromptHead,
+    BoxTop,
+    Input,
+    BoxBottom,
+    PadBottom,
+    Hint,
+}
+
+impl FormRow {
+    const ORDER: [Self; 13] = [
+        Self::PadTop,
+        Self::Agent,
+        Self::FolderHead,
+        Self::Path,
+        Self::Sep,
+        Self::List,
+        Self::Spacer,
+        Self::PromptHead,
+        Self::BoxTop,
+        Self::Input,
+        Self::BoxBottom,
+        Self::PadBottom,
+        Self::Hint,
+    ];
+
+    /// 高さが足りないときに落とす順（小さいほど先に落ちる）。`None` = 落とさない。
+    ///
+    /// **同じ値の行はまとめて落ちる**ので、枠の上下のように片方だけ残ると壊れて
+    /// 見えるものは同じ値にしてある
+    fn drop_level(self) -> Option<u8> {
+        match self {
+            // 案内は下部バーにも出せる / 下の空行は見た目だけ
+            Self::Hint | Self::PadBottom => Some(1),
+            // 節を離すための空行
+            Self::Spacer | Self::PadTop => Some(2),
+            // 見出しが無くても、下に来る欄そのものを見れば何かは分かる
+            Self::PromptHead | Self::FolderHead => Some(3),
+            Self::Sep => Some(4),
+            // 枠は上下そろって落ちる
+            Self::BoxTop | Self::BoxBottom => Some(5),
+            // agent には既定があるので、選べなくても起動はできる
+            Self::Agent => Some(6),
+            // 一覧は落とすのではなく 0 行まで縮む
+            Self::List => None,
+            // 「どこで」（パス）と「何を」（入力）は最後まで残す
+            Self::Path | Self::Input => None,
+        }
+    }
+
+    const MAX_DROP_LEVEL: u8 = 6;
+}
+
 /// New 画面のジオメトリ。描画とマウスのヒットテストが同じ座標を共有するための単一計算点。
 /// これまで draw と handle_mouse に散っていた行番号のマジックナンバー（row==1・row-3・
 /// term_height-4 等）をここへ集約する。値はすべて絶対スクリーン座標（Rect と同じ原点）。
+///
+/// **高さが足りないときは行を落として縮退する。** 以前は「収まらなければ何も描かない」
+/// （`ok` フラグ）だったので、内側 12 行以下 ＝ 15 行以下の端末では New 画面が
+/// 枠だけの空箱になっていた。落ちた行は `None` / 高さ 0 で表され、
+/// 描画もヒットテストもそれを見て飛ばす
 pub(crate) struct NewLayout {
-    pub(crate) inner: Rect,       // 枠の内側
-    pub(crate) agent_y: u16,      // AGENT 切替行
-    pub(crate) folder_hd_y: u16,  // "FOLDER" セクション見出し
-    pub(crate) path_y: u16,       // パス値の行
-    pub(crate) sep_y: u16,        // FOLDER セクションの ┄ 区切り
-    pub(crate) list_top: u16,     // フォルダ一覧の先頭行
-    pub(crate) list_height: u16,  // 一覧に割ける行数（縦が足りなければここが縮む）
-    pub(crate) prompt_hd_y: u16,  // "PROMPT" セクション見出し
-    pub(crate) prompt_box: Rect,  // プロンプト入力枠（Borders::ALL・高さ3）
-    pub(crate) input_y: u16,      // 枠内の入力行
-    pub(crate) hint_y: u16,       // ペイン内ヒント行
-    pub(crate) path_text_x: u16,  // パス値のテキスト開始列（左余白の直後）
-    pub(crate) input_text_x: u16, // 入力行のテキスト開始列（枠内 " ❯ " の直後）
-    pub(crate) ok: bool,          // フォーム全体 + 一覧 1 行が収まる高さか
+    pub(crate) inner: Rect, // 枠の内側
+    /// 必須行（パス値・入力行）が収まるか。false なら何も描かない
+    pub(crate) fits: bool,
+    /// 左右の余白。狭いペインでは 0 まで落とす
+    pub(crate) margin: u16,
+    pub(crate) agent_y: Option<u16>,     // AGENT 切替行
+    pub(crate) folder_hd_y: Option<u16>, // "FOLDER" セクション見出し
+    pub(crate) path_y: u16,              // パス値の行（必須）
+    pub(crate) sep_y: Option<u16>,       // FOLDER セクションの ┄ 区切り
+    pub(crate) list_top: u16,            // フォルダ一覧の先頭行
+    pub(crate) list_height: u16,         // 一覧に割ける行数（0 まで縮む）
+    pub(crate) prompt_hd_y: Option<u16>, // "PROMPT" セクション見出し
+    /// プロンプト入力枠（Borders::ALL・高さ3）。枠を落としたときは `None`
+    pub(crate) prompt_box: Option<Rect>,
+    pub(crate) input_y: u16,        // 入力行（必須）
+    pub(crate) hint_y: Option<u16>, // ペイン内ヒント行
+    pub(crate) path_text_x: u16,    // パス値のテキスト開始列（左余白の直後）
+    pub(crate) input_text_x: u16,   // 入力行のテキスト開始列（" ❯ " の直後）
+    /// 入力テキストが乗る 1 行の矩形。枠の有無で位置も幅も変わるので、
+    /// **描画とカーソルのクランプはこの 1 つを読む**（枠の内側を 2 箇所で計算しない）
+    pub(crate) input_area: Rect,
 }
 
 impl NewLayout {
@@ -543,13 +633,19 @@ impl NewLayout {
     const MARGIN: u16 = 2;
     /// 入力枠内の先頭 " ❯ "（先頭スペース + ❯ + スペース）の表示幅
     const INPUT_LEAD: u16 = 3;
-    /// ヘッダー行数（上パディング + AGENT 行 + FOLDER 見出し + パス値 + ┄ 区切り）
-    const HEAD_ROWS: u16 = 5;
-    /// フッター行数（spacer + PROMPT 見出し + 枠上 + 入力 + 枠下 + 空行 + ヒント）
-    const FOOT_ROWS: u16 = 7;
+    /// 必須行の数（パス値・入力行）。これが入らない高さでは何も描かない
+    const REQUIRED_ROWS: u16 = 2;
+
+    /// 固定行（伸縮する一覧を除く）の数
+    fn fixed_rows(rows: &[FormRow]) -> u16 {
+        rows.iter().filter(|r| **r != FormRow::List).count() as u16
+    }
 
     /// 右ペイン矩形（枠を含む）からフォーム型レイアウトを導く。draw は chunks[1] を、
     /// ヒットテストは同じ矩形を再構成して渡すことで両者のジオメトリを一致させる。
+    ///
+    /// **高さが足りなければ、一覧を 0 行まで縮めたうえで、
+    /// [`FormRow::drop_level`] の小さい順に行を落とす。**
     pub(crate) fn compute(pane: Rect) -> Self {
         // Block::inner(Borders::ALL) と同じ四辺 1px の縮小
         let inner = Rect {
@@ -558,29 +654,88 @@ impl NewLayout {
             width: pane.width.saturating_sub(2),
             height: pane.height.saturating_sub(2),
         };
-        let bottom = inner.y + inner.height; // 内側の下端（排他）
-        // 上から: 空行 / AGENT / FOLDER 見出し / パス値 / ┄ 区切り / 一覧…
-        let agent_y = inner.y + 1;
-        let folder_hd_y = inner.y + 2;
-        let path_y = inner.y + 3;
-        let sep_y = inner.y + 4;
-        let list_top = inner.y + Self::HEAD_ROWS;
-        // 下から: ヒント / 空行 / 枠下 / 入力 / 枠上 / PROMPT 見出し / spacer
-        let hint_y = bottom.saturating_sub(1);
-        let input_y = bottom.saturating_sub(4);
-        let box_top_y = bottom.saturating_sub(5);
-        let prompt_hd_y = bottom.saturating_sub(6);
-        let list_height = inner
-            .height
-            .saturating_sub(Self::HEAD_ROWS + Self::FOOT_ROWS);
-        let prompt_box = Rect {
-            x: inner.x + Self::MARGIN,
-            y: box_top_y,
-            width: inner.width.saturating_sub(Self::MARGIN * 2),
-            height: 3,
+        // **余白は入力行を犠牲にしてまで付けない。** 判断の材料を入力行の下限
+        // （" ❯ " の外に 1 桁）に揃えてあるのが要点で、揃っていないと
+        // 「幅 4 では出るのに幅 5〜7 では空箱」という非単調な穴ができる
+        let margin = if inner.width > Self::MARGIN * 2 + Self::INPUT_LEAD {
+            Self::MARGIN
+        } else {
+            0
         };
+        let fits =
+            inner.height >= Self::REQUIRED_ROWS && inner.width > margin * 2 + Self::INPUT_LEAD;
+        // 枠は左右 1 桁ずつ食うので、幅が足りなければ縦に余裕があっても落とす
+        let box_fits = inner.width > margin * 2 + 2 + Self::INPUT_LEAD;
+
+        let mut rows: Vec<FormRow> = FormRow::ORDER.to_vec();
+        if !box_fits {
+            rows.retain(|r| !matches!(r, FormRow::BoxTop | FormRow::BoxBottom));
+        }
+        for level in 1..=FormRow::MAX_DROP_LEVEL {
+            if Self::fixed_rows(&rows) <= inner.height {
+                break;
+            }
+            rows.retain(|r| r.drop_level() != Some(level));
+        }
+        let list_height = inner.height.saturating_sub(Self::fixed_rows(&rows));
+
+        // 上から順に配る。**並びの正本は [`FormRow::ORDER`]** なので、
+        // 行を足しても引いてもここの式は変わらない（以前は上端起点と下端起点の
+        // 絶対座標を突き合わせていて、両者が衝突する高さで破綻していた）
+        let mut agent_y = None;
+        let mut folder_hd_y = None;
+        let mut path_y = inner.y;
+        let mut sep_y = None;
+        let mut list_top = inner.y;
+        let mut prompt_hd_y = None;
+        let mut box_top_y = None;
+        let mut input_y = inner.y;
+        let mut hint_y = None;
+        let mut y = inner.y;
+        for row in &rows {
+            match row {
+                // 空行は場所を取るだけ（座標を覚える必要が無い）
+                FormRow::PadTop | FormRow::Spacer | FormRow::PadBottom => {}
+                FormRow::Agent => agent_y = Some(y),
+                FormRow::FolderHead => folder_hd_y = Some(y),
+                FormRow::Path => path_y = y,
+                FormRow::Sep => sep_y = Some(y),
+                FormRow::List => list_top = y,
+                FormRow::PromptHead => prompt_hd_y = Some(y),
+                FormRow::BoxTop => box_top_y = Some(y),
+                FormRow::Input => input_y = y,
+                FormRow::BoxBottom => {}
+                FormRow::Hint => hint_y = Some(y),
+            }
+            y += if *row == FormRow::List { list_height } else { 1 };
+        }
+
+        let prompt_box = box_top_y.map(|top| Rect {
+            x: inner.x + margin,
+            y: top,
+            width: inner.width.saturating_sub(margin * 2),
+            height: 3,
+        });
+        // 入力テキストが乗る 1 行。枠があればその内側、無ければ余白の内側
+        let input_area = match prompt_box {
+            Some(b) => Rect {
+                x: b.x.saturating_add(1),
+                y: input_y,
+                width: b.width.saturating_sub(2),
+                height: 1,
+            },
+            None => Rect {
+                x: inner.x + margin,
+                y: input_y,
+                width: inner.width.saturating_sub(margin * 2),
+                height: 1,
+            },
+        };
+
         NewLayout {
             inner,
+            fits,
+            margin,
             agent_y,
             folder_hd_y,
             path_y,
@@ -591,23 +746,11 @@ impl NewLayout {
             input_y,
             hint_y,
             // パス値は左余白の直後から
-            path_text_x: inner.x + Self::MARGIN,
-            // 入力は枠内側（+1）の " ❯ "（+INPUT_LEAD）の後ろ
-            input_text_x: prompt_box.x + 1 + Self::INPUT_LEAD,
+            path_text_x: inner.x + margin,
+            // 入力は " ❯ " の後ろ
+            input_text_x: input_area.x + Self::INPUT_LEAD,
             prompt_box,
-            // フォーム全体（HEAD + FOOT）+ 一覧 1 行が要る。狭い幅では ┄/枠が崩れるため下限も設ける
-            ok: inner.height > Self::HEAD_ROWS + Self::FOOT_ROWS && inner.width >= 10,
-        }
-    }
-
-    /// PROMPT 入力枠の内側（Borders::ALL の 1px 内側）。入力行の描画とカーソル位置で
-    /// 同じ値を共有するため、Block::inner の再計算をここへ集約する
-    pub(crate) fn prompt_inner(&self) -> Rect {
-        Rect {
-            x: self.prompt_box.x.saturating_add(1),
-            y: self.prompt_box.y.saturating_add(1),
-            width: self.prompt_box.width.saturating_sub(2),
-            height: self.prompt_box.height.saturating_sub(2),
+            input_area,
         }
     }
 }
@@ -626,27 +769,30 @@ pub(crate) fn new_view_cursor(
     focused: bool,
 ) -> FrameCursor {
     let layout = NewLayout::compute(pane);
-    if !layout.ok {
-        // フォームが収まらない（inner が潰れている場合も含む）。inner 基準のクランプは
+    if !layout.fits {
+        // 必須行すら入らない（inner が潰れている場合も含む）。inner 基準のクランプは
         // 使えないので共通の退避先へ寄せる
         return FrameCursor::hidden_at(pane_fallback_pos(pane));
     }
-    // ここに来た時点で layout.ok なので inner.width >= 10 が保証され、
-    // inner（幅 >= 10）も prompt_inner（幅 >= 4）も幅 0 になり得ない
-    // （= right() - 1 のクランプは inner の外を指さない）。
+    // ここに来た時点で `fits` が inner.width >= INPUT_LEAD + 1 を保証するので、
+    // inner も input_area も幅 0 になり得ない（= right() - 1 は矩形の外を指さない）。
     // cursor_x は入力テキストの表示幅なので加算は飽和させる
     // （素の + だと極端に長い入力で debug ビルドが panic する）
     let inner = layout.inner;
-    let prompt_inner = layout.prompt_inner();
+    let input_area = layout.input_area;
     let (pos, in_field) = match focus {
-        // 入力欄ではないのでカーソルは出さない（位置だけ確定させる）
-        NewFocus::Agent => (Position::new(inner.x, layout.agent_y), false),
+        // 入力欄ではないのでカーソルは出さない（位置だけ確定させる）。
+        // AGENT 行が縮退で落ちているときは必須行のパス値へ寄せる
+        NewFocus::Agent => (
+            Position::new(inner.x, layout.agent_y.unwrap_or(layout.path_y)),
+            false,
+        ),
         NewFocus::Path => (
             Position::new(
                 layout
                     .path_text_x
                     .saturating_add(path_cursor_x)
-                    .min(inner.right() - 1),
+                    .min(inner.right().saturating_sub(1)),
                 layout.path_y,
             ),
             true,
@@ -656,7 +802,7 @@ pub(crate) fn new_view_cursor(
                 layout
                     .input_text_x
                     .saturating_add(prompt_cursor_x)
-                    .min(prompt_inner.right() - 1),
+                    .min(input_area.right().saturating_sub(1)),
                 layout.input_y,
             ),
             true,
@@ -674,7 +820,7 @@ pub(crate) fn new_view_cursor(
 /// その 1 行を必ず確保する。
 ///
 /// `no_folder_rows` が真なら一覧は起動ボタン 1 行だけなので、`list_height >= 2` では
-/// 両方が収まり従来どおり。問題は `list_height == 1`（`layout.ok` が許す下限）で、
+/// 両方が収まり従来どおり。問題は `list_height == 1`（縮退が一覧を潰す一歩手前）で、
 /// メッセージを行の後ろへ足すと ratatui の Paragraph に切られて「なぜ一覧が空か」が
 /// 見えなくなる。そのときはメッセージを優先する: 起動ボタンは PROMPT 欄の Enter と
 /// 同じ `cur_dir` での起動なので、失うのは重複した導線だけ。一方メッセージは
@@ -729,7 +875,7 @@ pub(crate) fn draw_new_view(
 
     // 描画とマウス判定で同一のジオメトリを使う（フォーム型レイアウト）
     let layout = NewLayout::compute(area);
-    // カーソル位置は描画結果に依存しないので先に決める（!ok の早期 return と共有する）
+    // カーソル位置は描画結果に依存しないので先に決める（!fits の早期 return と共有する）
     let cursor = new_view_cursor(
         area,
         state.focus,
@@ -737,7 +883,7 @@ pub(crate) fn draw_new_view(
         state.prompt.cursor_x(),
         focused,
     );
-    if !layout.ok {
+    if !layout.fits {
         return cursor;
     }
     let inner = layout.inner;
@@ -769,7 +915,7 @@ pub(crate) fn draw_new_view(
             Style::default().fg(ui().dim)
         }
     };
-    let margin = NewLayout::MARGIN as usize;
+    let margin = layout.margin as usize;
     let pad = " ".repeat(margin);
 
     // AGENT 切替行。**選んだものだけ強調**。
@@ -796,18 +942,22 @@ pub(crate) fn draw_new_view(
             },
         ));
     }
-    frame.render_widget(
-        ratatui::widgets::Paragraph::new(Line::from(agent_spans)),
-        Rect::new(inner.x, layout.agent_y, inner.width, 1),
-    );
+    if let Some(y) = layout.agent_y {
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(Line::from(agent_spans)),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
 
     // FOLDER セクション見出し
-    frame.render_widget(
-        ratatui::widgets::Paragraph::new(
-            Line::from(format!("{pad}FOLDER")).style(heading_style(folder_focused)),
-        ),
-        Rect::new(inner.x, layout.folder_hd_y, inner.width, 1),
-    );
+    if let Some(y) = layout.folder_hd_y {
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(
+                Line::from(format!("{pad}FOLDER")).style(heading_style(folder_focused)),
+            ),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
 
     // パス値（見出し下の独立行。編集可・下線がフィールドの手掛かり。フォーカス中は emph）
     let value_style = Style::default()
@@ -821,17 +971,19 @@ pub(crate) fn draw_new_view(
         Rect::new(inner.x, layout.path_y, inner.width, 1),
     );
 
-    // ┄ 区切り（左右 2 桁余白を残す）
-    frame.render_widget(
-        ratatui::widgets::Paragraph::new(
-            Line::from(format!(
-                "{pad}{}",
-                "┄".repeat(inner.width.saturating_sub(NewLayout::MARGIN * 2) as usize)
-            ))
-            .style(Style::default().fg(ui().dim)),
-        ),
-        Rect::new(inner.x, layout.sep_y, inner.width, 1),
-    );
+    // ┄ 区切り（左右の余白を残す）
+    if let Some(y) = layout.sep_y {
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(
+                Line::from(format!(
+                    "{pad}{}",
+                    "┄".repeat(inner.width.saturating_sub(layout.margin * 2) as usize)
+                ))
+                .style(Style::default().fg(ui().dim)),
+            ),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
 
     // フォルダ一覧（一覧インデント）。先頭は「このフォルダで起動」ボタン行。
     // フィルタでフォルダ行が全部消えた場合はその状態も明示する（起動ボタンは残る）
@@ -890,12 +1042,14 @@ pub(crate) fn draw_new_view(
     );
 
     // PROMPT セクション見出し
-    frame.render_widget(
-        ratatui::widgets::Paragraph::new(
-            Line::from(format!("{pad}PROMPT")).style(heading_style(prompt_focused)),
-        ),
-        Rect::new(inner.x, layout.prompt_hd_y, inner.width, 1),
-    );
+    if let Some(y) = layout.prompt_hd_y {
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(
+                Line::from(format!("{pad}PROMPT")).style(heading_style(prompt_focused)),
+            ),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
 
     // PROMPT 入力枠（フォーカス中は FOCUS_BORDER、非フォーカスは dim）
     let box_border = if prompt_focused {
@@ -903,11 +1057,15 @@ pub(crate) fn draw_new_view(
     } else {
         Style::default().fg(ui().dim)
     };
-    let prompt_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(box_border);
-    let prompt_inner = layout.prompt_inner();
-    frame.render_widget(prompt_block, layout.prompt_box);
+    // 枠は縮退で落ちることがある（落ちても入力行そのものは必ず出る）
+    if let Some(rect) = layout.prompt_box {
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(box_border),
+            rect,
+        );
+    }
     // 入力行（starting 表示も枠内に出す）
     let marker_style = if prompt_focused {
         Style::default().fg(ui().emph).add_modifier(Modifier::BOLD)
@@ -935,17 +1093,19 @@ pub(crate) fn draw_new_view(
     };
     frame.render_widget(
         ratatui::widgets::Paragraph::new(input_line),
-        Rect::new(prompt_inner.x, layout.input_y, prompt_inner.width, 1),
+        layout.input_area,
     );
 
     // ペイン内ヒント（下部バーの "new session:" セグメントはここへ移設して重複を避ける）
-    let hint = new_view_hint(state.focus, can_leave);
-    frame.render_widget(
-        ratatui::widgets::Paragraph::new(
-            Line::from(format!("{pad}{hint}")).style(Style::default().fg(ui().dim)),
-        ),
-        Rect::new(inner.x, layout.hint_y, inner.width, 1),
-    );
+    if let Some(y) = layout.hint_y {
+        let hint = new_view_hint(state.focus, can_leave);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(
+                Line::from(format!("{pad}{hint}")).style(Style::default().fg(ui().dim)),
+            ),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
 
     cursor
 }
@@ -991,15 +1151,181 @@ mod tests {
         }
     }
 
-    /// フォームが収まらない高さ（layout.ok == false）でも位置はペイン内
+    /// 必須行すら入らない高さ（`fits == false`）でも位置はペイン内
     #[test]
     fn cursor_stays_in_pane_when_layout_does_not_fit() {
-        let pane = Rect::new(34, 0, 80, 6); // HEAD_ROWS + FOOT_ROWS に足りない
-        assert!(!NewLayout::compute(pane).ok);
+        // 内側 1 行 = 必須の 2 行（パス値・入力行）に足りない
+        let pane = Rect::new(34, 0, 80, 3);
+        assert!(!NewLayout::compute(pane).fits);
         for focus in FOCUSES {
             let cursor = new_view_cursor(pane, focus, 0, 0, true);
             assert_eq!(cursor.pos, Position::new(pane.x, pane.y));
             assert!(contains(pane, cursor.pos));
+        }
+    }
+
+    /// 観測できる行（座標を持つ行）と、その落とす順。
+    /// 空行は座標を持たないので [`NewLayout`] からは見えない ＝ ここには載せない
+    fn observable(layout: &NewLayout) -> Vec<(u8, bool)> {
+        vec![
+            (1, layout.hint_y.is_some()),
+            (3, layout.prompt_hd_y.is_some()),
+            (3, layout.folder_hd_y.is_some()),
+            (4, layout.sep_y.is_some()),
+            (5, layout.prompt_box.is_some()),
+            (6, layout.agent_y.is_some()),
+        ]
+    }
+
+    /// **かつて空箱になっていた高さで、フォームが出る。**
+    ///
+    /// 内側 12 行は「30 行の端末を 4 分割した 1 枚」の実寸。旧実装は
+    /// `inner.height > 12` を満たさないと何も描かなかったので、ここがちょうど
+    /// 枠だけの空箱になる高さだった
+    #[test]
+    fn the_form_renders_where_it_used_to_be_an_empty_box() {
+        let tmp = TempDir::new("degraded");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        let pane = Rect::new(0, 0, 40, 14); // 内側 12 行
+        let layout = NewLayout::compute(pane);
+        assert!(layout.fits, "the form still refuses to render at this height");
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(pane.width, pane.height))
+                .unwrap();
+        terminal
+            .draw(|frame| {
+                draw_new_view(frame, pane, &mut state, true, false, false);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..pane.height)
+            .flat_map(|y| (0..pane.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buffer.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect();
+        assert!(
+            text.contains('❯'),
+            "the prompt input is missing at this height: {text:?}"
+        );
+    }
+
+    /// **[`crate::panes::Layout::MIN_SLOT`] はこのフォームの最小サイズから来ている。**
+    ///
+    /// 片方だけ動かすと「スロットは作れるのに New 画面が出ない大きさ」が生まれる。
+    /// コメントで対応を書くと黙って腐るので、ここで機械に確かめさせる
+    #[test]
+    fn the_smallest_allowed_slot_can_still_show_the_form() {
+        let (rows, cols) = crate::panes::Layout::MIN_SLOT;
+        assert!(
+            NewLayout::compute(Rect::new(0, 0, cols, rows)).fits,
+            "the smallest slot a layout may create cannot show the new-session form"
+        );
+    }
+
+    /// **落ちる順は優先度どおりで、必須行は最後まで残る。**
+    ///
+    /// 高さを 1 行ずつ削っても、優先度の低い行が生きているのに高い行が
+    /// 落ちている状態にはならない（＝ 落とす判断が [`FormRow::drop_level`] の
+    /// 1 箇所だけから出ていることの検査）
+    #[test]
+    fn rows_drop_in_priority_order_and_the_required_ones_survive() {
+        for height in 4..=24u16 {
+            let pane = Rect::new(0, 0, 40, height);
+            let layout = NewLayout::compute(pane);
+            if !layout.fits {
+                continue;
+            }
+            let rows = observable(&layout);
+            for (low, low_present) in &rows {
+                if !low_present {
+                    continue;
+                }
+                for (high, high_present) in &rows {
+                    assert!(
+                        high <= low || *high_present,
+                        "height {height}: level {low} survived while level {high} was dropped"
+                    );
+                }
+            }
+            // 必須行は必ず内側にある
+            let inner = layout.inner;
+            assert!(
+                layout.path_y >= inner.y && layout.path_y < inner.y + inner.height,
+                "height {height}: the path row left the pane"
+            );
+            assert!(
+                layout.input_y >= inner.y && layout.input_y < inner.y + inner.height,
+                "height {height}: the input row left the pane"
+            );
+        }
+    }
+
+    /// **幅は単調でなければならない。** ある幅で出るなら、それより広い幅でも必ず出る。
+    ///
+    /// 余白を付ける条件と `fits` の条件がずれていた頃は、内側 4 桁では出るのに
+    /// 5〜7 桁で空箱になっていた（余白 2 桁 × 2 を先に確保してしまい、
+    /// 入力行のぶんが残らなかった）
+    #[test]
+    fn a_wider_pane_never_stops_rendering_what_a_narrower_one_showed() {
+        for height in [4u16, 14, 30] {
+            let mut seen = false;
+            for width in 0..40u16 {
+                let fits = NewLayout::compute(Rect::new(0, 0, width, height)).fits;
+                if fits {
+                    seen = true;
+                } else {
+                    assert!(
+                        !seen,
+                        "height {height}: width {width} is blank although a narrower pane rendered"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **どの大きさでも、生き残った行は内側に収まる。**
+    /// 旧実装は上端起点と下端起点の絶対座標を突き合わせていたので、
+    /// 両者が衝突する高さで行同士が重なっていた（だから `ok` で全部止めていた）
+    #[test]
+    fn every_row_stays_inside_the_inner_rect_at_any_size() {
+        for w in [4u16, 5, 6, 7, 8, 9, 10, 12, 40, 80] {
+            for h in [0u16, 2, 3, 4, 6, 9, 13, 14, 30] {
+                let pane = Rect::new(3, 5, w, h);
+                let layout = NewLayout::compute(pane);
+                if !layout.fits {
+                    continue;
+                }
+                let inner = layout.inner;
+                let bottom = inner.y + inner.height;
+                let mut rows: Vec<u16> = vec![layout.path_y, layout.input_y];
+                rows.extend(
+                    [
+                        layout.agent_y,
+                        layout.folder_hd_y,
+                        layout.sep_y,
+                        layout.prompt_hd_y,
+                        layout.hint_y,
+                    ]
+                    .into_iter()
+                    .flatten(),
+                );
+                for y in rows {
+                    assert!(y >= inner.y && y < bottom, "{w}x{h}: row {y} is outside");
+                }
+                assert!(
+                    layout.list_top + layout.list_height <= bottom,
+                    "{w}x{h}: the list overflows the pane"
+                );
+                if let Some(b) = layout.prompt_box {
+                    assert!(b.y + b.height <= bottom, "{w}x{h}: the prompt box overflows");
+                    assert!(b.x + b.width <= inner.x + inner.width, "{w}x{h}: box too wide");
+                }
+                assert!(
+                    layout.input_area.x + layout.input_area.width <= inner.x + inner.width,
+                    "{w}x{h}: the input row is wider than the pane"
+                );
+            }
         }
     }
 
@@ -1227,8 +1553,8 @@ mod tests {
         assert!(!state.selection_from_rebuild, "up arrow / wheel up");
     }
 
-    /// 0 件メッセージ用の 1 行を確保する。list_height == 1（layout.ok の下限）では
-    /// 起動ボタン行より優先する
+    /// 0 件メッセージ用の 1 行を確保する。list_height == 1（縮退が一覧を潰す
+    /// 一歩手前）では起動ボタン行より優先する
     #[test]
     fn reserves_a_line_for_the_no_match_message() {
         assert_eq!(list_rows_for_message(false, 1), 1);
@@ -1254,9 +1580,10 @@ mod tests {
         state.refresh_from_input();
         assert!(state.no_folder_rows());
 
-        // 一覧に 1 行だけ割ける最小の高さ（ヘッダーとフッターの行数から導く ＝
-        // AGENT 行のような行が増減しても、この test が測る条件は変わらない）
-        let pane = Rect::new(0, 0, 40, NewLayout::HEAD_ROWS + NewLayout::FOOT_ROWS + 3);
+        // 一覧に 1 行だけ割ける最小の高さ（固定行の数から導く ＝ 行が増減しても
+        // この test が測る条件は変わらない）。+2 は Block の上下の枠
+        let full_form = NewLayout::fixed_rows(&FormRow::ORDER);
+        let pane = Rect::new(0, 0, 40, full_form + 1 + 2);
         assert_eq!(NewLayout::compute(pane).list_height, 1);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(pane.width, pane.height))
