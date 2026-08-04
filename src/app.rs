@@ -686,6 +686,10 @@ impl App {
             self.slots.push(Slot::Empty);
         }
         self.focus_slot = self.focus_slot.min(want.saturating_sub(1));
+        // **枚数を減らすとフォーカススロットの中身が変わる**（丸めた先に別の行が
+        // 出る）ので、移動と同じく既読を合わせる。溢れて消えた側は画面から
+        // 消えるだけなので、そちらは未読のまま残るのが正しい
+        self.mark_focus_read();
         self.resize_sessions();
     }
 
@@ -799,7 +803,21 @@ impl App {
             self.windows[at].send_focus(false);
         }
         self.focus_slot = to;
+        self.mark_focus_read();
         self.focus_terminal_on(to);
+    }
+
+    /// **フォーカススロットに出ている行を既読にする**（[`mark_read`] の規則の実装）。
+    ///
+    /// 呼ぶのは「フォーカススロットの中身が変わり得た直後」＝ フォーカスの移動と
+    /// 配置の変更。**スロットが複数のとき、見に行く操作はこの 2 つしか無い**:
+    /// セッションは既に画面へ出ているので [`open_session`] を通らない
+    /// （どちらも通していなかった頃は、**サイドバーの行を押し直すまで `●` が
+    /// 消えなかった**）
+    fn mark_focus_read(&mut self) {
+        if let Some(id) = self.shown_session().cloned() {
+            mark_read(self, &id);
+        }
     }
 
     /// スロット `to` にフォーカスがあるとき、その窓へ focus in を送る
@@ -1703,9 +1721,11 @@ pub(crate) fn refresh_transcripts(app: &mut App) {
     }
 }
 
-/// その行を既読にする。**契機は 3 つで、どれも同じことをする**:
-/// ペインを開いた（開き方は問わない）・`mark as read`・ペインに出ている行へ
-/// hook が届いた（[`adopt_hook_states`]）。
+/// その行を既読にする。**規則は 1 つ ＝ 「フォーカススロットにその行が出た」**で、
+/// そこへ至る道が複数ある: 行を開く（開き方は問わない）・フォーカススロットの
+/// 中身が変わる（[`App::mark_focus_read`]）・出ている行へ hook が届く
+/// （[`adopt_hook_states`]）。**`mark as read` だけが規則の外**で、
+/// 出ていない行を直接既読にする。
 ///
 /// 進めるのは `last_opened_at` だけで **`updated_at` は触らない**: 既読は
 /// 行の中身（cwd・transcript・ピン留め）を 1 つも変えないので、ここで
@@ -5665,6 +5685,68 @@ mod tests {
 
         mark_read(&mut app, &SessionId::new("gone-row"));
         assert_eq!(app.sessions.len(), 1, "an unknown row changed the list");
+    }
+
+    /// **スロットのフォーカスを移した先も既読になる。**
+    ///
+    /// スロットが複数あるとき、未読の行は既に画面へ出ているので
+    /// [`open_session`] を通らない ＝ 見に行く操作はフォーカスの移動
+    /// （クリック / `Alt+Shift+方向`）しかない。ここが既読の契機でなかった頃は、
+    /// **サイドバーの行を押し直すまで `●` が消えなかった**
+    #[test]
+    fn focusing_a_slot_marks_the_session_it_shows_read() {
+        let rows = [session_row("s", "C:\\dev\\api", 1)];
+        let mut app = app_with_hooks(&rows, HookStates::from_entries([("s", crate::poll::State::Idle, 2)]));
+        app.term_size = TERM;
+        app.set_layout(crate::panes::Layout::TwoColumns);
+        app.slots[1] = Slot::Session(SessionId::new("s"));
+        assert!(app.hook_states.unread(row_of(&app, "s")), "the premise (an unread row) broke");
+
+        app.set_focus_slot(1);
+        assert!(
+            !app.hook_states.unread(row_of(&app, "s")),
+            "the row stayed unread after its slot took the focus"
+        );
+    }
+
+    /// **枚数を減らして残った行も既読になる。**
+    ///
+    /// 4 分割の左上に未読の行、フォーカスは別のスロット。`1 pane` へ戻すと
+    /// フォーカスが 0 へ丸められ、**残った 1 枚に出るのはその未読の行**
+    /// （見に行く操作はしたのに [`App::set_focus_slot`] は通らない）。
+    /// ここが抜けていた頃は `●` が消えなかった
+    #[test]
+    fn shrinking_the_layout_marks_the_row_that_survives_read() {
+        let rows = [session_row("s", "C:\\dev\\api", 1)];
+        let mut app = app_with_hooks(&rows, HookStates::from_entries([("s", crate::poll::State::Idle, 2)]));
+        app.term_size = TERM;
+        app.set_layout(crate::panes::Layout::Four);
+        app.slots[0] = Slot::Session(SessionId::new("s"));
+        app.focus_slot = 2;
+        assert!(app.hook_states.unread(row_of(&app, "s")), "the premise (an unread row) broke");
+
+        app.set_layout(crate::panes::Layout::One);
+        assert_eq!(app.focus_slot, 0, "the premise (the focus was rounded down) broke");
+        assert!(
+            !app.hook_states.unread(row_of(&app, "s")),
+            "the row that survived the shrink stayed unread"
+        );
+    }
+
+    /// **溢れて消えた行は未読のまま。** 画面から消えるだけで、見に行ってはいない
+    #[test]
+    fn shrinking_the_layout_leaves_the_rows_it_drops_unread() {
+        let rows = [session_row("s", "C:\\dev\\api", 1)];
+        let mut app = app_with_hooks(&rows, HookStates::from_entries([("s", crate::poll::State::Idle, 2)]));
+        app.term_size = TERM;
+        app.set_layout(crate::panes::Layout::Four);
+        app.slots[3] = Slot::Session(SessionId::new("s"));
+
+        app.set_layout(crate::panes::Layout::One);
+        assert!(
+            app.hook_states.unread(row_of(&app, "s")),
+            "a row that fell off the layout was marked read without being looked at"
+        );
     }
 
     /// Enter でメニューを開く行の画面 y。固定ヘッダーはスクロールに動かされず、
