@@ -27,7 +27,7 @@ conversation. OpenAI's `codex` CLI works the same way — [opt in](#codex-opt-in
   `▦ layout` row. Sessions are not split into panes, they are *placed* into slots:
   choosing a row moves that session into the focused slot, and only that one moves —
   the slot it came from goes empty. Nothing is ever killed by rearranging
-- **Mouse-first, keyboard-light** — click to switch, the `=` at the end of a row for
+- **Mouse-first, keyboard-light** — click to switch, the `⋮` at the end of a row for
   everything else, drag the cross between slots to resize. ccdesk reserves
   `Ctrl+Q`, `Alt+←/→` (sidebar ⇄ main view) and `Alt+Shift+←/→/↑/↓` (move between
   slots) — and **every other key goes to the agent untouched**
