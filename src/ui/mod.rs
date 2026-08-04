@@ -1,4 +1,4 @@
-//! サイドバー・右ペインの描画と、描画／クリック判定で共有するジオメトリ計算。
+//! サイドバー・スロット群の描画と、描画／クリック判定で共有するジオメトリ計算。
 pub(crate) mod new_view;
 pub(crate) mod text_field;
 
@@ -12,7 +12,7 @@ use tui_term::widget::PseudoTerminal;
 use ccdesk::{dir_key, LockExt};
 
 use crate::app::{
-    selected_enter, App, Focus, Popup, PopupKind, RightView, RowAction, SelfUpdate, SidebarPos,
+    selected_enter, App, Focus, Popup, PopupKind, RowAction, SelfUpdate, SidebarPos, Slot,
     SidebarRow,
 };
 use crate::backend::Kind;
@@ -1185,7 +1185,7 @@ impl FrameCursor {
 /// `None` は新規セッション画面だけ ＝ 案内をペイン内に持つので下部バーへ重ねない
 fn context_hint(app: &App) -> Option<(&'static str, String)> {
     if app.focus == Focus::Terminal {
-        if matches!(app.right_view, RightView::New(_)) {
+        if app.focus_is_new() {
             return None;
         }
         // ccdesk が取るのは予約キーだけ。残りは全部**その行の agent**が受ける
@@ -1253,7 +1253,7 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, app: &App) {
     // new session は右ペインの表示を変えない**ので、ここに出さないと無反応に見える。
     // 判定は `input_gate` 1 つ（起動中かどうかの正本を増やさない）。
     // New 画面は入力欄に自前の starting 表示を持つので、そこでは二重に出さない
-    if app.input_gate.is_some() && !matches!(app.right_view, RightView::New(_)) {
+    if app.input_gate.is_some() && !app.focus_is_new() {
         hint_spans.push(Span::styled(
             "  starting session…",
             Style::default().fg(ui().working),
@@ -1368,7 +1368,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             launched_at: w.started_at,
         })
         .collect();
-    let active = app.active;
+    // **今どれかのスロットに出ている行**（印を付ける対象）。フォーカス中の 1 枚だけ
+    // ではないのが要点で、4 枚並べたら 4 行に印が付く
+    let on_screen: Vec<crate::sessions::SessionId> = app
+        .slots
+        .iter()
+        .filter_map(|slot| slot.session().cloned())
+        .collect();
     // Working の明滅のコマ番号。**時計を読むのはここ 1 箇所**にして、1 フレームぶんの
     // 全行へ同じ番号を配る（[`session_row_line`] は時計を読まない）。
     // コマ列の長さ（＝ 何段階で何秒周期か）はテーマが持つので、ここは刻むだけ
@@ -1444,8 +1450,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             kind: row.kind,
             cwd: row.cwd.clone(),
             label: app.titles.of(row),
-            is_active_window: window.is_some_and(|(i, _)| i == active)
-                && matches!(app.right_view, RightView::Sessions),
+            is_active_window: on_screen.contains(&row.session_id),
             unread,
             pinned: row.pinned,
         });
@@ -1529,6 +1534,17 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         Line::from(separator_text(inner_width)),
         Style::default().fg(ui().dim),
         SidebarRow::Decoration,
+    );
+    // スロットの並べ方（クリックでメニューが開く）。現在値の綴りは Layout::as_str
+    push_row(
+        &mut items,
+        &mut rows,
+        Line::from(vec![
+            Span::raw("▦ layout: "),
+            Span::styled(app.layout.as_str(), Style::default().fg(ui().emph)),
+        ]),
+        Style::default().fg(ui().dim),
+        SidebarRow::Action(RowAction::ChooseLayout),
     );
     // グルーピング切替（クリックでメニューが開く）。現在値の綴りは Grouping::as_str
     push_row(
@@ -1810,52 +1826,102 @@ fn draw_popup(frame: &mut Frame, app: &App) {
     );
 }
 
-/// 右ペイン: 新規セッション画面 or アクティブセッションの画面。
-/// 終端カーソルの決定はこの中に閉じる（[`FrameCursor`] 参照）
+/// 右ペイン: スロットを並べて描く。
+///
+/// **カーソルを返すのはフォーカススロットだけ。** 端末のカーソルは 1 本しか無いので、
+/// 他のスロットは描くだけで位置を主張しない（[`FrameCursor`] 参照）
 fn draw_right_pane(frame: &mut Frame, pane: Rect, app: &mut App) -> FrameCursor {
-    let terminal_focused = app.focus == Focus::Terminal;
-    let starting = app.input_gate.is_some();
-    // Esc で戻れる先（セッションの窓）があるか。**借用の前に取る**（New 画面の
-    // 描画は right_view を可変で借りるため）
-    let can_leave = !app.windows.is_empty();
-    if let RightView::New(state) = &mut app.right_view {
-        return draw_new_view(frame, pane, state, terminal_focused, starting, can_leave);
+    let rects = app.layout.rects(pane, app.split);
+    // フォーカススロットが無いフレームでも物理カーソルは駐車させる（FrameCursor 参照）
+    let mut cursor = FrameCursor::hidden_at(pane_fallback_pos(pane));
+    for (at, rect) in rects.into_iter().enumerate() {
+        let focused = app.focus == Focus::Terminal && app.focus_slot == at;
+        let found = draw_slot(frame, rect, app, at, focused);
+        if app.focus_slot == at {
+            cursor = found;
+        }
     }
-    if app.windows.is_empty() {
+    cursor
+}
+
+/// スロット 1 枚。戻り値はその中身が主張するカーソル（採るかは呼び手が決める）
+fn draw_slot(frame: &mut Frame, rect: Rect, app: &mut App, at: usize, focused: bool) -> FrameCursor {
+    let starting = app.input_gate.is_some() && app.focus_slot == at;
+    // Esc で戻れる先（セッションの窓）があるか。**借用の前に取る**（New 画面の
+    // 描画はスロットを可変で借りるため）
+    let can_leave = !app.windows.is_empty();
+    // 見出しは名前を引くために不変で借りるので、可変借用より先に組む
+    let title = match app.slots.get(at) {
+        Some(Slot::Session(id)) => Some(
+            app.row(id)
+                .map_or_else(|| crate::title::UNTITLED.to_string(), |row| app.titles.of(row)),
+        ),
+        _ => None,
+    };
+    match app.slots.get_mut(at) {
+        Some(Slot::New(state)) => draw_new_view(frame, rect, state, focused, starting, can_leave),
+        Some(Slot::Session(_)) => {
+            let title = title.unwrap_or_else(|| crate::title::UNTITLED.to_string());
+            draw_session_slot(frame, rect, app, at, focused, title)
+        }
+        // 空スロット（起動時・stop / close の直後）
+        _ => {
+            frame.render_widget(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("no session")
+                    .border_style(border_style(focused)),
+                rect,
+            );
+            FrameCursor::hidden_at(pane_fallback_pos(rect))
+        }
+    }
+}
+
+/// セッションを映しているスロット。窓が見つからない（起こし損ねた）ときは空扱い
+fn draw_session_slot(
+    frame: &mut Frame,
+    rect: Rect,
+    app: &App,
+    at: usize,
+    focused: bool,
+    title: String,
+) -> FrameCursor {
+    let Some(window) = app
+        .slots
+        .get(at)
+        .and_then(Slot::session)
+        .and_then(|id| app.windows.iter().find(|w| &w.session_id == id))
+    else {
         frame.render_widget(
             Block::default()
                 .borders(Borders::ALL)
-                .title("no session")
+                .title(title)
                 .border_style(Style::default().fg(ui().dim)),
-            pane,
+            rect,
         );
-        return FrameCursor::hidden_at(pane_fallback_pos(pane));
-    }
-    let window = &app.windows[app.active];
-    // ペインの見出しもサイドバーと同じ導出（名前の正本は transcript 1 つ）
-    let title = app
-        .row(&window.session_id)
-        .map_or_else(|| crate::title::UNTITLED.to_string(), |row| app.titles.of(row));
+        return FrameCursor::hidden_at(pane_fallback_pos(rect));
+    };
     let parser = window.parser.lock_recover();
     let screen = parser.screen();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(border_style(terminal_focused));
-    let inner = block.inner(pane);
+        .border_style(border_style(focused));
+    let inner = block.inner(rect);
     // tui-term 独自の █ カーソル描画は無効化し、ネイティブカーソル
     // （set_cursor_position = 本家と同じ点滅バー）だけを使う
     let widget = PseudoTerminal::new(screen)
         .cursor(tui_term::widget::Cursor::default().visibility(false))
         .block(block);
-    frame.render_widget(widget, pane);
+    frame.render_widget(widget, rect);
 
     // カーソル位置を反映。フォーカス外・子が非表示指定のときも「隠すだけ」で
     // 位置は必ず確定させる（描かないとサイドバーに置き去りになる。FrameCursor 参照）。
     // ペイン外へはみ出す座標はペイン内へクランプする
     let (crow, ccol) = screen.cursor_position();
-    let pos = terminal_cursor_pos(pane, inner, crow, ccol);
-    if app.focus == Focus::Terminal && !screen.hide_cursor() {
+    let pos = terminal_cursor_pos(rect, inner, crow, ccol);
+    if focused && !screen.hide_cursor() {
         FrameCursor::shown_at(pos)
     } else {
         FrameCursor::hidden_at(pos)
@@ -4290,7 +4356,7 @@ pub(crate) mod tests {
         let mut app = App {
             term_size: (120, 30),
             focus: Focus::Terminal,
-            right_view: RightView::New(new_view::NewState::browse(".")),
+            slots: vec![Slot::New(new_view::NewState::browse("."))],
             ..Default::default()
         };
         let bar = drawn_hint_bar(&mut app);

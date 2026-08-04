@@ -86,8 +86,13 @@ const DEMO_PROJECTS: [&str; 4] = [
 /// 供給元から受け取る（demo は固定値、live は state.json / config.json）
 pub(crate) struct WindowState {
     pub(crate) sidebar_width: u16,
-    /// 復元するセッションの [`SessionId`]。None = new session 画面から始める
-    pub(crate) last_view: Option<String>,
+    /// スロットの並べ方
+    pub(crate) layout: crate::panes::Layout,
+    /// 十字の位置
+    pub(crate) split: crate::panes::Split,
+    /// スロットごとの復元内容（並びはスロット番号順）。
+    /// 長さが `layout.slots()` と食い違っていても `App::set_layout` が揃える
+    pub(crate) slots: Vec<SlotView>,
     /// new session の初期フォルダ
     pub(crate) dispatch_cwd: String,
     pub(crate) grouping: Grouping,
@@ -99,18 +104,55 @@ pub(crate) struct WindowState {
     pub(crate) projects: Vec<String>,
 }
 
-/// 「復元するセッションは無い ＝ new session 画面」を表す `last_view` の保存表記。
-/// UUID と衝突しない値なら何でもよい。**符号化・復号ともこのファイルの中だけ**で
-/// 使う（外は [`WindowItem::LastView`] の `Option` で意図を表す）
+/// スロット 1 枚の復元内容。**保存表記との変換はこのファイルに閉じる**
+/// （外は この enum で意図を表す）
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum SlotView {
+    Empty,
+    /// new session 画面
+    New,
+    Session(String),
+}
+
+/// 「new session 画面」を表す保存表記。UUID と衝突しない値なら何でもよい
 const LAST_VIEW_NEW: &str = "new";
+/// 「空スロット」を表す保存表記
+const LAST_VIEW_EMPTY: &str = "-";
+/// スロットの区切り
+const SLOT_SEP: char = ',';
+
+impl SlotView {
+    fn encode(&self) -> &str {
+        match self {
+            Self::Empty => LAST_VIEW_EMPTY,
+            Self::New => LAST_VIEW_NEW,
+            Self::Session(id) => id,
+        }
+    }
+
+    /// **旧版の保存値（スロット 1 枚ぶんの裸の値）もそのまま読める**:
+    /// 区切りが無ければ 1 要素の一覧として解釈されるため、
+    /// 移行のための分岐を持たなくてよい
+    fn decode(text: &str) -> Self {
+        match text {
+            LAST_VIEW_EMPTY | "" => Self::Empty,
+            LAST_VIEW_NEW => Self::New,
+            id => Self::Session(id.to_string()),
+        }
+    }
+}
 
 /// 永続化するウィンドウ状態の 1 項目。
 /// live は state.json / config.json へ書き、demo は捨てる
 /// （撮影が開発者の設定を書き換えないため）。
 /// 項目を増やすと live 側の match が非網羅になるので、保存先の指定漏れは起きない
 pub(crate) enum WindowItem<'a> {
-    /// 次回起動で開く画面。None = new session 画面（保存表記は [`LAST_VIEW_NEW`]）
-    LastView(Option<&'a SessionId>),
+    /// 次回起動で開くスロットの中身（並びはスロット番号順）
+    Slots(&'a [SlotView]),
+    /// スロットの並べ方
+    Layout(crate::panes::Layout),
+    /// 十字の位置
+    Split(crate::panes::Split),
     SidebarWidth(u16),
     LastFolder(&'a str),
     Grouping(Grouping),
@@ -499,8 +541,27 @@ impl DataSource for LiveSource {
                 .or_else(|| settings.string("sidebar_width"))
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_SIDEBAR_WIDTH),
-            // LAST_VIEW_NEW は new session 画面を意味する保存値（＝復元するセッションは無い）
-            last_view: state.string("last_view").filter(|view| view != LAST_VIEW_NEW),
+            // 綴りの正本は [`crate::panes::Layout::as_str`]
+            layout: settings
+                .string("layout")
+                .as_deref()
+                .map(crate::panes::Layout::parse)
+                .unwrap_or_default(),
+            split: crate::panes::Split {
+                v: state
+                    .string("split_v")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(crate::panes::Split::default().v),
+                h: state
+                    .string("split_h")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(crate::panes::Split::default().h),
+            },
+            // 区切りが無い旧版の値（セッション 1 つ）も 1 要素として読める
+            slots: state
+                .string("last_view")
+                .map(|text| text.split(SLOT_SEP).map(SlotView::decode).collect())
+                .unwrap_or_default(),
             // 前回使ったフォルダを復元（無ければ起動ディレクトリ）
             dispatch_cwd: state
                 .string("last_folder")
@@ -523,12 +584,21 @@ impl DataSource for LiveSource {
 
     fn save_window(&self, item: WindowItem<'_>) {
         match item {
-            // 「セッションではなく new session 画面」の符号化はこの match と
-            // 復号（[`Self::window_state`]）の 2 箇所 ＝ このファイルに閉じる
-            WindowItem::LastView(view) => save_state(
+            // 符号化はこの match と復号（[`Self::window_state`]）の 2 箇所 ＝
+            // このファイルに閉じる
+            WindowItem::Slots(slots) => save_state(
                 "last_view",
-                view.map_or(LAST_VIEW_NEW, SessionId::as_str),
+                &slots
+                    .iter()
+                    .map(SlotView::encode)
+                    .collect::<Vec<_>>()
+                    .join(&SLOT_SEP.to_string()),
             ),
+            WindowItem::Layout(layout) => save_setting("layout", layout.as_str()),
+            WindowItem::Split(split) => {
+                save_state("split_v", &split.v.to_string());
+                save_state("split_h", &split.h.to_string());
+            }
             WindowItem::SidebarWidth(width) => save_state("sidebar_width", &width.to_string()),
             WindowItem::LastFolder(cwd) => save_state("last_folder", cwd),
             // グルーピングだけはユーザー設定なので config.json 側
@@ -634,7 +704,10 @@ impl DataSource for DemoSource {
     fn window_state(&self) -> WindowState {
         WindowState {
             sidebar_width: DEMO_SIDEBAR_WIDTH,
-            last_view: None, // 撮影は必ず new session 画面から始める
+            layout: crate::panes::Layout::One,
+            split: crate::panes::Split::default(),
+            // 撮影は必ず new session 画面 1 枚から始める
+            slots: vec![SlotView::New],
             dispatch_cwd: DEMO_CWD.to_string(),
             grouping: Grouping::State,
             projects: DEMO_PROJECTS.iter().map(|p| p.to_string()).collect(),
@@ -909,7 +982,12 @@ mod tests {
     fn demo_window_state_does_not_come_from_disk() {
         let window = DemoSource.window_state();
         assert_eq!(window.sidebar_width, DEMO_SIDEBAR_WIDTH);
-        assert!(window.last_view.is_none(), "demo always starts from the new session screen");
+        assert_eq!(
+            window.slots,
+            vec![SlotView::New],
+            "demo always starts from the new session screen"
+        );
+        assert_eq!(window.layout, crate::panes::Layout::One);
         assert_eq!(window.dispatch_cwd, DEMO_CWD);
         assert_eq!(window.grouping, Grouping::State);
         assert_eq!(window.projects, DEMO_PROJECTS, "registered projects are fixed too");
@@ -1120,9 +1198,8 @@ mod tests {
     #[test]
     fn demo_does_not_persist_window_state() {
         let view = write_sentinel("view");
-        let view_id = SessionId::new(view.clone());
         let folder = write_sentinel("folder");
-        DemoSource.save_window(WindowItem::LastView(Some(&view_id)));
+        DemoSource.save_window(WindowItem::Slots(&[SlotView::Session(view.clone())]));
         DemoSource.save_window(WindowItem::LastFolder(&folder));
         assert_ne!(
             load_state("last_view").as_deref(),

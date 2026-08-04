@@ -12,11 +12,17 @@ use crate::app::App;
 pub(crate) fn forward_mouse(app: &mut App, mouse: &MouseEvent) {
     use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
-    // 右ペイン内側（枠線 1px）基準の原点。**矩形の正本は描画と同じ
-    // [`crate::ui::pane_rect`]**（窓を借りる前に取る）
-    let pane = crate::ui::pane_rect(app);
+    // フォーカススロットの内側（枠線 1px）基準の原点。**矩形の正本は描画と同じ
+    // [`crate::app::App::slot_rects`]**（窓を借りる前に取る）
+    let rects = app.slot_rects();
+    let Some(pane) = rects.get(app.focus_slot).copied() else {
+        return;
+    };
     let (ox, oy) = (pane.x + 1, pane.y + 1);
-    let window = &mut app.windows[app.active];
+    let Some(at) = app.focused_window() else {
+        return;
+    };
+    let window = &mut app.windows[at];
     let (mode, encoding, size) = {
         let parser = window.parser.lock_recover();
         let screen = parser.screen();

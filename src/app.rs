@@ -5,7 +5,7 @@ use std::time::Duration;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 
 use ccdesk::{log_error, now_ms, same_dir, LockExt};
 
@@ -62,6 +62,8 @@ pub(crate) enum RowAction {
     /// **クリックで即セッションが立つ行ではない**（起動は開いたメニューの中で選ぶ）
     Project(String),
     ToggleGroup, // グルーピング切替（state ⇔ directory）
+    /// スロットの並べ方を選ぶメニューを開く（▦ layout 行）
+    ChooseLayout,
     /// セッション行: ウィンドウが開いていれば切替、無ければ `claude -r` で再開
     Open(SessionId),
     UpdateCcdesk,  // ccdesk 自身を更新（サイドバー先頭の版行）
@@ -174,6 +176,13 @@ pub(crate) enum PopupKind {
         open: bool,
     },
     State,
+    /// スロットの並べ方。**どちらの値も開いた時点の写し**（[`PopupKind::Session`] と
+    /// 同じ作り）で、`current` は `●` を付ける項目、`fits` は押せる項目の判断に使う
+    Layout {
+        current: crate::panes::Layout,
+        /// 今の端末で崩れずに出せる配置（狭い端末では枚数の多いものが落ちる）
+        fits: Vec<crate::panes::Layout>,
+    },
     /// プロジェクト単位の操作。`has_sessions` は開いた時点の写し（[`PopupKind::Session`] の
     /// `open` と同じ作り）で、`remove project` を出せるかの判断に使う
     Project { cwd: String, has_sessions: bool },
@@ -196,6 +205,8 @@ enum PopupAction {
     /// 一覧から行を外す（transcript は消さない ＝ 会話ログは残る）
     Close(SessionId),
     SetGrouping(Grouping),
+    /// スロットの並べ方を変える（溢れたスロットの中身は表示から外れるだけ）
+    SetLayout(crate::panes::Layout),
     /// 指定フォルダで新規セッション（agent を選んで起こす）
     NewSessionIn(Kind, String),
     /// プロジェクトを一覧から外す
@@ -271,6 +282,20 @@ impl PopupKind {
                     action: PopupAction::SetGrouping(g),
                 })
                 .collect(),
+            // 項目は [`crate::panes::Layout::ORDER`] から導く（値を足すとメニューも
+            // 自動で増える）。**入らない配置は押せない**ので、選んだ瞬間に崩れることが無い。
+            //
+            // **1 枚だけは常に押せる。** 端末を縮めてどの配置も入らなくなったとき、
+            // 全部を落とすとメニューが全灰色になり、**画面の中から 1 枚へ戻る道が
+            // 消える**（端末を広げるまで詰む）。1 枚は退避先なので例外にする
+            PopupKind::Layout { current, fits } => crate::panes::Layout::ORDER
+                .into_iter()
+                .map(|l| PopupEntry {
+                    label: format!("{}{}", if *current == l { "● " } else { "  " }, l.as_str()),
+                    enabled: fits.contains(&l) || l == crate::panes::Layout::One,
+                    action: PopupAction::SetLayout(l),
+                })
+                .collect(),
             // **セッションが残っているフォルダは登録解除させない。** 見出しの一覧は
             // 「登録リスト ∪ セッションの cwd」なので、登録を外してもセッション由来で
             // 見出しは出続ける。押せるのに表示が変わらないのは嘘なので、
@@ -315,18 +340,46 @@ pub(crate) struct Popup {
     pub(crate) selected: usize,
 }
 
-/// 右ペインの表示内容
-pub(crate) enum RightView {
-    Sessions,
+/// スロット 1 枚の中身。**空も 1 つの中身**（`no session` 画面）。
+///
+/// **セッションは添字ではなく [`SessionId`] で指す。** 窓（[`App::windows`]）は
+/// 死んだものから抜けるので、添字で持つと他のスロットの指す先が黙ってずれる
+/// （かつて `active: usize` が窓を抜くたびに補正を要していたのと同じ問題を、
+/// スロットの数だけ抱えることになる）
+pub(crate) enum Slot {
+    Empty,
+    Session(SessionId),
     New(NewState),
+}
+
+impl Slot {
+    /// そのスロットが映しているセッション
+    pub(crate) fn session(&self) -> Option<&SessionId> {
+        match self {
+            Self::Session(id) => Some(id),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) struct App {
     /// 開いているウィンドウ（前景セッションの PTY そのもの）。**一覧の行とは別物**で、
     /// 窓を閉じてもプロセスが終わるだけ ＝ 行（[`Self::sessions`]）は残る
     pub(crate) windows: Vec<Session>,
-    /// 表示中のウィンドウ（[`Self::windows`] の添字）
-    pub(crate) active: usize,
+    /// スロットの並べ方（入口は サイドバーの ▦ layout 行のメニュー）
+    pub(crate) layout: crate::panes::Layout,
+    /// 十字の位置（境界ドラッグで動く）
+    pub(crate) split: crate::panes::Split,
+    /// スロットの中身。**長さは常に `layout.slots()`**（保つのは [`App::set_layout`] だけ）
+    pub(crate) slots: Vec<Slot>,
+    /// フォーカス中のスロット。**[`Self::focus`] がサイドバーでも保たれる**ので、
+    /// 一覧の `open` が入る先と `Alt+→` の戻り先が必ず一致する。
+    ///
+    /// **触るキーが分かれているのが要点**: `Alt+←/→` は [`Self::focus`] だけを、
+    /// `Alt+Shift+方向` はここだけを動かす。1 つのキーが両方へ書くと、
+    /// サイドバーへ抜ける道中でこの値が壊れ、最左列以外のスロットを
+    /// `open` の宛先にできなくなる
+    pub(crate) focus_slot: usize,
     // 生きている前景セッションのライブ状態（`~/.claude/sessions/` 由来。
     // バックグラウンドスレッドが更新）
     pub(crate) agents: Vec<AgentInfo>,
@@ -381,13 +434,17 @@ pub(crate) struct App {
     pub(crate) last_live_scan: std::time::Instant,
     pub(crate) sidebar_width: u16,
     pub(crate) dragging: bool,
+    /// 十字の境界をつかんでいる間だけ Some。中身は `(縦を動かすか, 横を動かすか)` で、
+    /// **交点をつかめば両方 true** ＝ 縦横を同時に動かせる
+    pub(crate) cross_drag: Option<(bool, bool)>,
     pub(crate) last_drag_resize: std::time::Instant,
     pub(crate) term_size: (u16, u16), // (width, height)
     // サイドバーに積まれた行（draw で構築）。飾りと押せない行の区別は [`SidebarRow`]
     pub(crate) sidebar_rows: Vec<SidebarRow>,
-    // サイドバー上部の固定行数（ccdesk 版行・claude 版行・区切り線・+ new session・
-    // 区切り線・⊞ group・集計行）。正本は draw（積んだ行数をそのまま記録する）で、
-    // ヒットテストとスクロール計算は sidebar_rows と同じく「最後に描いた値」を読む
+    // サイドバー上部の固定行数（版行・区切り線・+ new session・⊞ group・▦ layout・
+    // 集計行など）。**行の一覧をここに書き写さない**（足すたびに黙って古くなる）:
+    // 正本は draw が積んだ行数そのもので、ヒットテストとスクロール計算は
+    // sidebar_rows と同じく「最後に描いた値」を読む
     pub(crate) sidebar_header_rows: usize,
     // サイドバーのスクロール位置（先頭に表示する行 index。draw でクランプ）
     pub(crate) sidebar_scroll: usize,
@@ -405,7 +462,6 @@ pub(crate) struct App {
     // `↑↓` で選択だけを動かしている間は勝手に戻らない
     pub(crate) pane_shown: Option<SessionId>,
     pub(crate) dispatch_cwd: String,
-    pub(crate) right_view: RightView,
     // サイドバー下部のアカウント・バージョン表示（バックグラウンド取得）
     pub(crate) footer: FooterInfo,
     pub(crate) footer_shared: Arc<Mutex<FooterInfo>>,
@@ -509,7 +565,10 @@ impl Default for App {
     fn default() -> Self {
         Self {
             windows: Vec::new(),
-            active: 0,
+            layout: crate::panes::Layout::default(),
+            split: crate::panes::Split::default(),
+            slots: vec![Slot::Empty],
+            focus_slot: 0,
             agents: Vec::new(),
             agents_observed_at: 0,
             agents_shared: Arc::new(Mutex::new(crate::poll::AgentSnapshot::default())),
@@ -524,6 +583,7 @@ impl Default for App {
             last_live_scan: std::time::Instant::now(),
             sidebar_width: 34,
             dragging: false,
+            cross_drag: None,
             last_drag_resize: std::time::Instant::now(),
             term_size: (120, 30),
             sidebar_rows: Vec::new(),
@@ -534,7 +594,6 @@ impl Default for App {
             selection: SidebarPos::Row(0),
             pane_shown: None,
             dispatch_cwd: String::new(),
-            right_view: RightView::Sessions,
             footer: FooterInfo::default(),
             footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
             footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -579,27 +638,83 @@ impl Default for App {
 type Launched = Result<Option<SessionId>, String>;
 
 impl App {
-    fn pane_size(&self) -> (u16, u16) {
-        // 右ペインの矩形（正本は ui::pane_rect）から Block 枠線 2 桁/2 行を引いた
-        // 内側サイズ (rows, cols)
-        let pane = crate::ui::pane_rect(self);
+    /// 各スロットの矩形（並びはスロット番号順）。**矩形の正本はここ 1 つ**で、
+    /// 描画・ヒットテスト・PTY のサイズが同じ答えを読む
+    pub(crate) fn slot_rects(&self) -> Vec<Rect> {
+        self.layout.rects(crate::ui::pane_rect(self), self.split)
+    }
+
+    /// スロット矩形から Block 枠線 2 桁/2 行を引いた内側サイズ `(rows, cols)`
+    fn inner_size(rect: Rect) -> (u16, u16) {
         (
-            pane.height.saturating_sub(2).max(1),
-            pane.width.saturating_sub(2).max(1),
+            rect.height.saturating_sub(2).max(1),
+            rect.width.saturating_sub(2).max(1),
         )
     }
 
+    /// PTY のサイズを合わせる。**見えている窓は自分のスロットの大きさ**、
+    /// どのスロットにも出ていない窓はフォーカススロットの大きさにしておく
+    /// （次に映したときに正しい大きさで出る ＝ 映した瞬間の作り直しが要らない）
     fn resize_sessions(&mut self) {
-        let (rows, cols) = self.pane_size();
+        let rects = self.slot_rects();
+        let default = rects
+            .get(self.focus_slot)
+            .or_else(|| rects.first())
+            .map_or((1, 1), |r| Self::inner_size(*r));
+        let mut want: std::collections::HashMap<SessionId, (u16, u16)> =
+            std::collections::HashMap::new();
+        for (slot, rect) in self.slots.iter().zip(rects.iter()) {
+            if let Some(id) = slot.session() {
+                want.insert(id.clone(), Self::inner_size(*rect));
+            }
+        }
         for window in &mut self.windows {
+            let (rows, cols) = want.get(&window.session_id).copied().unwrap_or(default);
             window.resize(rows, cols);
         }
     }
 
+    /// 配置を変える。**スロットの数を `layout` に合わせるのはここだけ**なので、
+    /// 「長さが合っていない `slots`」が他所で作られることがない。
+    /// 溢れたスロットの中身は捨てるだけ（PTY は [`Self::windows`] が持ったまま
+    /// 生き続ける ＝ 表示から外れるだけで何も終わらない）
+    pub(crate) fn set_layout(&mut self, layout: crate::panes::Layout) {
+        self.layout = layout;
+        let want = layout.slots();
+        self.slots.truncate(want);
+        while self.slots.len() < want {
+            self.slots.push(Slot::Empty);
+        }
+        self.focus_slot = self.focus_slot.min(want.saturating_sub(1));
+        self.resize_sessions();
+    }
+
+    /// フォーカス中のスロットへ new session 画面を出す
     pub(crate) fn open_new_view(&mut self) {
-        self.right_view = RightView::New(NewState::browse(&self.dispatch_cwd));
-        // 次回起動時に同じ画面を復元する（None = new session 画面）
-        self.source.save_window(WindowItem::LastView(None));
+        let state = NewState::browse(&self.dispatch_cwd);
+        self.put_in_focus(Slot::New(state));
+    }
+
+    /// フォーカス中のスロットの中身を差し替える。**保存もここから**
+    fn put_in_focus(&mut self, slot: Slot) {
+        if let Some(at) = self.slots.get_mut(self.focus_slot) {
+            *at = slot;
+        }
+        self.save_slots();
+    }
+
+    /// 次回起動で同じ並びを復元できるように書き残す
+    pub(crate) fn save_slots(&self) {
+        let views: Vec<crate::source::SlotView> = self
+            .slots
+            .iter()
+            .map(|slot| match slot {
+                Slot::Empty => crate::source::SlotView::Empty,
+                Slot::New(_) => crate::source::SlotView::New,
+                Slot::Session(id) => crate::source::SlotView::Session(id.as_str().to_string()),
+            })
+            .collect();
+        self.source.save_window(WindowItem::Slots(&views));
     }
 
     /// ポーラーの書き込み先をまとめて渡す。どのポーラーを起こすかは供給元が決めるので、
@@ -618,14 +733,13 @@ impl App {
 
     /// フォーカス変更（PTY への focus in/out 通知つき）。
     /// サイドバーへ移った瞬間は一覧と生死を即スキャンして表示を最新化する
-    fn set_focus(&mut self, focus: Focus) {
+    pub(crate) fn set_focus(&mut self, focus: Focus) {
         if self.focus == focus {
             return;
         }
-        if matches!(self.right_view, RightView::Sessions)
-            && let Some(window) = self.windows.get_mut(self.active) {
-                window.send_focus(focus == Focus::Terminal);
-            }
+        if let Some(at) = self.focused_window() {
+            self.windows[at].send_focus(focus == Focus::Terminal);
+        }
         self.focus = focus;
         if focus == Focus::Sidebar {
             self.last_scan = instant_ago(SCAN_INTERVAL);
@@ -633,30 +747,115 @@ impl App {
         }
     }
 
-    /// 右ペインに表示するウィンドウを切り替える（フォーカスは動かさない）
-    fn show_session(&mut self, idx: usize) {
-        if self.focus == Focus::Terminal && idx != self.active
-            && let Some(old) = self.windows.get_mut(self.active) {
-                old.send_focus(false);
-            }
-        self.active = idx;
-        self.right_view = RightView::Sessions;
-        // 次回起動時に同じセッションを復元する
-        if let Some(id) = self.windows.get(idx).map(|w| w.session_id.clone()) {
-            self.source.save_window(WindowItem::LastView(Some(&id)));
+    /// **フォーカス中のスロットへそのセッションを移す。元居たスロットは空になる。**
+    ///
+    /// **動くのは触ったセッションだけ。** 入れ替え（押し出された側を元居た場所へ
+    /// 送る）にはしていない: 触っていないセッションが勝手に別のスロットへ
+    /// 飛ぶのは、押した人から見て説明できない動きになる。押し出された側は
+    /// 表示から外れるだけで、**行も PTY も残る**（選び直せば戻る）。
+    ///
+    /// 規則はこの 1 つだけで全部の場合を覆う（未表示 / 他スロットに表示中 ×
+    /// 移す先が空 / 埋まっている の 4 通り）。**同じセッションが 2 スロットに
+    /// 出ることは構造的に起きない**: 1 つの [`crate::session::Session`] は
+    /// PTY もパーサもサイズを 1 つしか持てないので、2 箇所に違う大きさで
+    /// 映すことがそもそもできない
+    fn show_session(&mut self, id: &SessionId) {
+        let to = self.focus_slot;
+        let from = self.slot_of(id);
+        if from == Some(to) {
+            return;
         }
+        if to >= self.slots.len() {
+            return; // 配置がまだ組まれていない（起動列の途中）
+        }
+        // **押し出される窓へ focus out を送るのが先。** これを落とすと、
+        // 追い出された側と入ってきた側の両方が「自分が端末を持っている」と
+        // 思い込んだまま残る（次に戻したとき focus in が 2 回続けて届く）
         if self.focus == Focus::Terminal
-            && let Some(window) = self.windows.get_mut(idx) {
-                window.send_focus(true);
-            }
+            && let Some(at) = self.focused_window()
+        {
+            self.windows[at].send_focus(false);
+        }
+        self.slots[to] = Slot::Session(id.clone());
+        // 元居たスロットは空にする（そこへ何かを送り込まない ＝ 触っていない
+        // セッションは 1 つも動かない）
+        if let Some(from) = from {
+            self.slots[from] = Slot::Empty;
+        }
+        self.save_slots();
+        self.focus_terminal_on(to);
+        self.resize_sessions();
     }
 
-    /// **今ペインに出ているセッション**（右ペインがセッション表示でないなら None）。
+    /// フォーカススロットを移す（PTY への focus in/out 通知つき）。
+    /// **[`Self::focus`] は触らない**（サイドバーにいるかどうかは `Alt+←/→` の担当）
+    pub(crate) fn set_focus_slot(&mut self, to: usize) {
+        if to == self.focus_slot || to >= self.slots.len() {
+            return;
+        }
+        if self.focus == Focus::Terminal
+            && let Some(at) = self.focused_window()
+        {
+            self.windows[at].send_focus(false);
+        }
+        self.focus_slot = to;
+        self.focus_terminal_on(to);
+    }
+
+    /// スロット `to` にフォーカスがあるとき、その窓へ focus in を送る
+    fn focus_terminal_on(&mut self, to: usize) {
+        if self.focus != Focus::Terminal || self.focus_slot != to {
+            return;
+        }
+        if let Some(at) = self.focused_window() {
+            self.windows[at].send_focus(true);
+        }
+    }
+
+    /// new session 画面をやめて空スロットへ戻す（Esc）
+    pub(crate) fn leave_new_view(&mut self) {
+        if self.focus_is_new() {
+            self.put_in_focus(Slot::Empty);
+        }
+    }
+
+    /// フォーカス中のスロットの内側サイズ `(rows, cols)`（起動する PTY の初期サイズ）
+    pub(crate) fn focus_slot_size(&self) -> (u16, u16) {
+        let rects = self.slot_rects();
+        rects
+            .get(self.focus_slot)
+            .or_else(|| rects.first())
+            .map_or((1, 1), |r| Self::inner_size(*r))
+    }
+
+    /// フォーカス中のスロットが new session 画面か
+    pub(crate) fn focus_is_new(&self) -> bool {
+        matches!(self.slots.get(self.focus_slot), Some(Slot::New(_)))
+    }
+
+    /// フォーカス中のスロットの new session 画面
+    pub(crate) fn focused_new(&mut self) -> Option<&mut NewState> {
+        match self.slots.get_mut(self.focus_slot) {
+            Some(Slot::New(state)) => Some(state),
+            _ => None,
+        }
+    }
+
+    /// そのセッションを映しているスロット
+    fn slot_of(&self, id: &SessionId) -> Option<usize> {
+        self.slots.iter().position(|s| s.session() == Some(id))
+    }
+
+    /// フォーカス中のスロットが映している窓（[`Self::windows`] の添字）
+    pub(crate) fn focused_window(&self) -> Option<usize> {
+        self.shown_session()
+            .and_then(|id| self.windows.iter().position(|w| &w.session_id == id))
+    }
+
+    /// **今フォーカススロットに出ているセッション**（空 / New 画面なら None）。
     /// 「キー入力の宛先」と「ユーザーが見ている行」がどちらもこの 1 つの判断から出る
     pub(crate) fn shown_session(&self) -> Option<&SessionId> {
-        matches!(self.right_view, RightView::Sessions)
-            .then(|| self.windows.get(self.active).map(|w| &w.session_id))
-            .flatten()
+        self.slots.get(self.focus_slot).and_then(Slot::session)
     }
 
     /// **キー入力が今このセッションへ届く形になっているか。**
@@ -782,7 +981,7 @@ fn draw_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow:
 /// （live-scan の「死んだ PTY は自分の窓だけ閉じる」と同じ扱い。以前は `?` で
 /// run() ごと抜け、健全な全セッションを道連れに ccdesk が終了していた）
 fn send_to_active(app: &mut App, bytes: &[u8]) {
-    let Some(window) = app.windows.get(app.active) else {
+    let Some(window) = app.focused_window().map(|at| &app.windows[at]) else {
         return;
     };
     if window.send(bytes).is_ok() {
@@ -791,6 +990,17 @@ fn send_to_active(app: &mut App, bytes: &[u8]) {
     let id = window.session_id.clone();
     set_notice(app, format!("could not write to session {id}; closing its window"));
     close_window_of(app, &id);
+}
+
+/// ホスト端末のフォーカス変化を中継する。**届くのはフォーカススロットの窓だけ**
+/// （裏のスロットは端末を持っていないので、通知しても意味が無い）
+fn forward_host_focus(app: &mut App, gained: bool) {
+    if app.focus != Focus::Terminal {
+        return;
+    }
+    if let Some(at) = app.focused_window() {
+        app.windows[at].send_focus(gained);
+    }
 }
 
 /// この周に描くか。**再描画は「PTY に新出力」「UI イベント」「無変化でも
@@ -859,8 +1069,8 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         // 決まっているので、待つのは「子が入力を読める状態になるまで」だけ）
         if app.input_gate.is_some()
             && let Some(id) = app
-                .windows
-                .get(app.active)
+                .focused_window()
+                .map(|at| &app.windows[at])
                 .filter(|w| w.started())
                 .map(|w| w.session_id.clone())
         {
@@ -949,12 +1159,13 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         }
         // claude が画面を作り替えている最中は掴まない（[`Session::holds_frame`]）。
         // 途中で掴むとカーソルが中間位置で確定し、IME の変換窓がそこへ飛ぶ。
-        // 見るのは右ペインに出ている窓だけ ＝ New 画面は自前のカーソルなので待たせない
-        let holding = !matches!(app.right_view, RightView::New(_))
-            && app
-                .windows
-                .get(app.active)
-                .is_some_and(|w| w.holds_frame(last_draw.elapsed()));
+        // **見るのはフォーカススロットの窓 1 つだけ。** 全スロットを見ると、
+        // 4 枚のうち誰か 1 人が常に書いている状況で描画が止まり続ける。
+        // 待つ理由（カーソルが中間位置で確定し IME の変換窓が飛ぶ）は
+        // カーソルを出している窓にしか無いので、これで足りる
+        let holding = app
+            .focused_window()
+            .is_some_and(|at| app.windows[at].holds_frame(last_draw.elapsed()));
         // **合図（dirty）を降ろすのは実際に描く周だけ**なので、読むのはここ。
         // 見送る周で降ろすと、次の出力が来るまで画面が古いままになる
         let pty_dirty = app
@@ -996,6 +1207,13 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                         app.set_focus(to);
                         continue;
                     }
+                    // 行き先が無い向きは何もしない（配置の端）
+                    Some(Reserved::Slot(dir)) => {
+                        if let Some(to) = app.layout.neighbor(app.focus_slot, dir) {
+                            app.set_focus_slot(to);
+                        }
+                        continue;
+                    }
                     None => {}
                 }
                 // サイドバーフォーカス中のキー操作（入力欄は名前の変更中だけ）
@@ -1004,7 +1222,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                     continue;
                 }
                 // 新規セッション画面のキー操作
-                if let RightView::New(_) = app.right_view {
+                if app.focus_is_new() {
                     handle_new_view_key(app, &key)?;
                     continue;
                 }
@@ -1016,17 +1234,17 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 if app.windows.is_empty() {
                     continue;
                 }
-                let bytes = {
-                    let window = &app.windows[app.active];
-                    encode_key(&key, &window.parser.lock_recover())
+                let Some(at) = app.focused_window() else {
+                    continue;
                 };
+                let bytes = encode_key(&key, &app.windows[at].parser.lock_recover());
                 if !bytes.is_empty() {
                     send_to_active(app, &bytes);
                 }
             }
             Event::Paste(text) => {
                 // New 画面の D&D/貼り付けの解釈は new_view 側（キー・マウスと同じ場所）
-                if let RightView::New(state) = &mut app.right_view {
+                if let Some(state) = app.focused_new() {
                     state.handle_paste(&text);
                     continue;
                 }
@@ -1042,10 +1260,11 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 }
                 // sanitize と bracketed paste の包みはキー入力と同じ keys 側
                 // （「入力を VT バイト列にする」知識を run ループに置かない）
-                let bytes = {
-                    let window = &app.windows[app.active];
-                    crate::keys::encode_paste(&text, &window.parser.lock_recover())
+                let Some(at) = app.focused_window() else {
+                    continue;
                 };
+                let bytes =
+                    crate::keys::encode_paste(&text, &app.windows[at].parser.lock_recover());
                 send_to_active(app, &bytes);
             }
             Event::Mouse(mouse) => {
@@ -1060,18 +1279,8 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             Event::Resize(w, h) => resize_terminal(app, w, h),
             // ホスト端末のフォーカス変化をアクティブ PTY へ中継
             // （ターミナルペインがフォーカス中のときだけ意味を持つ）
-            Event::FocusGained => {
-                if app.focus == Focus::Terminal
-                    && let Some(window) = app.windows.get_mut(app.active) {
-                        window.send_focus(true);
-                    }
-            }
-            Event::FocusLost => {
-                if app.focus == Focus::Terminal
-                    && let Some(window) = app.windows.get_mut(app.active) {
-                        window.send_focus(false);
-                    }
-            }
+            Event::FocusGained => forward_host_focus(app, true),
+            Event::FocusLost => forward_host_focus(app, false),
             _ => {}
         }
     }
@@ -1091,16 +1300,37 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
 enum Reserved {
     /// 緊急脱出（マウスが効かない環境向け）
     Quit,
-    /// ペインフォーカスの移動
+    /// サイドバー ⇄ メインビュー
     Focus(Focus),
+    /// スロット間の移動
+    Slot(crate::panes::Dir),
 }
 
+/// **Shift の有無で触るものが分かれているのが要点。**
+///
+/// `Alt+←/→` は「サイドバーにいるか」だけを、`Alt+Shift+方向` は
+/// 「どのスロットが宛先か」だけを動かす。1 つのキーが両方へ書く形にすると、
+/// サイドバーへ抜ける道中で宛先スロットが壊れ、**最左列以外のスロットへ
+/// セッションを開けなくなる**（`Alt+←` を 2 回押してサイドバーへ行った時点で、
+/// 宛先が左列のスロットに変わってしまうため）。
+///
+/// 行き先が無い向き（1 枚のときの `Alt+Shift+↑` 等）も**予約は外さない**:
+/// 外すとこの関数が配置を見る必要が生じ、`&KeyEvent` だけを見る純関数で
+/// なくなる。その純粋性は「素通しするキーを黙って減らしていないか」を
+/// テストで固定する土台なので崩さない
 fn reserved_key(key: &KeyEvent) -> Option<Reserved> {
+    use crate::panes::Dir;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
         // Shift の付いた `Ctrl+Shift+Q` は予約しない（1 打鍵でも減らす）
         KeyCode::Char('q') if ctrl => Some(Reserved::Quit),
+        // Alt+Shift が先（後ろに置くと Alt だけの腕に食われる）
+        KeyCode::Left if alt && shift => Some(Reserved::Slot(Dir::Left)),
+        KeyCode::Right if alt && shift => Some(Reserved::Slot(Dir::Right)),
+        KeyCode::Up if alt && shift => Some(Reserved::Slot(Dir::Up)),
+        KeyCode::Down if alt && shift => Some(Reserved::Slot(Dir::Down)),
         KeyCode::Left if alt => Some(Reserved::Focus(Focus::Sidebar)),
         KeyCode::Right if alt => Some(Reserved::Focus(Focus::Terminal)),
         _ => None,
@@ -1171,7 +1401,10 @@ pub(crate) fn selected_enter(app: &App) -> Option<Enter> {
     let SidebarPos::Row(row) = app.selection;
     match app.sidebar_rows.get(row)?.action()? {
         RowAction::New => Some(Enter::NewSession),
-        RowAction::Open(_) | RowAction::Project(_) | RowAction::ToggleGroup => Some(Enter::Menu),
+        RowAction::Open(_)
+        | RowAction::Project(_)
+        | RowAction::ToggleGroup
+        | RowAction::ChooseLayout => Some(Enter::Menu),
         RowAction::UpdateCcdesk => Some(Enter::UpdateCcdesk),
         RowAction::UpdateAgent(_) => Some(Enter::UpdateAgent),
         RowAction::RestartCcdesk => Some(Enter::RestartCcdesk),
@@ -1209,6 +1442,20 @@ fn run_row_action(app: &mut App, action: RowAction, anchor_y: u16) {
             app.set_focus(Focus::Terminal);
         }
         RowAction::ToggleGroup => open_popup(app, PopupKind::State, anchor_y),
+        RowAction::ChooseLayout => {
+            // 押せる項目の判断は**開いた時点の端末の大きさ**で決める
+            // （矩形の正本は ui::pane_rect、判定の正本は Layout::fits）
+            let area = crate::ui::pane_rect(app);
+            let fits = crate::panes::Layout::ORDER
+                .into_iter()
+                .filter(|l| l.fits(area, app.split))
+                .collect();
+            let kind = PopupKind::Layout {
+                current: app.layout,
+                fits,
+            };
+            open_popup(app, kind, anchor_y);
+        }
         // 見出し行はメニューを開くだけ。**フォーカスは移さない**（メニューがキーを受ける）
         RowAction::Project(cwd) => open_project_popup(app, cwd, anchor_y),
         // 更新行はその場で実行するだけ（右ペインを切り替えない）
@@ -1227,7 +1474,10 @@ fn run_row_action(app: &mut App, action: RowAction, anchor_y: u16) {
 /// New 画面からの起動。**セッションの実体は ccdesk の子プロセス**になり、
 /// ccdesk を閉じると終わる（行は `sessions.json` に残り `claude -r` で再開できる）
 pub(crate) fn start_new_session(app: &mut App) -> anyhow::Result<()> {
-    let RightView::New(state) = &app.right_view else {
+    let Some(state) = app.slots.get(app.focus_slot).and_then(|slot| match slot {
+        Slot::New(state) => Some(state),
+        _ => None,
+    }) else {
         return Ok(());
     };
     let cwd = state.cur_dir.clone();
@@ -1657,7 +1907,7 @@ fn start_foreground(app: &mut App, kind: Kind, cwd: &str, prompt: &str) -> Launc
     // statusline を奪わない。[`crate::hooks::inject_settings`]）
     let injection = hook_settings(app);
     let inject = injection.as_ref().map(as_inject);
-    let (rows, cols) = app.pane_size();
+    let (rows, cols) = app.focus_slot_size();
     let spawn = kind.spawn_command(&session_id, cwd, Launch::New { prompt }, inject.as_ref());
     // **渡した会話 ID を控えるのは起こす前。** 起こしてから読み直せる場所は無い
     // （argv には出ているが、そこから読み戻すのは同じ知識の 2 本目になる）
@@ -1675,7 +1925,7 @@ fn start_foreground(app: &mut App, kind: Kind, cwd: &str, prompt: &str) -> Launc
     app.sessions.push(row);
     save_sessions(app);
     app.windows.push(window);
-    app.show_session(app.windows.len() - 1);
+    app.show_session(&session_id);
     Ok(Some(session_id))
 }
 
@@ -1746,6 +1996,13 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         _ => {}
     }
 
+    // 十字の境界ドラッグ（サイドバー幅の掴み代と同じ作法）。**スロットのクリック判定
+    // より先**に見るのが要点で、境界はスロットの枠線に重なっているため、後回しにすると
+    // 掴み代がフォーカス移動に化ける。交点をつかめば縦横が同時に動く
+    if handle_cross_drag(app, mouse) {
+        return Ok(false);
+    }
+
     // 下部バーの使用率をクリックしたらその場で取り直す（周期を待たない）。
     // **サイドバー／右ペインの振り分けより先**に見るのが要点で、使用率は右端 ＝
     // 右ペインの列範囲に描かれるため、後回しにするとペインのクリックに食われる。
@@ -1803,7 +2060,7 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let action = app.sidebar_rows.get(row).and_then(SidebarRow::action).cloned();
             // サイドバー内クリックはサイドバーへフォーカス。
-            // 行クリックは右ペインの内容だけ切り替える（フォーカス移動は右ペインクリック or Enter）
+            // 行クリックはフォーカススロットの中身だけ切り替える（フォーカス移動はスロットのクリック or Enter）
             app.set_focus(Focus::Sidebar);
             if selectable {
                 app.selection = SidebarPos::Row(row);
@@ -1825,16 +2082,28 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         }
     } else {
         app.hovered = None;
+        // スロット矩形は state の可変借用の前に取る（矩形の正本は App::slot_rects）
+        let rects = app.slot_rects();
+        let on = rects
+            .iter()
+            .position(|r| r.contains(Position::new(mouse.column, mouse.row)));
         if let MouseEventKind::Down(_) = mouse.kind {
             app.set_focus(Focus::Terminal);
+            // **押したスロットが宛先になる**（`Alt+Shift+方向` で移るのと同じ結果）
+            if let Some(on) = on {
+                app.set_focus_slot(on);
+            }
         }
-        // 右ペイン矩形と出す agent は state の可変借用の前に取る
-        // （矩形の正本は ui::pane_rect、agent の正本は App::kinds）
-        let pane = crate::ui::pane_rect(app);
+        // **フォーカススロット以外へのイベントは中身へ渡さない。** 裏のスロットの
+        // claude にホイールやクリックが届くと、見ていない画面が勝手に動く
+        if on != Some(app.focus_slot) {
+            return Ok(false);
+        }
+        let pane = rects[app.focus_slot];
         let kinds = app.kinds.clone();
         // New 画面: 入力の解釈は new_view 側（ヒットテストのジオメトリ知識を
         // レイアウトと同じファイルに閉じる）。起動だけは state の借用を抜けて実行
-        if let RightView::New(state) = &mut app.right_view {
+        if let Some(state) = app.focused_new() {
             let action = state.handle_mouse(pane, mouse, &kinds);
             if action == Some(crate::ui::new_view::NewAction::Launch) {
                 start_new_session(app)?;
@@ -1844,10 +2113,63 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         if app.windows.is_empty() {
             return Ok(false);
         }
-        // 右ペイン: イベントを claude へ転送（ホイールも claude 自身がスクロール処理する）
+        // フォーカススロット: イベントを claude へ転送（ホイールも claude 自身が処理する）
         forward_mouse(app, mouse);
     }
     Ok(false)
+}
+
+/// 十字の境界ドラッグ。**掴んだ・動かした・離した周は true**（呼び手はそこで打ち切る）。
+///
+/// 掴み代は境界の 2 列（行）＝ 隣り合うスロットの枠線が並んで見える幅で、
+/// 位置の正本は [`crate::panes::Layout::cross`]（描画と同じ導出なので、
+/// 見えている線と掴める場所がずれない）
+fn handle_cross_drag(app: &mut App, mouse: &MouseEvent) -> bool {
+    let area = crate::ui::pane_rect(app);
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) if app.cross_drag.is_none() => {
+            // **掴めるかの判断は [`crate::panes::Layout::grab_at`] 1 つ**。
+            // 「列が合っている」だけでは足りない（3 分割では境界が途中で消えるので、
+            // 全高スロットの内側でそこを押した打鍵は claude へ届かねばならない）
+            let (on_v, on_h) = app.layout.grab_at(area, app.split, mouse.column, mouse.row);
+            if !on_v && !on_h {
+                return false;
+            }
+            app.cross_drag = Some((on_v, on_h));
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) if app.cross_drag.is_some() => {
+            let (v, h) = app.cross_drag.unwrap_or((false, false));
+            let pct = |n: u16, total: u16| {
+                if total == 0 {
+                    50
+                } else {
+                    (u32::from(n) * 100 / u32::from(total)) as u16
+                }
+            };
+            if v {
+                app.split.v = pct(mouse.column.saturating_sub(area.x), area.width);
+            }
+            if h {
+                app.split.h = pct(mouse.row.saturating_sub(area.y), area.height);
+            }
+            app.split = app.split.clamped();
+            // PTY リサイズは間引く（サイドバー幅のドラッグと同じ理由）
+            if app.last_drag_resize.elapsed() > Duration::from_millis(50) {
+                app.resize_sessions();
+                app.last_drag_resize = std::time::Instant::now();
+            }
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) if app.cross_drag.is_some() => {
+            app.cross_drag = None;
+            app.resize_sessions(); // 最終サイズを確定
+            app.source.save_window(WindowItem::Split(app.split));
+            true
+        }
+        // つかんでいる間は他の判定へ落とさない（掴んだ操作を優先する）
+        _ => app.cross_drag.is_some(),
+    }
 }
 
 /// 窓が開いていて子プロセスが生きているか。**前景では自分の子プロセスが
@@ -1966,6 +2288,7 @@ fn run_popup_action(app: &mut App, action: PopupAction) {
         PopupAction::Stop(id) => menu_stop(app, &id),
         PopupAction::Close(id) => menu_close(app, &id),
         PopupAction::SetGrouping(next) => set_grouping(app, next),
+        PopupAction::SetLayout(next) => set_layout(app, next),
         // 空プロンプトで起動する（登録は dispatch_session が行う）
         PopupAction::NewSessionIn(kind, cwd) => dispatch_session(app, kind, cwd, String::new()),
         PopupAction::RemoveProject(cwd) => remove_project(app, &cwd),
@@ -1982,6 +2305,19 @@ fn set_grouping(app: &mut App, next: Grouping) {
     }
     app.grouping = next;
     app.source.save_window(WindowItem::Grouping(next));
+}
+
+/// スロットの並べ方の選択（入口は ▦ layout 行のメニューだけ）。
+/// **スロット数を合わせるのは [`App::set_layout`] 1 箇所**なので、ここは
+/// 選ばれた値を渡して保存するだけ。溢れたスロットの中身は表示から外れるが、
+/// PTY は生きたまま残る（何も終わらない）
+fn set_layout(app: &mut App, next: crate::panes::Layout) {
+    if app.layout == next {
+        return;
+    }
+    app.set_layout(next);
+    app.source.save_window(WindowItem::Layout(next));
+    app.save_slots();
 }
 
 /// メニュー: stop（セッションのプロセスを終わらせる）。
@@ -2065,8 +2401,8 @@ fn close_window_of(app: &mut App, id: &SessionId) {
     remove_window(app, i);
 }
 
-/// ウィンドウを一覧から外す（active 添字も詰める）。
-/// 表示するウィンドウが無くなったら右ペインは New 画面へ。
+/// ウィンドウを一覧から外す。**その窓を映していたスロットは空になる**
+/// （行は残るので、開き直せば同じスロットへ戻せる）。
 ///
 /// **`App::stopped_at` を刻む場所はここ 1 箇所。** 窓を外す経路は 3 つある
 /// （[`close_window_of`] 経由の `stop`/`close`/PTY 書き込み失敗、生死スキャンが
@@ -2081,17 +2417,17 @@ fn remove_window(app: &mut App, idx: usize) {
     if idx >= app.windows.len() {
         return;
     }
-    app.stopped_at.insert(app.windows[idx].session_id.clone(), now_ms());
-    let was_active = idx == app.active;
+    let id = app.windows[idx].session_id.clone();
+    app.stopped_at.insert(id.clone(), now_ms());
     app.windows.remove(idx);
     app.hovered = None;
-    if app.active >= idx && app.active > 0 {
-        app.active -= 1;
-    }
-    // 右ペインが既に New 画面なら奪わない: 表示されていたのは死んだ窓ではなく
-    // New 画面で、作り直すと**入力途中のプロンプトが無警告で消える**
-    if (app.windows.is_empty() || was_active) && !matches!(app.right_view, RightView::New(_)) {
-        app.open_new_view();
+    // **その窓を映していたスロットは空になる**（New 画面へは奪われない）。
+    // 以前は New 画面を開いていたが、`stop` した直後に書きかけのフォームが出るのは
+    // 「止めた」という操作の結果として読めない。空の `no session` はそのまま
+    // 「ここには今なにも無い」を表す
+    if let Some(at) = app.slots.iter().position(|s| s.session() == Some(&id)) {
+        app.slots[at] = Slot::Empty;
+        app.save_slots();
     }
 }
 
@@ -2289,16 +2625,29 @@ fn start_unattended(
     if !app.kinds.contains(&kind) {
         return Err(format!("{} is not enabled in this ccdesk", kind.as_str()));
     }
-    // **添字で覚えておけるのは、窓が末尾にしか増えないから**（[`start_foreground`]
-    // は push する ＝ 既存の添字はずれない）
-    let watching = app.active;
-    let view = std::mem::replace(&mut app.right_view, RightView::Sessions);
+    // **頼まれていない起動が、今見ているものを画面から追い出さない。**
+    // 起動は必ずフォーカススロットへ映す（[`start_foreground`]）ので、
+    // 中身を退避して戻す ＝ 起きたセッションはどのスロットにも出ない
+    // （行としては一覧に出るので、見たければ選べばよい）
+    let watching = app
+        .slots
+        .get_mut(app.focus_slot)
+        .map(|slot| std::mem::replace(slot, Slot::Empty));
     let started = start_foreground(app, kind, cwd, prompt);
-    if !app.windows.is_empty() {
-        // 焦点の出入りを PTY へ正しく伝えるため、直接代入ではなく通常の経路で戻す
-        app.show_session(watching.min(app.windows.len() - 1));
+    if let (Some(watching), Some(slot)) = (watching, app.slots.get_mut(app.focus_slot)) {
+        *slot = watching;
     }
-    app.right_view = view;
+    app.save_slots();
+    // **起こした窓の focus in を取り消す。** 起動は必ずフォーカススロットを
+    // 経由するので focus in が飛んでいるが、中身を戻した今この窓はどこにも
+    // 出ていない ＝ 端末を持っていない
+    if let Ok(Some(id)) = &started
+        && let Some(at) = app.window_index(id)
+    {
+        app.windows[at].send_focus(false);
+    }
+    // 退避していた窓が戻ったので、フォーカスの持ち主を伝え直す
+    app.focus_terminal_on(app.focus_slot);
     match started {
         Ok(Some(id)) => Ok(id),
         // 起こさない供給元（撮影用）＝「試していない」ので、失敗として返す
@@ -2594,7 +2943,7 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
         if app.windows[i].alive() {
             // **その行を開いた時点が既読の契機**（切替も再開も同じ）
             mark_read(app, id);
-            app.show_session(i);
+            app.show_session(id);
             return true;
         }
         // 直前に死んだ窓（生死スキャンがまだ拾っていない）は開かない:
@@ -2650,7 +2999,7 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
     let cwd = cwd.into_owned();
     let spawn = kind.spawn_command(id, &cwd, launch, inject.as_ref());
     let conversation = spawn.conversation;
-    let (rows, cols) = app.pane_size();
+    let (rows, cols) = app.focus_slot_size();
     match Session::spawn(id, spawn.cmd, rows, cols) {
         Ok(window) => {
             // **起こし直しで会話が変わり得る**（記録を見失った行の新規起動）。
@@ -2668,7 +3017,7 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
             // （消さないと止めた行の数だけ溜まる）
             app.stopped_at.remove(id);
             app.windows.push(window);
-            app.show_session(app.windows.len() - 1);
+            app.show_session(id);
             // 再開は transcript の読み直しに時間がかかりうる。子が端末を掴むまでの
             // 打鍵は捨てる（[`drop_input_while_starting`]）
             app.input_gate = Some(std::time::Instant::now());
@@ -3454,7 +3803,7 @@ mod tests {
             match expected {
                 Some(Enter::Menu) => assert!(app.popup.is_some(), "{pos:?}: no menu opened"),
                 Some(Enter::NewSession) => assert!(
-                    matches!(app.right_view, RightView::New(_)),
+                    app.focus_is_new(),
                     "{pos:?}: the new session screen did not open"
                 ),
                 // restart は旗を立てるだけ（spawn は main）なので押しても安全
@@ -3466,7 +3815,7 @@ mod tests {
                 None => {
                     assert!(app.popup.is_none(), "{pos:?}: a menu opened on a row that offers nothing");
                     assert!(
-                        matches!(app.right_view, RightView::Sessions),
+                        !app.focus_is_new(),
                         "{pos:?}: the right pane switched on a row that offers nothing"
                     );
                     assert_eq!(state_name(&app), "Idle", "{pos:?}: an update started");
@@ -3524,9 +3873,14 @@ mod tests {
             "the hint lagged behind the selection: {inert_row:?}"
         );
 
-        // 版行を通り過ぎたら `+ new session`（区切り線は飛ばす）＝ 別の動詞になる。
-        // **版行の数は [`Kind::ORDER`] が決める**ので、ここで数を書き写さない
-        for _ in 0..Kind::ORDER.len() {
+        // `+ new session` まで下りると別の動詞になる。**間に何行あるかは数えない**:
+        // ヘッダーに行を足すたびに数を直す形にすると、この test が測っている
+        // 「案内が選択に追従するか」とは無関係な理由で落ちるようになる
+        let steps = app.sidebar_rows.len();
+        for _ in 0..steps {
+            if selected_enter(&app) == Some(Enter::NewSession) {
+                break;
+            }
             press(&mut app, KeyCode::Down);
         }
         let new_session_row = drawn_bottom_bar(&mut app);
@@ -3536,9 +3890,7 @@ mod tests {
         );
 
         // 戻しても同じフレームで戻る（片方向だけ追従しているのではない）
-        for _ in 0..Kind::ORDER.len() + 1 {
-            press(&mut app, KeyCode::Up);
-        }
+        app.selection = SidebarPos::Row(0);
         assert_eq!(drawn_bottom_bar(&mut app), update_row, "the hint did not follow back");
     }
 
@@ -3856,7 +4208,9 @@ mod tests {
         fn window_state(&self) -> WindowState {
             WindowState {
                 sidebar_width: 34,
-                last_view: None,
+                layout: crate::panes::Layout::One,
+                split: crate::panes::Split::default(),
+                slots: vec![crate::source::SlotView::New],
                 dispatch_cwd: String::new(),
                 grouping: Grouping::State,
                 // 起動時に読むディスクの内容。永続化層が無ければ 0 件
@@ -4862,7 +5216,7 @@ mod tests {
     fn launching_from_the_new_session_view_registers_its_folder() {
         let dir = std::env::temp_dir().to_string_lossy().to_string();
         let mut app = test_app(34, TERM);
-        app.right_view = RightView::New(NewState::browse(&dir));
+        app.slots = vec![Slot::New(NewState::browse(&dir))];
         start_new_session(&mut app).unwrap();
         assert_eq!(app.projects, std::slice::from_ref(&dir), "the launched folder was not registered");
         assert_eq!(app.dispatch_cwd, dir);
@@ -5577,7 +5931,7 @@ mod tests {
                 assert!(app.popup.is_none(), "{pos:?}: {code:?} opened a menu");
                 assert_eq!(app.selection, pos, "{pos:?}: {code:?} moved the selection");
                 assert!(
-                    matches!(app.right_view, RightView::Sessions),
+                    !app.focus_is_new(),
                     "{pos:?}: {code:?} switched the right pane"
                 );
                 assert_eq!(state_name(&app), "Idle", "{pos:?}: {code:?} started an update");
@@ -5621,11 +5975,15 @@ mod tests {
         }
     }
 
-    /// **予約はこの 3 つだけ。** ここに増やすと、その打鍵ぶんだけ claude 側の
+    /// **予約はこの 7 つだけ。** ここに増やすと、その打鍵ぶんだけ claude 側の
     /// キーバインドが死ぬ（二次操作はポップアップに集約した）
     #[test]
-    fn only_quit_and_pane_focus_are_reserved() {
+    fn only_quit_focus_and_slot_moves_are_reserved() {
+        use crate::panes::Dir;
         let alt = |code| KeyEvent::new(code, KeyModifiers::ALT);
+        let alt_shift = |code| {
+            KeyEvent::new(code, KeyModifiers::ALT | KeyModifiers::SHIFT)
+        };
         assert_eq!(
             reserved_key(&KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
             Some(Reserved::Quit)
@@ -5638,14 +5996,202 @@ mod tests {
             reserved_key(&alt(KeyCode::Right)),
             Some(Reserved::Focus(Focus::Terminal))
         );
-        // 修飾が違えば claude のもの（素の ←→ / 素の q / Ctrl+←→）
+        for (code, dir) in [
+            (KeyCode::Left, Dir::Left),
+            (KeyCode::Right, Dir::Right),
+            (KeyCode::Up, Dir::Up),
+            (KeyCode::Down, Dir::Down),
+        ] {
+            assert_eq!(
+                reserved_key(&alt_shift(code)),
+                Some(Reserved::Slot(dir)),
+                "Alt+Shift+{code:?} does not move between slots"
+            );
+        }
+        // 修飾が違えば claude のもの（素の ←→↑↓ / 素の q / Ctrl+←→ / Shift だけ）
         for key in [
             KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
             KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
         ] {
             assert_eq!(reserved_key(&key), None, "{key:?} is reserved");
         }
+    }
+
+    /// **▦ layout のメニューは配置の一覧そのもの。**
+    /// 現在値に `●` が付き、**その端末に入らない配置は押せない**（選んだ瞬間に
+    /// 崩れる項目を出さない）
+    #[test]
+    fn the_layout_menu_marks_the_current_one_and_disables_what_does_not_fit() {
+        use crate::panes::{Layout, Split};
+        let split = Split::default();
+        let roomy = Rect::new(0, 0, 80, 40);
+        let fits: Vec<Layout> = Layout::ORDER
+            .into_iter()
+            .filter(|l| l.fits(roomy, split))
+            .collect();
+        let kind = PopupKind::Layout {
+            current: Layout::TwoColumns,
+            fits,
+        };
+        let pairs = entry_pairs(&kind, Grouping::State);
+        assert_eq!(pairs.len(), Layout::ORDER.len(), "the menu is not the full list");
+        assert!(
+            pairs.iter().all(|(_, enabled)| *enabled),
+            "a layout is unusable on an 80x40 terminal: {pairs:?}"
+        );
+        let marked: Vec<&String> = pairs
+            .iter()
+            .filter(|(label, _)| label.starts_with("● "))
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(marked.len(), 1, "the current layout is not marked exactly once");
+        assert!(marked[0].ends_with(Layout::TwoColumns.as_str()));
+
+        // 1 枚ぶんしか無い端末では、分割した配置が全部落ちる
+        let tiny = Rect::new(0, 0, Layout::MIN_SLOT.1, Layout::MIN_SLOT.0);
+        let kind = PopupKind::Layout {
+            current: Layout::One,
+            fits: Layout::ORDER
+                .into_iter()
+                .filter(|l| l.fits(tiny, split))
+                .collect(),
+        };
+        let usable: Vec<String> = entry_pairs(&kind, Grouping::State)
+            .into_iter()
+            .filter(|(_, enabled)| *enabled)
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(usable.len(), 1, "a split layout is offered on a one-slot terminal");
+    }
+
+    /// **触ったセッションだけが動く。** 既に別のスロットに出ている行を選ぶと、
+    /// そのセッションがフォーカススロットへ移り、元居たスロットは空になる。
+    /// 押し出された側はどこへも飛ばない（表示から外れるだけで行も PTY も残る）
+    #[test]
+    fn choosing_a_visible_session_moves_only_that_one() {
+        let mut app = app_with_row("a");
+        app.sessions.push(session_row("b", "C:\\dev\\api", 1));
+        app.set_layout(crate::panes::Layout::TwoColumns);
+        app.slots[0] = Slot::Session(SessionId::new("a"));
+        app.slots[1] = Slot::Session(SessionId::new("b"));
+        // 右（b が居る）にフォーカスして a を選ぶ
+        app.focus_slot = 1;
+        app.show_session(&SessionId::new("a"));
+        assert_eq!(app.slots[1].session(), Some(&SessionId::new("a")), "a did not move");
+        assert!(
+            matches!(app.slots[0], Slot::Empty),
+            "the slot a came from was not emptied"
+        );
+        // b はどこにも出ていないが、行は残っている（選び直せば戻せる）
+        assert!(
+            app.slots.iter().all(|s| s.session() != Some(&SessionId::new("b"))),
+            "b was moved even though it was not touched"
+        );
+        assert!(app.row(&SessionId::new("b")).is_some(), "b's row disappeared");
+    }
+
+    /// **押したスロットが宛先になる**（キーボードの `Alt+Shift+方向` と同じ結果）。
+    /// 裏のスロットを押しても、そのスロットの中身へはイベントを渡さない
+    #[test]
+    fn clicking_a_slot_makes_it_the_target() {
+        let mut app = test_app(34, TERM);
+        app.set_layout(crate::panes::Layout::Four);
+        let rects = app.slot_rects();
+        for (at, rect) in rects.into_iter().enumerate() {
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + rect.width / 2,
+                row: rect.y + rect.height / 2,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_mouse(&mut app, &click).unwrap();
+            assert_eq!(app.focus_slot, at, "clicking slot {at} did not target it");
+            assert_eq!(app.focus, Focus::Terminal);
+        }
+    }
+
+    /// **十字の掴み代はスロットのクリックより先に効く。**
+    /// 境界はスロットの枠線に重なっているので、順序が逆だとドラッグが
+    /// フォーカス移動に化けて掴めなくなる
+    #[test]
+    fn the_cross_can_be_grabbed_where_the_slots_meet() {
+        let mut app = test_app(34, TERM);
+        app.set_layout(crate::panes::Layout::Four);
+        let area = crate::ui::pane_rect(&app);
+        let (vx, hy) = app.layout.cross(area, app.split);
+        let at = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, &at(vx.unwrap(), hy.unwrap())).unwrap();
+        assert_eq!(
+            app.cross_drag,
+            Some((true, true)),
+            "grabbing the intersection did not take both axes"
+        );
+        // 動かすと比率が変わり、離すと掴みが外れる
+        let before = app.split;
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x + area.width / 4,
+            row: area.y + area.height / 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, &drag).unwrap();
+        assert_ne!(app.split, before, "dragging the cross did not move it");
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: drag.column,
+            row: drag.row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, &up).unwrap();
+        assert_eq!(app.cross_drag, None, "the cross stayed grabbed after release");
+    }
+
+    /// **スロットを減らしても何も終わらない。** 溢れたセッションは表示から
+    /// 外れるだけで、PTY（[`App::windows`]）はそのまま残る
+    #[test]
+    fn shrinking_the_layout_only_hides_the_sessions_it_drops() {
+        let mut app = app_with_row("s");
+        app.set_layout(crate::panes::Layout::Four);
+        app.slots[2] = Slot::Session(SessionId::new("s"));
+        let windows = app.windows.len();
+        app.set_layout(crate::panes::Layout::One);
+        assert_eq!(app.slots.len(), 1, "the slots did not follow the layout");
+        assert_eq!(app.windows.len(), windows, "shrinking the layout killed a window");
+        assert_eq!(app.focus_slot, 0, "the focus stayed on a slot that no longer exists");
+    }
+
+    /// **`Alt+←/→` はスロットの宛先を壊さない。**
+    ///
+    /// これが崩れると、最左列以外のスロットを選んでサイドバーへ行き、
+    /// 行を開いても別のスロットに出る（設計上いちばん踏みやすい罠なので固定する）
+    #[test]
+    fn walking_to_the_sidebar_and_back_keeps_the_target_slot() {
+        let mut app = app_with_row("s");
+        app.set_layout(crate::panes::Layout::Four);
+        app.focus = Focus::Terminal;
+        // `Alt+Shift+→` `Alt+Shift+↓` で右下（3）へ
+        for code in [KeyCode::Right, KeyCode::Down] {
+            let key = KeyEvent::new(code, KeyModifiers::ALT | KeyModifiers::SHIFT);
+            let Some(Reserved::Slot(dir)) = reserved_key(&key) else {
+                panic!("Alt+Shift+{code:?} is not reserved for slot moves");
+            };
+            let to = app.layout.neighbor(app.focus_slot, dir).expect("no neighbour");
+            app.set_focus_slot(to);
+        }
+        assert_eq!(app.focus_slot, 3, "Alt+Shift did not reach the bottom-right slot");
+        // `Alt+←/→` はサイドバーとの行き来だけ ＝ 宛先スロットは動かない
+        app.set_focus(Focus::Sidebar);
+        assert_eq!(app.focus_slot, 3, "walking to the sidebar moved the target slot");
+        app.set_focus(Focus::Terminal);
+        assert_eq!(app.focus_slot, 3, "coming back landed on a different slot");
     }
 
     /// サイドバーにフォーカスがあっても、撤去した打鍵はもう何も起こさない
