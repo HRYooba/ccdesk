@@ -472,6 +472,15 @@ pub(crate) struct App {
     /// **agent ごとに 1 本。** 共有にすると片方の更新中にもう片方の版行まで
     /// Running になり、押せなくなる（実機で踏んだ）
     pub(crate) agent_updating: BTreeMap<Kind, Arc<std::sync::atomic::AtomicBool>>,
+    /// `<agent> update` の失敗。run ループが下部バーへ 1 度出して空へ戻す
+    /// （[`SelfUpdate::Failed`] と同じ作法）。
+    ///
+    /// **握り潰さないための置き場。** 更新は別スレッドで走るので失敗を
+    /// その場で通知できず、以前は捨てていた ＝ 起動すらできていない
+    /// （`codex` を PATH から引けない）ことに誰も気づけなかった。
+    /// agent ごとに分けないのは、文面が agent 名を含む ＝ どの行の失敗かは
+    /// 読めば分かり、同時に 2 つ失敗しても後の 1 つが出れば足りるため
+    pub(crate) agent_update_error: Arc<Mutex<Option<String>>>,
     // ccdesk 自身の更新の進行状態（版行の表示と多重起動防止の正本）
     pub(crate) ccdesk_update: Arc<Mutex<SelfUpdate>>,
     // 版行の restart で立った再起動要求（起こす exe のパス）。run ループは
@@ -599,6 +608,7 @@ impl Default for App {
             footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_updating: agent_updating_flags(),
+            agent_update_error: Arc::new(Mutex::new(None)),
             ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
             restart_to: None,
             ccdesk_latest: None,
@@ -1148,6 +1158,13 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             }
         };
         if let Some(msg) = failure {
+            set_notice(app, msg);
+            force_draw = true;
+        }
+        // agent 本体（`<agent> update`）の失敗も同じ場所へ出す。**成功は版行が
+        // 伝える**（再取得した版が新しくなり ⟳ が消える）ので、ここは失敗だけ
+        let agent_failure = app.agent_update_error.lock_recover().take();
+        if let Some(msg) = agent_failure {
             set_notice(app, msg);
             force_draw = true;
         }
@@ -2760,9 +2777,47 @@ pub(crate) fn agent_updating_flags(
         .collect()
 }
 
+/// `<agent> update` を 1 回走らせる。**失敗は必ず文面にして返す**
+/// （握り潰すと「押しても何も起きない」に見え、原因を追う手がかりが残らない）。
+///
+/// **PATH の解決は自前でやる**（[`ccdesk::resolve_program`]）。Windows の
+/// `Command::new("codex")` は `CreateProcess` が `PATHEXT` を見ないので、npm が
+/// 並べて置く `codex`（sh のシム）と `codex.cmd` のうち実行できる方を掴めず
+/// `NotFound` で終わる。claude は native インストールで `claude.exe` があるため
+/// 露見せず、**codex の更新ボタンだけが無反応**になっていた
+fn run_agent_update(program: &str) -> Result<(), String> {
+    use std::process::Stdio;
+    let resolved = ccdesk::resolve_program(program)
+        .ok_or_else(|| format!("{program} update failed: {program} not found on PATH"))?;
+    let out = std::process::Command::new(resolved)
+        .arg("update")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("{program} update failed: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    // 終了コードだけでは何が起きたか分からないので、stderr の最初の 1 行を添える
+    // （更新は npm 経由で失敗しうる ＝ 権限・ネットワークの区別が要る）。
+    // 成功時の warning は出さない（`codex update` は成功しても npm の警告を吐く）
+    let detail = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    Err(match detail.is_empty() {
+        true => format!("{program} update failed ({})", out.status),
+        false => format!("{program} update failed ({}): {detail}", out.status),
+    })
+}
+
 /// agent 本体の更新を実行する（`<agent> update`）。
 /// 公式仕様: 更新は次回起動時から有効で、実行中セッションは現行版のまま動き続ける。
-/// 完了後はフッターを再取得し、最新化されれば版行は最新表示へ戻る
+/// 完了後はフッターを再取得し、最新化されれば版行は最新表示へ戻る。
+///
+/// 失敗は下部バーへ回す（[`App::agent_update_error`]）＝ ccdesk 自身の更新
+/// （[`SelfUpdate::Failed`]）と同じ扱いで、旗が降りるので押し直せる
 fn start_agent_update(app: &mut App, kind: Kind) {
     let Some(flag) = app.agent_updating.get(&kind).cloned() else {
         return;
@@ -2775,14 +2830,11 @@ fn start_agent_update(app: &mut App, kind: Kind) {
     let updating = flag;
     let refresh = app.footer_refresh.clone();
     let dirty = app.footer_dirty.clone();
+    let failure = app.agent_update_error.clone();
     std::thread::spawn(move || {
-        use std::process::Stdio;
-        let _ = std::process::Command::new(program)
-            .arg("update")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .output();
+        if let Err(msg) = run_agent_update(program) {
+            *failure.lock_recover() = Some(msg);
+        }
         updating.store(false, std::sync::atomic::Ordering::Relaxed);
         refresh.store(true, std::sync::atomic::Ordering::Relaxed);
         dirty.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -4413,6 +4465,69 @@ mod tests {
                 "must not re-run an update that is finished or running"
             );
         }
+    }
+
+    /// 起動すらできなかった更新を**無言で終わらせない**。
+    ///
+    /// 以前は `let _ = …output()` で捨てていたので、押しても何も起きない行だけが
+    /// 残った。文面には agent 名と「PATH に無い」が要る（更新はユーザーの環境の
+    /// 問題で失敗しうるので、どちらを直せばよいか分かる必要がある）
+    #[test]
+    fn an_agent_update_that_cannot_start_says_so_instead_of_going_quiet() {
+        let err = run_agent_update("ccdesk-no-such-agent-here")
+            .expect_err("a program that is not installed reported success");
+        assert!(err.contains("ccdesk-no-such-agent-here"), "{err}");
+        assert!(err.contains("PATH"), "the message does not say where it looked: {err}");
+    }
+
+    /// **npm が並べて置くシムのうち、Windows が実行できる方を起こす。**
+    ///
+    /// npm は同じディレクトリへ `codex`（sh のシム）と `codex.cmd` を置く。
+    /// `Command::new("codex")` は `CreateProcess` が `PATHEXT` を見ないので
+    /// 拡張子なしの方しか見つけられず `NotFound` で終わる ＝ **codex の更新
+    /// ボタンだけが無反応**だった（claude は `claude.exe` なので露見しなかった）。
+    /// あわせて、渡す部分コマンドが `update` であることと、失敗が理由付きで
+    /// 返ることも同じ PATH で見る（PATH の差し替えを 1 回に閉じる）
+    #[cfg(windows)]
+    #[test]
+    fn an_agent_update_runs_the_shim_windows_can_execute_and_reports_failures() {
+        let dir = crate::testutil::TempDir::new("app", "agent-update-shim");
+        // npm と同じ並び: 拡張子なし（Windows では実行できない）と `.cmd`
+        std::fs::write(dir.join("ccdesk-fake-agent"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(
+            dir.join("ccdesk-fake-agent.cmd"),
+            "@echo off\r\nif not \"%1\"==\"update\" exit /b 3\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ccdesk-failing-agent.cmd"),
+            "@echo off\r\necho no write access 1>&2\r\nexit /b 1\r\n",
+        )
+        .unwrap();
+
+        // PATH の先頭へ足すだけにする（丸ごと差し替えると、並列で走る他の
+        // テストが本物の実行ファイルを引けなくなる）
+        let saved = std::env::var_os("PATH");
+        let prepended = match &saved {
+            Some(path) => format!("{};{}", dir.path().display(), path.to_string_lossy()),
+            None => dir.path().display().to_string(),
+        };
+        unsafe { std::env::set_var("PATH", prepended) };
+        let ok = run_agent_update("ccdesk-fake-agent");
+        let failed = run_agent_update("ccdesk-failing-agent");
+        match saved {
+            Some(path) => unsafe { std::env::set_var("PATH", path) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert_eq!(
+            ok,
+            Ok(()),
+            "the update did not reach the shim Windows can execute (exit 3 = the subcommand was not `update`)"
+        );
+        let err = failed.expect_err("a shim that exits non-zero reported success");
+        assert!(err.contains("ccdesk-failing-agent"), "{err}");
+        assert!(err.contains("no write access"), "the reason was dropped: {err}");
     }
 
     /// 版行の restart は**差し替え済みの exe を指す再起動要求**を立てる。
