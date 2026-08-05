@@ -253,6 +253,7 @@ fn main() -> anyhow::Result<()> {
         footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         agent_updating: app::agent_updating_flags(),
+        agent_update_error: Arc::new(Mutex::new(None)),
         ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
         restart_to: None,
         ccdesk_latest: None,
