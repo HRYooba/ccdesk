@@ -362,6 +362,13 @@ struct Scan {
     /// 予算（[`SCAN_BUDGET`]）の範囲で**末尾側からさかのぼって**消化する
     /// （[`Titles::drain_head`]）。None ＝ 読み残し無し
     head_pending: Option<std::ops::Range<u64>>,
+    /// 最後に stat した時刻（epoch ms）。**[`Self::grew_since`] を出すためだけ**に
+    /// 持つ ＝ 走査そのものには使わない
+    seen_at: u64,
+    /// **この時刻より後に記録が伸びた**（epoch ms。意味と使い道は
+    /// [`Titles::grew_since`]）。表示名とは無関係だが、記録を stat しているのが
+    /// ここ 1 箇所なので同じ周期に相乗りする
+    grew_since: u64,
 }
 
 /// transcript が前回から変わったかの判定材料（長さ・更新時刻）
@@ -568,12 +575,40 @@ impl Titles {
                 ..Scan::default()
             };
         }
+        // **記録が伸びたこと自体を、名前とは別に覚える**（[`Self::grew_since`]）。
+        // 覚えるのが「いつ伸びたか」ではなく「いつより後に伸びたか」なのが要点で、
+        // 理由はあちらの doc。ここでやるのは、**この周期の stat が唯一の stat** で、
+        // 別に stat を足すと同じ syscall とパス解決が 2 系統になるため
+        if scan.stamp.is_some_and(|(seen, _)| stamp.0 > seen) {
+            scan.grew_since = scan.seen_at;
+        }
+        scan.seen_at = ccdesk::now_ms();
         let stage = match scan.stamp {
             None => Some(Stage::First),
             Some(seen) if seen != stamp => Some(Stage::Append),
             Some(_) => None, // 前回から見え方が変わっていない ＝ 読むものが無い
         };
         (stage.map(|stage| (stage, stamp)), resolved_changed)
+    }
+
+    /// **その会話の記録が「いつより後に」伸びたか**（epoch ms。0 ＝ 一度も見ていない）。
+    ///
+    /// 返すのは伸びを見つけた時刻ではなく、**その 1 つ前に見たときの時刻**。
+    /// 読み手（[`crate::poll::row_state`]）は `grew_since(conv) > hook の時刻` で
+    /// 「その hook より後に伸びた」と判断するので、境目が跨がる形だと嘘になる:
+    /// 記録は許可を聞く直前にも伸びる（道具の呼び出しが書かれる）ので、**その伸びと
+    /// hook が同じ周期に入ると、見つけた時刻は hook より後になってしまう**
+    /// ＝ 許可ダイアログが出た瞬間に黄が消える。前回の観測時刻を返せば、
+    /// 「前に見たときには無く、今ある」＝ その区間で伸びたと言い切れる。
+    ///
+    /// 代償は最大 1 周期の遅れ（許可の直後 1 回だけは降ろさない）で、
+    /// **降ろし損ねる側へ倒れる**のが正しい: 呼ばれない害の方が大きい。
+    ///
+    /// **長さだけを見る（更新時刻は見ない）。** Windows では codex が開いたままの
+    /// rollout の mtime が進まない（実測: 全 10 本で最大 82 秒の遅れ）。
+    /// 長さは同じ状況でもライブに伸びる（実測）
+    pub(crate) fn grew_since(&self, conversation: &str) -> u64 {
+        self.scans.get(conversation).map_or(0, |scan| scan.grew_since)
     }
 
     /// その段でこの 1 行に許す読み取り量（`left` ＝ その段に残っている行数）。
@@ -1028,18 +1063,18 @@ pub(crate) mod tests {
         assert_eq!(row.transcript, None, "kept a record for a row with no conversation");
     }
 
-    /// **索引に載らない codex の会話も名前を持つ。**
+    /// **索引に載らない codex の会話も名前を持ち、打つたびに最新へ動く。**
     ///
-    /// codex の索引（`session_index.jsonl`）に載るのは名前が決まった会話だけで、
-    /// 実測（実機 2026-08-02）では**ターンのある rollout 211 本のうち 65 本
-    /// （31%）**しか載っていない。残り 69% は ccdesk で永久に `new session`
-    /// だった ＝ claude が `last-prompt` へ落ちるのに対して codex は諦めていた。
+    /// codex の索引（`session_index.jsonl`）に載るのは `/rename` された会話だけ
+    /// （実機で確認: リネームが 1 度も無いとファイルごと存在しない）。残りは
+    /// rollout の発話で名乗る ＝ claude が `last-prompt` へ落ちるのと同じ形。
     ///
-    /// **最初の発話を採るのが要点**（最後ではなく）: 会話の identity として
-    /// 安定するうえ、rollout の先頭は追記されないので有界に読める
+    /// **最新の発話が答え**（[`crate::backend::codex::TITLE_RECORDS`]）。
+    /// 最初の発話だけを採っていた頃は、claude の行が打つたびに動くのに codex の
+    /// 行だけ固まったままで、「名前が変わらない」として報告された
     #[test]
-    fn a_codex_conversation_that_is_not_in_the_index_is_named_by_its_first_prompt() {
-        let temp = crate::testutil::TempDir::new("title", "codex_first_prompt");
+    fn a_codex_conversation_that_is_not_in_the_index_is_named_by_its_latest_prompt() {
+        let temp = crate::testutil::TempDir::new("title", "codex_latest_prompt");
         let conversation = "019fc236-22c1-7bd3-8fcc-954de8d2ea9a";
         // 実機の形そのまま: session_meta → 前置き（AGENTS.md 等）→ 最初の発話
         let body = concat!(
@@ -1059,8 +1094,8 @@ pub(crate) mod tests {
         };
         assert_eq!(
             titles.title_now(&mut row),
-            "fix the login form",
-            "a later prompt won over the first one"
+            "now do the signup form",
+            "the name did not follow the latest prompt"
         );
         // 記録の場所は**会話 ID から日ディレクトリを導いて**見つける
         // （ファイル名の時刻部分を組み立て直すとタイムゾーンで腐る）
@@ -1072,6 +1107,80 @@ pub(crate) mod tests {
         // 会話が変われば名前も落ちる（claude と同じ扱い）
         row.conversation = crate::sessions::Conversation::Observed("019fc299-0000-7000-8000-000000000000".to_string());
         assert_eq!(titles.of(&row), UNTITLED);
+    }
+
+    /// **末尾窓に発話が 1 つも無い会話は、先頭の発話で名乗る。**
+    ///
+    /// codex の rollout は道具の出力が末尾を埋めるので、[`TAIL_BYTES`] では
+    /// 発話に届かない会話が実測 60% ある。最新の発話だけを見る形にすると、
+    /// その 60% が `new session` へ戻る ＝ 先頭窓の候補は捨てられない
+    #[test]
+    fn a_codex_conversation_whose_tail_is_all_tool_output_still_uses_its_first_prompt() {
+        let temp = crate::testutil::TempDir::new("title", "codex_head_fallback");
+        let conversation = "019fc236-22c1-7bd3-8fcc-954de8d2ea9a";
+        let noise = line("response_item", "payload", &"x".repeat(1024));
+        let mut body = String::new();
+        body.push_str(r#"{"type":"event_msg","payload":{"type":"user_message","message":"fix the login form"}}"#);
+        body.push('\n');
+        // 末尾窓を道具の出力だけで埋める（発話が窓の外へ出る）
+        while body.len() < (TAIL_BYTES as usize) * 2 {
+            body.push_str(&noise);
+            body.push('\n');
+        }
+        write_rollout(temp.path(), conversation, "2026-08-02T20-22-35", &body);
+
+        let mut titles = Titles::with_root(Kind::Codex, temp.path().to_path_buf());
+        let mut row = SessionRow {
+            kind: Kind::Codex,
+            conversation: crate::sessions::Conversation::Observed(conversation.to_string()),
+            ..SessionRow::new(SessionId::new("row"), "C:\\dev\\app", 1_000)
+        };
+        assert_eq!(
+            titles.title_now(&mut row),
+            "fix the login form",
+            "the head window stopped naming a rollout whose tail is all tool output"
+        );
+    }
+
+    /// **記録が伸びたことは、伸びた区間まるごとが「いつより後か」で答える。**
+    ///
+    /// [`Titles::grew_since`] が返すのは伸びを見つけた時刻ではなく **1 つ前に見た
+    /// 時刻**。読み手は `grew_since > hook の時刻` で判断するので、ここが
+    /// 見つけた時刻だと、**hook と同じ周期に入った伸びまで「hook より後」**に
+    /// なってしまう（記録は許可を聞く直前にも伸びる ＝ ダイアログが出た瞬間に
+    /// 黄が消える）。
+    ///
+    /// **長さだけを見る。** Windows では codex が開いたままの rollout の mtime が
+    /// 進まない（実測: 全 10 本で最大 82 秒の遅れ）ので、更新時刻は材料にならない
+    #[test]
+    fn a_record_reports_the_span_it_grew_in_not_the_moment_it_was_noticed() {
+        let temp = TempProjects::new("record_growth");
+        let mut titles = temp.titles();
+        let mut row = row("77777777-7777-4777-8777-777777777777");
+        let conversation = row.conversation.id().expect("no conversation").to_string();
+
+        // 一度も見ていない会話は「伸びていない」（0 ＝ どの hook にも勝てない）
+        assert_eq!(titles.grew_since(&conversation), 0);
+
+        let first = format!("{}\n", line("last-prompt", "lastPrompt", "first"));
+        titles.write_transcript(&row, &first);
+        let before_first_look = ccdesk::now_ms();
+        titles.title_now(&mut row);
+        // 初回は「前に見たとき」が無い ＝ まだ何も言えない
+        assert_eq!(titles.grew_since(&conversation), 0, "the first look claimed a growth");
+
+        // 記録は追記されるだけ（縮んだら走査ごとやり直しになる ＝ 別の話）
+        let grown = format!("{first}{}\n", line("last-prompt", "lastPrompt", "second"));
+        titles.write_transcript(&row, &grown);
+        titles.title_now(&mut row);
+        let grew = titles.grew_since(&conversation);
+        assert!(grew >= before_first_look, "the growth span started before the previous look");
+        assert!(grew <= ccdesk::now_ms(), "the growth span starts in the future");
+
+        // 伸びない周期は値を動かさない（動かすと、待たれているだけの行が降りる）
+        let held = titles.grew_since(&conversation);
+        titles.title_now(&mut row);
+        assert_eq!(titles.grew_since(&conversation), held, "a quiet cycle moved the growth span");
     }
 
     /// テスト用: codex の rollout を本番と同じ形で置く

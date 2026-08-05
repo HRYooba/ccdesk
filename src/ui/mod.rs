@@ -1404,8 +1404,14 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         // 生きている行が主で、無ければ撮影用の固定表、それも無ければ
         // ライブ状態が拾っている前景セッション（＝ 別インスタンスや
         // ccdesk の外で動いている実行）を実行として扱う
-        // hook を取り逃したときに PTY の無音を材料にしてよいか（agent が答える）
-        let quiet_means_idle = row.kind.backend().quiet_means_idle();
+        // hook を取り逃したときに代用の材料（PTY の無音・記録の伸び）が要るか
+        // （agent が答える。[`crate::backend::Backend::has_live_status`]）
+        let has_live_status = row.kind.backend().has_live_status();
+        // 記録が伸びたかは会話に付く（会話を知らない行は代用の材料も持てない）
+        let record_grew_since = row
+            .conversation
+            .id()
+            .map_or(0, |conversation| app.titles.grew_since(conversation));
         let run = window
             .filter(|(_, w)| w.alive)
             .map(|(_, w)| Run {
@@ -1413,7 +1419,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                 status,
                 status_at,
                 pty: Some(w.pty),
-                quiet_means_idle,
+                has_live_status,
+                record_grew_since,
             })
             .or_else(|| {
                 app.fixed_states.get(&row.session_id).map(|state| Run {
@@ -1423,7 +1430,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                     status: "",
                     status_at: 0,
                     pty: None,
-                    quiet_means_idle,
+                    has_live_status,
+                    record_grew_since: 0,
                 })
             })
             .or_else(|| {
@@ -1443,7 +1451,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                     hook: None,
                     status,
                     status_at,
-                    quiet_means_idle,
+                    has_live_status,
+                    record_grew_since,
                     // 他インスタンスの実行 ＝ こちらに窓が無い（材料は status）
                     pty: None,
                 })
@@ -2508,35 +2517,76 @@ pub(crate) mod tests {
     /// （考え込んで出力が止まっている間を「手が空いた」と誤読しないため）
     #[test]
     fn a_quiet_pane_only_clears_working_for_an_agent_with_no_live_status() {
-        let view = |quiet_means_idle, pty| {
+        let view = |has_live_status, pty| {
             row_state(Some(Run {
                 hook: Some((WORKING, 1_000)),
                 status: "",
                 status_at: 0,
                 pty: Some(pty),
-                quiet_means_idle,
+                has_live_status,
+                record_grew_since: 0,
             }))
         };
         // 補正する agent（codex）: 無音になったら降りる
-        assert_eq!(view(true, PtyHint::Quiet), IDLE);
-        assert_eq!(view(true, PtyHint::Writing), WORKING);
-        assert_eq!(view(true, PtyHint::Starting), WORKING);
+        assert_eq!(view(false, PtyHint::Quiet), IDLE);
+        assert_eq!(view(false, PtyHint::Writing), WORKING);
+        assert_eq!(view(false, PtyHint::Starting), WORKING);
         // 補正しない agent（claude）: 無音でも hook のまま
-        assert_eq!(view(false, PtyHint::Quiet), WORKING);
+        assert_eq!(view(true, PtyHint::Quiet), WORKING);
     }
 
-    /// 補正がかかるのは Working だけ。**Waiting を無音で降ろすと、許可待ちの行が
-    /// 黙って消える**（ユーザーが動かないと進まないのに呼ばれなくなる）
+    /// **PTY は Waiting を降ろす材料にならない。**
+    ///
+    /// 無音で降ろせば許可待ちの行が黙って消える（ユーザーが動かないと進まないのに
+    /// 呼ばれなくなる）。出力で降ろすこともできない: codex の TUI は承認ダイアログを
+    /// 出している間も 1 秒ごとにタイトルを書き換える（実測）ので、Writing は
+    /// 「動いている」と「待たれている」の両方に付く
     #[test]
-    fn a_quiet_pane_never_clears_waiting() {
-        let state = row_state(Some(Run {
-            hook: Some((WAITING, 1_000)),
-            status: "",
-            status_at: 0,
-            pty: Some(PtyHint::Quiet),
-            quiet_means_idle: true,
-        }));
-        assert_eq!(state, WAITING);
+    fn no_amount_of_pty_output_clears_waiting() {
+        let view = |pty| {
+            row_state(Some(Run {
+                hook: Some((WAITING, 1_000)),
+                status: "",
+                status_at: 0,
+                pty: Some(pty),
+                has_live_status: false,
+                record_grew_since: 0,
+            }))
+        };
+        for pty in [PtyHint::Quiet, PtyHint::Writing, PtyHint::Starting] {
+            assert_eq!(view(pty), WAITING, "{pty:?} cleared a permission prompt");
+        }
+    }
+
+    /// **許可された行は、記録が伸びたことで Waiting から降りる。**
+    ///
+    /// 許可が解除されたことを知らせる hook はどの agent にも無い。claude は
+    /// `status` が次の観測で直すが、codex にはそれが無く、次の `Stop` まで
+    /// 黄が残る ＝ 動いている間ずっと「入力待ち」と名乗っていた（報告された症状）。
+    ///
+    /// **伸びが hook より後でなければ降ろさない**のが要点: 記録は許可を聞く直前にも
+    /// 伸びる（道具の呼び出しが書かれる）ので、そこで降ろすとダイアログが出た
+    /// 瞬間に黄が消える
+    #[test]
+    fn a_record_that_grows_after_the_prompt_ends_the_wait() {
+        let view = |has_live_status, record_grew_since| {
+            row_state(Some(Run {
+                hook: Some((WAITING, 1_000)),
+                status: "",
+                status_at: 0,
+                pty: Some(PtyHint::Writing),
+                has_live_status,
+                record_grew_since,
+            }))
+        };
+        // 許可の後に伸びた ＝ 道具が動いた ＝ もう待たれていない
+        assert_eq!(view(false, 1_001), WORKING);
+        // 許可を聞く前・同時の伸びでは降ろさない（ダイアログはまだ出ている）
+        assert_eq!(view(false, 1_000), WAITING);
+        assert_eq!(view(false, 999), WAITING);
+        assert_eq!(view(false, 0), WAITING, "a row with no record was cleared");
+        // ライブ状態を持つ agent（claude）は `status` が直すので代用しない
+        assert_eq!(view(true, 9_999), WAITING);
     }
 
     /// **行の状態は hook（イベント）と `status`（現在値）の新しい方で決まる。**
@@ -2547,7 +2597,7 @@ pub(crate) mod tests {
     #[test]
     fn the_newer_of_the_hook_and_the_live_status_decides_the_row() {
         let view = |hook, status, status_at| {
-            row_state(Some(Run { hook, status, status_at, pty: None, quiet_means_idle: false }))
+            row_state(Some(Run { hook, status, status_at, pty: None, has_live_status: true, record_grew_since: 0 }))
         };
         // 観測の方が新しい → 観測が勝つ
         assert_eq!(view(Some((WORKING, 1_000)), "idle", 2_000), IDLE);
@@ -2605,7 +2655,7 @@ pub(crate) mod tests {
     #[test]
     fn a_status_observation_heals_a_hook_whose_closing_event_never_came() {
         let view = |hook, status| {
-            row_state(Some(Run { hook, status, status_at: 2_000, pty: None, quiet_means_idle: false }))
+            row_state(Some(Run { hook, status, status_at: 2_000, pty: None, has_live_status: true, record_grew_since: 0 }))
         };
         // Esc 中断: working のまま固着していた行が、次の観測で赤を降りる
         assert_eq!(view(Some((WORKING, 1_000)), "idle"), IDLE);
@@ -2624,7 +2674,7 @@ pub(crate) mod tests {
     #[test]
     fn background_shell_work_is_not_a_request_for_input() {
         let view = |hook, status| {
-            row_state(Some(Run { hook, status, status_at: 2_000, pty: None, quiet_means_idle: false }))
+            row_state(Some(Run { hook, status, status_at: 2_000, pty: None, has_live_status: true, record_grew_since: 0 }))
         };
         for status in ["idle", "shell"] {
             assert_eq!(view(None, status), IDLE, "{status:?} asks for input");
@@ -2639,7 +2689,7 @@ pub(crate) mod tests {
     /// 「入力待ち」と名乗ってユーザーを呼びつけない）
     #[test]
     fn a_row_with_no_hook_and_no_status_falls_back_to_the_pty_output() {
-        let view = |pty| row_state(Some(Run { hook: None, status: "", status_at: 0, pty: Some(pty), quiet_means_idle: false }));
+        let view = |pty| row_state(Some(Run { hook: None, status: "", status_at: 0, pty: Some(pty), has_live_status: true, record_grew_since: 0 }));
         // まだ端末を掴んでいない ＝ 起動中。**「もう終わった」ではない**
         assert_eq!(view(PtyHint::Starting), WORKING);
         assert_eq!(view(PtyHint::Writing), WORKING);
@@ -2802,7 +2852,7 @@ pub(crate) mod tests {
             status: "idle",
             status_at: 0,
             pty: None,
-            quiet_means_idle: false,
+            has_live_status: true, record_grew_since: 0,
         }));
         assert_eq!(view, STOPPED, "a fresh stopped was thrown away");
         // かつては「Stopped なのにアイコンが生存形（✻）」を `alive` フィールドで
@@ -2810,7 +2860,7 @@ pub(crate) mod tests {
 
         // 他の state はそのまま生きている実行として出る（畳まれるのは stopped だけ）
         assert_eq!(
-            row_state(Some(Run { hook: Some((WORKING, 0)), status: "", status_at: 0, pty: None, quiet_means_idle: false })),
+            row_state(Some(Run { hook: Some((WORKING, 0)), status: "", status_at: 0, pty: None, has_live_status: true, record_grew_since: 0 })),
             State::Working
         );
     }

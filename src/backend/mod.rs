@@ -216,14 +216,27 @@ pub(crate) trait Backend: Send + Sync {
     /// hook へ渡す env は共通の口（[`Kind::spawn_command`]）が立てる
     fn command(&self, cwd: &str, launch: Launch<'_>, inject: Option<&Inject>) -> Spawn;
 
-    /// **hook を取り逃したとき、PTY の無音を「手が空いた」と読んでよいか。**
+    /// **この agent は「今どうしているか」を外から読める現在値を持つか。**
     ///
-    /// hook はイベントなので取りこぼすと自己修復しない。claude にはライブ状態
-    /// （`~/.claude/sessions/` の `status`）があり、次の観測で必ず正しくなるので補正は
-    /// 要らない。codex にはそれが無く、実際に Esc 中断では `Stop` が発火しない
-    /// （[openai/codex#22858](https://github.com/openai/codex/issues/22858)）ので、
-    /// 補正しないと Working（赤）が固着する
-    fn quiet_means_idle(&self) -> bool;
+    /// claude は持つ（`~/.claude/sessions/` の `status`。遷移のたびに上書きされる）。
+    /// codex は持たない。
+    ///
+    /// **hook はイベントなので取りこぼすと自己修復しない。** ライブ状態がある側は
+    /// 次の観測で必ず正しくなるが、無い側は誰も直せず固着する。実際に 2 通り出た:
+    ///
+    /// | 固着 | 起きる理由 | 持たない agent の直し方 |
+    /// |:--|:--|:--|
+    /// | Working が残る | Esc 中断で `Stop` が飛ばない（[codex#22858](https://github.com/openai/codex/issues/22858)） | PTY の無音 |
+    /// | Waiting が残る | **許可が解除されたことを知らせる hook がそもそも無い** | 記録が伸びたこと |
+    ///
+    /// **代用の材料が 2 つに割れるのは、片方では区別が付かないから。** codex の TUI は
+    /// 承認ダイアログを出している間も 1 秒ごとにタイトルを書き換える（実測）ので、
+    /// PTY の出力では「動いている」と「待たれている」を分けられない。逆に記録
+    /// （rollout）は承認待ちの間だけ伸びが止まる（実測: 20 秒の停止）ので、
+    /// そちらが Waiting を降ろす材料になる。
+    ///
+    /// 判断そのものは [`crate::poll::row_state`]（この bool を読むのはあそこだけ）
+    fn has_live_status(&self) -> bool;
 
     /// この agent の現行版と、それより新しい版があればその番号。
     ///
