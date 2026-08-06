@@ -103,7 +103,7 @@ pub(crate) fn agent_glyph(kind: Kind) -> &'static str {
 const PINNED_TITLE: &str = "pinned";
 
 /// 行頭が食う桁 ＝ ペイン印 1 + ドット 1 + 名前との間の空白 1。
-/// **[`row_name_and_gap`] の予算と [`crate::app::MIN_SIDEBAR`] の根拠がこの値に乗る**ので、
+/// **[`row_name_spans`] の予算と [`crate::app::MIN_SIDEBAR`] の根拠がこの値に乗る**ので、
 /// 行頭に何かを足したらテスト（`the_row_head_marks_are_one_column_wide`）が落ちる。
 /// `pub(crate)` なのは [`crate::source`] の撮影用サイドバー幅がここから桁を導くため
 /// （手で数えた桁を別ファイルに書き写さない）
@@ -128,6 +128,13 @@ pub(crate) const MIN_ROW_COLS: u16 = (HEAD_COLS + MIN_NAME_COLS + MENU_COLS) as 
 pub(crate) const MIN_SIDEBAR: u16 = MIN_ROW_COLS + 2;
 /// 右ペインに最低限残す桁（サイドバーを広げても claude の画面が潰れない下限）
 const MIN_PANE: u16 = 40;
+
+/// 幅を選んでいないときのサイドバー幅（[`crate::app::App`] の初期値）。
+///
+/// **桁の予算を数えるファイルに置く**のが要点で、短い ID を出すかの判断
+/// （[`shows_short_id`]）はこの幅のときに名前が持つ桁を基準にする ＝
+/// 「既定幅で名前がどれだけ出るか」という 1 つの事実を 2 箇所に書かない
+pub(crate) const DEFAULT_SIDEBAR: u16 = 34;
 
 /// **描画とヒットテストが使うサイドバー幅**（＝ 画面に出ている桁数）。
 ///
@@ -933,6 +940,10 @@ impl Look {
 /// 決まる ＝ 窓（PTY）を起こさずに見た目を検査できる
 struct RowData {
     action: RowAction,
+    /// 行の identity。**名前の直後に出す短い ID の材料**（[`row_name_spans`]）で、
+    /// `ccdesk list` が出すものと同じ [`SessionId::short`] を読む ＝
+    /// 画面で読んだ 8 桁がそのまま宛先として通る
+    id: SessionId,
     /// 状態そのもの。**ドットの色・明滅も行末の語と色もここから導く**
     /// （[`State::color`] / [`State::blinks`] / [`State::title`]）ので、
     /// `group` と食い違う色や語を別に持たせられない（これを別フィールドで
@@ -975,11 +986,10 @@ fn session_row_line(d: &RowData, look: Look, inner_width: u16, blink_tick: u64) 
     } else {
         Style::default()
     };
-    // **名前は名前だけ。** どの agent の行かはドットの形が答えるので、
-    // 行頭の略記（かつての `[cc]` / `[cx]`）も行末の綴りも要らない
-    let (name, gap) = row_name_and_gap(&d.label, inner_width);
-    spans.push(Span::styled(name, name_style));
-    spans.push(Span::raw(gap));
+    // **agent の綴りはここに居ない。** どの agent の行かはドットの形が答えるので、
+    // 行頭の略記（かつての `[cc]` / `[cx]`）も行末の綴りも要らない。
+    // 名前の直後に短い ID が並ぶ幅もある（[`row_name_spans`]）
+    spans.extend(row_name_spans(d, inner_width, name_style));
     spans.extend(row_tail_spans(d, inner_width, blink_tick));
     // 行末のメニュー記号（当たり判定は [`menu_zone`] が同じ桁から導く）
     spans.push(Span::raw(" "));
@@ -990,7 +1000,7 @@ fn session_row_line(d: &RowData, look: Look, inner_width: u16, blink_tick: u64) 
     Line::from(spans).style(look.band(Style::default()))
 }
 
-/// 行末ブロック（状態語）が食う桁。前の空白 1 桁を含む。
+/// 行末ブロックのうち状態語が食う桁。前の空白 1 桁を含む。
 /// **agent はここに居ない**（ドットの形が答えるので、綴りで場所を取らない）
 const TAIL_STATE_COLS: usize = 1 + State::TITLE_COLS;
 
@@ -1039,26 +1049,78 @@ fn row_tail_spans(d: &RowData, inner_width: u16, blink_tick: u64) -> Vec<Span<'s
     ]
 }
 
-/// この内側幅でセッション名に使える桁。**名前の予算はここ 1 箇所**で決まる。
-///
+/// 名前ブロック（名前 + 短い ID + 詰め物）が使える桁。
 /// 「内側の幅 - 行頭 [`HEAD_COLS`] - 行末のメニュー [`MENU_COLS`] -
-/// 行末ブロック [`tail_cols`]」。`pub(crate)` なのは、撮影用のサイドバー幅
-/// （[`crate::source`]）が「この名前が切れない幅か」をここから導くため
-/// ＝ 行の桁割りを変えたときに撮影側の検査が黙って古くならない
-pub(crate) fn name_cols(inner_width: u16) -> usize {
+/// 行末ブロック [`tail_cols`]」
+fn name_block_cols(inner_width: u16) -> usize {
     let body = (inner_width as usize).saturating_sub(HEAD_COLS + MENU_COLS);
     body - tail_cols(body)
 }
 
-/// セッション行の桁割り（名前・詰め物）。名前が長い行は右で切れる
-/// （[`clip_to_width`]）。合わせると必ず予算ちょうどの桁になるので、
-/// **メニュー記号は常に内側の右端に来る**（[`menu_zone`] の当たり判定が成り立つ前提）
-fn row_name_and_gap(label: &str, inner_width: u16) -> (String, String) {
+/// 短い ID が食う桁。**名前との間の空白 1 桁を含む**
+/// （桁数の正本は [`crate::sessions::SHORT_ID_COLS`]）
+const SHORT_ID_BLOCK_COLS: usize = 1 + crate::sessions::SHORT_ID_COLS;
+
+/// 既定幅（[`DEFAULT_SIDEBAR`]）のサイドバーで名前が持つ桁。
+/// **ID を出してよいかの判断がこの値に乗る**（[`shows_short_id`]）
+const NAME_COLS_AT_DEFAULT: usize =
+    (DEFAULT_SIDEBAR as usize) - 2 - HEAD_COLS - MENU_COLS - TAIL_STATE_COLS;
+
+/// この名前ブロックに短い ID を並べるか。
+///
+/// **ID は「サイドバーを広げたときだけ」出る。** 既定幅で出すと名前が 9 桁痩せる
+/// （日本語のタイトルなら 4 文字ぶん消える）。ID が要るのは他のセッションを
+/// 宛先として指すときだけで、名前は常に読む ＝ 常に読む方を痩せさせない。
+///
+/// 閾値を「既定幅のときの名前の桁」に置いたのは、**恣意的な数値を置かない**ため:
+/// ID が見えているどの幅でも、名前は既定幅と同じかそれより広い。
+///
+/// **広げた瞬間に名前の桁が一度縮む**のは承知の上（境目をまたぐと ID が
+/// 9 桁を取るため）。ID が現れることでその縮みは説明が付く
+fn shows_short_id(block: usize) -> bool {
+    block >= NAME_COLS_AT_DEFAULT + SHORT_ID_BLOCK_COLS
+}
+
+/// この内側幅でセッション名そのものに使える桁。**名前の予算はここ 1 箇所**で決まる。
+///
+/// `pub(crate)` なのは、撮影用のサイドバー幅（[`crate::source`]）が
+/// 「この名前が切れない幅か」をここから導くため ＝ 行の桁割りを変えたときに
+/// 撮影側の検査が黙って古くならない
+pub(crate) fn name_cols(inner_width: u16) -> usize {
+    let block = name_block_cols(inner_width);
+    if shows_short_id(block) {
+        block - SHORT_ID_BLOCK_COLS
+    } else {
+        block
+    }
+}
+
+/// 名前ブロックの中身（名前 + 短い ID + 詰め物）。**合計は必ず
+/// [`name_block_cols`] ちょうど**なので、メニュー記号は常に内側の右端に来る
+/// （[`menu_zone`] の当たり判定が成り立つ前提）。
+///
+/// **ID は名前の直後**（行末の固定列ではない）。指したいセッションの名前を
+/// 見つけたら、視線を動かさずにその宛先が読める。位置が行ごとに動くのは承知の上で、
+/// ID は流し読みで拾うものではなく「この行だ」と決めた後に読むものなので、
+/// 桁が揃っていることに意味が無い。
+///
+/// **ID は dim。** 行を縦に流し読みするときに拾うのは名前と状態なので、
+/// 名前と同じ濃さで隣に並べない
+fn row_name_spans(d: &RowData, inner_width: u16, name_style: Style) -> Vec<Span<'static>> {
     use unicode_width::UnicodeWidthStr;
-    let budget = name_cols(inner_width);
-    let name = clip_to_width(label, budget as u16);
-    let gap = budget - name.width();
-    (name, " ".repeat(gap))
+    let block = name_block_cols(inner_width);
+    let name = clip_to_width(&d.label, name_cols(inner_width) as u16);
+    let mut used = name.width();
+    let mut spans = vec![Span::styled(name, name_style)];
+    if shows_short_id(block) {
+        // 8 桁に満たない ID（壊れた保管など）でも桁が合うよう、実測した幅で数える
+        let short = d.id.short();
+        used += 1 + short.width();
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(short, Style::default().fg(ui().dim)));
+    }
+    spans.push(Span::raw(" ".repeat(block - used)));
+    spans
 }
 
 /// 未ログインのときのアカウント行。**再ログインの手順まで出す**
@@ -1453,6 +1515,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         let unread = app.hook_states.unread(row);
         data.push(RowData {
             action: RowAction::Open(row.session_id.clone()),
+            id: row.session_id.clone(),
             group: row_state(run),
             kind: row.kind,
             cwd: row.cwd.clone(),
@@ -1809,6 +1872,39 @@ fn draw_popup(frame: &mut Frame, app: &App) {
     );
 }
 
+/// ペイン枠の見出しでタイトルと短い ID を分ける区切り。
+/// **前後の空白を含めて 3 桁**（桁の予算がこの定数の表示幅に乗る）
+const PANE_TITLE_SEP: &str = " · ";
+
+/// 枠の見出しが使える桁 ＝ ペインの幅から左右の角 1 桁ずつを引いたもの。
+/// ratatui は角の内側から見出しを描き、溢れたぶんは黙って落ちる ＝
+/// **ここで数えておかないと ID が先に消える**（見出しの末尾に居るため）
+const PANE_TITLE_MARGIN: usize = 2;
+
+/// ペイン枠の見出し（`<タイトル> · <短い ID>`）。
+///
+/// **ID を出すのは、名前に [`MIN_NAME_COLS`] 桁残るときだけ。** サイドバーの
+/// 名前ブロック（[`shows_short_id`]）と同じ規則で、「ID は名前を削ってまで
+/// 出さない」を画面の 2 箇所で同じ言い方にしてある（分割して細くなった
+/// スロットでは ID が消え、タイトルだけが残る）。
+///
+/// **切るのは表示幅**（[`clip_to_width`]）: タイトルは会話から生成されるので
+/// 全角を含み得る
+fn pane_title(name: &str, id: &SessionId, pane_width: u16) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let budget = (pane_width as usize).saturating_sub(PANE_TITLE_MARGIN);
+    let short = id.short();
+    // 区切りと ID が食う桁。ID は ASCII 16 進なので文字数 = 表示桁
+    let tail = PANE_TITLE_SEP.width() + short.width();
+    if budget < MIN_NAME_COLS + tail {
+        return clip_to_width(name, budget as u16);
+    }
+    format!(
+        "{}{PANE_TITLE_SEP}{short}",
+        clip_to_width(name, (budget - tail) as u16)
+    )
+}
+
 /// 右ペイン: スロットを並べて描く。
 ///
 /// **カーソルを返すのはフォーカススロットだけ。** 端末のカーソルは 1 本しか無いので、
@@ -1833,12 +1929,16 @@ fn draw_slot(frame: &mut Frame, rect: Rect, app: &mut App, at: usize, focused: b
     // Esc で戻れる先（セッションの窓）があるか。**借用の前に取る**（New 画面の
     // 描画はスロットを可変で借りるため）
     let can_leave = !app.windows.is_empty();
-    // 見出しは名前を引くために不変で借りるので、可変借用より先に組む
+    // 見出しは名前を引くために不変で借りるので、可変借用より先に組む。
+    // **見出しには短い ID も入る**（[`pane_title`]）＝ 今どのセッションを見ているかを
+    // `ccdesk list` と同じ 8 桁で名乗るので、そのまま宛先として打てる
     let title = match app.slots.get(at) {
-        Some(Slot::Session(id)) => Some(
-            app.row(id)
-                .map_or_else(|| crate::title::UNTITLED.to_string(), |row| app.titles.of(row)),
-        ),
+        Some(Slot::Session(id)) => {
+            let name = app
+                .row(id)
+                .map_or_else(|| crate::title::UNTITLED.to_string(), |row| app.titles.of(row));
+            Some(pane_title(&name, id, rect.width))
+        }
         _ => None,
     };
     match app.slots.get_mut(at) {
@@ -2364,8 +2464,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// 既定のサイドバー幅（34 桁）の内側。版行の幅の予算はこの桁数
-    const DEFAULT_INNER: u16 = 32;
+    /// 既定のサイドバー幅の内側（枠の左右 1 桁ずつを引いたもの）。
+    /// 版行の幅の予算はこの桁数。**幅そのものは [`DEFAULT_SIDEBAR`] から導く**
+    /// ので、既定幅を動かしたときにここが黙って古くならない
+    const DEFAULT_INNER: u16 = DEFAULT_SIDEBAR - 2;
 
     /// **行の桁の前提はすべて「記号 1 桁」に乗っている。**
     ///
@@ -2415,7 +2517,9 @@ pub(crate) mod tests {
         );
         assert_eq!(MIN_SIDEBAR, MIN_ROW_COLS + 2, "the sidebar floor lost the border columns");
         // 下限の幅で描いても名前に [`MIN_NAME_COLS`] 桁が残る（式ではなく実物で見る）
-        let (name, _) = row_name_and_gap(&"n".repeat(30), MIN_SIDEBAR - 2);
+        let mut d = look_fixture();
+        d.label = "n".repeat(30);
+        let name = row_name_spans(&d, MIN_SIDEBAR - 2, Style::default())[0].content.clone();
         assert_eq!(name.width(), MIN_NAME_COLS, "the narrowest sidebar lost the name column");
     }
 
@@ -3622,11 +3726,10 @@ pub(crate) mod tests {
         // どの幅でも名前の予算は下限を割らず、行はちょうど内側の幅を埋める
         use unicode_width::UnicodeWidthStr as _;
         for inner in MIN_ROW_COLS..80 {
-            let (name, gap) = row_name_and_gap("x".repeat(80).as_str(), inner);
             assert!(
-                name.width() >= MIN_NAME_COLS,
+                name_cols(inner) >= MIN_NAME_COLS,
                 "inner {inner} left only {} columns for the name",
-                name.width()
+                name_cols(inner)
             );
             // **全 kind × 全状態**で見る（綴りの長さが違っても桁は動かない）
             for kind in Kind::ORDER {
@@ -3634,12 +3737,16 @@ pub(crate) mod tests {
                     let mut d = look_fixture();
                     d.kind = kind;
                     d.group = group;
-                    let tail: usize = row_tail_spans(&d, inner, 0)
-                        .iter()
-                        .map(|s| s.content.width())
-                        .sum();
-                    // 行頭 + 名前 + 詰め物 + 行末ブロック + メニュー = ちょうど内側の幅
-                    let used = HEAD_COLS + name.width() + gap.width() + tail + MENU_COLS;
+                    d.label = "x".repeat(80);
+                    let cols = |spans: Vec<Span<'_>>| -> usize {
+                        spans.iter().map(|s| s.content.width()).sum()
+                    };
+                    // 行頭 + 名前ブロック（名前 + ID + 詰め物）+ 行末ブロック +
+                    // メニュー = ちょうど内側の幅
+                    let used = HEAD_COLS
+                        + cols(row_name_spans(&d, inner, Style::default()))
+                        + cols(row_tail_spans(&d, inner, 0))
+                        + MENU_COLS;
                     assert_eq!(
                         used, inner as usize,
                         "inner {inner} / {} / {} does not fill the row exactly",
@@ -3649,6 +3756,93 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// **短い ID は名前の直後に並び、「サイドバーを広げたときだけ」出る。**
+    ///
+    /// 既定幅で出すと名前が 9 桁痩せる。ID が要るのは他のセッションを宛先として
+    /// 指すときだけで、名前は常に読む ＝ 常に読む方を痩せさせない。
+    ///
+    /// 閾値は「ID を出しても名前が既定幅ぶん残るか」なので、**ID が見えている
+    /// どの幅でも、名前は既定幅と同じかそれより広い**。ここが崩れると
+    /// 「広げたのに名前が読めなくなる」が起きる
+    #[test]
+    fn the_short_id_sits_next_to_the_name_once_the_sidebar_is_widened() {
+        use unicode_width::UnicodeWidthStr as _;
+        let mut d = look_fixture();
+        d.label = "some-session".to_string();
+        let short = d.id.short();
+        let name_block = |inner: u16| -> String {
+            row_name_spans(&d, inner, Style::default())
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+
+        // 既定幅では出ない
+        let default = name_block(DEFAULT_INNER);
+        assert!(
+            !default.contains(&short),
+            "the id ate the name at the default width: {default:?}"
+        );
+
+        // 十分広げれば出る。**名前の直後**（行末ではない）で、
+        // 出るのは `ccdesk list` と同じ 8 桁
+        let wide = name_block(60);
+        assert_eq!(short.width(), crate::sessions::SHORT_ID_COLS, "the id is not 8 columns");
+        assert!(
+            wide.starts_with(&format!("{} {short}", d.label)),
+            "the id is not right after the name: {wide:?}"
+        );
+
+        // 名前の桁は、ID が出ているどの幅でも既定幅を下回らない
+        let mut seen_id = false;
+        for inner in MIN_ROW_COLS..120 {
+            if !name_block(inner).contains(&short) {
+                continue;
+            }
+            seen_id = true;
+            assert!(
+                name_cols(inner) >= NAME_COLS_AT_DEFAULT,
+                "inner {inner} shows the id but left the name only {} columns",
+                name_cols(inner)
+            );
+        }
+        assert!(seen_id, "the id never appears at any width");
+    }
+
+    /// **ペイン枠は今どのセッションを見ているかを名乗る。**
+    /// 出す ID は `ccdesk list` と同じ 8 桁なので、読んだままを宛先として打てる。
+    ///
+    /// 細くなったスロットでは ID から落ちる（サイドバーの行末と同じ規則）
+    #[test]
+    fn the_pane_frame_names_the_session_and_gives_up_the_id_when_thin() {
+        use unicode_width::UnicodeWidthStr as _;
+        let id = SessionId::new("0123456789abcdef-0123");
+        let short = id.short();
+
+        // 広いペイン: タイトルと ID が並ぶ
+        let wide = pane_title("api probe", &id, 60);
+        assert!(wide.starts_with("api probe"), "the title is not first: {wide:?}");
+        assert!(wide.ends_with(&short), "the id is not at the end: {wide:?}");
+
+        // 長いタイトルは詰められるが、ID は残る（見出しは枠に収まる）。
+        // **2 桁の文字で見る**: タイトルは会話から生成されるので全角を含み得て、
+        // 文字数で切ると枠を壊す（この検査に日本語を使えないのでハングルを置く。
+        // 見たいのは「1 文字 2 桁」であって字種ではない）
+        for width in MIN_PANE..100 {
+            let drawn = pane_title(&"\u{ac00}".repeat(80), &id, width);
+            assert!(
+                drawn.width() <= usize::from(width) - PANE_TITLE_MARGIN,
+                "width {width} overflows the frame: {drawn:?}"
+            );
+            assert!(drawn.ends_with(&short), "width {width} dropped the id: {drawn:?}");
+        }
+
+        // 分割で細くなったスロットでは ID が落ち、タイトルだけが残る
+        let thin = pane_title("api probe", &id, 14);
+        assert!(!thin.contains(&short), "the id squeezed the name: {thin:?}");
+        assert!(!thin.is_empty(), "the title vanished: {thin:?}");
     }
 
     /// **止めた行は `Stopped`（行末の語も Stopped）。**
@@ -3731,6 +3925,7 @@ pub(crate) mod tests {
         RowData {
             kind: Kind::Claude,
             action: RowAction::Open(SessionId::new("a")),
+            id: SessionId::new("0123456789abcdef"),
             group: State::Waiting,
             cwd: "C:\\dev\\api".to_string(),
             label: "the-row".to_string(),

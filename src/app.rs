@@ -590,7 +590,7 @@ impl Default for App {
             titles: Titles::default(),
             last_scan: std::time::Instant::now(),
             last_live_scan: std::time::Instant::now(),
-            sidebar_width: 34,
+            sidebar_width: crate::ui::DEFAULT_SIDEBAR,
             dragging: false,
             cross_drag: None,
             last_drag_resize: std::time::Instant::now(),

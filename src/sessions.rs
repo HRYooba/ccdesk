@@ -84,7 +84,25 @@ impl SessionId {
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// 人に見せる短い ID。**`ccdesk list` も画面もここを読む**ので、
+    /// 一覧に出た 8 桁とサイドバー・ペイン枠に出る 8 桁が食い違わない。
+    ///
+    /// **そのまま宛先として通る長さ**（[`crate::relay::resolve`] は id を
+    /// 前方一致で解くので、8 桁が衝突しない限り一意に解ける）。衝突しても
+    /// 黙って 1 つ目へ送るのではなく候補を並べて失敗するので、
+    /// 短く切ったことが誤配に化けることはない
+    pub(crate) fn short(&self) -> String {
+        self.0.chars().take(SHORT_ID_COLS).collect()
+    }
 }
+
+/// [`SessionId::short`] の桁数。**桁の予算（サイドバーの行末・ペイン枠）が
+/// この値に乗る**ので、切る長さを画面側に書き写さない。
+///
+/// UUID の先頭 8 桁は ASCII の 16 進 ＝ **文字数と表示桁が一致する**
+/// （表示幅を測り直さなくてよい根拠）
+pub(crate) const SHORT_ID_COLS: usize = 8;
 
 impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -513,6 +531,23 @@ mod tests {
     use std::time::Instant;
     // 取り残し tmp の判定と保持期間は lib 側（tmp 名を決める場所）が持つ
     use ccdesk::{is_leftover_tmp, TMP_KEEP};
+
+    /// **人に見せる ID は宛先として通る形でなければ意味が無い。**
+    /// `ccdesk list` も画面も [`SessionId::short`] を読むので、桁数が
+    /// [`SHORT_ID_COLS`] と食い違わないことをここで固定する。
+    ///
+    /// 8 桁に満たない ID（テストの手組みや壊れた保管）でも切り詰めずに
+    /// そのまま返す ＝ 短いことを理由に空にしない
+    #[test]
+    fn the_short_id_is_a_prefix_that_can_be_typed_back_as_a_target() {
+        let full = "0123abcd-4567-89ef-0123-456789abcdef";
+        let short = SessionId::new(full).short();
+        assert_eq!(short.chars().count(), SHORT_ID_COLS);
+        assert!(full.starts_with(&short), "{short:?} is not a prefix of {full:?}");
+        // 短い ID はそのまま返る（切り詰めも詰め物もしない）
+        assert_eq!(SessionId::new("abc").short(), "abc");
+        assert_eq!(SessionId::default().short(), "");
+    }
 
     /// テスト専用の保管先。**実ユーザーの `~/.ccdesk` を絶対に触らない**ための境界
     /// （安全な置き場の実装は [`crate::testutil::TempDir`] 1 つ。
