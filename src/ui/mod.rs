@@ -151,14 +151,20 @@ fn mark(on: bool, yes: &'static str, no: &'static str) -> &'static str {
     if on { yes } else { no }
 }
 
-/// リセット時刻のローカル表記。当日なら "14:00"、別日なら "7/29 09:00"
-fn fmt_reset_at(resets_at: u64) -> String {
+/// リセット時刻のローカル表記。別日なら "7/29 09:00"、当日は `with_date` 次第で
+/// "8/6 14:00" か "14:00"。
+///
+/// **当日を時刻だけで出せるのは 5h 枠だけ。** 5h は数時間おきに来るので日付は
+/// ほぼ常に今日か明日で、幅を食うだけの情報になる。週次（7d / モデル別）は
+/// 週に 1 度しか来ないので、当日に時刻だけで出ると 5h の時刻と見分けが付かない
+/// （「時刻だけ ＝ 当日」という規則は画面に書かれていない ＝ 読み手は知らない）
+fn fmt_reset_at(resets_at: u64, with_date: bool) -> String {
     use chrono::{Datelike, Local, TimeZone, Timelike};
     let Some(t) = Local.timestamp_opt(resets_at as i64, 0).single() else {
         return String::new();
     };
     let today = Local::now().date_naive();
-    if t.date_naive() == today {
+    if !with_date && t.date_naive() == today {
         format!("{:02}:{:02}", t.hour(), t.minute())
     } else {
         format!("{}/{} {:02}:{:02}", t.month(), t.day(), t.hour(), t.minute())
@@ -256,10 +262,11 @@ fn push_window(
     ));
 }
 
-/// 直前までの枠に共通するリセット時刻
-fn push_reset(spans: &mut Vec<Span<'static>>, resets_at: u64) {
+/// 直前までの枠に共通するリセット時刻。`with_date` は [`fmt_reset_at`] の判断
+/// （当日を時刻だけで出してよいのは 5h だけ）
+fn push_reset(spans: &mut Vec<Span<'static>>, resets_at: u64, with_date: bool) {
     spans.push(Span::styled(
-        format!(" →{}", fmt_reset_at(resets_at)),
+        format!(" →{}", fmt_reset_at(resets_at, with_date)),
         Style::default().fg(ui().dim),
     ));
 }
@@ -294,7 +301,8 @@ fn usage_spans(
     if let Some(w) = &info.five {
         push_window(&mut spans, "5h", w.pct, stale, spin);
         if with_resets && let Some(resets_at) = w.resets_at {
-            push_reset(&mut spans, resets_at);
+            // 5h だけは当日を時刻だけで出す（数時間おきに来るので日付は幅の無駄）
+            push_reset(&mut spans, resets_at, false);
         }
     }
 
@@ -314,7 +322,8 @@ fn usage_spans(
             .and_then(|w| w.resets_at)
             .or_else(|| models.iter().find_map(|(_, w)| w.resets_at))
     {
-        push_reset(&mut spans, resets_at);
+        // 週次は当日でも日付を出す（週に 1 度しか来ない時刻を 5h と混同させない）
+        push_reset(&mut spans, resets_at, true);
     }
 
     if !spans.is_empty() {
@@ -2246,6 +2255,42 @@ pub(crate) mod tests {
         let text = usage_text(&usage, 200);
         assert!(text.contains("Fable"), "{text}");
         assert_eq!(text.matches('\u{2192}').count(), 1, "{text}");
+    }
+
+    /// **週次のリセットが当日でも日付を出す。** 「時刻だけ ＝ 当日」という規則は
+    /// 画面のどこにも書かれていないので、週に 1 度しか来ない週次の時刻がその形で
+    /// 出ると 5h の時刻と見分けが付かない。5h は数時間おきに来るので当日は時刻だけ
+    /// （日付は幅を食うだけ）＝ **同じ時刻でも週次にだけ日付が付く**
+    #[test]
+    fn the_weekly_reset_keeps_its_date_even_when_it_falls_today() {
+        use chrono::{Local, TimeZone};
+        // 今日の正午（日付が変わる境目で走っても当日に収まる時刻を選ぶ）
+        let today_noon = Local::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .and_then(|t| Local.from_local_datetime(&t).single())
+            .expect("today has a noon")
+            .timestamp() as u64;
+        let usage = Usage::Ready(UsageInfo {
+            five: Some(UsageWindow {
+                pct: 18.0,
+                resets_at: Some(today_noon),
+            }),
+            seven: Some(UsageWindow {
+                pct: 55.0,
+                resets_at: Some(today_noon),
+            }),
+            models: Vec::new(),
+            fetched_at: ccdesk::now_secs(),
+        });
+        let text = usage_text(&usage, 200);
+        assert_eq!(text.matches('\u{2192}').count(), 2, "{text}");
+        // 日付は 1 つだけ ＝ 5h には付かず、週次にだけ付く
+        assert_eq!(text.matches('/').count(), 1, "the date is on the wrong window: {text}");
+        let date = text.find('/').expect("the weekly date is missing");
+        let seven = text.find("7d").expect("the weekly window is missing");
+        assert!(date > seven, "the date landed on the 5h window: {text}");
+        assert!(text.contains("12:00"), "{text}");
     }
 
     /// **狭い端末では詳しさから落とす。** 落とす順はリセット時刻 → モデル別 →
