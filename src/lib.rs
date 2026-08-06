@@ -89,6 +89,12 @@ impl vt100::Callbacks for Responder {
                         1004 => known(self.focus_reporting),
                         1049 => known(screen.alternate_screen()),
                         2004 => known(screen.bracketed_paste()),
+                        // 9001（win32-input-mode）は codex も claude も起動時に
+                        // 立てるが、ccdesk は実装しない ＝ ここも「未認識」を返す。
+                        // crossterm のキーイベントには仮想キーコードもスキャン
+                        // コードも無く、あの形式は組めない。**実測で害が無い**:
+                        // 素の文字・Backspace・矢印を legacy VT で送って、
+                        // 両者とも正しく反映される（Left+Z で "abZc"）
                         _ => 0,
                     };
                     self.pending

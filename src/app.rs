@@ -590,7 +590,7 @@ impl Default for App {
             titles: Titles::default(),
             last_scan: std::time::Instant::now(),
             last_live_scan: std::time::Instant::now(),
-            sidebar_width: 34,
+            sidebar_width: crate::ui::DEFAULT_SIDEBAR,
             dragging: false,
             cross_drag: None,
             last_drag_resize: std::time::Instant::now(),
@@ -1012,6 +1012,10 @@ fn send_to_active(app: &mut App, bytes: &[u8]) {
     let Some(window) = app.focused_window().map(|at| &app.windows[at]) else {
         return;
     };
+    // 打鍵・貼り付けは「今」に対する操作なので、スクロールバックを見ていたら
+    // 最下部へ戻す（子の応答が画面外で起きて止まって見えるのを防ぐ）。
+    // **マウス転送はここを通らない**ので、ホイールで戻した位置は保たれる
+    window.parser.lock_recover().screen_mut().set_scrollback(0);
     if window.send(bytes).is_ok() {
         return;
     }

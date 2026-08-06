@@ -158,7 +158,7 @@ fn require_running(session: &Open, verb: &str) -> anyhow::Result<()> {
     anyhow::bail!(
         "{} ({}) is not running; `{verb}` needs a running session",
         session.name,
-        short_id(&session.id)
+        session.id.short()
     )
 }
 
@@ -447,19 +447,13 @@ pub(crate) fn resolve<'a>(target: &str, open: &'a [Open]) -> anyhow::Result<&'a 
                 found.len(),
                 found
                     .iter()
-                    .map(|session| format!("  {}  {}", short_id(&session.id), session.name))
+                    .map(|session| format!("  {}  {}", session.id.short(), session.name))
                     .collect::<Vec<_>>()
                     .join("\n")
             ),
         }
     }
     anyhow::bail!("no session matches `{needle}`; run `ccdesk list` to see the sessions")
-}
-
-/// 一覧と失敗の説明に出す短い ID。**そのまま宛先として通る**長さ
-/// （[`resolve`] は前方一致で解くので、8 桁が衝突しない限り一意）
-fn short_id(id: &SessionId) -> String {
-    id.as_str().chars().take(8).collect()
 }
 
 /// 自分がどのインスタンスの子か。**無ければ失敗**（ccdesk の外で叩かれた）
@@ -499,7 +493,7 @@ pub(crate) fn run_list() -> anyhow::Result<()> {
         let state = if session.running { "running" } else { "stopped" };
         println!(
             "{mark} {}  {:<8} {:<8} {}  ({})",
-            short_id(&session.id),
+            session.id.short(),
             session.kind.as_str(),
             state,
             session.name,
@@ -531,7 +525,7 @@ pub(crate) fn run_send(target: &str, text: &str) -> anyhow::Result<()> {
             text: text.to_string(),
         },
     )?;
-    println!("sent to {} ({})", to.name, short_id(&to.id));
+    println!("sent to {} ({})", to.name, to.id.short());
     Ok(())
 }
 
@@ -541,7 +535,7 @@ pub(crate) fn run_stop(target: &str) -> anyhow::Result<()> {
     let (instance, to) = other(target)?;
     require_running(&to, "stop")?;
     push(instance, &Request::Stop { to: to.id.clone() })?;
-    println!("stopped {} ({})", to.name, short_id(&to.id));
+    println!("stopped {} ({})", to.name, to.id.short());
     Ok(())
 }
 
@@ -553,7 +547,7 @@ pub(crate) fn run_stop(target: &str) -> anyhow::Result<()> {
 pub(crate) fn run_close(target: &str) -> anyhow::Result<()> {
     let (instance, to) = other(target)?;
     push(instance, &Request::Close { to: to.id.clone() })?;
-    println!("closed {} ({})", to.name, short_id(&to.id));
+    println!("closed {} ({})", to.name, to.id.short());
     Ok(())
 }
 
@@ -605,7 +599,7 @@ pub(crate) fn run_read(target: &str, last: usize, screen: bool) -> anyhow::Resul
     let Some(path) = session.transcript.as_deref() else {
         anyhow::bail!(
             "no transcript for {} yet; try `--screen`",
-            short_id(&session.id)
+            session.id.short()
         );
     };
     let messages = read_transcript(path, session.kind, last);
@@ -656,7 +650,7 @@ pub(crate) fn run_new(kind: Option<Kind>, cwd: Option<&str>, prompt: &str) -> an
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("ccdesk answered without a session id"))?;
     // **短い ID を出す**（そのまま次のコマンドの宛先として通る）
-    println!("started {}", short_id(&SessionId::new(id)));
+    println!("started {}", SessionId::new(id).short());
     Ok(())
 }
 
