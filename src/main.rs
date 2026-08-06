@@ -255,7 +255,6 @@ fn main() -> anyhow::Result<()> {
         agent_updating: app::agent_updating_flags(),
         agent_update_error: Arc::new(Mutex::new(None)),
         ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
-        restart_to: None,
         ccdesk_latest: None,
         ccdesk_latest_shared: Arc::new(Mutex::new(None)),
         ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -338,9 +337,6 @@ fn main() -> anyhow::Result<()> {
     // 窓の公開をやめる。**pid は再利用される**ので、残すと次に同じ pid を得た
     // プロセスの子が、死んだインスタンスの窓一覧を自分のものとして読む
     relay::unpublish(std::process::id());
-    // 再起動先を先に取り出して App を落とす。restart のときこのプロセスは
-    // **子を見送るまで残る**（下）ので、画面バッファを抱えたまま居座らせない
-    let restart_to = app.restart_to.take();
     drop(app);
     let _ = crossterm::execute!(
         std::io::stdout(),
@@ -354,28 +350,6 @@ fn main() -> anyhow::Result<()> {
     // `?25h` を出す）。alt screen を出た後に出さないと通常画面に効かない端末があるため、
     // restore() の後で明示的に drop する（この順序は意味を持つので暗黙の drop に任せない）
     drop(terminal);
-    // 版行の restart: 差し替え済みの exe を**端末を返し終えた後**に起こす
-    // （TUI を持ったまま起こすと 2 つの TUI が同じ画面を取り合う）。
-    // 子は同じコンソールを引き継ぐ
-    if let Some(exe) = restart_to {
-        match std::process::Command::new(&exe).spawn() {
-            // **子が終わるまで見送る。** 起こしてすぐ退くと、ccdesk を起こした
-            // シェルが「コマンドが終わった」と見なしてプロンプトへ戻り、同じ
-            // コンソールの入力を子と奪い合う（クリックがシェルに食われる／
-            // 行編集がコンソールの入力モードを戻すのでマウス報告そのものが止まる）。
-            // ここで待つ ＝ コンソールを読むプロセスは常に 1 つに保たれる。
-            // 待っている間このプロセスがすることは無い（セッションは既に止め、
-            // 端末も返し終えている）
-            Ok(mut child) => {
-                let _ = child.wait();
-            }
-            // 失敗は次の起動が無いだけ ＝ 普通の終了と同じ状態なので、ログと 1 行の案内に留める
-            Err(e) => {
-                log_error(&format!("could not restart {}: {e}", exe.display()));
-                eprintln!("could not restart {}: {e} — run it again yourself", exe.display());
-            }
-        }
-    }
     result
 }
 

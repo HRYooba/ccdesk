@@ -602,10 +602,13 @@ enum UpdateState {
     Available,
     /// 更新の実行中
     Running,
-    /// 差し替え済み。反映は次回起動なので、クリックで再起動して適用する
-    /// （この状態になるのは ccdesk の行だけ。claude 側は次の `claude --version` が
+    /// 差し替え済み。反映は次回起動なので、案内だけ出して押させない。
+    /// **自動再起動はしない**（コンソールを親子で奪い合いマウスが効かなくなる不具合が
+    /// 実機で出たため、TUI を持ったまま自プロセスを起こす経路そのものをやめた）。
+    /// 利用者が自分の好きなタイミングで ccdesk を終了・再起動して適用する。
+    /// この状態になるのは ccdesk の行だけ（claude 側は次の `claude --version` が
     /// 新版を返して行が最新表示へ戻る）
-    Restart,
+    RestartPending,
 }
 
 impl UpdateState {
@@ -619,31 +622,32 @@ impl UpdateState {
             Self::Current => "",
             Self::Available => "update",
             Self::Running => "updating…",
-            Self::Restart => "restart",
+            // 案内であって呼びかけではない: 押しても何も起きない（[`Self::action`]）。
+            // 語自体は変えない ＝ 「やることの名前」として読める（利用者が自分で
+            // ccdesk を終了・再起動する）。既定幅の版数字と並んでも収まる短さも兼ねる
+            Self::RestartPending => "restart",
         }
     }
 
-    /// 押したときの動作（＝行に付ける [`RowAction`]）。`update` は更新の実行、
-    /// `restart` は再起動での適用で、**動詞（[`Self::verb`]）が押した結果の名前**。
-    /// 実行中と最新は押す意味が無いので付けない。**それでも行は行**なので、
-    /// 選択・ホバーの対象からは外れない（[`SidebarRow::Inert`]）。
-    /// `restart` は ccdesk の行にしか無い（claude は次回起動で勝手に適用される）ので、
-    /// 持たない行は `None` を渡す ＝ その状態になっても押せない行に留まる
-    fn action(self, update: RowAction, restart: Option<RowAction>) -> SidebarRow {
-        match (self, restart) {
-            (Self::Available, _) => SidebarRow::Action(update),
-            (Self::Restart, Some(restart)) => SidebarRow::Action(restart),
+    /// 押したときの動作（＝行に付ける [`RowAction`]）。押して意味があるのは
+    /// `update`（更新の実行）だけ。**差し替え済みの行も押せない**: 自動再起動を
+    /// やめたので、案内を出すだけの [`SidebarRow::Inert`] に留める
+    /// （それでも行は行なので、選択・ホバーの対象からは外れない）
+    fn action(self, update: RowAction) -> SidebarRow {
+        match self {
+            Self::Available => SidebarRow::Action(update),
             _ => SidebarRow::Inert,
         }
     }
 
     /// 行のスタイル。最新は dim（背景情報）、やることがある行は本文色にする
-    /// （dim だと更新の存在に気づかない）
+    /// （dim だと更新の存在に気づかない）。差し替え済みも押せないだけで
+    /// 気づいてほしい情報なので dim には落とさない
     fn style(self) -> Style {
         match self {
             Self::Current => Style::default().fg(ui().dim),
             Self::Running => Style::default().fg(ui().working),
-            Self::Available | Self::Restart => Style::default().fg(MUTED_FG),
+            Self::Available | Self::RestartPending => Style::default().fg(MUTED_FG),
         }
     }
 }
@@ -710,7 +714,7 @@ fn version_rows(
             inner_width,
         ),
         ccdesk.style(),
-        ccdesk.action(RowAction::UpdateCcdesk, Some(RowAction::RestartCcdesk)),
+        ccdesk.action(RowAction::UpdateCcdesk),
     )];
     // **agent ごとに 1 行。** 1 行へ詰めると横に長くなり、更新導線も行単位で
     // 押せなくなる（どちらの更新かを行が名乗れない）。
@@ -725,7 +729,7 @@ fn version_rows(
                 inner_width,
             ),
             state.style(),
-            state.action(RowAction::UpdateAgent(*kind), None),
+            state.action(RowAction::UpdateAgent(*kind)),
         )
     }));
     rows.push((
@@ -839,7 +843,7 @@ fn ccdesk_update_state(app: &App) -> UpdateState {
         .lock_recover()
     {
         SelfUpdate::Running => UpdateState::Running,
-        SelfUpdate::Done(_) => UpdateState::Restart,
+        SelfUpdate::Done => UpdateState::RestartPending,
         // Failed は run ループが下部バーへ出して Idle へ戻すので、行は再試行可のまま
         SelfUpdate::Idle | SelfUpdate::Failed(_) => {
             if app.ccdesk_latest.is_some() {
@@ -851,7 +855,7 @@ fn ccdesk_update_state(app: &App) -> UpdateState {
     }
 }
 
-/// claude 本体の版行の状態。ccdesk 側と違って Restart を持たないのは、更新後に
+/// claude 本体の版行の状態。ccdesk 側と違って RestartPending を持たないのは、更新後に
 /// `claude --version` が新しい版を返して `footer.latest` が消える ＝ 行が自然に
 /// 最新表示へ戻るため。ネイティブインストールは既定で自動更新するので、
 /// 何もしなくてもこの行が消えることもある（公式仕様）
@@ -3040,7 +3044,7 @@ pub(crate) mod tests {
             (UpdateState::Current, UpdateState::Current),
             (UpdateState::Available, UpdateState::Current),
             (UpdateState::Running, UpdateState::Available),
-            (UpdateState::Restart, UpdateState::Running),
+            (UpdateState::RestartPending, UpdateState::Running),
         ] {
             let rows = version_rows(ccdesk, &agents(claude, "2.1.220"), DEFAULT_INNER);
             assert_eq!(rows.len(), total, "expected one row per agent + 1 separator");
@@ -3080,7 +3084,7 @@ pub(crate) mod tests {
         for (state, verb) in [
             (UpdateState::Available, "update"),
             (UpdateState::Running, "updating…"),
-            (UpdateState::Restart, "restart"),
+            (UpdateState::RestartPending, "restart"),
         ] {
             let text = row(state);
             assert!(text.starts_with(UPDATE_MARK), "{text:?}");
@@ -3110,7 +3114,7 @@ pub(crate) mod tests {
         for state in [
             UpdateState::Available,
             UpdateState::Running,
-            UpdateState::Restart,
+            UpdateState::RestartPending,
         ] {
             let text = version_row(" ", "ccdesk", "0.5.0", state, DEFAULT_INNER);
             assert_eq!(
@@ -3136,10 +3140,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// 押せるのは「やることがある」行だけ: 更新あり = update、ccdesk の
-    /// 差し替え済み = restart（動詞の通りに動く）。実行中・最新は押しても
-    /// 意味が無いので動作を付けない。**それでも行は行**なので
-    /// [`SidebarRow::Inert`] ＝ 選択・ホバーの対象からは外れない
+    /// 押せるのは「更新がある」行だけ（= update）。実行中・最新・差し替え済みは
+    /// 押しても意味が無いので動作を付けない。**それでも行は行**なので
+    /// [`SidebarRow::Inert`] ＝ 選択・ホバーの対象からは外れない。
+    ///
+    /// **差し替え済み（`RestartPending`）も押せない側。** 自動再起動をやめたので、
+    /// ccdesk の行もクリックでは何も起きない案内に留まる
     #[test]
     fn version_rows_are_clickable_only_when_there_is_something_to_do() {
         let rows_of = |ccdesk, claude| {
@@ -3157,17 +3163,13 @@ pub(crate) mod tests {
                 SidebarRow::Action(RowAction::UpdateAgent(Kind::Claude))
             )
         );
-        // 差し替え済み: ccdesk は restart で適用できる。claude はこの状態に
-        // ならない（版チェックが新版を返して行が最新表示へ戻る）ので、
-        // 仮になっても押せない行に留まる
-        assert_eq!(
-            rows_of(UpdateState::Restart, UpdateState::Restart),
-            (
-                SidebarRow::Action(RowAction::RestartCcdesk),
-                SidebarRow::Inert
-            )
-        );
-        for state in [UpdateState::Current, UpdateState::Running] {
+        // 差し替え済み: claude はこの状態にならない（版チェックが新版を返して
+        // 行が最新表示へ戻る）ので、仮になっても押せない行に留まる
+        for state in [
+            UpdateState::Current,
+            UpdateState::Running,
+            UpdateState::RestartPending,
+        ] {
             assert_eq!(
                 rows_of(state, state),
                 (SidebarRow::Inert, SidebarRow::Inert),
@@ -3190,7 +3192,7 @@ pub(crate) mod tests {
             UpdateState::Current,
             UpdateState::Available,
             UpdateState::Running,
-            UpdateState::Restart,
+            UpdateState::RestartPending,
         ] {
             for version in ["", "0.5.0", "2.1.220", "10.20.300"] {
                 for (glyph, name) in &names {
