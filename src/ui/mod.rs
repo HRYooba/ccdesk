@@ -1987,6 +1987,15 @@ fn draw_session_slot(
     };
     let parser = window.parser.lock_recover();
     let screen = parser.screen();
+    // スクロールバックを見ている間は、新しい出力が来ても画面が動かない
+    // （vt100 が見ている位置を保つ）。**止まったのか遡っているのかは
+    // 見ただけでは区別が付かない**ので、枠に遡り量を出す
+    let scrolled = screen.scrollback();
+    let title = if scrolled > 0 {
+        format!("{title} ↑{scrolled}")
+    } else {
+        title
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -2004,7 +2013,9 @@ fn draw_session_slot(
     // ペイン外へはみ出す座標はペイン内へクランプする
     let (crow, ccol) = screen.cursor_position();
     let pos = terminal_cursor_pos(rect, inner, crow, ccol);
-    if focused && !screen.hide_cursor() {
+    // 遡っている間はカーソルを出さない（座標は「今の画面」のもので、
+    // 表示している行とは無関係 ＝ 出すと無関係な位置で点滅する）
+    if focused && !screen.hide_cursor() && scrolled == 0 {
         FrameCursor::shown_at(pos)
     } else {
         FrameCursor::hidden_at(pos)

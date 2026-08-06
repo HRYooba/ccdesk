@@ -1,12 +1,36 @@
-//! キー入力・貼り付けの VT エンコードと、マウスイベントの PTY 転送。
+//! キー入力・貼り付けの VT エンコードと、マウスイベントの宛先。
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use ccdesk::{LockExt, Parser};
 
 use crate::app::App;
 
-/// マウスイベントを claude が要求したプロトコル（SGR 前提）で PTY へ転送する。
-/// claude は AnyMotion(1003) + SGR(1006) を有効化してくる。
+/// ホイール 1 段で動かす行数（サイドバーの一覧と同じ刻み）
+const WHEEL_LINES: usize = 3;
+
+/// マウス報告を持たない子のホイール。**ccdesk 自身のスクロールバックを動かす**
+/// （[`crate::session`] の `SCROLLBACK`）。
+///
+/// 位置の正本は vt100 のスクロールバックオフセットで、写しは持たない
+/// （描画は同じ [`vt100::Screen`] を読むので、見えている位置と必ず一致する）。
+/// **代替画面にいる子（claude）では何も起きない**: vt100 の代替グリッドは
+/// スクロールバックを持たず、`set_scrollback` が 0 にクランプされる
+fn scroll_local(parser: &mut Parser, kind: MouseEventKind) {
+    let at = parser.screen().scrollback();
+    let to = match kind {
+        MouseEventKind::ScrollUp => at.saturating_add(WHEEL_LINES),
+        MouseEventKind::ScrollDown => at.saturating_sub(WHEEL_LINES),
+        _ => return,
+    };
+    parser.screen_mut().set_scrollback(to);
+}
+
+/// マウスイベントの宛先を決める。**子がマウス報告を有効化しているかで分かれる**:
+/// - 有効化している（claude は AnyMotion(1003) + SGR(1006)）: 要求どおり PTY へ転送し、
+///   ホイールの意味も子が決める
+/// - 有効化していない（codex）: 子はマウスを見ないので、ホイールは
+///   ccdesk のスクロールバックが受ける（[`scroll_local`]）
+///
 /// 書き込みの失敗は落とす（マウスは高頻度で、取りこぼしても次のイベントが来る。
 /// 壊れた PTY の窓はキー入力側の経路が閉じる）
 pub(crate) fn forward_mouse(app: &mut App, mouse: &MouseEvent) {
@@ -32,7 +56,11 @@ pub(crate) fn forward_mouse(app: &mut App, mouse: &MouseEvent) {
             screen.size(),
         )
     };
-    if mode == MouseProtocolMode::None || encoding != MouseProtocolEncoding::Sgr {
+    if mode == MouseProtocolMode::None {
+        scroll_local(&mut window.parser.lock_recover(), mouse.kind);
+        return;
+    }
+    if encoding != MouseProtocolEncoding::Sgr {
         return; // claude は SGR(1006) を有効化する。他エンコーディングは対象外
     }
 
@@ -276,6 +304,78 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    /// `rows` 行の画面に `lines` 行を流したパーサ（画面外は保持される）。
+    /// `setup` は流す前に食わせるシーケンス（代替画面へ入る等）
+    fn parser_with_history(rows: u16, lines: usize, setup: &str) -> Parser {
+        let mut parser = ccdesk::new_parser(rows, 20, 100);
+        parser.process(setup.as_bytes());
+        for i in 0..lines {
+            parser.process(format!("line{i}\r\n").as_bytes());
+        }
+        parser
+    }
+
+    /// **マウス報告を有効化しない子（codex）のホイールは ccdesk が受ける。**
+    /// codex は代替画面を使わず通常画面へ履歴を流すので、遡り先を持っているのは
+    /// 端末側 ＝ ccdesk だけ（実測: codex が立てるのは 9001/1004/2004/2026 のみ）
+    #[test]
+    fn the_wheel_scrolls_this_pane_for_a_child_that_does_not_take_the_mouse() {
+        let mut parser = parser_with_history(4, 20, "");
+        assert!(parser.screen().contents().contains("line19"), "precondition: the newest line is in view");
+
+        scroll_local(&mut parser, MouseEventKind::ScrollUp);
+        assert_eq!(parser.screen().scrollback(), WHEEL_LINES);
+        let scrolled = parser.screen().contents();
+        assert!(!scrolled.contains("line19"), "the newest line is still in view after scrolling back");
+        assert!(scrolled.contains("line16"), "the scrolled-to lines are not in view");
+
+        scroll_local(&mut parser, MouseEventKind::ScrollDown);
+        assert_eq!(parser.screen().scrollback(), 0);
+        assert!(parser.screen().contents().contains("line19"));
+    }
+
+    /// 下端・上端で止まる（行き過ぎて空白を見せない）
+    #[test]
+    fn scrolling_stops_at_both_ends() {
+        let mut parser = parser_with_history(4, 20, "");
+        // 最下部でさらに下へ回しても動かない
+        scroll_local(&mut parser, MouseEventKind::ScrollDown);
+        assert_eq!(parser.screen().scrollback(), 0);
+        // 溜まっている行数を超えて遡らない
+        for _ in 0..50 {
+            scroll_local(&mut parser, MouseEventKind::ScrollUp);
+        }
+        assert!(parser.screen().scrollback() <= 20, "scrolled past what was ever written");
+        assert!(parser.screen().contents().contains("line0"), "the oldest line is out of reach");
+    }
+
+    /// **代替画面にいる子（claude）のスクロールは子自身の仕事。**
+    /// claude はマウス報告も有効化するので [`forward_mouse`] はそもそも
+    /// ここへ来ないが、来ても vt100 の代替グリッドはスクロールバックを持たない
+    /// （二重の安全。この前提が崩れたらここが落ちる）
+    #[test]
+    fn a_child_on_the_alternate_screen_is_left_to_scroll_itself() {
+        let mut parser = parser_with_history(4, 20, "\x1b[?1049h");
+        let before = parser.screen().contents();
+        scroll_local(&mut parser, MouseEventKind::ScrollUp);
+        assert_eq!(parser.screen().scrollback(), 0, "the alternate screen has nothing to scroll back to");
+        assert_eq!(parser.screen().contents(), before);
+    }
+
+    /// ホイール以外（移動・クリック）はスクロールに化けない
+    #[test]
+    fn only_the_wheel_scrolls() {
+        let mut parser = parser_with_history(4, 20, "");
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            scroll_local(&mut parser, kind);
+        }
+        assert_eq!(parser.screen().scrollback(), 0);
     }
 
     /// **kitty を名乗っている間、Ctrl/Alt を含む文字キーは CSI u 形式で届く。**
