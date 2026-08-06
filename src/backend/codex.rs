@@ -111,14 +111,11 @@ impl Backend for Codex {
         Spawn { cmd, conversation }
     }
 
-    /// **要る。** codex に claude の `status` 相当のライブ状態は無く、Esc 中断では
-    /// `Stop` が発火しない（[#22858](https://github.com/openai/codex/issues/22858)。
-    /// 2026-08-02 時点で OPEN）。補正しないと中断した行が Working のまま固着する。
-    ///
-    /// 誤読の危険は小さい: codex の TUI は考えている間もスピナーを描き続けるので、
-    /// 「無出力が続く」＝ ほぼ本当に止まっている
-    fn quiet_means_idle(&self) -> bool {
-        true
+    /// **持たない。** codex に claude の `status` 相当のものは無い（`state_*.sqlite`
+    /// の `threads` は会話の索引であって、今どうしているかを言わない）。
+    /// 代用の材料と、それが要る理由は [`Backend::has_live_status`]
+    fn has_live_status(&self) -> bool {
+        false
     }
 
     /// 最新版は codex の配布元（npm registry の `@openai/codex`、dist-tag `latest`）
@@ -206,16 +203,24 @@ impl Backend for Codex {
 
     /// **索引で拾えない会話のための下段**（[`Self::name_index`] が主）。
     ///
-    /// 索引に載るのは名前が決まった会話だけで、実測（実機 2026-08-02）では
-    /// **ターンのある rollout 211 本のうち 65 本（31%）**しか載っていない。
-    /// 残りは rollout の**最初のユーザー発話**で名乗る ＝ claude が
-    /// `last-prompt` へ落ちるのと同じ形。
+    /// 索引に載るのは `/rename` された会話だけ（実機で確認: 索引ファイルは
+    /// リネームが 1 度も無いと存在すらしない）。残りは rollout の
+    /// **ユーザー発話**で名乗る ＝ claude が `last-prompt` へ落ちるのと同じ形。
     ///
-    /// **[`Span::Head`] なのが claude との違い。** codex の rollout は道具の出力が
-    /// 末尾を埋めるので末尾窓では届かない（実測 60%）が、先頭は
-    /// `session_meta` → 前置き → 最初のプロンプトと決まった形で、
-    /// 先頭 256 KiB に 213/214（99.5%）が収まる。**先頭は追記されない**ので
-    /// 1 会話 1 回の有界読みで済む
+    /// **同じ記録を 2 つの範囲で読む**のが codex の事情:
+    ///
+    /// | 順 | 範囲 | 拾えるもの |
+    /// |:--|:--|:--|
+    /// | 1 | [`Span::Appended`]（末尾窓） | **最後の**打鍵 ＝ 今やらせていること |
+    /// | 2 | [`Span::Head`]（先頭窓） | 最初の打鍵（末尾窓に発話が無いとき） |
+    ///
+    /// **1 が無いと名前が最初の打鍵で固定される。** claude の行は打つたびに
+    /// 最新へ動くのに codex の行だけ動かず、「名前が変わらない」として報告された。
+    ///
+    /// **2 を捨てられないのは、末尾窓に発話が届かない会話があるから**: codex の
+    /// rollout は道具の出力が末尾を埋める（実測 60%）。先頭は `session_meta` →
+    /// 前置き → 最初のプロンプトと決まった形で、先頭 256 KiB に 213/214（99.5%）が
+    /// 収まる。**先頭は追記されない**ので 1 会話 1 回の有界読みで済む
     fn title_records(&self) -> &'static [Candidate] {
         &TITLE_RECORDS
     }
@@ -246,12 +251,22 @@ impl Backend for Codex {
     }
 }
 
-/// 表示名の候補。**索引（`thread_name`）が上、これは下段**なので 1 つだけ
-static TITLE_RECORDS: [Candidate; 1] = [Candidate {
-    marker: USER_MESSAGE,
-    text: first_prompt,
-    span: Span::Head,
-}];
+/// 表示名の候補。**索引（`thread_name`）が上、これは下段**（[`Backend::title_records`]）。
+///
+/// 取り出しは 2 つとも同じ（rollout は打鍵を 1 種類の行でしか運ばない）で、
+/// **違うのは読む範囲だけ**。並びがそのまま優先順 ＝ 末尾で拾えたら先頭は見ない
+static TITLE_RECORDS: [Candidate; 2] = [
+    Candidate {
+        marker: USER_MESSAGE,
+        text: user_prompt,
+        span: Span::Appended,
+    },
+    Candidate {
+        marker: USER_MESSAGE,
+        text: user_prompt,
+        span: Span::Head,
+    },
+];
 
 /// rollout の中でユーザーの打鍵そのものを運ぶ行の型名。
 ///
@@ -259,13 +274,13 @@ static TITLE_RECORDS: [Candidate; 1] = [Candidate {
 /// permissions の前置きも同じ形で入るので、名前にすると前置きが行に出る
 const USER_MESSAGE: &str = "user_message";
 
-/// codex の答えそのものを運ぶ行の型名。**表示名には使わない**（名前は最初の
-/// 打鍵から採る）が、会話を読むには要る（[`Backend::message`]）
+/// codex の答えそのものを運ぶ行の型名。**表示名には使わない**（名前は打鍵から
+/// 採る）が、会話を読むには要る（[`Backend::message`]）
 const AGENT_MESSAGE: &str = "agent_message";
 
 /// `{"type":"event_msg","payload":{"type":"user_message","message":"…"}}` から
 /// 打鍵を取り出す
-fn first_prompt(value: &serde_json::Value) -> Option<&str> {
+fn user_prompt(value: &serde_json::Value) -> Option<&str> {
     let payload = value.get("payload")?;
     (payload.get("type").and_then(serde_json::Value::as_str) == Some(USER_MESSAGE))
         .then(|| payload.get("message").and_then(serde_json::Value::as_str))?

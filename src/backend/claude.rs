@@ -70,12 +70,12 @@ impl Backend for Claude {
         Spawn { cmd, conversation }
     }
 
-    /// **要らない。** claude は `~/.claude/sessions/` の `status` を遷移のたびに書き直す
-    /// ので、hook を取り逃しても次の観測（2 秒周期）で必ず正しくなる。
-    /// PTY の無音まで材料にすると、考え込んで出力が止まっている間を
-    /// 「手が空いた」と誤って読む
-    fn quiet_means_idle(&self) -> bool {
-        false
+    /// **持つ。** `~/.claude/sessions/` の `status` を遷移のたびに書き直すので、
+    /// hook を取り逃しても次の観測（2 秒周期）で必ず正しくなる ＝ 代用の材料
+    /// （[`Backend::has_live_status`]）は要らない。PTY の無音まで材料にすると、
+    /// 考え込んで出力が止まっている間を「手が空いた」と誤って読む
+    fn has_live_status(&self) -> bool {
+        true
     }
 
     /// 最新版は claude 本体の更新チェックと同じ公式配布エンドポイント

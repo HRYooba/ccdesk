@@ -820,9 +820,14 @@ pub(crate) struct Run<'a> {
     /// （フォーカスの出入りや再描画でも動くので精度は低い）。
     /// `None` ＝ この行に窓が無い（材料は必ず他にあるので、この値は読まれない）
     pub(crate) pty: Option<PtyHint>,
-    /// この行の agent が「PTY の無音 ＝ 手が空いた」を許すか
-    /// （[`crate::backend::Backend::quiet_means_idle`]）。**codex だけ true**
-    pub(crate) quiet_means_idle: bool,
+    /// この行の agent が現在値を外へ出しているか
+    /// （[`crate::backend::Backend::has_live_status`]）。**codex だけ false** ＝
+    /// hook を取り逃したときに下の 2 つの代用材料が効くのは codex の行だけ
+    pub(crate) has_live_status: bool,
+    /// **この時刻より後に会話の記録が伸びた**（epoch ms。0 ＝ 見ていない）。
+    /// 出どころと「なぜ伸びを見つけた時刻ではないのか」は
+    /// [`crate::title::Titles::grew_since`]
+    pub(crate) record_grew_since: u64,
 }
 
 /// 窓の PTY から見た様子。**2 値では足りない**のが要点で、「まだ 1 バイトも
@@ -899,9 +904,22 @@ pub(crate) fn row_state(run: Option<Run<'_>>) -> State {
         // **hook を取り逃した Working は PTY の無音で降ろす。** ライブ状態を持たない
         // agent（codex）は、これが無いと中断した行が赤のまま固着する
         Some((State::Working, _))
-            if run.quiet_means_idle && run.pty == Some(PtyHint::Quiet) =>
+            if !run.has_live_status && run.pty == Some(PtyHint::Quiet) =>
         {
             State::Idle
+        }
+        // **許可された Waiting は記録の伸びで降ろす。** 許可されたことを知らせる
+        // hook はどの agent にも無く、ライブ状態を持つ側は次の観測で直るが、
+        // 持たない側（codex）は次の `Stop` まで黄が残る ＝ **動いている間ずっと
+        // 「入力待ち」と名乗る**（報告された症状）。記録（rollout）が伸びたなら
+        // 道具は動いた ＝ もうユーザーは待たれていない。
+        //
+        // **PTY では代用できない**（無音の側で降ろせない）: codex の TUI は
+        // ダイアログを出している間も 1 秒ごとにタイトルを書き換える（実測）ので
+        // 「動いている」と「待たれている」が同じ Writing になる。記録の方は
+        // 承認待ちの間だけ止まる（実測: 20 秒の停止）
+        Some((State::Waiting, at)) if !run.has_live_status && run.record_grew_since > at => {
+            State::Working
         }
         Some((state, _)) => state,
         // 材料が 1 つも無い行 ＝ **自分の窓を起こした直後**（他インスタンスの行は
