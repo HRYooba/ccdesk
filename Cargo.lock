@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "ccdesk"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "chrono",
