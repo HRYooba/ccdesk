@@ -1572,14 +1572,24 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     };
     // セッション行以外の 1 行を積む。**items と rows が 1:1 であること**と
     // 「帯（選択・ホバー）を載せるのは触れる行だけ」の規則を、行種ごとに
-    // 書き写さずここ 1 箇所で守る（片方だけ push すると全行のヒットテストがずれる）
+    // 書き写さずここ 1 箇所で守る（片方だけ push すると全行のヒットテストがずれる）。
+    //
+    // `keep_fg`: 選択時に前景色を `emph` へ差し替えないための逃げ道。版行のように
+    // 前景色そのものが状態（更新中の赤など）を運ぶ行では、選択で emph に潰すと
+    // 状態が読めなくなる（選択中だけ更新中の赤が消える不具合の原因だった）。
+    // 帯（背景）は掛かるので「今ここ」は変わらず読める
     let push_row = |items: &mut Vec<ListItem>,
                     rows: &mut Vec<SidebarRow>,
                     line: Line<'static>,
                     base: Style,
-                    kind: SidebarRow| {
+                    kind: SidebarRow,
+                    keep_fg: bool| {
         let style = if kind.selectable() {
-            Look::at(app, SidebarPos::Row(rows.len()), false).band(base)
+            let banded = Look::at(app, SidebarPos::Row(rows.len()), false).band(base);
+            match (keep_fg, base.fg) {
+                (true, Some(fg)) => banded.fg(fg),
+                _ => banded,
+            }
         } else {
             base
         };
@@ -1602,7 +1612,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         })
         .collect();
     for (text, style, row) in version_rows(ccdesk_update_state(app), &agents, inner_width) {
-        push_row(&mut items, &mut rows, Line::from(text), style, row);
+        // keep_fg = true: 版行の前景色は状態そのもの（更新中の赤など）なので、
+        // 選択しても emph に潰さず保つ
+        push_row(&mut items, &mut rows, Line::from(text), style, row, true);
     }
 
     // 新規セッション
@@ -1612,6 +1624,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         Line::from("+ new session"),
         Style::default(),
         SidebarRow::Action(RowAction::New),
+        false,
     );
     // 区切り線: new session（アクション）とセッション一覧領域を分ける（Desktop 風）
     push_row(
@@ -1620,6 +1633,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         Line::from(separator_text(inner_width)),
         Style::default().fg(ui().dim),
         SidebarRow::Decoration,
+        false,
     );
     // スロットの並べ方（クリックでメニューが開く）。現在値の綴りは Layout::as_str
     push_row(
@@ -1631,6 +1645,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         ]),
         Style::default().fg(ui().dim),
         SidebarRow::Action(RowAction::ChooseLayout),
+        false,
     );
     // グルーピング切替（クリックでメニューが開く）。現在値の綴りは Grouping::as_str
     push_row(
@@ -1642,6 +1657,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         ]),
         Style::default().fg(ui().dim),
         SidebarRow::Action(RowAction::ToggleGroup),
+        false,
     );
     // **状態ごとの件数は出さない。** 数は節の見出しの下に並ぶ行そのもので見えており、
     // 同じ知識をヘッダーにもう 1 本置くと幅を食うだけだった。
@@ -1659,13 +1675,14 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
         if members.is_empty() {
             return;
         }
-        push_row(items, rows, Line::from(""), Style::default(), SidebarRow::Decoration);
+        push_row(items, rows, Line::from(""), Style::default(), SidebarRow::Decoration, false);
         push_row(
             items,
             rows,
             Line::from(title.to_string()),
             Style::default().fg(ui().dim),
             SidebarRow::Decoration,
+            false,
         );
         for d in members {
             push_data_row(items, rows, d);
@@ -1715,13 +1732,14 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             // なる。見出し側のキーは project_rows が持っている）
             let data_keys: Vec<String> = unpinned.iter().map(|d| dir_key_of(&d.cwd)).collect();
             for row in project_rows(&app.projects, &cwds) {
-                push_row(&mut items, &mut rows, Line::from(""), Style::default(), SidebarRow::Decoration);
+                push_row(&mut items, &mut rows, Line::from(""), Style::default(), SidebarRow::Decoration, false);
                 push_row(
                     &mut items,
                     &mut rows,
                     Line::from(row.heading),
                     Style::default().fg(ui().dim),
                     SidebarRow::Action(RowAction::Project(row.cwd)),
+                    false,
                 );
                 // 配下のセッション行。見出しの一覧と同じ同一判定キーで振り分ける
                 // （ここだけ厳密一致にすると大小違いのセッションが行き場を失う）
@@ -4719,6 +4737,42 @@ pub(crate) mod tests {
         (0..w).filter(|x| buffer[(*x, y)].bg == ui().hl_bg).collect()
     }
 
+    /// そのスクリーン行に、指定した前景色のセルが 1 つでもあるか
+    fn row_has_fg(app: &mut App, y: u16, fg: ratatui::style::Color) -> bool {
+        let (w, h) = app.term_size;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw(frame, app);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..w).any(|x| buffer[(x, y)].fg == fg)
+    }
+
+    /// **選択中でも版行の状態色（更新中の赤）は消えない。**
+    ///
+    /// 版行は [`Look::band`] の帯（選択・ホバー）に乗るが、前景色は
+    /// [`UpdateState`] が運ぶ状態そのもの。選択のたびに `emph` へ上書きすると
+    /// 「更新した本人が選択した行だけ更新中の赤が見えない」という形になっていた
+    /// （クリックが hovered と selection を同じ行へ揃えるため、更新した本人は
+    /// 必ずこの状態を踏む）
+    #[test]
+    fn a_selected_version_row_keeps_its_state_color_while_updating() {
+        let mut app = App {
+            term_size: (120, 30),
+            agent_updating: crate::app::agent_updating_flags(),
+            ..Default::default()
+        };
+        app.agent_updating[&Kind::Claude].store(true, std::sync::atomic::Ordering::Relaxed);
+        // claude の版行はヘッダー 2 行目（y=1 が ccdesk, y=2 が claude）
+        app.selection = SidebarPos::Row(1);
+        assert!(
+            row_has_fg(&mut app, 2, ui().working),
+            "selecting the updating row lost its red (overwritten by emph)"
+        );
+    }
 
     /// **更新中の旗は agent ごと。** 共有にすると、片方を更新している間に
     /// もう片方の版行まで Running になって押せなくなる（実機で踏んだ）
