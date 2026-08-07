@@ -2802,9 +2802,20 @@ fn start_agent_update(app: &mut App, kind: Kind) {
     let refresh = app.footer_refresh.clone();
     let dirty = app.footer_dirty.clone();
     let failure = app.agent_update_error.clone();
+    let footer = app.footer_shared.clone();
     std::thread::spawn(move || {
         if let Err(msg) = run_agent_update(program) {
             *failure.lock_recover() = Some(msg);
+        }
+        // 旗を落とす**前に**版を取り直しておく。ここを飛ばして旗だけ落とすと、
+        // 周期ポーラー（1 秒間隔）が追いつくまでの間、版行が古い `latest` を
+        // 読んで一度 Available（"update"）へ戻ってしまう
+        // （`Running → Available → Current` と一往復して見える不具合の原因）。
+        // 取得に失敗した（current が空）場合は書かない ＝ 古い表示のまま
+        // 周期ポーラーの再取得に委ねる（他の版取得と同じ「空振りは無視」の作法）
+        let fresh = kind.backend().version();
+        if !fresh.current.is_empty() {
+            footer.lock_recover().versions.insert(kind, fresh);
         }
         updating.store(false, std::sync::atomic::Ordering::Relaxed);
         refresh.store(true, std::sync::atomic::Ordering::Relaxed);
