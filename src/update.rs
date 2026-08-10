@@ -105,15 +105,35 @@ pub(crate) fn cleanup_old_exe() {
 /// 呼ぶ）。ccdesk がセッションを常駐させるせいで agent 側の掃除が空振りする以上、
 /// 後始末は ccdesk の仕事になる。
 ///
-/// **消せなかったものは黙って残す。** まだ掴まれている（そのイメージで動いている
-/// セッションがある）のが主な理由で、これは異常ではない: 次の起動でもう一度来る。
-/// 戻り値は消せた数で、報告するのは `doctor` だけ（TUI の起動列は黙って進む）
-pub(crate) fn sweep_agent_leftovers(kinds: &[crate::backend::Kind]) -> usize {
-    kinds
-        .iter()
-        .flat_map(|kind| kind.backend().update_leftovers())
-        .filter(|path| remove_leftover(path))
-        .count()
+/// **消せなかったものはその場では残す**が、数は捨てずに [`Swept::held`] で返す。
+/// まだ掴まれている（そのイメージで動いているセッションがある）のが主な理由で、
+/// これは異常ではない: 次の起動でもう一度来る。
+/// 報告するのは `doctor` だけ（TUI の起動列は黙って進む）
+pub(crate) fn sweep_agent_leftovers(kinds: &[crate::backend::Kind]) -> Swept {
+    sweep(kinds.iter().flat_map(|kind| kind.backend().update_leftovers()))
+}
+
+/// [`sweep_agent_leftovers`] の結果。**「見つけたが消せなかった」を捨てない**:
+/// 消せた数だけだと、doctor が「掴まれて消せない」と「そもそも無い」を
+/// 区別できず、残骸があるのに "none to clear" と嘘をつく
+pub(crate) struct Swept {
+    /// 消せた数
+    pub(crate) cleared: usize,
+    /// 見つけたが消せず残った数
+    pub(crate) held: usize,
+}
+
+/// [`sweep_agent_leftovers`] の本体。パス列を引数で受けるので、実在の
+/// backend 走査（ユーザーのホーム配下）に触れずにテストできる
+fn sweep(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Swept {
+    let mut swept = Swept { cleared: 0, held: 0 };
+    for path in paths {
+        match remove_leftover(&path) {
+            true => swept.cleared += 1,
+            false => swept.held += 1,
+        }
+    }
+    swept
 }
 
 /// 残骸 1 つを消す（消せたら true）。
@@ -701,6 +721,28 @@ mod tests {
         assert!(!file.exists() && !dir.exists());
         // 無いものを消しても落ちない（掴まれていて消せなかった場合と同じ扱い ＝ false）
         assert!(!remove_leftover(&file));
+    }
+
+    /// 消せた数と「掴まれて消せなかった数」を分けて数える。消せた数しか返さないと、
+    /// 残骸を見つけたのに doctor が "none to clear" と報告する（実際に起きた嘘）
+    #[test]
+    fn sweeping_counts_held_leftovers_separately() {
+        let ws = Workspace::new("sweep_held");
+        let free = ws.write("claude.exe.old.1", "PARKED");
+        let held = ws.write("claude.exe.old.2", "STILL RUNNING");
+        // 「そのイメージで動いているセッションがいる」を再現する:
+        // 削除共有なしで開いている間、remove_file は共有違反で失敗する
+        use std::os::windows::fs::OpenOptionsExt;
+        let _handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ（削除を許さない）
+            .open(&held)
+            .unwrap();
+
+        let swept = sweep([free.clone(), held.clone()]);
+        assert_eq!(swept.cleared, 1, "the unheld leftover was not cleared");
+        assert_eq!(swept.held, 1, "the held leftover was not counted");
+        assert!(!free.exists() && held.exists());
     }
 
     /// ローカルビルドがリリースより新しいときに更新を勧めない

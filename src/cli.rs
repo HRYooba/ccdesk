@@ -146,12 +146,17 @@ fn check_claude_cli() -> Check {
 ///
 /// **診断ではなく後始末**だが doctor に置く: TUI を開かずに `ccdesk doctor` だけ
 /// 叩く使い方があり、自分の `<exe>.old` を同じ入口で消しているのと理由が揃う。
-/// 消せるものが無いのが正常なので、報告は ok 止まり（消えなかったものは
-/// まだ掴まれているだけで、次の起動でもう一度来る）
+/// 消せず残ったものは warn で数を伝える（掴まれているだけで次の起動でもう一度
+/// 来るが、「見つけたのに none to clear」と嘘をつかない）
 fn check_agent_leftovers() -> Check {
-    match crate::update::sweep_agent_leftovers(&crate::backend::Kind::ORDER) {
-        0 => Check::Ok("agent leftovers: none to clear".to_string()),
-        n => Check::Ok(format!("agent leftovers: cleared {n}")),
+    let swept = crate::update::sweep_agent_leftovers(&crate::backend::Kind::ORDER);
+    match (swept.cleared, swept.held) {
+        (0, 0) => Check::Ok("agent leftovers: none to clear".to_string()),
+        (n, 0) => Check::Ok(format!("agent leftovers: cleared {n}")),
+        (0, h) => Check::Warn(format!("agent leftovers: {h} still held by running sessions")),
+        (n, h) => Check::Warn(format!(
+            "agent leftovers: cleared {n}, {h} still held by running sessions"
+        )),
     }
 }
 
