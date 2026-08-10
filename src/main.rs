@@ -117,6 +117,15 @@ fn main() -> anyhow::Result<()> {
     // ここと doctor の 2 箇所で行い、`ccdesk update` の出力もその 2 つを案内する。
     // TUI 初期化より前に済ませて画面に影響させない
     update::cleanup_old_exe();
+    // agent 側の残骸も同じタイミングで掃除する。**ccdesk がセッションを常駐させる
+    // せいで agent 自身の掃除が空振りする**（掴まれていて消せない）ので、後始末は
+    // こちらの仕事になる。ここが一番よく消せる瞬間でもある: 前回のセッションは
+    // もう終わっていて、今回のセッションはまだ起こしていない。
+    //
+    // **設定で出していない agent も見る。** 走査は PATH を引いて read_dir するだけで
+    // プロセスを起こさないし、codex を off にした人の環境に残った残骸を
+    // 取り逃す理由が無い
+    let _ = update::sweep_agent_leftovers(&backend::Kind::ORDER);
 
     // 使用率表示の opt-in（`~/.ccdesk/config.json` の `"usage_display": "on"`）。
     //
@@ -254,6 +263,7 @@ fn main() -> anyhow::Result<()> {
         footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         agent_updating: app::agent_updating_flags(),
+        agent_update_stalled: app::agent_updating_flags(),
         agent_update_error: Arc::new(Mutex::new(None)),
         ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
         ccdesk_latest: None,

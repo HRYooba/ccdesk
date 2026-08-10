@@ -142,6 +142,19 @@ impl Backend for Codex {
         PROGRAM
     }
 
+    /// `codex update` は npm を通るので、**走っている codex が掴んでいる
+    /// `codex.exe` を unlink できないと npm が作業ディレクトリごと諦める**
+    /// （実測: `EPERM` を warn 扱いにして exit 0 を返し、`@openai/.codex-<乱数>` が
+    /// 285MB 残った）。npm 自身は次の更新でも消しに来ない。
+    ///
+    /// 拾うのは `@openai/` 直下の**先頭ドット付き**のものだけ。npm の作業用の名前で、
+    /// 正規のインストール（`@openai/codex`）とはドットの有無で必ず分かれる
+    fn update_leftovers(&self) -> Vec<PathBuf> {
+        ccdesk::resolve_program(PROGRAM)
+            .map(|shim| npm_workdirs_beside(&shim))
+            .unwrap_or_default()
+    }
+
     /// app-server へ 1 往復（[`codex_app_server`]）。**rollout は読まない**
     /// （あちらは最後にセッションが動いた時点の値で、現在値ではない）
     fn usage(&self) -> crate::usage::Usage {
@@ -362,10 +375,59 @@ fn parse_latest_version(body: &str) -> Option<String> {
     (version.split('.').count() >= 3).then_some(version)
 }
 
+/// `shim` の隣の npm ツリーに残った作業ディレクトリ `@openai/.codex-<乱数>`。
+///
+/// `codex update` は npm を通るので、**走っている codex が掴んでいる `codex.exe` を
+/// unlink できないと npm が作業ディレクトリごと諦める**（実測: `EPERM` を warn 扱いに
+/// して exit 0 を返し、285MB が残った）。npm 自身は次の更新でも消しに来ない。
+///
+/// **先頭ドット付きだけを拾う。** npm の作業用の名前で、正規のインストール
+/// （`@openai/codex`）とはドットの有無で必ず分かれる。
+/// **パスを引数で受ける**ので、テストが実ユーザーの npm ツリーを見ずに済む
+fn npm_workdirs_beside(shim: &Path) -> Vec<PathBuf> {
+    // npm はシムの隣に node_modules を置く（`npm prefix -g` の中身そのもの）
+    let Some(dir) = shim.parent() else {
+        return Vec::new();
+    };
+    let scope = dir.join("node_modules").join("@openai");
+    crate::backend::leftovers_in(&scope, ".codex-", |rest| {
+        rest.chars().all(|c| c.is_ascii_alphanumeric())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::tests::argv;
+
+    /// **npm の作業ディレクトリだけを拾い、正規のインストールには触れない。**
+    ///
+    /// `codex update` が EPERM で諦めると `@openai/.codex-<乱数>` が 285MB 残る。
+    /// 拾い方を間違えると **codex 本体を消す**ので、隣に正規のインストールを
+    /// 置いた状態で固定する（両者はドットの有無だけで分かれる）
+    #[test]
+    fn only_the_npm_workdirs_beside_the_real_install_are_collected() {
+        let dir = crate::testutil::TempDir::new("codex", "npm-workdirs");
+        let scope = dir.join("node_modules").join("@openai");
+        for name in [
+            "codex",           // 正規のインストール
+            "codex-win32-x64", // 正規のプラットフォーム別パッケージ
+            ".codex-g3ieL94X", // npm の作業場（消す）
+            ".codex-AbC123",   // 同上
+            ".codex-",         // 乱数が無い ＝ 何か分からないので残す
+            ".codex-has.dot",  // 乱数でない ＝ 残す
+        ] {
+            std::fs::create_dir_all(scope.join(name)).unwrap();
+        }
+        let mut found: Vec<String> = npm_workdirs_beside(&dir.join("codex.cmd"))
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        assert_eq!(found, [".codex-AbC123", ".codex-g3ieL94X"]);
+        // npm ツリーが無い置き方（PATH に codex が無い / 別の入れ方）でも落ちない
+        assert!(npm_workdirs_beside(&dir.join("elsewhere").join("codex.cmd")).is_empty());
+    }
 
     fn inject() -> Inject<'static> {
         Inject {

@@ -250,6 +250,19 @@ pub(crate) trait Backend: Send + Sync {
     /// 更新を走らせるコマンド（`<program> update`）。**版行の更新導線**
     fn update_program(&self) -> &'static str;
 
+    /// この agent が更新のたびに置き去りにする残骸（今あるものだけ）。
+    ///
+    /// **これは ccdesk が引き取るべき後始末。** agent の更新は古い実行ファイルを
+    /// 消そうとするが、ccdesk はセッションを常駐させるので**そのファイルを掴んだ
+    /// プロセスが残り続ける**。ターミナルで 1 本起動して閉じる使い方なら次の更新で
+    /// 消えるものが、ccdesk の下でだけ溜まり続ける（実測: claude 側 1.1GB /
+    /// codex 側 285MB）。作るのは agent でも、消えない状況を作っているのは ccdesk。
+    ///
+    /// **消してよいと確信できるものだけを返す。** 判断は各実装が持ち、迷うものは
+    /// 返さない: 掃除しそこねてもディスクが減らないだけだが、取り違えれば
+    /// 動いているインストールを壊す。掃除そのものは [`crate::update::sweep`]
+    fn update_leftovers(&self) -> Vec<std::path::PathBuf>;
+
     /// 使用率（枠の残り）。**取得の作法は agent ごとに違う**が、どちらも
     /// ターンを起こさず・課金せず・記録を残さない経路を通る
     fn usage(&self) -> crate::usage::Usage;
@@ -381,9 +394,62 @@ pub(crate) struct AgentVersion {
     pub(crate) latest: Option<String>,
 }
 
+/// `dir` の直下で、名前が `prefix` で始まり**残りが `rest_ok` を満たす**ものを集める。
+///
+/// **残骸を拾う走査はここ 1 実装**（[`Backend::update_leftovers`] の材料）。
+/// 前置きだけで拾わないのが要点で、`claude.exe.old.` の後ろは世代を表す数字、
+/// npm の `.codex-` の後ろはランダムな英数と決まっている。ここを緩めると
+/// **動いているインストールを巻き込む**（`claude.exe` そのもの、正規の `codex`）ので、
+/// 呼び手は必ず「残りがどうあるべきか」まで指定する。
+///
+/// 読めないディレクトリは空を返す（掃除できないだけで、困る人はいない）
+pub(crate) fn leftovers_in(
+    dir: &std::path::Path,
+    prefix: &str,
+    rest_ok: impl Fn(&str) -> bool,
+) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            // 前置きぴったりで終わる名前は残骸ではない（世代を持たない ＝ 本体）
+            let rest = name.strip_prefix(prefix).filter(|r| !r.is_empty())?;
+            rest_ok(rest).then(|| e.path())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// 走査は**前置きだけでは拾わない**。残骸の掃除は削除なので、
+    /// 動いているインストール（`claude.exe` 本体・正規の `codex`）を
+    /// 巻き込まないことをここで固定する
+    #[test]
+    fn the_leftover_scan_needs_more_than_a_matching_prefix() {
+        let dir = crate::testutil::TempDir::new("backend", "leftovers");
+        for name in [
+            "claude.exe",            // 本体（前置きの手前で終わる）
+            "claude.exe.old",        // 世代を持たない ＝ 判断がつかないので拾わない
+            "claude.exe.old.17858",  // 残骸
+            "claude.exe.old.nope",   // 数字でない ＝ 別物
+        ] {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        let found: Vec<String> = leftovers_in(dir.path(), "claude.exe.old.", |rest| {
+            rest.chars().all(|c| c.is_ascii_digit())
+        })
+        .into_iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+        assert_eq!(found, ["claude.exe.old.17858"]);
+        // 読めないディレクトリでも落ちない（掃除できないだけ）
+        assert!(leftovers_in(&dir.join("missing"), "x", |_| true).is_empty());
+    }
 
     /// 組んだコマンドラインの引数（実行ファイル名を除く）。**各 backend の
     /// test が共有する**ので、引数の読み方が実装ごとにぶれない

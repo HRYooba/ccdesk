@@ -114,6 +114,7 @@ pub(crate) fn run_doctor() -> anyhow::Result<()> {
     update::cleanup_old_exe();
 
     check_claude_cli().report(&mut failed);
+    check_agent_leftovers().report(&mut failed);
     check_agents().report(&mut failed);
     check_codex_cli().report(&mut failed);
     check_codex_account().report(&mut failed);
@@ -138,6 +139,19 @@ fn check_claude_cli() -> Check {
         }
         Some(_) => Check::Fail("claude CLI: `claude --version` answered nothing".to_string()),
         None => Check::Fail("claude CLI not found on PATH".to_string()),
+    }
+}
+
+/// agent が置き去りにした残骸を掃除して、片付いた数を報告する。
+///
+/// **診断ではなく後始末**だが doctor に置く: TUI を開かずに `ccdesk doctor` だけ
+/// 叩く使い方があり、自分の `<exe>.old` を同じ入口で消しているのと理由が揃う。
+/// 消せるものが無いのが正常なので、報告は ok 止まり（消えなかったものは
+/// まだ掴まれているだけで、次の起動でもう一度来る）
+fn check_agent_leftovers() -> Check {
+    match crate::update::sweep_agent_leftovers(&crate::backend::Kind::ORDER) {
+        0 => Check::Ok("agent leftovers: none to clear".to_string()),
+        n => Check::Ok(format!("agent leftovers: cleared {n}")),
     }
 }
 

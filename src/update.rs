@@ -99,6 +99,35 @@ pub(crate) fn cleanup_old_exe() {
     }
 }
 
+/// agent が置き去りにした残骸を消す（[`crate::backend::Backend::update_leftovers`]）。
+///
+/// **自分の `<exe>.old` を消すのと同じ扱い**にする（[`cleanup_old_exe`] の隣で
+/// 呼ぶ）。ccdesk がセッションを常駐させるせいで agent 側の掃除が空振りする以上、
+/// 後始末は ccdesk の仕事になる。
+///
+/// **消せなかったものは黙って残す。** まだ掴まれている（そのイメージで動いている
+/// セッションがある）のが主な理由で、これは異常ではない: 次の起動でもう一度来る。
+/// 戻り値は消せた数で、報告するのは `doctor` だけ（TUI の起動列は黙って進む）
+pub(crate) fn sweep_agent_leftovers(kinds: &[crate::backend::Kind]) -> usize {
+    kinds
+        .iter()
+        .flat_map(|kind| kind.backend().update_leftovers())
+        .filter(|path| remove_leftover(path))
+        .count()
+}
+
+/// 残骸 1 つを消す（消せたら true）。
+///
+/// **ファイルとディレクトリの両方が来る**: claude は退避した実行ファイルを残し、
+/// npm は作業ディレクトリごと残す。片方の消し方しか持たないと、もう片方が
+/// 毎回失敗して静かに溜まり続ける
+fn remove_leftover(path: &std::path::Path) -> bool {
+    match path.is_dir() {
+        true => std::fs::remove_dir_all(path).is_ok(),
+        false => std::fs::remove_file(path).is_ok(),
+    }
+}
+
 /// 指定タグの実行ファイルを取得して現行版と差し替える。
 ///
 /// **SHA-256 の検証を通るまで既存の実行ファイルには一切触らない。** 検証失敗・
@@ -655,6 +684,23 @@ mod tests {
             !staged_exe_path(&exe).exists(),
             "staged <exe>.new remains"
         );
+    }
+
+    /// 残骸はファイルとディレクトリの**両方**が来る。片方の消し方しか持たないと、
+    /// もう片方（npm の作業場は 285MB のディレクトリ）が毎回失敗して溜まり続ける
+    #[test]
+    fn leftovers_are_removed_whether_they_are_files_or_directories() {
+        let ws = Workspace::new("sweep");
+        let file = ws.write("claude.exe.old.1785884570678", "PARKED BINARY");
+        let dir = ws.0.join(".codex-g3ieL94X");
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::fs::write(dir.join("node_modules").join("big.bin"), "x").unwrap();
+
+        assert!(remove_leftover(&file), "a parked exe was not removed");
+        assert!(remove_leftover(&dir), "a non-empty work directory was not removed");
+        assert!(!file.exists() && !dir.exists());
+        // 無いものを消しても落ちない（掴まれていて消せなかった場合と同じ扱い ＝ false）
+        assert!(!remove_leftover(&file));
     }
 
     /// ローカルビルドがリリースより新しいときに更新を勧めない
