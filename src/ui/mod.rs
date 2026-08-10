@@ -619,6 +619,12 @@ enum UpdateState {
     Available,
     /// 更新の実行中
     Running,
+    /// **更新は成功と報告されたのに版が動かなかった。**
+    ///
+    /// 5 秒で消える下部バーの通知だけでは足りないので行に残す: 押しても効かない
+    /// 状態は次の更新まで続くのに、通知を見逃すと「押したのに何も起きない行」に
+    /// 戻ってしまう。押せるままにしておく（agent 側が直れば次の一押しで通る）
+    Stalled,
     /// 差し替え済み。反映は次回起動なので、案内だけ出して押させない。
     /// **自動再起動はしない**（コンソールを親子で奪い合いマウスが効かなくなる不具合が
     /// 実機で出たため、TUI を持ったまま自プロセスを起こす経路そのものをやめた）。
@@ -629,6 +635,19 @@ enum UpdateState {
 }
 
 impl UpdateState {
+    /// 全状態。**テストが網羅を回す土台**（幅に収まるか・名前の桁がずれないか・
+    /// 押せるかを状態ごとに見る箇所が 4 つあり、それぞれが自前の一覧を持っていた
+    /// ＝ 状態を足すたびに 4 箇所へ手で足す形だった）。
+    /// 状態を足したらここへ足す: [`Self::verb`] の match がコンパイラに気づかせる
+    #[cfg(test)]
+    const ALL: [Self; 5] = [
+        Self::Current,
+        Self::Available,
+        Self::Running,
+        Self::Stalled,
+        Self::RestartPending,
+    ];
+
     /// 右端に置く動詞。最新のときだけ空（やることが無い）。
     ///
     /// **新しい版の番号は出さない。** 新旧を並べた `⟳ claude v2.1.218 → v2.1.220` に
@@ -639,6 +658,9 @@ impl UpdateState {
             Self::Current => "",
             Self::Available => "update",
             Self::Running => "updating…",
+            // **動詞ではなく状態**（押せる行だが、押しても同じ結果になりうる）。
+            // "update" のままだと、効かなかったことが行から読めない
+            Self::Stalled => "stalled",
             // 案内であって呼びかけではない: 押しても何も起きない（[`Self::action`]）。
             // 語自体は変えない ＝ 「やることの名前」として読める（利用者が自分で
             // ccdesk を終了・再起動する）。既定幅の版数字と並んでも収まる短さも兼ねる
@@ -652,7 +674,9 @@ impl UpdateState {
     /// （それでも行は行なので、選択・ホバーの対象からは外れない）
     fn action(self, update: RowAction) -> SidebarRow {
         match self {
-            Self::Available => SidebarRow::Action(update),
+            // 据え置きも押せる: agent 側の詰まりが解ければ次の一押しで通るので、
+            // 押せなくすると利用者が直したあとに ccdesk を再起動する羽目になる
+            Self::Available | Self::Stalled => SidebarRow::Action(update),
             _ => SidebarRow::Inert,
         }
     }
@@ -664,6 +688,10 @@ impl UpdateState {
         match self {
             Self::Current => Style::default().fg(ui().dim),
             Self::Running => Style::default().fg(ui().working),
+            // 据え置きは**人の手当てが要る**ので、やることがある行より強い色で出す
+            // （更新が効かないまま何日も気づかれない状態が実際に起きた）。
+            // `fail` ではない: agent は成功と言っていて、失敗したのは差し替えだけ
+            Self::Stalled => Style::default().fg(ui().attention),
             Self::Available | Self::RestartPending => Style::default().fg(MUTED_FG),
         }
     }
@@ -877,17 +905,23 @@ fn ccdesk_update_state(app: &App) -> UpdateState {
 /// 最新表示へ戻るため。ネイティブインストールは既定で自動更新するので、
 /// 何もしなくてもこの行が消えることもある（公式仕様）
 fn agent_update_state(app: &App, kind: Kind) -> UpdateState {
+    let flag = |flags: &std::collections::BTreeMap<Kind, std::sync::Arc<std::sync::atomic::AtomicBool>>| {
+        flags
+            .get(&kind)
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+    };
     // **旗は agent ごと**（片方の更新中にもう片方の行まで止めない）
-    if app
-        .agent_updating
-        .get(&kind)
-        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-    {
+    if flag(&app.agent_updating) {
         UpdateState::Running
-    } else if app.footer.version(kind).latest.is_some() {
-        UpdateState::Available
-    } else {
+    } else if app.footer.version(kind).latest.is_none() {
+        // **新しい版が無いなら据え置きも解けている。** 旗を明示的に降ろさずに
+        // 済むのが要点で、別経路で更新された場合（手で入れ直した・agent 自身の
+        // 自動更新が通った）も次の版取得だけで行が最新表示へ戻る
         UpdateState::Current
+    } else if flag(&app.agent_update_stalled) {
+        UpdateState::Stalled
+    } else {
+        UpdateState::Available
     }
 }
 
@@ -3184,24 +3218,40 @@ pub(crate) mod tests {
         assert!(!rows[1].0.contains(" v"), "showing a v with no version: {:?}", rows[1].0);
     }
 
-    /// 4 状態の文面。左端がマーカー桁、右端が動詞で、**新版の番号は出さない**
+    /// 各状態の文面。左端がマーカー桁、右端が動詞で、**新版の番号は出さない**
     #[test]
-    fn version_row_spells_out_all_four_update_states() {
+    fn version_row_spells_out_every_update_state() {
         let row = |state| version_row(" ", "ccdesk", "0.5.0", state, DEFAULT_INNER);
         // 最新: マーカー桁も記号桁も空白、動詞なし
         let current = row(UpdateState::Current);
         assert_eq!(current, "    ccdesk v0.5.0");
-        // 更新あり / 実行中 / 再起動待ち: ⟳ + 右端の動詞
-        for (state, verb) in [
-            (UpdateState::Available, "update"),
-            (UpdateState::Running, "updating…"),
-            (UpdateState::RestartPending, "restart"),
-        ] {
+        // 残りは ⟳ + 右端の動詞。**動詞は状態ごとに違う**（同じ綴りが 2 つあると、
+        // 行を見ても今どちらなのか分からない）
+        let mut verbs = Vec::new();
+        for state in UpdateState::ALL.into_iter().filter(|s| *s != UpdateState::Current) {
             let text = row(state);
+            let verb = state.verb();
+            assert!(!verb.is_empty(), "{state:?} has nothing to say at the right edge");
             assert!(text.starts_with(UPDATE_MARK), "{text:?}");
             assert!(text.ends_with(verb), "{text:?} does not end with {verb:?}");
             assert!(text.contains("ccdesk v0.5.0"), "{text:?}");
+            verbs.push(verb);
         }
+        let unique: std::collections::BTreeSet<_> = verbs.iter().collect();
+        assert_eq!(unique.len(), verbs.len(), "two states share a verb: {verbs:?}");
+    }
+
+    /// **据え置きは押せる行のまま。** agent 側の詰まりが解けたあと、ccdesk を
+    /// 起動し直さずに押し直せる必要がある（更新が効かなかっただけで、
+    /// やることが無くなったわけではない）
+    #[test]
+    fn a_stalled_row_still_offers_the_update_it_could_not_apply() {
+        assert_eq!(
+            UpdateState::Stalled.action(RowAction::UpdateAgent(Kind::Claude)),
+            SidebarRow::Action(RowAction::UpdateAgent(Kind::Claude))
+        );
+        // 状態が行から読める（"update" のままだと効かなかったことが伝わらない）
+        assert_ne!(UpdateState::Stalled.verb(), UpdateState::Available.verb());
     }
 
     /// **最新のときもマーカー桁を確保する。** 更新が出た瞬間に名前が横へずれると、
@@ -3222,11 +3272,7 @@ pub(crate) mod tests {
             "ccdesk",
         );
         assert_eq!(base, 4, "expected marker + glyph columns with a space each");
-        for state in [
-            UpdateState::Available,
-            UpdateState::Running,
-            UpdateState::RestartPending,
-        ] {
+        for state in UpdateState::ALL {
             let text = version_row(" ", "ccdesk", "0.5.0", state, DEFAULT_INNER);
             assert_eq!(
                 name_col(&text, "ccdesk"),
@@ -3274,13 +3320,12 @@ pub(crate) mod tests {
                 SidebarRow::Action(RowAction::UpdateAgent(Kind::Claude))
             )
         );
-        // 差し替え済み: claude はこの状態にならない（版チェックが新版を返して
-        // 行が最新表示へ戻る）ので、仮になっても押せない行に留まる
-        for state in [
-            UpdateState::Current,
-            UpdateState::Running,
-            UpdateState::RestartPending,
-        ] {
+        // 押せるのは「やることが残っている」状態だけ。差し替え済み（claude は
+        // この状態にならない）も実行中も最新も、押しても意味が無いので Inert
+        for state in UpdateState::ALL
+            .into_iter()
+            .filter(|s| !matches!(s, UpdateState::Available | UpdateState::Stalled))
+        {
             assert_eq!(
                 rows_of(state, state),
                 (SidebarRow::Inert, SidebarRow::Inert),
@@ -3299,12 +3344,7 @@ pub(crate) mod tests {
         let names: Vec<(&str, &str)> = std::iter::once((" ", "ccdesk"))
             .chain(Kind::ORDER.into_iter().map(|k| (agent_glyph(k), k.title())))
             .collect();
-        for state in [
-            UpdateState::Current,
-            UpdateState::Available,
-            UpdateState::Running,
-            UpdateState::RestartPending,
-        ] {
+        for state in UpdateState::ALL {
             for version in ["", "0.5.0", "2.1.220", "10.20.300"] {
                 for (glyph, name) in &names {
                     let text = version_row(glyph, name, version, state, DEFAULT_INNER);
@@ -4879,6 +4919,52 @@ pub(crate) mod tests {
             row_has_fg(&mut app, 2, ui().working),
             "selecting the updating row lost its red (overwritten by emph)"
         );
+    }
+
+    /// **据え置きは版行に残る。** 下部バーの通知は 5 秒で消えるのに、押しても
+    /// 効かない状態は次の更新まで続く ＝ 通知を見逃すと「押しても何も起きない行」に
+    /// 戻ってしまう（claude が 5 日間更新されないまま気づかれなかった）。
+    ///
+    /// **旗を明示的に降ろす経路は要らない**ことも同時に見る: 新しい版が無くなれば
+    /// （別経路で入った・手で入れ直した）行は旗を見ずに最新表示へ戻る
+    #[test]
+    fn a_stalled_update_stays_on_the_row_until_the_version_moves() {
+        use crate::backend::AgentVersion;
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut app = App {
+            agent_updating: crate::app::agent_updating_flags(),
+            agent_update_stalled: crate::app::agent_updating_flags(),
+            ..Default::default()
+        };
+        let behind = AgentVersion {
+            current: "2.1.225".to_string(),
+            latest: Some("2.1.226".to_string()),
+        };
+        app.footer.versions.insert(Kind::Claude, behind.clone());
+        assert_eq!(agent_update_state(&app, Kind::Claude), UpdateState::Available);
+
+        // 更新を試して版が動かなかった ＝ 行に残る
+        app.agent_update_stalled[&Kind::Claude].store(true, Relaxed);
+        assert_eq!(agent_update_state(&app, Kind::Claude), UpdateState::Stalled);
+
+        // **旗は立てたまま**版が上がれば、行は最新表示へ戻る
+        app.footer.versions.insert(
+            Kind::Claude,
+            AgentVersion {
+                current: "2.1.226".to_string(),
+                latest: None,
+            },
+        );
+        assert_eq!(
+            agent_update_state(&app, Kind::Claude),
+            UpdateState::Current,
+            "the row stayed stalled after the version actually moved"
+        );
+
+        // 押し直している間は Running が勝つ（やり直しが行から見える）
+        app.footer.versions.insert(Kind::Claude, behind);
+        app.agent_updating[&Kind::Claude].store(true, Relaxed);
+        assert_eq!(agent_update_state(&app, Kind::Claude), UpdateState::Running);
     }
 
     /// **更新中の旗は agent ごと。** 共有にすると、片方を更新している間に

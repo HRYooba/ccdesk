@@ -106,6 +106,19 @@ impl Backend for Claude {
         PROGRAM
     }
 
+    /// claude は更新のたびに現行の実行ファイルを `<exe>.old.<ミリ秒>` へ退避するが、
+    /// **消す側が見当たらない**（実測: 3 世代 1.1GB が、その後 2 回の更新に成功した
+    /// あとも残っていた）。1 世代あたり約 280MB あるので放置できない。
+    ///
+    /// 拾うのは `<exe名>.old.` の後ろが**数字だけ**のものに限る。この綴りは
+    /// claude が付ける退避名そのもので、実行ファイル本体（`claude.exe`）とも
+    /// 世代を持たない `.old` とも重ならない
+    fn update_leftovers(&self) -> Vec<PathBuf> {
+        ccdesk::resolve_program(PROGRAM)
+            .map(|exe| parked_exes_beside(&exe))
+            .unwrap_or_default()
+    }
+
     /// 取得から解釈まで [`crate::usage`] が一手に持つ（claude を短命な
     /// ヘッドレスプロセスとして起こし、SDK の制御チャンネルへ 1 往復投げる）
     fn usage(&self) -> crate::usage::Usage {
@@ -207,6 +220,25 @@ impl Backend for Claude {
     }
 }
 
+/// `exe` の隣に溜まった退避ファイル `<exe名>.old.<ミリ秒>`。
+///
+/// claude は更新のたびにこの名前で現行版を退避するが、**消す側が見当たらない**
+/// （実測: 3 世代 1.1GB が、その後 2 回の更新に成功したあとも残っていた）。
+/// 1 世代あたり約 280MB あるので放置できない。
+///
+/// **後ろが数字だけのものに限る。** その綴りは claude が付ける退避名そのもので、
+/// 実行ファイル本体（`claude.exe`）とも世代を持たない `.old` とも重ならない。
+/// **パスを引数で受ける**ので、テストが実ユーザーの `~/.local/bin` を見ずに済む
+fn parked_exes_beside(exe: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}.old.", name.to_string_lossy());
+    crate::backend::leftovers_in(dir, &prefix, |rest| {
+        rest.chars().all(|c| c.is_ascii_digit())
+    })
+}
+
 /// 表示名の候補（**この並びが優先順**）。
 ///
 /// `custom-title` だけ [`Span::Rare`] なのは、ユーザーが `/rename` したときにしか
@@ -232,6 +264,38 @@ fn flat<const AT: usize>(value: &serde_json::Value) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::backend::tests::argv;
+
+    /// **退避ファイルだけを拾い、動いているインストールには触れない。**
+    ///
+    /// claude が置き去りにする `<exe>.old.<ミリ秒>` は 1 世代 280MB あり、
+    /// ccdesk がセッションを常駐させるせいで消える機会を失う（掴まれたまま次の
+    /// 更新を迎える）。拾い方を間違えると **claude 本体を消す**ので、
+    /// 隣り合う紛らわしい名前を並べて固定する
+    #[test]
+    fn only_the_parked_generations_next_to_the_exe_are_collected() {
+        let dir = crate::testutil::TempDir::new("claude", "parked-exes");
+        for name in [
+            "claude.exe",                   // 本体
+            "claude.exe.old.1785884570678", // 退避（消す）
+            "claude.exe.old.1786075360017", // 退避（消す）
+            "claude.exe.old",               // 世代が無い ＝ 何か分からないので残す
+            "claude.exe.old.manual",        // 人が付けた名前 ＝ 残す
+            "claude.exe.new",               // 更新の途中経過 ＝ 別の話
+        ] {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        let mut found: Vec<String> = parked_exes_beside(&dir.join("claude.exe"))
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            ["claude.exe.old.1785884570678", "claude.exe.old.1786075360017"]
+        );
+        // 実行ファイルが無い場所を指しても落ちない（PATH に claude が無い環境）
+        assert!(parked_exes_beside(&dir.join("nowhere").join("claude.exe")).is_empty());
+    }
 
     fn build(launch: Launch<'_>, inject: Option<&Inject>) -> Spawn {
         Claude.command("C:\\dev\\app", launch, inject)

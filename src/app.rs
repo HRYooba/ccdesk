@@ -561,6 +561,13 @@ pub(crate) struct App {
     /// **agent ごとに 1 本。** 共有にすると片方の更新中にもう片方の版行まで
     /// Running になり、押せなくなる（実機で踏んだ）
     pub(crate) agent_updating: BTreeMap<Kind, Arc<std::sync::atomic::AtomicBool>>,
+    /// 直前の更新が**成功と報告されたのに版を動かさなかった**agent。
+    ///
+    /// 下部バーの通知は 5 秒で消えるが、押しても効かない状態は次の更新まで続く
+    /// ので、版行に残す材料をここに持つ（[`crate::ui::UpdateState::Stalled`]）。
+    /// **降ろすのは押し直したときだけ**でよい: 新しい版が無くなれば版行は
+    /// 旗を見ずに最新表示へ戻る（判定は [`crate::ui`] 側の 1 箇所）
+    pub(crate) agent_update_stalled: BTreeMap<Kind, Arc<std::sync::atomic::AtomicBool>>,
     /// `<agent> update` の失敗。run ループが下部バーへ 1 度出して空へ戻す
     /// （[`SelfUpdate::Failed`] と同じ作法）。
     ///
@@ -695,6 +702,7 @@ impl Default for App {
             footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_updating: agent_updating_flags(),
+            agent_update_stalled: agent_updating_flags(),
             agent_update_error: Arc::new(Mutex::new(None)),
             ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
             ccdesk_latest: None,
@@ -3316,6 +3324,11 @@ fn start_agent_update(app: &mut App, kind: Kind) {
     let program = kind.backend().update_program();
     // 押した時点の版。更新が本当に効いたかは、これと取り直した版の差でしか分からない
     let before = app.footer.version(kind).current;
+    // 前回の据え置きは押し直しで一度降ろす（行が Running へ入る ＝ やり直しが見える）
+    let stalled = app.agent_update_stalled.get(&kind).cloned();
+    if let Some(stalled) = &stalled {
+        stalled.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     let updating = flag;
     let refresh = app.footer_refresh.clone();
     let dirty = app.footer_dirty.clone();
@@ -3336,6 +3349,10 @@ fn start_agent_update(app: &mut App, kind: Kind) {
             Err(msg) => *failure.lock_recover() = Some(msg),
             Ok(()) if update_left_the_version_behind(&before, &fresh) => {
                 *failure.lock_recover() = Some(stale_update_message(program, &before));
+                // 通知は 5 秒で消えるので、版行に残る材料も立てる
+                if let Some(stalled) = &stalled {
+                    stalled.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             Ok(()) => {}
         }
@@ -3366,13 +3383,20 @@ fn update_left_the_version_behind(before: &str, after: &crate::backend::AgentVer
     !before.is_empty() && after.current == before && after.latest.is_some()
 }
 
-/// 据え置きを伝える文面。**原因を断定しない**: ccdesk に見えているのは
-/// 「成功と言われたのに版が動かなかった」ことだけで、なぜ差し替えられなかったかは
-/// agent 側にしか分からない。手で確かめられるコマンドを添えて、次の一手を渡す
+/// 据え置きを伝える文面。**原因を断定せず、手順も書かない。**
+///
+/// ccdesk に見えているのは「成功と言われたのに版が動かなかった」ことだけで、
+/// なぜ差し替えられなかったかは agent 側にしか分からない。
+///
+/// **「shell で打ち直せ」とは書かない**: 同じコマンドが同じ嘘を返すことを実測して
+/// いる（claude は `update` にも `install` にも成功を返しながら実行ファイルを
+/// 置き換えなかった）ので、それは行き止まりへの案内になる。同じ理由で agent 内部の
+/// 置き場所（ダウンロード済みの版がどこにあるか）も書かない ＝ agent 側が配置を
+/// 変えた日に黙って嘘になる。**ccdesk が観測した事実だけを渡し、判断は人に返す**
 fn stale_update_message(program: &str, before: &str) -> String {
     format!(
-        "{program} update reported success but {program} is still v{before} -- \
-         run `{program} update` in a shell to see what it did"
+        "{program} reported a successful update but is still v{before} -- \
+         its installer did not replace the executable"
     )
 }
 
