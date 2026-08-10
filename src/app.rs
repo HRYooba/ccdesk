@@ -3302,7 +3302,9 @@ fn run_agent_update(program: &str) -> Result<(), String> {
 /// 完了後はフッターを再取得し、最新化されれば版行は最新表示へ戻る。
 ///
 /// 失敗は下部バーへ回す（[`App::agent_update_error`]）＝ ccdesk 自身の更新
-/// （[`SelfUpdate::Failed`]）と同じ扱いで、旗が降りるので押し直せる
+/// （[`SelfUpdate::Failed`]）と同じ扱いで、旗が降りるので押し直せる。
+/// **成功と報告されても版が動かないことがある**ので、そちらも同じ扱いで出す
+/// （[`update_left_the_version_behind`]）
 fn start_agent_update(app: &mut App, kind: Kind) {
     let Some(flag) = app.agent_updating.get(&kind).cloned() else {
         return;
@@ -3312,15 +3314,15 @@ fn start_agent_update(app: &mut App, kind: Kind) {
     }
     // **どのコマンドを叩くかは agent が答える**（[`crate::backend`]）
     let program = kind.backend().update_program();
+    // 押した時点の版。更新が本当に効いたかは、これと取り直した版の差でしか分からない
+    let before = app.footer.version(kind).current;
     let updating = flag;
     let refresh = app.footer_refresh.clone();
     let dirty = app.footer_dirty.clone();
     let failure = app.agent_update_error.clone();
     let footer = app.footer_shared.clone();
     std::thread::spawn(move || {
-        if let Err(msg) = run_agent_update(program) {
-            *failure.lock_recover() = Some(msg);
-        }
+        let outcome = run_agent_update(program);
         // 旗を落とす**前に**版を取り直しておく。ここを飛ばして旗だけ落とすと、
         // 周期ポーラー（1 秒間隔）が追いつくまでの間、版行が古い `latest` を
         // 読んで一度 Available（"update"）へ戻ってしまう
@@ -3328,6 +3330,15 @@ fn start_agent_update(app: &mut App, kind: Kind) {
         // 取得に失敗した（current が空）場合は書かない ＝ 古い表示のまま
         // 周期ポーラーの再取得に委ねる（他の版取得と同じ「空振りは無視」の作法）
         let fresh = kind.backend().version();
+        // **書くのは伝えることがあるときだけ。** 毎回代入すると、run ループが
+        // 拾う前（33ms 周期）に別の agent の更新が成功して文面を消しうる
+        match outcome {
+            Err(msg) => *failure.lock_recover() = Some(msg),
+            Ok(()) if update_left_the_version_behind(&before, &fresh) => {
+                *failure.lock_recover() = Some(stale_update_message(program, &before));
+            }
+            Ok(()) => {}
+        }
         if !fresh.current.is_empty() {
             footer.lock_recover().versions.insert(kind, fresh);
         }
@@ -3335,6 +3346,34 @@ fn start_agent_update(app: &mut App, kind: Kind) {
         refresh.store(true, std::sync::atomic::Ordering::Relaxed);
         dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     });
+}
+
+/// 更新は成功したと報告されたのに、版が 1 つも動いていないか。
+///
+/// **これを見ないと「押しても効かない」が無言になる。** 実際に claude が
+/// `update` にも `install` にも成功を返しながら実行ファイルを差し替えない状態に
+/// なることがあり（終了コード 0・"Successfully updated" の出力つき）、ccdesk 側は
+/// 版行を `update` のまま描き直すだけなので、利用者からは押しても押しても
+/// 何も起きない行に見える。
+///
+/// 3 つ揃ったときだけ疑う ＝ 正常な経路を誤って失敗と呼ばない:
+///
+/// - **押す前の版が分かっている**（空 ＝ そもそも版を取れていなかった）
+/// - **版が変わっていない**
+/// - **まだ新しい版がある**（`latest` が消えていれば、押した時点で既に最新
+///   だっただけ ＝ 更新するものが無かったので版が動かないのが正しい）
+fn update_left_the_version_behind(before: &str, after: &crate::backend::AgentVersion) -> bool {
+    !before.is_empty() && after.current == before && after.latest.is_some()
+}
+
+/// 据え置きを伝える文面。**原因を断定しない**: ccdesk に見えているのは
+/// 「成功と言われたのに版が動かなかった」ことだけで、なぜ差し替えられなかったかは
+/// agent 側にしか分からない。手で確かめられるコマンドを添えて、次の一手を渡す
+fn stale_update_message(program: &str, before: &str) -> String {
+    format!(
+        "{program} update reported success but {program} is still v{before} -- \
+         run `{program} update` in a shell to see what it did"
+    )
 }
 
 /// 通知の寿命。**表示だけでなく当たり判定にも効く**（notice 表示中は下部バーの
@@ -5047,6 +5086,59 @@ mod tests {
         let err = failed.expect_err("a shim that exits non-zero reported success");
         assert!(err.contains("ccdesk-failing-agent"), "{err}");
         assert!(err.contains("no write access"), "the reason was dropped: {err}");
+    }
+
+    /// **成功と報告された更新も、版が動かなければ黙って通さない。**
+    ///
+    /// claude は `update` にも `install latest` にも終了コード 0 と
+    /// "Successfully updated" を返しながら実行ファイルを差し替えないことがある
+    /// （実測: 版行を押しても `claude --version` は前の版のまま）。ccdesk 側は
+    /// 終了コードしか材料を持たないので、版が動いたかどうかで判断する
+    #[test]
+    fn an_update_that_reported_success_but_moved_nothing_is_not_taken_at_its_word() {
+        let behind = |latest: Option<&str>| crate::backend::AgentVersion {
+            current: "2.1.225".to_string(),
+            latest: latest.map(str::to_string),
+        };
+        assert!(
+            update_left_the_version_behind("2.1.225", &behind(Some("2.1.226"))),
+            "a version that did not move was taken as a successful update"
+        );
+        // 版が動いていれば当然よい
+        assert!(!update_left_the_version_behind(
+            "2.1.225",
+            &crate::backend::AgentVersion {
+                current: "2.1.226".to_string(),
+                latest: None,
+            }
+        ));
+        // **latest が消えていれば更新するものが無かっただけ**（押した時点で最新
+        // だった / 別経路で上がった）＝ 版が動かないのが正しい
+        assert!(!update_left_the_version_behind("2.1.225", &behind(None)));
+        // 押す前の版が分からなければ何も言えない（版取得そのものが失敗していた）
+        assert!(!update_left_the_version_behind("", &behind(Some("2.1.226"))));
+        // 取り直しに失敗した（current が空）ときも黙る ＝ 周期ポーラーに委ねる
+        assert!(!update_left_the_version_behind(
+            "2.1.225",
+            &crate::backend::AgentVersion {
+                current: String::new(),
+                latest: Some("2.1.226".to_string()),
+            }
+        ));
+    }
+
+    /// 据え置きの文面には**どの agent がどの版で止まっているか**が要る
+    /// （下部バーは 1 行なので、読んだだけで次の一手が分かる必要がある）
+    #[test]
+    fn the_stale_update_message_names_the_agent_and_the_version_it_is_stuck_on() {
+        let msg = stale_update_message("claude", "2.1.225");
+        assert!(msg.contains("claude"), "{msg}");
+        assert!(msg.contains("2.1.225"), "the version it is stuck on is missing: {msg}");
+        // 原因を断定しない（差し替えられなかった理由は agent 側にしか分からない）
+        assert!(
+            !msg.contains("failed"),
+            "the message blames a failure ccdesk cannot see: {msg}"
+        );
     }
 
     /// 差し替え済み（`Done`）の版行は案内だけで、押しても何も起きない。
