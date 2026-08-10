@@ -62,6 +62,16 @@ impl Split {
     }
 }
 
+/// スロットを割る軸（[`Layout::split_slot`]）。**割ってできた 2 枚のどちらを使うかは
+/// 含まない**（それは掴んだ座標が決めることで、割り方の性質ではない）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Axis {
+    /// 縦に割る ＝ 左右 2 枚になる
+    Vertical,
+    /// 横に割る ＝ 上下 2 枚になる
+    Horizontal,
+}
+
 /// 移動の向き（`Alt+Shift+←→↑↓`）
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Dir {
@@ -303,6 +313,71 @@ impl Layout {
             col >= s.col && col < s.col + s.cols && row >= s.row && row < s.row + s.rows
         })
     }
+
+    /// スロット `at` を `axis` で 2 枚に割った配置（割れないなら `None`）。
+    ///
+    /// **対応表を持たずに導出する。** 割った結果の占有範囲の集合と一致する配置を
+    /// [`Self::ORDER`] から引くので、`spans` を足し引きしても「どれへ成長するか」の
+    /// 知識が古びない（手で書いた `One + 右 → 2 columns` の表は、
+    /// 配置を 1 つ足した日に黙って嘘になる）。
+    ///
+    /// **割れるのは 2 セルぶんある向きだけ。** 1 セルまで割れたスロットはこれ以上
+    /// 分けられない ＝ そこが 8 値の enum で表せる限界で、`None` がその境界を返す
+    pub(crate) fn split_slot(self, at: usize, axis: Axis) -> Option<Grown> {
+        let me = *self.spans().get(at)?;
+        let (first, second) = match axis {
+            Axis::Vertical if me.cols == 2 => (
+                Span::new(me.col, me.row, 1, me.rows),
+                Span::new(me.col + 1, me.row, 1, me.rows),
+            ),
+            Axis::Horizontal if me.rows == 2 => (
+                Span::new(me.col, me.row, me.cols, 1),
+                Span::new(me.col, me.row + 1, me.cols, 1),
+            ),
+            _ => return None,
+        };
+        // 割った後の占有範囲。**並びは作らない**（スロット番号は見つけた配置の
+        // 読み順が決めるので、ここで順を決めると 2 つの正本ができる）
+        let mut want: Vec<Span> = self.spans().to_vec();
+        want.remove(at);
+        want.extend([first, second]);
+        let layout = Self::ORDER.into_iter().find(|l| same_cells(l.spans(), &want))?;
+        let index = |s: Span| layout.spans().iter().position(|g| *g == s);
+        // **割らなかったスロットの番号は動き得る**（読み順が変わるため。例:
+        // `2 rows` の上を割ると、下段は 1 番から 2 番へずれる）。番号を
+        // 振り直すのは占有範囲の一致だけで、呼び手が数え直さなくていい
+        let mut moved = Vec::new();
+        for (old, span) in self.spans().iter().enumerate() {
+            if old == at {
+                continue;
+            }
+            moved.push((old, index(*span)?));
+        }
+        Some(Grown {
+            layout,
+            moved,
+            halves: [index(first)?, index(second)?],
+        })
+    }
+}
+
+/// [`Layout::split_slot`] の答え。**番号の振り直しまで含める**ので、
+/// 呼び手は「割った後どのスロットが何番になったか」を自分で数え直さない
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Grown {
+    /// 割った後の配置
+    pub(crate) layout: Layout,
+    /// 割らなかったスロットの `(旧番号, 新番号)`
+    pub(crate) moved: Vec<(usize, usize)>,
+    /// 割ってできた 2 枚 `[左または上, 右または下]`。
+    /// **どちらへ落とすかは呼び手が座標で決める**
+    pub(crate) halves: [usize; 2],
+}
+
+/// 占有範囲の集合が同じか。**並びは見ない**（スロット番号の付け方は配置側が持つ）。
+/// 同じ配置に同一の範囲は 2 つと無いので、枚数の一致と包含で集合の一致になる
+fn same_cells(a: &[Span], b: &[Span]) -> bool {
+    a.len() == b.len() && a.iter().all(|s| b.contains(s))
 }
 
 /// 1 辺を十字で 2 つに割る。**どちらも 0 にしない**（0 幅のスロットは掴めない）
@@ -545,6 +620,124 @@ mod tests {
         assert!(Layout::One.fits(tiny, split));
         for layout in Layout::ORDER.into_iter().filter(|l| l.slots() > 1) {
             assert!(!layout.fits(tiny, split), "{layout:?} fits a one-slot area");
+        }
+    }
+
+    /// **割った先はどれも既定の配置になる。** 2 セルぶんある向きを割った結果は
+    /// 必ず [`Layout::ORDER`] の中に在り、枚数はちょうど 1 枚増える
+    #[test]
+    fn splitting_a_two_cell_slot_always_lands_on_a_known_layout() {
+        let mut splittable = 0;
+        for layout in Layout::ORDER {
+            for at in 0..layout.slots() {
+                for axis in [Axis::Vertical, Axis::Horizontal] {
+                    let Some(grown) = layout.split_slot(at, axis) else {
+                        continue;
+                    };
+                    splittable += 1;
+                    assert_eq!(
+                        grown.layout.slots(),
+                        layout.slots() + 1,
+                        "{layout:?} slot {at} {axis:?} did not add exactly one slot"
+                    );
+                    // 割ってできた 2 枚と、割らなかったスロットの行き先で全部が埋まる
+                    let mut seen: Vec<usize> =
+                        grown.moved.iter().map(|(_, new)| *new).collect();
+                    seen.extend(grown.halves);
+                    seen.sort_unstable();
+                    seen.dedup();
+                    assert_eq!(
+                        seen.len(),
+                        grown.layout.slots(),
+                        "{layout:?} slot {at} {axis:?} left a slot unaccounted for"
+                    );
+                }
+            }
+        }
+        assert!(splittable > 0, "nothing was splittable — the fixture is broken");
+    }
+
+    /// **割れるのは 2 セルぶんある向きだけ。** 4 分割はどのスロットも 1 セルなので
+    /// もう割れない ＝ ここが 8 値の enum で表せる限界
+    #[test]
+    fn a_one_cell_slot_cannot_be_split() {
+        for at in 0..Layout::Four.slots() {
+            for axis in [Axis::Vertical, Axis::Horizontal] {
+                assert_eq!(
+                    Layout::Four.split_slot(at, axis),
+                    None,
+                    "4 grid slot {at} {axis:?} claimed to split"
+                );
+            }
+        }
+        // 1 枚を縦に割ったら左右にしか割れない（できた枚はもう縦に割れない）
+        let two = Layout::One.split_slot(0, Axis::Vertical).unwrap();
+        assert_eq!(two.layout, Layout::TwoColumns);
+        assert_eq!(two.layout.split_slot(0, Axis::Vertical), None);
+    }
+
+    /// **割り方と行き先の対応**（画面で見える結果そのもの）。
+    /// 落とした縁がどの配置へ育つかは、この 1 本が読めば分かる
+    #[test]
+    fn splitting_grows_into_the_layout_the_drop_edge_implies() {
+        let cases = [
+            // (元, 割るスロット, 軸, 育った先)
+            (Layout::One, 0, Axis::Vertical, Layout::TwoColumns),
+            (Layout::One, 0, Axis::Horizontal, Layout::TwoRows),
+            // 2 列の右を横に割る = 右側が上下に分かれる ＝ 左が全高の 3 枚
+            (Layout::TwoColumns, 1, Axis::Horizontal, Layout::ThreeTallLeft),
+            (Layout::TwoColumns, 0, Axis::Horizontal, Layout::ThreeTallRight),
+            (Layout::TwoRows, 1, Axis::Vertical, Layout::ThreeWideTop),
+            (Layout::TwoRows, 0, Axis::Vertical, Layout::ThreeWideBottom),
+            (Layout::ThreeTallLeft, 0, Axis::Horizontal, Layout::Four),
+            (Layout::ThreeWideTop, 0, Axis::Vertical, Layout::Four),
+        ];
+        for (from, at, axis, want) in cases {
+            let grown = from
+                .split_slot(at, axis)
+                .unwrap_or_else(|| panic!("{from:?} slot {at} {axis:?} refused to split"));
+            assert_eq!(grown.layout, want, "{from:?} slot {at} {axis:?}");
+        }
+    }
+
+    /// **割らなかったスロットの番号は動き得る。** 読み順が変わるので、
+    /// 中身を写す側が番号を数え直さなくていいように `moved` が答える
+    #[test]
+    fn the_untouched_slots_carry_their_new_numbers() {
+        // 2 rows の上段を割ると、下段は 1 番から 2 番へずれる
+        let grown = Layout::TwoRows.split_slot(0, Axis::Vertical).unwrap();
+        assert_eq!(grown.layout, Layout::ThreeWideBottom);
+        assert_eq!(grown.moved, vec![(1, 2)], "the bottom row did not follow its cells");
+        assert_eq!(grown.halves, [0, 1], "the halves are not left-then-right");
+        // 下段を割る側は、上段が 0 番のまま動かない
+        let grown = Layout::TwoRows.split_slot(1, Axis::Vertical).unwrap();
+        assert_eq!(grown.layout, Layout::ThreeWideTop);
+        assert_eq!(grown.moved, vec![(0, 0)]);
+        assert_eq!(grown.halves, [1, 2]);
+    }
+
+    /// **割ってできた 2 枚は「左/上 が先」。** 落とした縁がどちらの側かで
+    /// 呼び手が選べる ＝ 右の縁へ落としたのに左へ入る、が起きない
+    #[test]
+    fn the_halves_are_ordered_by_the_side_they_sit_on() {
+        let split = Split::default();
+        let area = Rect::new(0, 0, 80, 40);
+        for (from, at, axis) in [
+            (Layout::One, 0, Axis::Vertical),
+            (Layout::One, 0, Axis::Horizontal),
+            (Layout::TwoColumns, 1, Axis::Horizontal),
+            (Layout::TwoRows, 0, Axis::Vertical),
+        ] {
+            let grown = from.split_slot(at, axis).unwrap();
+            let rects = grown.layout.rects(area, split);
+            let [first, second] = grown.halves;
+            let (a, b) = (rects[first], rects[second]);
+            match axis {
+                Axis::Vertical => assert!(a.x < b.x, "{from:?} {at} {axis:?}: halves are swapped"),
+                Axis::Horizontal => {
+                    assert!(a.y < b.y, "{from:?} {at} {axis:?}: halves are swapped")
+                }
+            }
         }
     }
 }
