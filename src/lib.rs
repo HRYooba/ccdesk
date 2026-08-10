@@ -980,11 +980,14 @@ const KV_LOCK_WAIT: Duration = Duration::from_millis(500);
 /// 黙って捨てると、呼び手が「こう書いた」と記録したのに実際は書かれていない状態に
 /// なり、次の書き込みの判断材料が嘘になる
 /// （[`crate::update_state_list`] の呼び手が持つマージの基準）
+/// **`edit` が `None` を返せばキーごと消える。** 値の持ち場が別のファイルへ移った
+/// 旧キーの掃除（[`forget_setting`]）がこれを使う: `null` を書き込む形にすると
+/// 「キーが無い」と「値が無い」の 2 通りを読み側が両方扱う羽目になる
 #[must_use]
 fn kv_edit(
     path: Option<std::path::PathBuf>,
     key: &str,
-    edit: impl FnOnce(Option<&serde_json::Value>) -> serde_json::Value,
+    edit: impl FnOnce(Option<&serde_json::Value>) -> Option<serde_json::Value>,
 ) -> bool {
     let Some(path) = path else { return false };
     let _guard = KV_LOCK.lock_recover();
@@ -997,7 +1000,19 @@ fn kv_edit(
     if !v.is_object() {
         v = serde_json::json!({});
     }
-    v[key] = edit(v.get(key));
+    match edit(v.get(key)) {
+        Some(next) => v[key] = next,
+        // オブジェクトであることは直前で保証済み
+        None => {
+            let Some(obj) = v.as_object_mut() else {
+                return false;
+            };
+            // 元から無ければ書き戻す必要も無い（掃除は何度呼んでも同じ ＝ 冪等）
+            if obj.remove(key).is_none() {
+                return true;
+            }
+        }
+    }
     write_json_atomically(&path, &v).is_ok()
 }
 
@@ -1005,7 +1020,7 @@ fn kv_save(path: Option<std::path::PathBuf>, key: &str, value: &str) {
     // 単値（サイドバー幅・最後に開いた画面）は失敗しても次の保存で上書きされる
     // ＝ 呼び手に判断させるものが無いので、成否は返さない
     let _ = kv_edit(path, key, |_| {
-        serde_json::Value::String(value.to_string())
+        Some(serde_json::Value::String(value.to_string()))
     });
 }
 
@@ -1016,12 +1031,12 @@ fn kv_update_list(
     merge: impl FnOnce(Vec<String>) -> Vec<String>,
 ) -> bool {
     kv_edit(path, key, |current| {
-        serde_json::Value::Array(
+        Some(serde_json::Value::Array(
             merge(value_strings(current))
                 .into_iter()
                 .map(serde_json::Value::String)
                 .collect(),
-        )
+        ))
     })
 }
 
@@ -1065,6 +1080,18 @@ pub fn load_setting(key: &str) -> Option<String> {
 
 pub fn save_setting(key: &str, value: &str) {
     kv_save(settings_path(), key, value);
+}
+
+/// config.json からキーを取り除く。
+///
+/// **設定ではなかったものを設定ファイルから降ろす**ための口で、呼ぶのは
+/// 画面状態を state.json へ引き取る移行（[`crate::source::LiveSource::window_state`]）
+/// だけ。config.json はユーザーが手で書くファイルなので、ccdesk がもう読まない
+/// キーを残しておくと「書けば効く」と読めてしまう ＝ 消すところまでが移行になる。
+/// 元から無ければ何もしない（何度呼んでも同じ）
+pub fn forget_setting(key: &str) {
+    // 失敗しても次の起動でもう一度掃除される ＝ 呼び手に判断させるものが無い
+    let _ = kv_edit(settings_path(), key, |_| None);
 }
 
 pub fn load_state(key: &str) -> Option<String> {
@@ -1422,6 +1449,30 @@ mod tests {
             "did not report success"
         );
         assert!(seen_legacy.is_empty(), "legacy single value was passed through as a list");
+    }
+
+    /// キーを消す編集は**そのキーだけ**を落とし、他のキーは残す。
+    /// 値の持ち場が移った旧キーの掃除（[`forget_setting`]）がこれに乗る
+    #[test]
+    fn removing_a_key_keeps_the_rest_of_the_file() {
+        let path = temp_json(
+            "forget",
+            Some("{\"layout\": \"1 pane\", \"codex\": \"on\"}"),
+        );
+        let some = || Some(path.clone());
+        let forget = |key: &str| kv_edit(some(), key, |_| None);
+        assert!(forget("layout"), "did not report success");
+        assert_eq!(kv_load(some(), "layout"), None, "the key was not removed");
+        assert_eq!(
+            kv_load(some(), "codex").as_deref(),
+            Some("on"),
+            "removing one key erased another"
+        );
+        // 無いキーを消すのは成功（掃除は起動のたびに走るので、何度呼んでも同じ）
+        assert!(forget("layout"));
+        assert!(forget("never-was-here"));
+        // 書けないときは失敗を返す（[`a_write_that_cannot_land_reports_failure`] と同じ扱い）
+        assert!(!kv_edit(None, "layout", |_| None));
     }
 
     /// **書けなかったことを黙って飲まない。** tmp 書き込み / rename は失敗しうる

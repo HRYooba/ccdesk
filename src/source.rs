@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use ccdesk::{same_dir, save_setting, save_state, update_state_list, LockExt};
+use ccdesk::{same_dir, save_state, update_state_list, LockExt};
 
 use crate::backend::Kind;
 use crate::hooks::HookStates;
@@ -138,8 +138,15 @@ impl SlotView {
 }
 
 /// 永続化するウィンドウ状態の 1 項目。
-/// live は state.json / config.json へ書き、demo は捨てる
+/// live は **state.json へ書き**、demo は捨てる
 /// （撮影が開発者の設定を書き換えないため）。
+///
+/// **ここに並ぶものは 1 つ残らず state.json 側**: どれもユーザーが選んだ設定ではなく
+/// 「最後にどうなっていたか」の記録で、操作するたびに ccdesk が書き換える。
+/// config.json はユーザーが手で書くファイルなので、書いた端から上書きされる値を
+/// 置くと「書いても効かない設定」に見える（旧版は layout / grouping / sidebar_width を
+/// あちらへ置いていた ＝ [`LiveSource::window_state`] が引き取る）。
+///
 /// 項目を増やすと live 側の match が非網羅になるので、保存先の指定漏れは起きない
 pub(crate) enum WindowItem<'a> {
     /// 次回起動で開くスロットの中身（並びはスロット番号順）
@@ -518,7 +525,9 @@ impl DataSource for LiveSource {
         // 起動列なので state.json / config.json は 1 度だけ読む
         // （キーごとの単発読みだと同じファイルを 5 回読み直す）
         let state = ccdesk::state_snapshot();
-        let settings = ccdesk::settings_snapshot();
+        // **config.json を画面状態のために読むのはここが最後**。旧版はこちらへ
+        // 書いていたので、値が残っている環境からは読んで引き取る（[`adopt_legacy_keys`]）
+        let legacy = ccdesk::settings_snapshot();
         // **存在しないディレクトリも落とさない**（dispatch_cwd の is_dir と対照的）:
         // リムーバブルドライブ・ネットワークドライブ・未マウントの作業領域は
         // 「今この瞬間見えない」だけで、消えたわけではない。ここで黙って隠すと
@@ -529,16 +538,20 @@ impl DataSource for LiveSource {
         let projects = state.list("projects");
         // **読んだ内容が以降の書き込みでマージする基準になる**（[`merge_projects`]）
         *self.projects_baseline.lock_recover() = projects.clone();
+        // **旧版の値は読むだけでなく引き取って降ろす**（読み側のフォールバックだけ
+        // 残すと、ccdesk が二度と書かないキーが config.json に居座り続ける）
+        adopt_legacy_keys(|key| state.string(key), |key| legacy.string(key));
         WindowState {
             // 旧版は config.json に保存していたため、state.json に無ければそちらへフォールバック
             sidebar_width: state
                 .string("sidebar_width")
-                .or_else(|| settings.string("sidebar_width"))
+                .or_else(|| legacy.string("sidebar_width"))
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_SIDEBAR_WIDTH),
             // 綴りの正本は [`crate::panes::Layout::as_str`]
-            layout: settings
+            layout: state
                 .string("layout")
+                .or_else(|| legacy.string("layout"))
                 .as_deref()
                 .map(crate::panes::Layout::parse)
                 .unwrap_or_default(),
@@ -568,8 +581,9 @@ impl DataSource for LiveSource {
                 }),
             // デフォルトは公式 Agent View と同じ State 別グルーピング。
             // 綴りの正本は [`Grouping::as_str`]
-            grouping: settings
+            grouping: state
                 .string("grouping")
+                .or_else(|| legacy.string("grouping"))
                 .as_deref()
                 .map(Grouping::parse)
                 .unwrap_or(Grouping::State),
@@ -589,15 +603,14 @@ impl DataSource for LiveSource {
                     .collect::<Vec<_>>()
                     .join(&SLOT_SEP.to_string()),
             ),
-            WindowItem::Layout(layout) => save_setting("layout", layout.as_str()),
+            WindowItem::Layout(layout) => save_state("layout", layout.as_str()),
             WindowItem::Split(split) => {
                 save_state("split_v", &split.v.to_string());
                 save_state("split_h", &split.h.to_string());
             }
             WindowItem::SidebarWidth(width) => save_state("sidebar_width", &width.to_string()),
             WindowItem::LastFolder(cwd) => save_state("last_folder", cwd),
-            // グルーピングだけはユーザー設定なので config.json 側
-            WindowItem::Grouping(grouping) => save_setting("grouping", grouping.as_str()),
+            WindowItem::Grouping(grouping) => save_state("grouping", grouping.as_str()),
         }
     }
 
@@ -649,6 +662,52 @@ impl DataSource for LiveSource {
         Titles::default()
     }
 
+}
+
+/// 旧版が config.json へ書いていた画面状態のキー。
+///
+/// **この並びは過去の事実なので増えない。** 画面状態の保存先は state.json 一本
+/// （[`WindowItem`]）になったので、新しい項目がここへ足されることはない。
+/// 逆に減らすこともできない: 一度も起動していない旧版の環境が残っている限り、
+/// 引き取る相手が居る
+const LEGACY_SETTING_KEYS: [&str; 3] = ["layout", "grouping", "sidebar_width"];
+
+/// 旧版の値を state.json へ引き取り、config.json から降ろす。
+///
+/// **読むだけのフォールバックでは足りない。** ccdesk が二度と書かないキーが
+/// config.json に残ると、手で書けば効く設定に見える（実際には次の操作で
+/// state.json 側の値に負ける）。引き取りと掃除まで済ませて初めて移行が終わる。
+///
+/// 読みを関数で受けるのは、判断（[`legacy_adoptions`]）を実ユーザーの
+/// `~/.ccdesk` に触らずテストできるようにするため
+fn adopt_legacy_keys(
+    state: impl Fn(&str) -> Option<String>,
+    legacy: impl Fn(&str) -> Option<String>,
+) {
+    for (key, adopted) in legacy_adoptions(state, legacy) {
+        if let Some(value) = adopted {
+            save_state(key, &value);
+        }
+        ccdesk::forget_setting(key);
+    }
+}
+
+/// config.json に残っていたキーと、state.json へ引き取る値。
+///
+/// **state.json に既に値があるキーは引き取らない**（`Some(key, None)`）: あちらは
+/// この版で書かれた新しい記録で、旧版の値で上書きすると「前回終了時の状態」が
+/// 一世代前へ巻き戻る。それでも config.json からは降ろす ＝ 戻り値に残す
+fn legacy_adoptions(
+    state: impl Fn(&str) -> Option<String>,
+    legacy: impl Fn(&str) -> Option<String>,
+) -> Vec<(&'static str, Option<String>)> {
+    LEGACY_SETTING_KEYS
+        .into_iter()
+        .filter_map(|key| {
+            let value = legacy(key)?;
+            Some((key, state(key).is_none().then_some(value)))
+        })
+        .collect()
 }
 
 /// スクリーンショット撮影用の固定データ（`--demo`）。
@@ -861,6 +920,59 @@ fn demo_usage() -> UsageInfo {
 mod tests {
     use super::*;
     use ccdesk::{load_state, load_state_list};
+
+    /// キー引きを表で与える（実ユーザーの `~/.ccdesk` を読まずに移行の判断を試す）
+    fn reader(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |key: &str| map.get(key).cloned()
+    }
+
+    /// 旧版の値（config.json）は state.json へ引き取り、**引き取れなくても降ろす**
+    #[test]
+    fn legacy_window_keys_move_out_of_the_settings_file() {
+        // state 側が空 ＝ 全部引き取る
+        assert_eq!(
+            legacy_adoptions(reader(&[]), reader(&[("layout", "1 pane"), ("grouping", "directory")])),
+            [
+                ("layout", Some("1 pane".to_string())),
+                ("grouping", Some("directory".to_string())),
+            ]
+        );
+        // state 側に既にある値は**引き取らない**が、config からは降ろす（None）。
+        // 引き取ると「前回終了時の状態」が旧版の値へ巻き戻る
+        assert_eq!(
+            legacy_adoptions(
+                reader(&[("layout", "2 panes")]),
+                reader(&[("layout", "1 pane")])
+            ),
+            [("layout", None)]
+        );
+        // config に無いキーは触らない（無いキーへ掃除をかけに行かない）
+        assert!(legacy_adoptions(reader(&[("layout", "2 panes")]), reader(&[])).is_empty());
+    }
+
+    /// 移行の対象は**旧版が config.json へ書いていたキーだけ**。
+    /// 現に書いている項目（[`WindowItem`]）を混ぜると、書いた端から掃除される
+    #[test]
+    fn only_keys_the_old_version_wrote_to_settings_are_migrated() {
+        assert_eq!(LEGACY_SETTING_KEYS, ["layout", "grouping", "sidebar_width"]);
+        for key in ["last_view", "last_folder", "split_v", "split_h", "projects"] {
+            assert!(
+                !LEGACY_SETTING_KEYS.contains(&key),
+                "{key} was never a setting -- migrating it would delete a live state key"
+            );
+        }
+        // 設定として残るキー（config.json の正当な住人）を巻き込まない
+        for key in ["codex", "usage_display"] {
+            assert!(
+                !LEGACY_SETTING_KEYS.contains(&key),
+                "{key} is a real setting and must stay in config.json"
+            );
+        }
+    }
 
     /// 撮影データは固定。実セッション・実アカウント・実使用率が混ざらないことを、
     /// 中身そのもので固定する（描画側はこの値をそのまま出す）
