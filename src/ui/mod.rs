@@ -12,8 +12,8 @@ use tui_term::widget::PseudoTerminal;
 use ccdesk::{dir_key, LockExt};
 
 use crate::app::{
-    selected_enter, App, Focus, Popup, PopupKind, RowAction, SelfUpdate, SidebarPos, Slot,
-    SidebarRow,
+    selected_enter, App, Focus, Grab, Grabbed, Popup, PopupKind, RowAction, SelfUpdate, SidebarPos,
+    Slot, SidebarRow,
 };
 use crate::backend::Kind;
 use crate::poll::{row_state, AccountStatus, State, Grouping, Run};
@@ -26,7 +26,9 @@ use crate::usage::{Usage, UsageInfo, UsageWindow};
 
 /// **セッション行の行頭に並ぶ 2 つの印。**
 ///
-/// 1 桁目は「この行が今ペインに出ているか」だけを答える（[`OPEN_MARK`] / [`CLOSED_MARK`]）。
+/// 1 桁目は「この行が今どこかのスロットに出ているか」を答え、出ているなら
+/// **どのスロットか**（フォーカス中か、他スロットで見えているだけか）まで
+/// 形で分ける（[`OPEN_MARK`] / [`SCREEN_MARK`] / [`CLOSED_MARK`]）。
 /// 消えている側も同じ幅の空白を取る ＝ 印が付いたり消えたりしても名前の開始桁が
 /// 動かない。**状態ラベルの前ではなく行頭に置く**のが判断: 印が答えるのは
 /// 「この行はどうか」なので、行を縦に流し読みするときに 1 つの桁へ揃っている方が
@@ -68,8 +70,11 @@ use crate::usage::{Usage, UsageInfo, UsageWindow};
 /// CJK ロケールで Ambiguous を 2 桁に描く端末では行がずれる ＝ 既知の制約。
 /// 選べる場面（[`MENU_MARK`] のように ASCII で足りるところ）では Ambiguous を避ける。
 ///
-/// 1 桁目: **その行が今ペインに出ているか**（`❯` U+276F ＝ ペインが指している行）
+/// 1 桁目: **その行が今ペインに出ているか、かつどのペインか**
+/// （`❯` U+276F ＝ フォーカス中のペインが指している行、
+/// `›` U+203A ＝ 他のペインに出ているだけの行）
 const OPEN_MARK: &str = "❯";
+const SCREEN_MARK: &str = "›";
 const CLOSED_MARK: &str = " ";
 /// claude の行のドット。**塗りが答えるのは未読だけ**（色と明滅は状態が決める）
 const DOT_FILLED: &str = "●";
@@ -156,6 +161,18 @@ pub(crate) fn fit_sidebar(width: u16, term_w: u16) -> u16 {
 
 fn mark(on: bool, yes: &'static str, no: &'static str) -> &'static str {
     if on { yes } else { no }
+}
+
+/// 行頭のペイン印。**フォーカス中のペインが指しているか、他のペインが指して
+/// いるだけか**を形で分ける（[`OPEN_MARK`] / [`SCREEN_MARK`]）
+fn open_mark(open: bool, focused: bool) -> &'static str {
+    if !open {
+        CLOSED_MARK
+    } else if focused {
+        OPEN_MARK
+    } else {
+        SCREEN_MARK
+    }
 }
 
 /// リセット時刻のローカル表記。別日なら "7/29 09:00"、当日は `with_date` 次第で
@@ -907,7 +924,7 @@ pub(crate) fn width_prefix(text: &str, cols: usize) -> (usize, usize) {
 ///
 /// - ホバー ＝ 帯（背景 `hl_bg`）
 /// - 選択 ＝ 帯 + 前景 `emph`
-/// - ペインに出ている ＝ 行頭 1 桁目の [`OPEN_MARK`] と名前の太字
+/// - ペインに出ている ＝ 行頭 1 桁目の記号（[`OPEN_MARK`] / [`SCREEN_MARK`]）と名前の太字
 ///
 /// **帯と印は別の軸**なので、開いている行を選択してホバーした場合も
 /// 「帯 + 前景の強調 + `❯` + 太字」で 3 つとも同時に読める。
@@ -919,17 +936,22 @@ struct Look {
     band: bool,
     /// 選択（帯の中でホバーと区別する前景の強調）
     selected: bool,
-    /// 今ペインに出ている行
+    /// 今ペインに出ている行（フォーカス中かは問わない）
     open: bool,
+    /// `open` な行のうち、出ているスロットが今フォーカス中か。
+    /// **`open` が false なら意味を持たない**（呼び手は常に false を渡す）
+    focused: bool,
 }
 
 impl Look {
-    /// その位置の見た目。`open` は一覧の行だけが持つ（飾りやアカウント行は false）
-    fn at(app: &App, pos: SidebarPos, open: bool) -> Self {
+    /// その位置の見た目。`open` / `focused` は一覧の行だけが持つ
+    /// （飾りやアカウント行はどちらも false）
+    fn at(app: &App, pos: SidebarPos, open: bool, focused: bool) -> Self {
         Self {
             band: app.selection == pos || app.hovered == Some(pos),
             selected: app.selection == pos,
             open,
+            focused,
         }
     }
 
@@ -988,7 +1010,7 @@ fn session_row_line(d: &RowData, look: Look, inner_width: u16, blink_tick: u64) 
     // 行頭のペイン印 + ドット + 空白（消えている側も同じ幅を取る）
     let mut spans = vec![
         Span::styled(
-            mark(look.open, OPEN_MARK, CLOSED_MARK),
+            open_mark(look.open, look.focused),
             Style::default().fg(ui().emph).add_modifier(Modifier::BOLD),
         ),
         Span::styled(dot_glyph(d.kind, d.unread), Style::default().fg(color)),
@@ -1564,9 +1586,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     let mut items: Vec<ListItem> = Vec::new();
     let mut rows: Vec<SidebarRow> = Vec::new();
 
+    let focused_id = app.shown_session();
     let push_data_row = |items: &mut Vec<ListItem>, rows: &mut Vec<SidebarRow>, d: &RowData| {
         let cur = rows.len();
-        let look = Look::at(app, SidebarPos::Row(cur), d.is_active_window);
+        let focused = d.is_active_window && focused_id == Some(&d.id);
+        let look = Look::at(app, SidebarPos::Row(cur), d.is_active_window, focused);
         items.push(ListItem::new(session_row_line(d, look, inner_width, blink_tick)));
         rows.push(SidebarRow::Action(d.action.clone()));
     };
@@ -1585,7 +1609,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
                     kind: SidebarRow,
                     keep_fg: bool| {
         let style = if kind.selectable() {
-            let banded = Look::at(app, SidebarPos::Row(rows.len()), false).band(base);
+            let banded = Look::at(app, SidebarPos::Row(rows.len()), false, false).band(base);
             match (keep_fg, base.fg) {
                 (true, Some(fg)) => banded.fg(fg),
                 _ => banded,
@@ -1960,7 +1984,60 @@ fn draw_right_pane(frame: &mut Frame, pane: Rect, app: &mut App) -> FrameCursor 
             cursor = found;
         }
     }
+    draw_drop_guide(frame, app);
     cursor
+}
+
+/// **掴んでいるセッションの落とし先を塗る**（IDE のタブドロップと同じ見え方）。
+///
+/// 塗る範囲は [`crate::app::drop_rect`] ＝ ドロップを実行する側と同じ答えなので、
+/// 「塗られた場所と違うところに入る」が構造的に起きない。
+///
+/// **落とせないところでは何も塗らない**（4 分割の縁・育った先が端末に入らないとき）。
+/// 塗りが消えること自体が「ここへは落とせない」の返事になる ＝
+/// 落としてから何も起きないより早く分かる
+fn draw_drop_guide(frame: &mut Frame, app: &App) {
+    let Some(drag) = app.drag.as_ref() else {
+        return;
+    };
+    // 押しただけ（まだ動いていない）ではクリックかもしれないので塗らない
+    if !drag.moved {
+        return;
+    }
+    let Some(rect) = drag.target.and_then(|t| crate::app::drop_rect(app, t)) else {
+        return;
+    };
+    // 半透明が無いので、下の内容は消して塗り潰す（透けさせると落とし先の
+    // 輪郭が読めない ＝ ガイドの用が足りない）
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(grabbed_title(app, &drag.what, rect.width))
+        .border_style(Style::default().fg(ui().emph).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(ui().hl_bg));
+    frame.render_widget(block, rect);
+}
+
+/// ガイドの見出し ＝ **掴んでいるものの名前**（落とすと何が出るか）。
+/// セッション行はペインの見出しと同じ綴り（[`pane_title`]）なので、
+/// 落ちた後に出る枠と読みが変わらない
+fn grabbed_title(app: &App, what: &Grab, width: u16) -> String {
+    match what.shows() {
+        // 掴んだのが既にある行なら、その名前（ペインの見出しと同じ綴り）
+        Grabbed::Session(id) => {
+            let name = app
+                .row(id)
+                .map_or_else(|| crate::title::UNTITLED.to_string(), |row| app.titles.of(row));
+            pane_title(&name, id, width)
+        }
+        // メニューの `new <agent> session` は**どのフォルダで始まるか**まで出す
+        // （掴み間違いが落とす前に分かる）
+        Grabbed::NewIn(cwd) => {
+            let leaf = leaf_name(cwd).unwrap_or_else(|| cwd.to_string());
+            format!("new session in {leaf}")
+        }
+        Grabbed::New => "new session".to_string(),
+    }
 }
 
 /// スロット 1 枚。戻り値はその中身が主張するカーソル（採るかは呼び手が決める）
@@ -1987,14 +2064,24 @@ fn draw_slot(frame: &mut Frame, rect: Rect, app: &mut App, at: usize, focused: b
             let title = title.unwrap_or_else(|| crate::title::UNTITLED.to_string());
             draw_session_slot(frame, rect, app, at, focused, title)
         }
-        // 空スロット（起動時・stop / close の直後）
+        // 空スロット（起動時・stop / close の直後）。枠だけだと「壊れている」
+        // のか「ただ空」なのか見分かないので、案内を 1 行出す
         _ => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title("no session")
+                .border_style(border_style(focused));
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+            let mid = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(1), Constraint::Min(0)])
+                .split(inner)[1];
             frame.render_widget(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("no session")
-                    .border_style(border_style(focused)),
-                rect,
+                ratatui::widgets::Paragraph::new("pick a session, or + new session, from the sidebar")
+                    .style(Style::default().fg(ui().dim))
+                    .alignment(ratatui::layout::Alignment::Center),
+                mid,
             );
             FrameCursor::hidden_at(pane_fallback_pos(rect))
         }
@@ -2580,6 +2667,12 @@ pub(crate) mod tests {
         );
         // ペインに出ているかの印は、消えている側も同じ 1 桁の空白
         assert_eq!(OPEN_MARK.width(), 1, "{OPEN_MARK:?} is not 1 column wide");
+        assert_eq!(SCREEN_MARK.width(), 1, "{SCREEN_MARK:?} is not 1 column wide");
+        assert_eq!(
+            SCREEN_MARK.width_cjk(),
+            1,
+            "the screen mark is East Asian Ambiguous: {SCREEN_MARK:?}"
+        );
         assert_eq!(CLOSED_MARK.width(), 1, "{CLOSED_MARK:?} is not 1 column wide");
         assert!(
             CLOSED_MARK.trim().is_empty(),
@@ -4094,7 +4187,7 @@ pub(crate) mod tests {
         let row = |open: bool, band: bool, selected: bool| {
             let mut d = look_fixture();
             d.is_active_window = open;
-            row_cells(&d, Look { band, selected, open })
+            row_cells(&d, Look { band, selected, open, focused: open })
         };
         let plain = row(false, false, false);
         let hovered = row(false, true, false);
@@ -4133,10 +4226,24 @@ pub(crate) mod tests {
         let mut d = look_fixture();
         d.unread = true;
         d.is_active_window = true;
-        let look = Look { band: false, selected: false, open: true };
+        let look = Look { band: false, selected: false, open: true, focused: true };
         let drawn = row_cells(&d, look);
         assert_eq!(drawn[0].0, OPEN_MARK);
         assert_eq!(drawn[1].0, DOT_FILLED);
+    }
+
+    /// **画面に出ていても、フォーカス中のペインでなければ違う印。**
+    /// `on_screen`（4 枚並べたら 4 行が open になる）と `focused`（そのうち
+    /// キー入力が届く 1 枚）は別の軸なので、印も別でないと見分けが付かない
+    #[test]
+    fn an_open_row_not_in_the_focused_pane_gets_a_different_mark() {
+        let mut d = look_fixture();
+        d.is_active_window = true;
+        let in_focus = row_cells(&d, Look { band: false, selected: false, open: true, focused: true });
+        let elsewhere = row_cells(&d, Look { band: false, selected: false, open: true, focused: false });
+        assert_eq!(in_focus[0].0, OPEN_MARK);
+        assert_eq!(elsewhere[0].0, SCREEN_MARK);
+        assert_ne!(in_focus[0].0, elsewhere[0].0, "focused and unfocused open rows look the same");
     }
 
     /// **未読行はドットが塗り、既読行は抜き。** 塗りは 2 値だけで、
@@ -4144,7 +4251,7 @@ pub(crate) mod tests {
     /// **agent が変わっても塗りのチャンネルは欠けない**（丸も菱も塗り/中空の対を持つ）
     #[test]
     fn the_dot_fill_marks_unread_rows() {
-        let look = Look { band: false, selected: false, open: false };
+        let look = Look { band: false, selected: false, open: false, focused: false };
         let mut d = look_fixture();
         for kind in Kind::ORDER {
             d.kind = kind;
@@ -4176,7 +4283,7 @@ pub(crate) mod tests {
     /// 対応表は [`dot_glyph`] から引くので、記号を手で書き写さない
     #[test]
     fn the_dot_shape_tells_the_agent_apart() {
-        let look = Look { band: false, selected: false, open: false };
+        let look = Look { band: false, selected: false, open: false, focused: false };
         let glyphs: Vec<&str> = Kind::ORDER
             .into_iter()
             .flat_map(|k| [dot_glyph(k, true), dot_glyph(k, false)])
@@ -4218,7 +4325,7 @@ pub(crate) mod tests {
     /// [`State::color`] を経由して取るので、対応表を手で書き写さない
     #[test]
     fn the_dot_color_matches_the_row_state() {
-        let look = Look { band: false, selected: false, open: false };
+        let look = Look { band: false, selected: false, open: false, focused: false };
         let dot_color = |state: State| {
             let mut d = look_fixture();
             d.group = state;
@@ -4240,7 +4347,7 @@ pub(crate) mod tests {
     /// 位相しだいで止まった行と動いている行が同じ見た目になっていた
     #[test]
     fn a_working_dot_blinks_through_its_ramp() {
-        let look = Look { band: false, selected: false, open: false };
+        let look = Look { band: false, selected: false, open: false, focused: false };
         let mut d = look_fixture();
         d.group = State::Working;
         let fg = |d: &RowData, tick: u64| {
@@ -4275,7 +4382,7 @@ pub(crate) mod tests {
         for state in State::ORDER {
             let mut d = look_fixture();
             d.group = state;
-            let drawn = row_cells(&d, Look { band: false, selected: false, open: false });
+            let drawn = row_cells(&d, Look { band: false, selected: false, open: false, focused: false });
             let text: String = drawn.iter().map(|c| c.0.as_str()).collect();
             let at = text
                 .find(state.title())
@@ -4297,7 +4404,7 @@ pub(crate) mod tests {
     /// （片方だけ [`row_state_color`] を経由しなくなったら落ちる）
     #[test]
     fn the_state_word_blinks_in_step_with_the_dot() {
-        let look = Look { band: false, selected: false, open: false };
+        let look = Look { band: false, selected: false, open: false, focused: false };
         let mut d = look_fixture();
         d.group = State::Working;
         for tick in 0..ui().blink_len() as u64 {

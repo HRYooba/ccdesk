@@ -236,6 +236,7 @@ fn main() -> anyhow::Result<()> {
         sidebar_width: window.sidebar_width,
         dragging: false,
         cross_drag: None,
+        drag: None,
         last_drag_resize: std::time::Instant::now(),
         term_size: (area.width, area.height),
         sidebar_rows: Vec::new(),

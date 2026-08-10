@@ -187,8 +187,8 @@ pub(crate) enum PopupKind {
 /// 項目を選んだときに起きること。**選択 index から作る**ので、表示名が同じ項目が
 /// 並んでも対象を取り違えない（ラベル文字列から対象を復元しない）。
 /// 副作用は持たず、実行は [`run_popup_action`] だけが行う
-#[derive(Debug, PartialEq)]
-enum PopupAction {
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PopupAction {
     /// そのセッションを開く（窓があれば切替、無ければ `claude -r` で再開）。
     /// **行クリックと同じ [`open_session`]** を通る ＝ 開く経路を 2 つ持たない
     OpenSession(SessionId),
@@ -358,6 +358,95 @@ impl Slot {
     }
 }
 
+/// **掴んだセッションを落とせる先。** 座標 1 つから [`drop_target`] が導き、
+/// ガイドの塗り（[`drop_rect`]）とドロップの実行（[`drop_session`]）が
+/// **同じ 1 つの答えを読む**。別々に判定すると「塗った場所と入る場所が違う」が
+/// いつか必ず起きる ＝ ここが分岐点を持つ唯一の場所
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DropAt {
+    /// そのスロットへ入れる（元の中身は押し出される）
+    Slot(usize),
+    /// そのスロットを割って、できた片方へ入れる
+    Split {
+        at: usize,
+        axis: crate::panes::Axis,
+        /// [`crate::panes::Grown::halves`] のどちら（0 = 左/上、1 = 右/下）
+        half: usize,
+    },
+}
+
+/// 掴めるもの ＝ **ペインへ何かを出す操作**。サイドバーの行とメニューの項目は
+/// 綴りが違うだけで、落とし先の決め方も出るものも同じなのでここで 1 つに束ねる。
+///
+/// **持つのは元の動作そのもの**で、掴んだ物の種類を別の言葉へ写し取らない:
+/// 運ばずに離したときはこれをそのまま元の実行表（[`run_row_action`] /
+/// [`run_popup_action`]）へ渡す ＝ **押して離すだけの意味は、掴めるようにする
+/// 前と 1 ビットも変わらない**
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Grab {
+    /// サイドバーの行
+    Row(RowAction),
+    /// メニューの項目
+    Menu(PopupAction),
+}
+
+impl Grab {
+    /// 掴めるか。**掴めるのは「ペインに何かを出す」操作だけ**で、その場で走る
+    /// もの（版行の更新・グルーピング切替・ピン留め・stop / close）は運ぶ先を持たない
+    fn grabbable(&self) -> bool {
+        match self {
+            // **プロジェクト見出しは掴めない。** この行の動作はメニューを開くこと
+            // で、そこから起こす項目は agent を選ばせてから走る ＝ 見出しごと
+            // 運ぶと、選ばせる段が落ちるか、選ばせる画面を出すだけの別物になる。
+            // 運びたいのはメニューの `new <agent> session` の側（下）
+            Self::Row(action) => matches!(action, RowAction::Open(_) | RowAction::New),
+            Self::Menu(action) => matches!(
+                action,
+                PopupAction::OpenSession(_) | PopupAction::NewSessionIn(..)
+            ),
+        }
+    }
+
+    /// **落とすと何が出るか。** ガイドの見出し（[`crate::ui`]）はこれだけを読むので、
+    /// 掴める入口が増えても見出しの綴りは 1 箇所のまま
+    pub(crate) fn shows(&self) -> Grabbed<'_> {
+        match self {
+            Self::Row(RowAction::Open(id)) | Self::Menu(PopupAction::OpenSession(id)) => {
+                Grabbed::Session(id)
+            }
+            Self::Menu(PopupAction::NewSessionIn(_, cwd)) => Grabbed::NewIn(cwd),
+            _ => Grabbed::New,
+        }
+    }
+}
+
+/// 掴んでいるものを**出るもの**で言い換えたもの（[`Grab::shows`]）
+pub(crate) enum Grabbed<'a> {
+    /// 既にあるセッション（その名前で出る）
+    Session(&'a SessionId),
+    /// 新規セッション（フォルダは直近のもの ＝ [`App::dispatch_cwd`]）
+    New,
+    /// 新規セッション（このフォルダ）
+    NewIn(&'a str),
+}
+
+/// 掴んでいるもの（ドラッグ＆ドロップ）
+pub(crate) struct DragSession {
+    pub(crate) what: Grab,
+    /// 掴んだ行の画面 y。**離した位置ではなくここを使う**ので、少しずれた
+    /// 手つきでもメニューは掴んだ行の下に出る
+    pub(crate) anchor_y: u16,
+    /// この掴みが**メニューを閉じた押し**から始まったか（[`arm_grab`]）。
+    /// 運ばずに離したときは何もしない: 閉じるのがその押しの仕事だったので、
+    /// 同じ押しで行の動作まで走らせると閉じた直後に開き直す
+    pub(crate) dismissed: bool,
+    /// 実際に動いたか。**押しただけでは掴みにしない**ので、押して離すだけの
+    /// 操作は今までどおりのクリックとして通る
+    pub(crate) moved: bool,
+    /// 今の指し先（落とせないところを指しているなら `None`）
+    pub(crate) target: Option<DropAt>,
+}
+
 pub(crate) struct App {
     /// 開いているウィンドウ（前景セッションの PTY そのもの）。**一覧の行とは別物**で、
     /// 窓を閉じてもプロセスが終わるだけ ＝ 行（[`Self::sessions`]）は残る
@@ -433,6 +522,10 @@ pub(crate) struct App {
     /// 十字の境界をつかんでいる間だけ Some。中身は `(縦を動かすか, 横を動かすか)` で、
     /// **交点をつかめば両方 true** ＝ 縦横を同時に動かせる
     pub(crate) cross_drag: Option<(bool, bool)>,
+    /// サイドバーの行を掴んでいる間だけ Some（ドラッグ＆ドロップ）。
+    /// **押した時点で Some になる**が、動くまでは掴みとして扱わない
+    /// （[`DragSession::moved`]）＝ ただのクリックは今までどおり通る
+    pub(crate) drag: Option<DragSession>,
     pub(crate) last_drag_resize: std::time::Instant,
     pub(crate) term_size: (u16, u16), // (width, height)
     // サイドバーに積まれた行（draw で構築）。飾りと押せない行の区別は [`SidebarRow`]
@@ -586,6 +679,7 @@ impl Default for App {
             sidebar_width: crate::ui::DEFAULT_SIDEBAR,
             dragging: false,
             cross_drag: None,
+            drag: None,
             last_drag_resize: std::time::Instant::now(),
             term_size: (120, 30),
             sidebar_rows: Vec::new(),
@@ -681,13 +775,29 @@ impl App {
     /// 溢れたスロットの中身は捨てるだけ（PTY は [`Self::windows`] が持ったまま
     /// 生き続ける ＝ 表示から外れるだけで何も終わらない）
     pub(crate) fn set_layout(&mut self, layout: crate::panes::Layout) {
-        self.layout = layout;
         let want = layout.slots();
-        self.slots.truncate(want);
-        while self.slots.len() < want {
-            self.slots.push(Slot::Empty);
+        let mut slots = std::mem::take(&mut self.slots);
+        slots.truncate(want);
+        while slots.len() < want {
+            slots.push(Slot::Empty);
         }
-        self.focus_slot = self.focus_slot.min(want.saturating_sub(1));
+        self.apply_layout(layout, slots);
+    }
+
+    /// 配置とスロットの中身を**同時に**差し替える。
+    ///
+    /// **枚数を `layout` に合わせるのはここと [`Self::set_layout`] だけ**なので、
+    /// 長さの合わない `slots` が他所で作られない。
+    ///
+    /// 中身を組み替える呼び手（ドロップで割るとき ＝ [`make_room`]）が居るので
+    /// 分けてある: 枚数合わせと中身の入れ替えが 1 つの関数だと、**中身の欠けた
+    /// 瞬間に下のリサイズが走る**（触っていない窓まで誤ったサイズへ潰れ、
+    /// vt100 の画面が刈られて内容が消える）
+    fn apply_layout(&mut self, layout: crate::panes::Layout, slots: Vec<Slot>) {
+        debug_assert_eq!(slots.len(), layout.slots(), "slots do not match the layout");
+        self.layout = layout;
+        self.slots = slots;
+        self.focus_slot = self.focus_slot.min(layout.slots().saturating_sub(1));
         // **枚数を減らすとフォーカススロットの中身が変わる**（丸めた先に別の行が
         // 出る）ので、移動と同じく既読を合わせる。溢れて消えた側は画面から
         // 消えるだけなので、そちらは未読のまま残るのが正しい
@@ -707,6 +817,31 @@ impl App {
             *at = slot;
         }
         self.save_slots();
+    }
+
+    /// **宛先を明示してスロットの中身を差し替え、フォーカスもそこへ移す。**
+    /// 入口はドラッグ＆ドロップ（[`drop_new_view`]）＝ どのスロットへ出すかを
+    /// ユーザーが名指しした操作。
+    ///
+    /// [`Self::put_in_focus`] と分けてあるのは焦点の受け渡しの有無:
+    /// あちらは今見ているスロットの中身を入れ替えるだけで、フォーカスは動かない
+    fn put_in_slot(&mut self, at: usize, slot: Slot) {
+        if at >= self.slots.len() {
+            return;
+        }
+        // **離れる窓へ focus out を送るのが先**（[`Self::place_session`] と同じ作法）
+        if self.focus == Focus::Terminal
+            && let Some(w) = self.focused_window()
+        {
+            self.windows[w].send_focus(false);
+        }
+        self.slots[at] = slot;
+        self.save_slots();
+        self.focus_slot = at;
+        self.mark_focus_read();
+        // 出したのは New 画面 ＝ 映す窓が無いので focus in は誰にも行かない
+        self.focus_terminal_on(at);
+        self.resize_sessions();
     }
 
     /// 次回起動で同じ並びを復元できるように書き残す
@@ -753,26 +888,47 @@ impl App {
         }
     }
 
-    /// **フォーカス中のスロットへそのセッションを移す。元居たスロットは空になる。**
+    /// **そのセッションを見えるところへ出す。**
     ///
+    /// 既に別スロットへ出ているなら、中身は動かさずフォーカスをそこへ移すだけ
+    /// （[`Self::set_focus_slot`]）。画面のどこかに出ているセッションを選んだのに
+    /// 中身ごとフォーカス中のスロットへ引き寄せると、押した人から見て
+    /// 「別スロットの中身が消えた」ように映る ＝ 見えている場所へ視線を移す方が
+    /// 説明できる動きになる。
+    ///
+    /// まだどこにも出ていなければ、フォーカス中のスロットへ表示する。
     /// **動くのは触ったセッションだけ。** 入れ替え（押し出された側を元居た場所へ
     /// 送る）にはしていない: 触っていないセッションが勝手に別のスロットへ
     /// 飛ぶのは、押した人から見て説明できない動きになる。押し出された側は
     /// 表示から外れるだけで、**行も PTY も残る**（選び直せば戻る）。
     ///
-    /// 規則はこの 1 つだけで全部の場合を覆う（未表示 / 他スロットに表示中 ×
-    /// 移す先が空 / 埋まっている の 4 通り）。**同じセッションが 2 スロットに
-    /// 出ることは構造的に起きない**: 1 つの [`crate::session::Session`] は
-    /// PTY もパーサもサイズを 1 つしか持てないので、2 箇所に違う大きさで
-    /// 映すことがそもそもできない
+    /// 規則はこの 2 つで全部の場合を覆う（他スロットに表示中 / 未表示）。
+    /// **同じセッションが 2 スロットに出ることは構造的に起きない**: 1 つの
+    /// [`crate::session::Session`] は PTY もパーサもサイズを 1 つしか持てないので、
+    /// 2 箇所に違う大きさで映すことがそもそもできない
     fn show_session(&mut self, id: &SessionId) {
-        let to = self.focus_slot;
-        let from = self.slot_of(id);
-        if from == Some(to) {
+        if let Some(from) = self.slot_of(id) {
+            // 見えているなら視線だけ移す（中身は動かさない）
+            self.set_focus_slot(from);
             return;
         }
+        self.place_session(id, self.focus_slot);
+    }
+
+    /// **宛先を明示してセッションを出す。** 元居たスロットは空になり、
+    /// フォーカスも宛先へ移る。
+    ///
+    /// [`Self::show_session`] と違い、既に別のスロットへ出ていても**動かす**:
+    /// こちらの入口はドラッグ＆ドロップ（[`drop_session`]）＝ どこへ置くかを
+    /// ユーザーが名指しした操作なので、「見えているから動かさない」の遠慮は要らない
+    pub(crate) fn place_session(&mut self, id: &SessionId, to: usize) {
         if to >= self.slots.len() {
             return; // 配置がまだ組まれていない（起動列の途中）
+        }
+        let from = self.slot_of(id);
+        if from == Some(to) {
+            self.set_focus_slot(to);
+            return;
         }
         // **押し出される窓へ focus out を送るのが先。** これを落とすと、
         // 追い出された側と入ってきた側の両方が「自分が端末を持っている」と
@@ -789,6 +945,10 @@ impl App {
             self.slots[from] = Slot::Empty;
         }
         self.save_slots();
+        // フォーカスも宛先へ。**`set_focus_slot` は通さない**（focus out は上で
+        // 済ませてあるので、通すと離れる側へ 2 回続けて届く）
+        self.focus_slot = to;
+        self.mark_focus_read();
         self.focus_terminal_on(to);
         self.resize_sessions();
     }
@@ -1897,6 +2057,23 @@ fn selected_row_y(app: &App) -> u16 {
 /// **PTY の起動は同期**（数 ms）。結果を待つ別スレッドが要らないので、
 /// 起動と反映が 1 本の流れに収まる
 fn dispatch_session(app: &mut App, kind: Kind, cwd: String, prompt: String) {
+    dispatch_session_into(app, kind, cwd, prompt, None);
+}
+
+/// 起こした窓の出し先を名指しできる版（`at` が `None` なら今までどおり
+/// フォーカススロットへ）。
+///
+/// **`at` を渡す側（ドロップ）は、起こしてから配置を育てる**: 逆にすると
+/// 起動に失敗したとき空のペインだけが増えて残る（[`drop_session`] と同じ順序）。
+/// 起こす前に大きさが要るのは PTY の初期サイズのため ＝ 落とし先の内寸は
+/// 配置を変える前に [`drop_rect`] から分かる
+fn dispatch_session_into(
+    app: &mut App,
+    kind: Kind,
+    cwd: String,
+    prompt: String,
+    at: Option<DropAt>,
+) {
     // フォルダの登録はここでは行わない（起動が成功してから ＝ [`apply_launch`]）。
     // 打った文字列は new session 画面の初期値として持つだけに留める
     app.dispatch_cwd = cwd.clone();
@@ -1908,28 +2085,51 @@ fn dispatch_session(app: &mut App, kind: Kind, cwd: String, prompt: String) {
     // 撮影用データは本物のセッションを起こさない（架空の一覧に実セッションが混ざらない）。
     // 起動しない ＝ 失敗もしないので `Ok(None)` で実データと同じ反映経路へ渡す
     // （demo だけフォルダの登録の意味が違う、という状態を作らない）
+    // 起こす先の内寸（落とし先が決まっているならそちら ＝ 起こした直後に
+    // 作り直させない）
+    let size = at
+        .and_then(|target| drop_rect(app, target))
+        .map_or_else(|| app.focus_slot_size(), App::inner_size);
     let launched = if app.source.spawns_sessions() {
-        start_foreground(app, kind, &cwd, &prompt)
+        start_foreground(app, kind, &cwd, &prompt, size)
     } else {
         Ok(None)
     };
+    // 起こせたものを画面へ出す。**落とし先を名指しされているときだけ**、
+    // 配置をここで育てる（起こせなかったら育てない）
+    if let Ok(Some(id)) = &launched {
+        let id = id.clone();
+        match at.and_then(|target| make_room(app, target)) {
+            Some(to) => app.place_session(&id, to),
+            None => app.show_session(&id),
+        }
+    }
     apply_launch(app, cwd, launched);
 }
 
-/// 新規の前景セッションを起こし、一覧へ行を足してその窓を表示する。
+/// 新規の前景セッションを起こして一覧へ行を足す。
 ///
 /// **UUID は ccdesk が採番する**（`claude --session-id` へ渡した値がそのまま
 /// transcript の `sessionId` になる ＝ 行と claude 側の記録が同じ鍵で結びつく）。
 /// 新規生成なので同 cwd の既存 transcript と衝突しない。
 ///
-/// **行を足すのは起動できてから**（起動できなかったセッションを一覧に残さない）
-fn start_foreground(app: &mut App, kind: Kind, cwd: &str, prompt: &str) -> Launched {
+/// **行を足すのは起動できてから**（起動できなかったセッションを一覧に残さない）。
+///
+/// **画面のどこへ出すかは含まない**（[`ensure_window`] と同じ切れ目）: 出し先が
+/// 違う入口が起こし方を 2 本持たないため。`size` は PTY の初期サイズ
+fn start_foreground(
+    app: &mut App,
+    kind: Kind,
+    cwd: &str,
+    prompt: &str,
+    size: (u16, u16),
+) -> Launched {
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
     // state を取る hook を注入する（statusLine は載せない ＝ ユーザーの
     // statusline を奪わない。[`crate::hooks::inject_settings`]）
     let injection = hook_settings(app);
     let inject = injection.as_ref().map(as_inject);
-    let (rows, cols) = app.focus_slot_size();
+    let (rows, cols) = size;
     let spawn = kind.spawn_command(&session_id, cwd, Launch::New { prompt }, inject.as_ref());
     // **渡した会話 ID を控えるのは起こす前。** 起こしてから読み直せる場所は無い
     // （argv には出ているが、そこから読み戻すのは同じ知識の 2 本目になる）
@@ -1947,7 +2147,6 @@ fn start_foreground(app: &mut App, kind: Kind, cwd: &str, prompt: &str) -> Launc
     app.sessions.push(row);
     save_sessions(app);
     app.windows.push(window);
-    app.show_session(&session_id);
     Ok(Some(session_id))
 }
 
@@ -1981,10 +2180,24 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
     // 判定するのが要点で、内容から幅を決めるメニューは境界線の列に被り得るため、
     // 被った列の項目クリックがサイドバー幅変更に化けてはいけない
     // （ドラッグ中だけは掴んだ操作を優先する = 下のドラッグ分岐へ落とす）
+    // 掴んでいる間は他の判定を通さない（境界の掴み代・スロットのクリック・
+    // 子への転送・モーダルのどれにも化けさせない）。**モーダルより先**なのが
+    // 要点で、メニューの項目を掴んだ直後はまだ閉じ切っていないフレームがあり得る
+    if app.drag.is_some() && handle_session_drag(app, mouse) {
+        return Ok(false);
+    }
     if app.popup.is_some() && !app.dragging {
-        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            handle_popup_click(app, mouse.column, mouse.row);
+        let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
+            return Ok(false);
+        };
+        if handle_popup_click(app, mouse.column, mouse.row) {
+            return Ok(false);
         }
+        // メニューを閉じた押しは**何も実行しない**（背後の版行やセッション行が
+        // 誤爆しない ＝ 閉じるのがこの押しの仕事）。**掴みだけは始める**ので、
+        // メニューを開いた行（行末の `=` を押したセッション行）だけ運べない、
+        // という説明できない差が生まれない
+        arm_grab(app, mouse);
         return Ok(false);
     }
     // 境界線ドラッグ（サイドバー右枠線と右ペイン左枠線の 2 列をつかみ代にする）。
@@ -2095,10 +2308,24 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                     open_session_popup(app, &id.clone(), mouse.row);
                     return Ok(false);
                 }
-            // 実行表はキーボードの Enter と同じ [`run_row_action`]。
-            // セッション行のクリックは「開く」（Enter はメニュー）で、開けたとき
-            // だけフォーカスを端末へ移す判断も表の側にある
+            // **ペインへ何かを出す行は掴めるので、押した時点では走らせない。**
+            // 走るのは離したとき（運んでいなければクリック ＝ [`handle_session_drag`]）。
+            // ここで走らせると、ドロップ先へ運ぶ前にフォーカススロットで一度
+            // 開いてから移動する、という二段動作になる
             if let Some(action) = action {
+                if Grab::Row(action.clone()).grabbable() {
+                    app.drag = Some(DragSession {
+                        what: Grab::Row(action),
+                        anchor_y: mouse.row,
+                        dismissed: false,
+                        moved: false,
+                        target: None,
+                    });
+                    return Ok(false);
+                }
+                // 実行表はキーボードの Enter と同じ [`run_row_action`]。
+                // 掴めない行（版行の更新・グルーピング切替・配置メニュー）は
+                // 運ぶ先を持たないので押した時点で走る
                 run_row_action(app, action, mouse.row);
             }
         }
@@ -2194,6 +2421,270 @@ fn handle_cross_drag(app: &mut App, mouse: &MouseEvent) -> bool {
     }
 }
 
+/// **メニューを閉じた押しから掴みを始める。** 掴む以外の副作用（ホバー・選択・
+/// 行の実行）は持たないので、閉じた押しが背後の行を誤爆させない。
+///
+/// 掴めない行・サイドバーの外なら何もしない
+fn arm_grab(app: &mut App, mouse: &MouseEvent) {
+    // **幅変更の掴み代（サイドバー右枠の 2 列）は掴みにしない。** ここを含めると、
+    // メニューを開いたまま境界をつかもうとした操作が行の掴みに化ける
+    // （掴みが成立すると幅変更の判定はもう見られない ＝ 幅を広げるつもりが
+    // セッションをペインへ落としてしまう）
+    if mouse.column >= sidebar_cols(app).saturating_sub(1) {
+        return;
+    }
+    let sl = sidebar_layout(app);
+    let row = row_at(mouse.row, sl.capacity, app.sidebar_header_rows, app.sidebar_scroll);
+    let Some(action) = app.sidebar_rows.get(row).and_then(SidebarRow::action).cloned() else {
+        return;
+    };
+    let what = Grab::Row(action);
+    if !what.grabbable() {
+        return;
+    }
+    app.drag = Some(DragSession {
+        what,
+        anchor_y: mouse.row,
+        dismissed: true,
+        moved: false,
+        target: None,
+    });
+}
+
+/// 掴んでいるセッションの後始末（動いたか / 落としたか）。
+/// 戻り値 true ＝ このイベントは掴みが受け取った（他の判定へ落とさない）。
+///
+/// **クリックとドラッグを分けるのはここ 1 箇所。** 押して動かさずに離せば
+/// 今までどおり「その行を開く」で、動かしてから離せばドロップになる
+fn handle_session_drag(app: &mut App, mouse: &MouseEvent) -> bool {
+    match mouse.kind {
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let target = drop_target(app, mouse.column, mouse.row);
+            if let Some(drag) = app.drag.as_mut() {
+                drag.moved = true;
+                drag.target = target;
+            }
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let Some(drag) = app.drag.take() else {
+                return false;
+            };
+            if let Some(target) = drag.target {
+                // フォーカスを端末へ移すのは**出せたときだけ**（[`drop_row`]）。
+                // 起こし直しに失敗したのに移すと、打鍵が直前まで出ていた別の
+                // セッションへ流れる
+                drop_row(app, &drag.what, target);
+                return true;
+            }
+            // **運んだ末にペインの上で離したのに行き先が無いなら、何もしない。**
+            // ガイドが塗らなかった ＝ そこへは落とせないと画面で断ってあるので、
+            // 代わりに別のスロットで開くと断った直後に別のことをすることになる。
+            //
+            // **動かしていないなら断りは効かせない**: メニューはペインの上へ
+            // はみ出して描かれるので、項目をただ押しただけの操作がここへ来る
+            // （はみ出した列の項目が押しても走らなくなっていた）
+            if drag.moved
+                && crate::ui::pane_rect(app).contains(Position::new(mouse.column, mouse.row))
+            {
+                return true;
+            }
+            // 運ばずに離した押しがメニューを閉じた押しなら、それで仕事は済んでいる
+            // （ここで行の動作まで走らせると、閉じた直後に同じメニューが開き直す）
+            if drag.dismissed {
+                return true;
+            }
+            // ペインの外（サイドバーやメニューの上）で離した ＝ どこにも運んで
+            // いない。**動いたかどうかで分けない**のが要点で、トラックパッドの
+            // 微妙なずれで 1 桁動いただけの操作が「押したのに何も起きない」に
+            // 化けない。**掴んだものの動作をそのまま元の実行表へ流す**ので、
+            // 押して離すだけの意味は掴めるようにする前と変わらない
+            match drag.what {
+                Grab::Row(action) => run_row_action(app, action, drag.anchor_y),
+                Grab::Menu(action) => run_popup_action(app, action),
+            }
+            true
+        }
+        // ボタンを離したイベントを取り逃がしたときの逃げ道（掴んだまま戻らない
+        // 状態を残さない）。押している間は Drag しか来ないので、Moved が届いた
+        // 時点で指は離れている
+        MouseEventKind::Moved => {
+            app.drag = None;
+            false
+        }
+        // 掴んでいる間の他のイベント（ホイール等）は捨てる
+        _ => true,
+    }
+}
+
+/// 掴んだセッションを落としたときの行き先（落とせないなら `None`）。
+///
+/// **判定の正本はここ 1 つ。** ガイドの塗り（[`drop_rect`]）も実行
+/// （[`drop_session`]）も同じ答えを読むので、「塗られた場所と違うところに入る」が
+/// 構造的に起きない。
+///
+/// スロットの**縁**（各辺の 1/4 の帯）を指していれば割って入れる、
+/// **真ん中**ならそのスロットへ入れる。角のように帯が重なるところは、
+/// 帯の中でどれだけ端に寄っているかで決める（辺の長さが違っても比べられる）。
+///
+/// **割れない縁は `None`**（4 分割の縁・端末が狭くて育った先が入らないとき）。
+/// 落とせないことをガイドが塗らないことで表す ＝ 落としてから何も起きないより早く分かる
+pub(crate) fn drop_target(app: &App, column: u16, row: u16) -> Option<DropAt> {
+    use crate::panes::Axis;
+    let rects = app.slot_rects();
+    let at = rects
+        .iter()
+        .position(|r| r.contains(Position::new(column, row)))?;
+    let r = rects[at];
+    // 縁の帯は各辺の 1/4（狭いスロットでも 1 桁は確保する）
+    let band_w = (r.width / 4).max(1);
+    let band_h = (r.height / 4).max(1);
+    let edges = [
+        (column.saturating_sub(r.x), band_w, Axis::Vertical, 0usize),
+        (
+            (r.x + r.width).saturating_sub(1).saturating_sub(column),
+            band_w,
+            Axis::Vertical,
+            1,
+        ),
+        (row.saturating_sub(r.y), band_h, Axis::Horizontal, 0),
+        (
+            (r.y + r.height).saturating_sub(1).saturating_sub(row),
+            band_h,
+            Axis::Horizontal,
+            1,
+        ),
+    ];
+    // 帯に入っている辺のうち、**帯の中で最も端に寄っている**もの
+    // （生の距離で比べると、長い辺の帯が短い辺の帯に必ず勝ってしまう）
+    let Some(&(_, _, axis, half)) = edges
+        .iter()
+        .filter(|(dist, band, _, _)| dist < band)
+        .min_by_key(|(dist, band, _, _)| u32::from(*dist) * 100 / u32::from(*band))
+    else {
+        return Some(DropAt::Slot(at)); // 真ん中 ＝ そのスロットへ
+    };
+    // 育った先が今の端末に収まらないなら落とせない
+    // （**判断はメニューと同じ [`crate::panes::Layout::fits`]** ＝ 崩れる形へ育たない）
+    let grown = app.layout.split_slot(at, axis)?;
+    grown
+        .layout
+        .fits(crate::ui::pane_rect(app), app.split)
+        .then_some(DropAt::Split { at, axis, half })
+}
+
+/// ドロップ先の矩形（ガイドが塗る範囲 ＝ 落とした結果そのもの）。
+///
+/// **割った先は本物の矩形を引く**（半分に割った近似ではない）: 育った配置に
+/// 同じ [`crate::panes::Split`] を渡して計算するので、十字を寄せてあるときも
+/// 塗った通りの大きさで入る
+pub(crate) fn drop_rect(app: &App, target: DropAt) -> Option<Rect> {
+    match target {
+        DropAt::Slot(at) => app.slot_rects().get(at).copied(),
+        DropAt::Split { at, axis, half } => {
+            let grown = app.layout.split_slot(at, axis)?;
+            let rects = grown.layout.rects(crate::ui::pane_rect(app), app.split);
+            rects.get(grown.halves[half]).copied()
+        }
+    }
+}
+
+/// 掴んだものを落とす。[`drop_target`] が返した行き先をそのまま実行する。
+///
+/// **即起動するかは「agent が決まっているか」で分かれる。** `+ new session` は
+/// 決まっていないので選ばせる画面を出し、メニューの `new <agent> session` は
+/// 項目が名指ししているのでそのまま起こす（[`PopupKind::Project`] の項目が
+/// agent ごとに分かれているのは、黙って選ばせないため）
+fn drop_row(app: &mut App, what: &Grab, target: DropAt) {
+    match what {
+        Grab::Row(RowAction::Open(id)) | Grab::Menu(PopupAction::OpenSession(id)) => {
+            drop_session(app, id, target);
+        }
+        // `+ new session` は直近のフォルダで**選ばせる画面**を出す
+        // （どの agent で起こすかはその画面が受け持つ）
+        Grab::Row(RowAction::New) => drop_new_view(app, app.dispatch_cwd.clone(), target),
+        // **メニューの `new <agent> session` は落とした先で即起動する。**
+        // 選ばせる画面を挟まないのは、この項目が agent を名指ししているから ＝
+        // 落とす操作に選ばせるものが残っていない
+        Grab::Menu(PopupAction::NewSessionIn(kind, cwd)) => {
+            drop_new_session(app, *kind, cwd.clone(), target);
+        }
+        // 掴めないものはここまで来ない（[`Grab::grabbable`]）
+        _ => {}
+    }
+}
+
+/// 落とし先で新規セッションを起こす（メニューの `new <agent> session`）。
+/// **起こしてから配置を育てる**順序は [`dispatch_session_into`] が持つ
+fn drop_new_session(app: &mut App, kind: Kind, cwd: String, target: DropAt) {
+    dispatch_session_into(app, kind, cwd, String::new(), Some(target));
+}
+
+/// 落とし先へ新規セッション画面を出す
+fn drop_new_view(app: &mut App, cwd: String, target: DropAt) {
+    let Some(to) = make_room(app, target) else {
+        return;
+    };
+    app.put_in_slot(to, Slot::New(NewState::browse(&cwd)));
+    app.set_focus(Focus::Terminal);
+}
+
+/// 掴んだセッションを落とす。
+///
+/// **起こし直しはクリックと同じ [`ensure_window`] を通る**ので、止まっている行を
+/// 落としても再開する（窓を用意せずスロットへ入れるだけだと、死んだ枠だけが出る）。
+///
+/// **窓を用意するのが先、配置を変えるのは後。** 逆にすると、起こし直しに失敗した
+/// ときに空のペインだけが増えて残る
+fn drop_session(app: &mut App, id: &SessionId, target: DropAt) {
+    // 落とし先の**内寸**で起こす（育った先の大きさは配置を変える前に分かる ＝
+    // 起こした直後に作り直させない）
+    let size = drop_rect(app, target).map_or_else(|| app.focus_slot_size(), App::inner_size);
+    if !ensure_window(app, id, size) {
+        return;
+    }
+    let Some(to) = make_room(app, target) else {
+        return;
+    };
+    app.place_session(id, to);
+    app.set_focus(Focus::Terminal);
+}
+
+/// 落とし先のスロットを空けて、その番号を返す（**中身は入れない**）。
+///
+/// 割って入れる先なら配置を育て、割らなかったスロットの中身は番号の
+/// 振り直しに沿って写す（[`crate::panes::Grown::moved`]）。
+/// **窓の用意は含まない**ので、育てる側だけを起動なしで検査できる
+fn make_room(app: &mut App, target: DropAt) -> Option<usize> {
+    let to = match target {
+        DropAt::Slot(at) => at,
+        DropAt::Split { at, axis, half } => {
+            let grown = app.layout.split_slot(at, axis)?;
+            // **新しい並びを組み終えてから入れ替える。** 途中で `App` に
+            // 中身の欠けた並びを持たせると、そこで走るリサイズが触っていない窓まで
+            // 誤ったサイズへ潰す（[`App::apply_layout`]）
+            let mut before = std::mem::take(&mut app.slots);
+            let mut next: Vec<Slot> = (0..grown.layout.slots()).map(|_| Slot::Empty).collect();
+            for (from, to) in &grown.moved {
+                if let Some(slot) = before.get_mut(*from) {
+                    next[*to] = std::mem::replace(slot, Slot::Empty);
+                }
+            }
+            // 割ったスロットの中身は、**落とさなかった側へ残る**
+            // （押し出さない ＝ 触っていないセッションは 1 つも画面から消えない）
+            if let Some(slot) = before.get_mut(at) {
+                next[grown.halves[1 - half]] = std::mem::replace(slot, Slot::Empty);
+            }
+            app.apply_layout(grown.layout, next);
+            // **配置ごと書き残す**（スロットだけ保存すると、次の起動で古い配置の
+            // 枚数しか復元されず、割って増えたペインが消える）
+            save_layout(app);
+            grown.halves[half]
+        }
+    };
+    Some(to)
+}
+
 /// 窓が開いていて子プロセスが生きているか。**前景では自分の子プロセスが
 /// 唯一の真実**なので、生きた窓を持たない行はすべて停止済み
 /// （`claude -r` で再開できる ＝ メニューの `close` は出せない）
@@ -2254,12 +2745,15 @@ fn handle_popup_key(app: &mut App, code: KeyCode) {
 }
 
 /// モーダル内クリック
-fn handle_popup_click(app: &mut App, col: u16, row: u16) {
-    let Some(popup) = &app.popup else { return };
+fn handle_popup_click(app: &mut App, col: u16, row: u16) -> bool {
+    let Some(popup) = &app.popup else { return false };
     let rect = popup_rect(app, popup);
     if !rect.contains(Position::new(col, row)) {
         app.popup = None; // 外クリックで閉じる（階層を持たないので全閉）
-        return;
+        // **閉じるだけで押しを使い切らない。** 使い切ると、メニューを開いた行
+        // （行末の `=` を押したセッション行）は開いた直後に掴めなくなる ＝
+        // メニューを開いた行にだけドラッグの入口が無い、という差が生まれる
+        return false;
     }
     // 枠線上のクリックは何もしない（上枠が先頭項目に化けて誤発火しない）
     if row == rect.y
@@ -2267,14 +2761,39 @@ fn handle_popup_click(app: &mut App, col: u16, row: u16) {
         || col == rect.x
         || col == rect.x + rect.width - 1
     {
-        return;
+        return true;
     }
     // 枠内に入りきらないメニューは描画がスクロールしている（[`crate::ui::popup_scroll`]）
     // ので、クリックの行 → 項目 index も同じずらしを通す
     let visible = rect.height.saturating_sub(2) as usize;
-    let total = popup.kind.entries(app.grouping, &app.kinds).len();
-    let offset = crate::ui::popup_scroll(popup.selected, total, visible);
-    activate_popup(app, offset + (row - rect.y - 1) as usize);
+    let entries = popup.kind.entries(app.grouping, &app.kinds);
+    let offset = crate::ui::popup_scroll(popup.selected, entries.len(), visible);
+    let index = offset + (row - rect.y - 1) as usize;
+    // **ペインへ何かを出す項目は掴める**（`new <agent> session` / `open`）。
+    // 走らせるのは離したとき ＝ 押した時点で走らせると、運ぶ前にフォーカス
+    // スロットで一度起きてから移動する二段動作になる。
+    //
+    // **掴んだ時点でメニューを閉じる**のは、開いたままだとこの後の Drag が
+    // モーダル側に飲まれてドロップ先を選べないため（＋ ペインを覆って
+    // ガイドが見えない）
+    let grab = entries
+        .get(index)
+        .filter(|entry| entry.enabled)
+        .map(|entry| Grab::Menu(entry.action.clone()))
+        .filter(Grab::grabbable);
+    if let Some(what) = grab {
+        app.popup = None;
+        app.drag = Some(DragSession {
+            what,
+            anchor_y: row,
+            dismissed: false,
+            moved: false,
+            target: None,
+        });
+        return true;
+    }
+    activate_popup(app, index);
+    true
 }
 
 /// 選択項目の実行（Enter / クリック共通）。実行できない項目・範囲外の index は無視する
@@ -2338,7 +2857,17 @@ fn set_layout(app: &mut App, next: crate::panes::Layout) {
         return;
     }
     app.set_layout(next);
-    app.source.save_window(WindowItem::Layout(next));
+    save_layout(app);
+}
+
+/// **配置を変えたことを書き残す唯一の口**（メニューで選んだとき / ドロップで
+/// 割ったとき）。
+///
+/// 配置とスロットは**必ず一緒に**保存する: 片方だけ書くと、次の起動で
+/// `main` が古い配置の枚数だけスロットを復元して**残りが黙って消える**
+/// （割って増やしたペインが再起動のたびに失われていた）
+fn save_layout(app: &mut App) {
+    app.source.save_window(WindowItem::Layout(app.layout));
     app.save_slots();
 }
 
@@ -2648,28 +3177,13 @@ fn start_unattended(
         return Err(format!("{} is not enabled in this ccdesk", kind.as_str()));
     }
     // **頼まれていない起動が、今見ているものを画面から追い出さない。**
-    // 起動は必ずフォーカススロットへ映す（[`start_foreground`]）ので、
-    // 中身を退避して戻す ＝ 起きたセッションはどのスロットにも出ない
-    // （行としては一覧に出るので、見たければ選べばよい）
-    let watching = app
-        .slots
-        .get_mut(app.focus_slot)
-        .map(|slot| std::mem::replace(slot, Slot::Empty));
-    let started = start_foreground(app, kind, cwd, prompt);
-    if let (Some(watching), Some(slot)) = (watching, app.slots.get_mut(app.focus_slot)) {
-        *slot = watching;
-    }
-    app.save_slots();
-    // **起こした窓の focus in を取り消す。** 起動は必ずフォーカススロットを
-    // 経由するので focus in が飛んでいるが、中身を戻した今この窓はどこにも
-    // 出ていない ＝ 端末を持っていない
-    if let Ok(Some(id)) = &started
-        && let Some(at) = app.window_index(id)
-    {
-        app.windows[at].send_focus(false);
-    }
-    // 退避していた窓が戻ったので、フォーカスの持ち主を伝え直す
-    app.focus_terminal_on(app.focus_slot);
+    // 起こすだけで画面へは出さない（[`start_foreground`] は出し先を持たない）＝
+    // 起きたセッションはどのスロットにも出ない。行としては一覧に出るので、
+    // 見たければ選べばよい。
+    //
+    // **窓の大きさはフォーカススロットに合わせておく**（[`App::resize_sessions`] が
+    // 出ていない窓に与えるのと同じ値）＝ 次に映したときに作り直しが要らない
+    let started = start_foreground(app, kind, cwd, prompt, app.focus_slot_size());
     match started {
         Ok(Some(id)) => Ok(id),
         // 起こさない供給元（撮影用）＝「試していない」ので、失敗として返す
@@ -2993,11 +3507,28 @@ fn relaunch<'a>(
 /// フォーカスを端末へ移す（失敗したのに移すと、打鍵が直前まで表示していた
 /// 別セッションへ流れる）
 pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
+    if !ensure_window(app, id, app.focus_slot_size()) {
+        return false;
+    }
+    app.show_session(id);
+    true
+}
+
+/// **その行を動かす窓を用意する**（生きていればそのまま、無ければ起こし直す）。
+/// 起こし方と起動先は [`relaunch`] が決める。
+///
+/// **画面のどこへ出すかは含まない。** 出し先が違う入口（サイドバーのクリック ＝
+/// [`open_session`] / ドラッグ＆ドロップ ＝ [`drop_session`]）で、起こし直しの
+/// 手順を 2 本持たないための切れ目 ＝ **止まっている行はどちらの入口からでも
+/// 同じように再開する**（ドロップだけ再開しなかったのはここが分かれていたため）。
+///
+/// `size` は起こすときの PTY 初期サイズ（落とし先のスロットの内寸）。
+/// 戻り値は「この行を動かす窓が居るか」
+fn ensure_window(app: &mut App, id: &SessionId, size: (u16, u16)) -> bool {
     if let Some(i) = app.window_index(id) {
         if app.windows[i].alive() {
             // **その行を開いた時点が既読の契機**（切替も再開も同じ）
             mark_read(app, id);
-            app.show_session(id);
             return true;
         }
         // 直前に死んだ窓（生死スキャンがまだ拾っていない）は開かない:
@@ -3053,7 +3584,7 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
     let cwd = cwd.into_owned();
     let spawn = kind.spawn_command(id, &cwd, launch, inject.as_ref());
     let conversation = spawn.conversation;
-    let (rows, cols) = app.focus_slot_size();
+    let (rows, cols) = size;
     match Session::spawn(id, spawn.cmd, rows, cols) {
         Ok(window) => {
             // **起こし直しで会話が変わり得る**（記録を見失った行の新規起動）。
@@ -3071,7 +3602,6 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
             // （消さないと止めた行の数だけ溜まる）
             app.stopped_at.remove(id);
             app.windows.push(window);
-            app.show_session(id);
             // 再開は transcript の読み直しに時間がかかりうる。子が端末を掴むまでの
             // 打鍵は捨てる（[`drop_input_while_starting`]）
             app.input_gate = Some(std::time::Instant::now());
@@ -4118,6 +4648,9 @@ mod tests {
         usage: Usage,
         /// 一覧の保存が呼ばれた回数（**保存しないことを検査する軸**）
         session_saves: Arc<std::sync::atomic::AtomicUsize>,
+        /// 書き残された `(配置, スロット枚数)`。**両方を 1 つの軸で持つ**のが要点で、
+        /// 片方だけ書かれた状態（次の起動で増えたペインが消える）をそのまま検出できる
+        saved_window: Arc<Mutex<(Option<crate::panes::Layout>, Option<usize>)>>,
         /// 「ディスクにはこう載っている」一覧（[`DataSource::sessions`] が返す値）。
         /// **読み直しが何を落とすか**を見るための軸で、実ファイルは読まない
         disk_sessions: Vec<SessionRow>,
@@ -4152,6 +4685,7 @@ mod tests {
                 usage_asked: Arc::new(Mutex::new(Vec::new())),
                 usage: Usage::Unknown,
                 session_saves: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                saved_window: Arc::new(Mutex::new((None, None))),
                 disk_sessions: Vec::new(),
             }
         }
@@ -4272,8 +4806,16 @@ mod tests {
             }
         }
 
-        // 実ファイル（`~/.ccdesk/state.json`）は書かない
-        fn save_window(&self, _item: WindowItem<'_>) {}
+        // 実ファイル（`~/.ccdesk/state.json`）は書かない。**配置とスロットだけ
+        // 控える**（次の起動で読み直される 2 つで、片方だけ書かれると壊れる）
+        fn save_window(&self, item: WindowItem<'_>) {
+            let mut saved = self.saved_window.lock_recover();
+            match item {
+                WindowItem::Layout(layout) => saved.0 = Some(layout),
+                WindowItem::Slots(slots) => saved.1 = Some(slots.len()),
+                _ => {}
+            }
+        }
 
         fn store_projects(&self, next: &[String]) -> Vec<String> {
             match &self.projects {
@@ -5105,13 +5647,17 @@ mod tests {
     }
 
     /// 見出し行クリックでそのフォルダのメニューが開く（`+` を押して即起動ではない）。
-    /// **フォーカスはサイドバーに残る**（開いたメニューがキーを受ける）
+    /// **フォーカスはサイドバーに残る**（開いたメニューがキーを受ける）。
+    ///
+    /// **見出しは掴めない**ので、開くのは押した時点（運べるのはメニューの中の
+    /// `new <agent> session` の側 ＝ [`drop_new_session`]）
     #[test]
     fn clicking_a_project_heading_opens_its_menu() {
         let mut app = test_app(34, TERM);
         app.sidebar_rows = vec![SidebarRow::Action(RowAction::Project("C:\\dev\\api".to_string()))];
         app.sidebar_header_rows = 1;
         handle_mouse(&mut app, &click(5, 1)).unwrap();
+        assert!(app.drag.is_none(), "the heading was grabbed instead of opening its menu");
         let popup = app.popup.as_ref().expect("no menu opened");
         assert_eq!(popup.kind, project("C:\\dev\\api", false));
         assert_eq!(popup.anchor_y, 1, "the menu is not anchored below the clicked row");
@@ -5548,9 +6094,11 @@ mod tests {
             "the label is chopped by the right pane: {drawn:?}"
         );
         // そのはみ出した列のクリックが、描かれている項目どおりに効く
+        // （`new <agent> session` は掴める項目なので、走るのは離したとき）
         let col = rect.right() - 2;
         assert!(col >= MIN_SIDEBAR, "this column is not past the sidebar: {col}");
         handle_mouse(&mut app, &click(col, rect.y + 1)).unwrap();
+        handle_mouse(&mut app, &release(col, rect.y + 1)).unwrap();
         assert_eq!(app.dispatch_cwd, "C:\\dev\\api", "the item that was drawn did not run");
     }
 
@@ -6233,11 +6781,11 @@ mod tests {
         assert_eq!(usable.len(), 1, "a split layout is offered on a one-slot terminal");
     }
 
-    /// **触ったセッションだけが動く。** 既に別のスロットに出ている行を選ぶと、
-    /// そのセッションがフォーカススロットへ移り、元居たスロットは空になる。
-    /// 押し出された側はどこへも飛ばない（表示から外れるだけで行も PTY も残る）
+    /// **見えているセッションを選ぶとフォーカスがそこへ動く。** 中身は動かさない ＝
+    /// 既に別のスロットに出ている行を選んでも、両方のスロットの中身はそのまま、
+    /// フォーカスだけがそのセッションの居るスロットへ移る
     #[test]
-    fn choosing_a_visible_session_moves_only_that_one() {
+    fn choosing_a_visible_session_moves_focus_there_instead() {
         let mut app = app_with_row("a");
         app.sessions.push(session_row("b", "C:\\dev\\api", 1));
         app.set_layout(crate::panes::Layout::TwoColumns);
@@ -6246,17 +6794,17 @@ mod tests {
         // 右（b が居る）にフォーカスして a を選ぶ
         app.focus_slot = 1;
         app.show_session(&SessionId::new("a"));
-        assert_eq!(app.slots[1].session(), Some(&SessionId::new("a")), "a did not move");
-        assert!(
-            matches!(app.slots[0], Slot::Empty),
-            "the slot a came from was not emptied"
+        assert_eq!(app.focus_slot, 0, "focus did not move to the slot showing a");
+        assert_eq!(
+            app.slots[0].session(),
+            Some(&SessionId::new("a")),
+            "a moved even though it was already visible"
         );
-        // b はどこにも出ていないが、行は残っている（選び直せば戻せる）
-        assert!(
-            app.slots.iter().all(|s| s.session() != Some(&SessionId::new("b"))),
-            "b was moved even though it was not touched"
+        assert_eq!(
+            app.slots[1].session(),
+            Some(&SessionId::new("b")),
+            "b was pushed out of its slot"
         );
-        assert!(app.row(&SessionId::new("b")).is_some(), "b's row disappeared");
     }
 
     /// **押したスロットが宛先になる**（キーボードの `Alt+Shift+方向` と同じ結果）。
@@ -6318,6 +6866,432 @@ mod tests {
         };
         handle_mouse(&mut app, &up).unwrap();
         assert_eq!(app.cross_drag, None, "the cross stayed grabbed after release");
+    }
+
+    // ── サイドバーの行を掴んでペインへ落とす ──────────────────────────
+
+    /// ボタンを押したまま動かす
+    fn drag_to(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// ボタンを離す
+    fn release(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// 掴める行 1 本を持つサイドバー。**別インスタンスで動いている扱い**にして
+    /// あるので、開く経路へ落ちても実際の起動は踏まない（[`open_session`] の二重
+    /// 再開ガードで止まる）
+    fn app_with_grabbable_row() -> App {
+        let mut app = app_with_row("s");
+        app.sessions[0].conversation = Conversation::Observed("conv-1".to_string());
+        app.agents = vec![AgentInfo {
+            session_id: "conv-1".to_string(),
+            kind: "interactive".to_string(),
+            status: "busy".to_string(),
+            ..AgentInfo::default()
+        }];
+        app
+    }
+
+    /// **押しただけでは開かない。離して初めて開く。**
+    ///
+    /// 掴める行になった以上、押した時点で開くと「運ぶ前に一度開いてから移動する」
+    /// 二段動作になる。動かさずに離す ＝ ただのクリックは今までどおり通る
+    #[test]
+    fn pressing_a_session_row_waits_for_the_release_before_opening_it() {
+        let mut app = app_with_grabbable_row();
+        handle_mouse(&mut app, &click(5, 1)).unwrap();
+        assert!(app.drag.is_some(), "pressing the row did not arm a grab");
+        assert!(app.notice.is_none(), "the row was opened on press instead of release");
+        handle_mouse(&mut app, &release(5, 1)).unwrap();
+        assert!(app.drag.is_none(), "the grab outlived the release");
+        assert!(app.notice.is_some(), "releasing without moving did not open the row");
+    }
+
+    /// **サイドバーの中で少し動いてから離しても、クリックとして通る。**
+    ///
+    /// 動いたかどうかで分けると、トラックパッドで 1 桁ずれただけの操作が
+    /// 「押したのに何も起きない」に化ける。運んでいない ＝ ペインの外で離した
+    /// なら、行き先が無いのだからクリックとして扱うのが素直
+    #[test]
+    fn a_grab_that_never_left_the_sidebar_still_counts_as_a_click() {
+        let mut app = app_with_grabbable_row();
+        handle_mouse(&mut app, &click(5, 1)).unwrap();
+        handle_mouse(&mut app, &drag_to(6, 1)).unwrap();
+        assert!(app.drag.as_ref().is_some_and(|d| d.moved), "the fixture's premise broke");
+        assert_eq!(
+            app.drag.as_ref().and_then(|d| d.target),
+            None,
+            "the sidebar is not a drop target"
+        );
+        handle_mouse(&mut app, &release(6, 1)).unwrap();
+        assert!(app.notice.is_some(), "a jittered click did nothing at all");
+    }
+
+    /// **スロットの真ん中を指すと、そのスロットがそのまま落とし先。**
+    /// 配置は育たない
+    #[test]
+    fn the_middle_of_a_slot_reads_as_a_plain_drop() {
+        let mut app = app_with_grabbable_row();
+        app.set_layout(crate::panes::Layout::TwoColumns);
+        let right = app.slot_rects()[1];
+        let (x, y) = (right.x + right.width / 2, right.y + right.height / 2);
+        handle_mouse(&mut app, &click(5, 1)).unwrap();
+        handle_mouse(&mut app, &drag_to(x, y)).unwrap();
+        assert_eq!(
+            app.drag.as_ref().and_then(|d| d.target),
+            Some(DropAt::Slot(1)),
+            "the middle of a slot is not a plain drop"
+        );
+        assert_eq!(make_room(&mut app, DropAt::Slot(1)), Some(1));
+        assert_eq!(app.layout, crate::panes::Layout::TwoColumns, "the layout grew");
+    }
+
+    /// **縁へ落とすと配置が育ち、落とした側が空く。元居た中身は反対側へ残る**
+    /// （触っていないセッションは画面から消えない）
+    #[test]
+    fn dropping_on_an_edge_grows_the_layout_and_keeps_the_old_content() {
+        use crate::panes::{Axis, Layout};
+        let mut app = app_with_grabbable_row();
+        app.sessions.push(session_row("old", "C:\\dev\\api", 2));
+        app.slots[0] = Slot::Session(SessionId::new("old"));
+        assert_eq!(app.layout, Layout::One, "the fixture's premise broke");
+        let only = app.slot_rects()[0];
+        let (x, y) = (only.x + only.width - 1, only.y + only.height / 2);
+        handle_mouse(&mut app, &click(5, 1)).unwrap();
+        handle_mouse(&mut app, &drag_to(x, y)).unwrap();
+        let target = DropAt::Split {
+            at: 0,
+            axis: Axis::Vertical,
+            half: 1,
+        };
+        assert_eq!(
+            app.drag.as_ref().and_then(|d| d.target),
+            Some(target),
+            "the right edge did not read as a split to the right"
+        );
+        assert_eq!(make_room(&mut app, target), Some(1), "the freed slot is not the right half");
+        assert_eq!(app.layout, Layout::TwoColumns, "the layout did not grow");
+        assert!(matches!(app.slots[1], Slot::Empty), "the drop target was not left empty");
+        assert_eq!(
+            app.slots[0].session(),
+            Some(&SessionId::new("old")),
+            "the slot's old content was pushed off the screen"
+        );
+    }
+
+    /// **`+ new session` を落とすと、そのスロットへ新規セッション画面が出る。**
+    /// 即起動にしないのは、この入口が agent を選ばせてから起こす契約だから
+    /// （落とす操作にその選択を載せる場所が無い）
+    #[test]
+    fn dropping_the_new_session_row_opens_the_form_in_that_slot() {
+        let mut app = test_app(34, TERM);
+        app.sidebar_rows = vec![SidebarRow::Action(RowAction::New)];
+        app.sidebar_header_rows = 1;
+        app.dispatch_cwd = std::env::temp_dir().to_string_lossy().to_string();
+        app.set_layout(crate::panes::Layout::TwoColumns);
+        let right = app.slot_rects()[1];
+        let (x, y) = (right.x + right.width / 2, right.y + right.height / 2);
+        handle_mouse(&mut app, &click(5, 1)).unwrap();
+        handle_mouse(&mut app, &drag_to(x, y)).unwrap();
+        handle_mouse(&mut app, &release(x, y)).unwrap();
+        assert!(matches!(app.slots[1], Slot::New(_)), "the form did not land in the slot");
+        assert!(matches!(app.slots[0], Slot::Empty), "the other slot was disturbed");
+        assert_eq!(app.focus_slot, 1, "the focus did not follow the drop");
+        assert_eq!(app.focus, Focus::Terminal, "keys still go to the sidebar");
+        assert!(app.sessions.is_empty(), "the drop started a session without asking");
+    }
+
+    /// **メニューを開いた行を、そのまま掴み直せる。**
+    ///
+    /// メニューを閉じるためだけに 1 回押させると、**メニューを持つ行にだけ
+    /// ドラッグの入口が無くなる**: 見出し行はクリックでメニューが開くので、
+    /// 次に掴もうとした押しがメニューを閉じるのに使われて掴みが始まらない
+    /// （プロジェクト見出しが運べなかったのはこれ）
+    #[test]
+    fn a_row_whose_menu_is_open_can_still_be_grabbed() {
+        let mut app = app_with_grabbable_row();
+        // セッション行のメニューは行末の `=` で開く
+        let mark_x = *menu_zone(sidebar_cols(&app)).end();
+        handle_mouse(&mut app, &click(mark_x, 1)).unwrap();
+        assert!(app.popup.is_some(), "the fixture's premise broke");
+        // そのまま押し直せば掴める（閉じるだけで終わらない）
+        handle_mouse(&mut app, &click(5, 1)).unwrap();
+        assert!(app.popup.is_none(), "the menu stayed open");
+        assert!(
+            app.drag.is_some(),
+            "the row could not be grabbed while its own menu was open"
+        );
+    }
+
+    /// **メニューの `new <agent> session` を掴んでペインへ落とせる。**
+    ///
+    /// この項目は agent を名指ししている ＝ 落とす操作に選ばせるものが残って
+    /// いないので、落とした先でそのまま起こす（見出しを掴んだときは選ばせる
+    /// 画面が出る、との違いはそこ）。
+    ///
+    /// 掴んだ時点でメニューは閉じる（開いたままだと Drag がモーダルに飲まれて
+    /// ドロップ先を選べず、ペインを覆ってガイドも見えない）
+    #[test]
+    fn a_new_session_menu_item_can_be_dropped_on_a_pane() {
+        use crate::panes::Layout;
+        let mut app = test_app(34, TERM);
+        app.set_layout(Layout::TwoColumns);
+        open(&mut app, project("C:\\dev\\api", false), 1);
+        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+        // 先頭項目 = new claude session を押す
+        handle_mouse(&mut app, &click(rect.x + 1, rect.y + 1)).unwrap();
+        assert!(app.popup.is_none(), "the menu stayed open over the panes");
+        assert!(app.drag.is_some(), "the menu item was not grabbed");
+        assert_eq!(app.dispatch_cwd, "", "the item ran on press instead of release");
+        // 右のスロットの真ん中へ運ぶ
+        let right = app.slot_rects()[1];
+        let (x, y) = (right.x + right.width / 2, right.y + right.height / 2);
+        handle_mouse(&mut app, &drag_to(x, y)).unwrap();
+        assert_eq!(
+            app.drag.as_ref().and_then(|d| d.target),
+            Some(DropAt::Slot(1)),
+            "the menu item found no drop target"
+        );
+        handle_mouse(&mut app, &release(x, y)).unwrap();
+        // 起動そのものは撮影用の供給元が止めるが、**そのフォルダで起こしに
+        // いった**ことは観測できる（落とし先の反映は起動できたときだけ ＝ 下のテスト）
+        assert_eq!(app.dispatch_cwd, "C:\\dev\\api", "the item did not run on release");
+        assert_eq!(app.layout, Layout::TwoColumns, "the layout grew for a plain drop");
+    }
+
+    /// **起こせなかったら配置を育てない。** 育ててから起こすと、起動に失敗した
+    /// とき空のペインだけが増えて残る（[`drop_session`] が守っている順序と同じ）。
+    ///
+    /// 撮影用の供給元はセッションを起こさないので、そのまま「起こせなかった」
+    /// 側の経路になる
+    #[test]
+    fn a_new_session_that_never_starts_does_not_grow_the_layout() {
+        use crate::panes::{Axis, Layout};
+        let mut app = test_app(34, TERM);
+        open(&mut app, project("C:\\dev\\api", false), 1);
+        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+        handle_mouse(&mut app, &click(rect.x + 1, rect.y + 1)).unwrap();
+        let only = app.slot_rects()[0];
+        let (x, y) = (only.x + only.width - 1, only.y + only.height / 2);
+        handle_mouse(&mut app, &drag_to(x, y)).unwrap();
+        // 縁を指しているので、起こせていれば育つはずの落とし先が出ている
+        assert_eq!(
+            app.drag.as_ref().and_then(|d| d.target),
+            Some(DropAt::Split {
+                at: 0,
+                axis: Axis::Vertical,
+                half: 1,
+            }),
+            "the edge did not read as a split"
+        );
+        handle_mouse(&mut app, &release(x, y)).unwrap();
+        assert_eq!(app.layout, Layout::One, "the layout grew for a session that never started");
+        assert_eq!(app.slots.len(), 1, "a stray empty pane was left behind");
+    }
+
+    /// **メニューを閉じた押しは、運ばずに離しても行の動作まで走らせない。**
+    /// 閉じるのがその押しの仕事なので、同じ押しで開くところまでやると
+    /// 1 回の押しが 2 つのことをする
+    #[test]
+    fn the_press_that_closes_a_menu_does_nothing_else() {
+        let mut app = app_with_grabbable_row();
+        let mark_x = *menu_zone(sidebar_cols(&app)).end();
+        handle_mouse(&mut app, &click(mark_x, 1)).unwrap();
+        assert!(app.popup.is_some(), "the fixture's premise broke");
+        handle_mouse(&mut app, &click(5, 1)).unwrap();
+        handle_mouse(&mut app, &release(5, 1)).unwrap();
+        assert!(app.popup.is_none(), "the menu reopened on the press that closed it");
+        assert!(app.drag.is_none(), "the grab outlived the release");
+        assert!(app.notice.is_none(), "the press that closed the menu also opened the row");
+    }
+
+    /// **メニューを閉じた押しでも、幅変更の掴み代は掴みにしない。**
+    ///
+    /// 掴みが成立すると幅変更の判定はもう見られない ＝ サイドバーを広げる
+    /// つもりの操作が、そのままセッションをペインへ落とす動きに化ける
+    #[test]
+    fn closing_a_menu_on_the_resize_grip_does_not_grab_the_row() {
+        let mut app = app_with_row("s");
+        open(&mut app, PopupKind::State, 8); // 掴み代から離れた位置に出す
+        let grip = sidebar_cols(&app) - 1;
+        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+        assert!(
+            !rect.contains(Position::new(grip, 1)),
+            "the menu covers the grip, so this is not an outside click: {rect:?}"
+        );
+        handle_mouse(&mut app, &click(grip, 1)).unwrap();
+        assert!(app.popup.is_none(), "the outside click did not close the menu");
+        assert!(app.drag.is_none(), "the resize grip grabbed the row behind it");
+    }
+
+    /// **メニューの項目を押した分は下へ通さない。** 通すと、項目を実行した
+    /// その押しが背後の行のクリックとしても効いてしまう
+    #[test]
+    fn a_click_inside_the_menu_does_not_reach_the_row_behind_it() {
+        let mut app = test_app(34, TERM);
+        app.sidebar_rows = vec![SidebarRow::Action(RowAction::Project("C:\\dev\\api".to_string()))];
+        app.sidebar_header_rows = 1;
+        open(&mut app, PopupKind::State, 1);
+        let rect = popup_rect(&app, app.popup.as_ref().unwrap());
+        handle_mouse(&mut app, &click(rect.x + 1, rect.y + 2)).unwrap(); // 2 行目 = directory
+        assert_eq!(app.grouping, Grouping::Directory, "the item did not run");
+        assert!(app.drag.is_none(), "the item's click also grabbed the row behind the menu");
+    }
+
+    /// **掴めるのはペインへ何かを出すものだけ。** その場で走るもの（版行の更新・
+    /// グルーピング切替・ピン留め・stop / close）は運ぶ先が無いので、押した時点で走る
+    #[test]
+    fn only_the_things_that_put_something_in_a_pane_can_be_grabbed() {
+        let cwd = || "C:\\dev\\api".to_string();
+        for what in [
+            Grab::Row(RowAction::Open(SessionId::new("s"))),
+            Grab::Row(RowAction::New),
+            Grab::Menu(PopupAction::OpenSession(SessionId::new("s"))),
+            Grab::Menu(PopupAction::NewSessionIn(Kind::Claude, cwd())),
+        ] {
+            assert!(what.grabbable(), "{what:?} must be grabbable");
+        }
+        for what in [
+            // 見出しの動作は**メニューを開くこと**なので運ぶ先を持たない
+            // （運べるのはそのメニューの中の `new <agent> session`）
+            Grab::Row(RowAction::Project(cwd())),
+            Grab::Row(RowAction::ToggleGroup),
+            Grab::Row(RowAction::ChooseLayout),
+            Grab::Row(RowAction::UpdateCcdesk),
+            Grab::Row(RowAction::UpdateAgent(Kind::Claude)),
+            Grab::Menu(PopupAction::TogglePin(SessionId::new("s"))),
+            Grab::Menu(PopupAction::Stop(SessionId::new("s"))),
+            Grab::Menu(PopupAction::Close(SessionId::new("s"))),
+            Grab::Menu(PopupAction::RemoveProject(cwd())),
+        ] {
+            assert!(!what.grabbable(), "{what:?} must not be grabbable");
+        }
+        // 掴めない行は押した時点で走る（離すまで待たない）
+        let mut app = test_app(34, TERM);
+        app.sidebar_rows = vec![SidebarRow::Action(RowAction::ToggleGroup)];
+        app.sidebar_header_rows = 1;
+        handle_mouse(&mut app, &click(5, 1)).unwrap();
+        assert!(app.drag.is_none(), "an unmovable row was grabbed");
+        assert!(app.popup.is_some(), "the row did not run on press");
+    }
+
+    /// **割って増えた配置は書き残される。** スロットだけ保存すると、次の起動で
+    /// `main` が古い配置の枚数しかスロットを復元せず、増えたペインが黙って消える
+    #[test]
+    fn growing_the_layout_by_a_drop_is_written_down() {
+        use crate::panes::{Axis, Layout};
+        let source = TestSource::plain();
+        let saved = source.saved_window.clone();
+        let mut app = App {
+            source: Arc::new(source),
+            ..test_app(34, TERM)
+        };
+        make_room(
+            &mut app,
+            DropAt::Split {
+                at: 0,
+                axis: Axis::Vertical,
+                half: 1,
+            },
+        )
+        .expect("the split had nowhere to go");
+        assert_eq!(app.layout, Layout::TwoColumns, "the fixture's premise broke");
+        let (layout, slots) = *saved.lock_recover();
+        assert_eq!(layout, Some(Layout::TwoColumns), "the grown layout was not written down");
+        // **枚数が配置と食い違わない。** 食い違うと次の起動で溢れた側が黙って消える
+        assert_eq!(
+            slots,
+            Some(Layout::TwoColumns.slots()),
+            "the saved slots do not match the saved layout"
+        );
+    }
+
+    /// **窓を用意できなければ配置を触らない。** 逆順（先に育ててから起こす）だと、
+    /// 起こし直しに失敗したとき空のペインだけが増えて残る
+    #[test]
+    fn a_drop_that_cannot_open_the_session_leaves_the_layout_alone() {
+        use crate::panes::{Axis, Layout};
+        // 別インスタンスで動いている ＝ 二重再開ガードで開けない行
+        let mut app = app_with_grabbable_row();
+        let target = DropAt::Split {
+            at: 0,
+            axis: Axis::Vertical,
+            half: 1,
+        };
+        drop_session(&mut app, &SessionId::new("s"), target);
+        assert_eq!(app.layout, Layout::One, "the layout grew for a session that never opened");
+        assert!(
+            app.slots.iter().all(|s| s.session() != Some(&SessionId::new("s"))),
+            "the session was placed even though it could not be opened"
+        );
+        assert!(app.notice.is_some(), "the user was not told why nothing happened");
+        assert_ne!(app.focus, Focus::Terminal, "the focus moved to a pane that opened nothing");
+    }
+
+    /// **これ以上割れない縁は落とし先にならない。** 4 分割のスロットはどれも
+    /// 1 セルなので育てられない ＝ ガイドが塗らないことで「ここは無理」を示す
+    #[test]
+    fn an_edge_that_cannot_grow_is_not_a_drop_target() {
+        let mut app = app_with_grabbable_row();
+        app.set_layout(crate::panes::Layout::Four);
+        let first = app.slot_rects()[0];
+        let (x, y) = (first.x + first.width - 1, first.y + first.height / 2);
+        handle_mouse(&mut app, &click(5, 1)).unwrap();
+        handle_mouse(&mut app, &drag_to(x, y)).unwrap();
+        assert_eq!(
+            app.drag.as_ref().and_then(|d| d.target),
+            None,
+            "an unsplittable edge offered a drop"
+        );
+        let before = app.layout;
+        handle_mouse(&mut app, &release(x, y)).unwrap();
+        assert_eq!(app.layout, before, "releasing on a dead edge changed the layout");
+        assert!(
+            app.slots.iter().all(|s| s.session() != Some(&SessionId::new("s"))),
+            "the session was placed even though there was no target"
+        );
+    }
+
+    /// **ガイドが塗る矩形と、実際に入る矩形が同じ。** 2 つが別の導出を持つと
+    /// 「塗られた場所と違うところに入る」が起きるので、答えが 1 つであることを固定する
+    #[test]
+    fn the_guide_paints_exactly_where_the_session_lands() {
+        use crate::panes::Axis;
+        let mut app = app_with_grabbable_row();
+        // 十字を寄せてある状態で確かめる（半分に割った近似だとここでずれる）
+        app.split = crate::panes::Split { v: 30, h: 50 };
+        let target = DropAt::Split {
+            at: 0,
+            axis: Axis::Vertical,
+            half: 1,
+        };
+        let painted = drop_rect(&app, target).expect("the guide had nothing to paint");
+        let freed = make_room(&mut app, target).expect("the drop had nowhere to go");
+        assert_eq!(painted, app.slot_rects()[freed], "the guide and the drop disagree");
+    }
+
+    /// **ボタンを離したイベントを取り逃がしても掴んだままにならない。**
+    /// 押していない移動（[`MouseEventKind::Moved`]）が届いた時点で指は離れている
+    #[test]
+    fn a_grab_does_not_survive_a_lost_release() {
+        let mut app = app_with_grabbable_row();
+        handle_mouse(&mut app, &click(5, 1)).unwrap();
+        assert!(app.drag.is_some());
+        handle_mouse(&mut app, &moved(5, 1)).unwrap();
+        assert!(app.drag.is_none(), "the grab outlived the button");
     }
 
     /// **スロットを減らしても何も終わらない。** 溢れたセッションは表示から
