@@ -282,6 +282,7 @@ fn main() -> anyhow::Result<()> {
         usage_fetching,
         usage_hovered: None,
         input_gate: None,
+        held_input: Vec::new(),
         notice: None,
         grouping: window.grouping,
         kinds: source.kinds(),

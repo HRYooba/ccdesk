@@ -10,7 +10,7 @@ use ratatui::layout::{Position, Rect};
 use ccdesk::{log_error, now_ms, same_dir, LockExt};
 
 use crate::hooks::HookStates;
-use crate::keys::{encode_key, forward_mouse};
+use crate::keys::{encode_key, forward_mouse, HeldInput};
 use crate::poll::{AgentInfo, FooterInfo, Grouping};
 use crate::usage::Usage;
 use std::collections::BTreeMap;
@@ -607,6 +607,16 @@ pub(crate) struct App {
     // 降ろす契機は「子が最初の出力を出した」（run ループ）と期限切れ
     // （[`expire_input_gate`]）の 2 つで、**降ろすのは [`lift_input_gate`] だけ**
     pub(crate) input_gate: Option<std::time::Instant>,
+    /// 門番（[`Self::input_gate`]）が立っている間に打たれた入力を、打った順に
+    /// 溜めておく列（[`hold_input_while_starting`] が積み、門番を降ろす
+    /// [`lift_input_gate`] が流すか捨てるかを決める）。
+    ///
+    /// **溜めるのは生のイベントで、バイト列ではない**（理由は [`HeldInput`]）。
+    /// 打鍵と貼り付けを 1 本で持つのは順序を保つため。
+    ///
+    /// 似た名前の [`Self::pending_submit`] とは別物: あちらはセッション間の
+    /// 受け渡し（`ccdesk send`）の送信待ちで、こちらはこの端末で打った人の入力
+    pub(crate) held_input: Vec<HeldInput>,
     // 下部バーに数秒表示するエラー等の通知
     pub(crate) notice: Option<(String, std::time::Instant)>,
     pub(crate) grouping: Grouping,
@@ -716,6 +726,7 @@ impl Default for App {
             // テストが開発者の設定を踏まない
             source: Arc::new(crate::source::DemoSource),
             input_gate: None,
+            held_input: Vec::new(),
             notice: None,
             grouping: Grouping::State,
             // テストの既定は**全 agent**。本番の既定（claude だけ。
@@ -1475,8 +1486,8 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                     handle_new_view_key(app, &key)?;
                     continue;
                 }
-                // 起動処理中の打鍵は捨てる（宛先のセッションがまだ無い）
-                if drop_input_while_starting(app) {
+                // 起動処理中の打鍵は溜める（子が掴んだ時点でその宛先へ流れる）
+                if hold_input_while_starting(app, || HeldInput::Key(key)) {
                     continue;
                 }
                 // フォーカスがターミナル側にあるときだけ PTY へ流す
@@ -1500,8 +1511,9 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 if app.focus != Focus::Terminal {
                     continue;
                 }
-                // 打鍵と同じ門番（貼り付けのほうが 1 回で送る量が多い ＝ 素通しの害が大きい）
-                if drop_input_while_starting(app) {
+                // 打鍵と同じ門番（貼り付けのほうが 1 回で送る量が多い ＝ 素通しの害が大きい）。
+                // **同じ列に積む**ので、打鍵と貼り付けの順序は打った順のまま
+                if hold_input_while_starting(app, || HeldInput::Paste(text.clone())) {
                     continue;
                 }
                 if app.windows.is_empty() {
@@ -1747,8 +1759,8 @@ fn apply_launch(app: &mut App, cwd: String, launched: Launched) {
             app.source.save_window(WindowItem::LastFolder(&cwd));
             register_project(app, &cwd);
             // **門番を立てるのは起こせたときだけ。** 子が端末を掴むまでの打鍵は
-            // 捨てる（run ループが最初の出力で降ろす。理由は
-            // [`drop_input_while_starting`]）
+            // 溜める（run ループが最初の出力で降ろす。理由は
+            // [`hold_input_while_starting`]）
             if started.is_some() {
                 app.input_gate = Some(std::time::Instant::now());
             } else {
@@ -3507,32 +3519,106 @@ fn set_hint(app: &mut App, msg: String) {
 /// 長い `-r` の読み込み）門番が降りず、既存の全セッションへのタイプが死ぬ
 const INPUT_GATE_LIMIT: Duration = Duration::from_secs(10);
 
-/// 起動処理中（[`App::input_gate`] が生きている間）に
-/// ターミナルペインへ来た入力を捨てる。捨てたら `true`（呼び手は何もしない）。
+/// 起動中に溜めておける入力の量（打鍵は 1、貼り付けは文字数 ＝
+/// [`HeldInput::weight`]）。**上限が要るのは、応答しない子に対して
+/// 際限なくメモリを食わないため**（`-r` の再開は数十秒かかることがあり、
+/// その間ずっと積める）。
+///
+/// **超えた分は新しい方から受け付けない**（古い方を押し出すのではなく）。
+/// どちらを残しても届く入力は途中までになるが、**頭を残す方が壊さない**:
+/// プロンプトは頭から溜まるので、末尾を落とせば送信の `\r` が落ちて
+/// 文字が入力欄に残る ＝ 送られる前に本人が見て直せる。頭を落とすと
+/// `\r` だけが生き残り、**切れたプロンプトがそのまま送信される**
+pub(crate) const HELD_INPUT_LIMIT: usize = 64 * 1024;
+
+/// 起動処理中（[`App::input_gate`] が生きている間）にターミナルペインへ来た入力を
+/// **溜める**。溜めたら `true`（呼び手は素通しをやめる）。
 ///
 /// **子が端末を掴む前の打鍵を守る門番。** 前景セッションは PTY を開いた時点で
 /// 宛先が決まるが、claude が raw mode に入るまでの打鍵は行き場が定まらない
 /// （読み捨てられる・エコーが混ざる）。特に `-r` の再開は transcript の読み直しに
-/// 時間がかかりうるので、掴むまでは捨てて「届いていない」と伝える方が確実。
+/// 時間がかかりうるので、**掴むまでは素通しさせない**。
+///
+/// **捨てずに溜めるのが要点**: 実ユーザーの transcript は数十 MB あり、再開が
+/// 期限（[`INPUT_GATE_LIMIT`]）を超えるのは常態。その間の打鍵を捨てると、
+/// 「打ったのに何も起きなかった」が普通に起きる。溜めた入力は子が掴んだ時点で
+/// その宛先へ流す（[`flush_held_input`]）。
 ///
 /// **フォーカスの移動を遅らせる形は採らない**: それは直したはずの問題
 /// （起動したのにキーがサイドバーへ行き ↑↓ で選択が動く）を戻すことになる。
-/// フォーカスは即座に端末へ移し、**子が掴むまでの入力だけを捨てる**。
+/// フォーカスは即座に端末へ移し、**子が掴むまでの入力だけを溜める**。
 ///
 /// 降ろす契機は「子が最初の出力を出した」（run ループ）と期限切れ
 /// （[`expire_input_gate`]）の 2 つ。**判断は [`lift_input_gate`] 1 箇所**。
 ///
-/// **黙って捨てない**: 下部バーの "starting session…" は通知が出ている間は隠れるため、
-/// 捨てたこと自体をここで伝える（[`set_hint`] ＝ 異常ではないので error.log には残さない）。
+/// `input` を関数で受けるのは、門番が立っていないときに貼り付けの本文を
+/// 複製しないため（素通しの経路がそのまま元の文字列を使う）。
 ///
 /// マウスは門番の対象外: 届くのはクリックとホイールでプロンプトへ文字を送る経路ではなく、
 /// 移動イベントごとに案内を出すとノイズになる
-fn drop_input_while_starting(app: &mut App) -> bool {
+fn hold_input_while_starting(app: &mut App, input: impl FnOnce() -> HeldInput) -> bool {
     if app.input_gate.is_none() {
         return false;
     }
-    set_hint(app, "starting session — keys are not delivered yet".to_string());
+    let input = input();
+    let held: usize = app.held_input.iter().map(HeldInput::weight).sum();
+    if held + input.weight() > HELD_INPUT_LIMIT {
+        // 溜め切れない。**黙って捨てない**（打鍵のたびに来うるので [`set_hint`] ＝
+        // error.log には残さない。1 秒の取りこぼしで数十行増える）
+        set_hint(
+            app,
+            "too much input while starting — the newest input is dropped".to_string(),
+        );
+        return true;
+    }
+    app.held_input.push(input);
+    // 下部バーの "starting session…" は通知が出ている間は隠れるため、
+    // 打った入力がどうなったかをここで伝える（異常ではないので [`set_hint`]）
+    set_hint(
+        app,
+        "starting session — keys are held until it takes the terminal".to_string(),
+    );
     true
+}
+
+/// 溜めた入力を宛先へ流す。**宛先が打ち先として成立していることは呼び手
+/// （[`lift_input_gate`]）が確かめた後**なので、ここは流すだけ。
+///
+/// **encode はここで初めて行う**（[`crate::keys::encode_held`]）。溜める時点で
+/// バイト列にすると、子が有効化する前のプロトコルで組んだ列を流すことになる。
+///
+/// 表示が宛先を指しているのに窓が無い（表示と窓がずれた）ときは流し先が無いので
+/// 捨てる ＝ ここでも黙っては捨てない
+fn flush_held_input(app: &mut App) {
+    if app.held_input.is_empty() {
+        return;
+    }
+    let Some(at) = app.focused_window() else {
+        discard_held_input(app);
+        return;
+    };
+    let held = std::mem::take(&mut app.held_input);
+    let bytes = crate::keys::encode_held(&held, &app.windows[at].parser.lock_recover());
+    if !bytes.is_empty() {
+        send_to_active(app, &bytes);
+    }
+}
+
+/// 溜めた入力を捨てて、**捨てたことを伝える**。
+///
+/// 報告が [`set_notice`]（error.log にも残す）なのは、打った本人にしか
+/// 気づけない損失だから: 下部バーの数秒を見逃すと「打ったはずの文字が無い」
+/// だけが残る。門番を降ろすときに 1 度しか通らないので、行が溢れることもない
+fn discard_held_input(app: &mut App) {
+    let dropped = app.held_input.len();
+    if dropped == 0 {
+        return;
+    }
+    app.held_input.clear();
+    set_notice(
+        app,
+        format!("dropped {dropped} input(s) typed while starting — no session to deliver them to"),
+    );
 }
 
 /// 門番を降ろす。**`input_gate` を降ろすのはここだけ**で、
@@ -3549,6 +3635,10 @@ fn drop_input_while_starting(app: &mut App) -> bool {
 /// なっているかは呼び手の報告ではなく右ペインの実際の表示で確かめる**
 /// （[`App::showing`]）＝ 呼び手が「成功した」と言い間違える余地を持たせない。
 ///
+/// **溜めた入力（[`App::held_input`]）の行き先も同じ答えから出す。** 門番が立って
+/// いる間にユーザーがフォーカススロットを別のセッションへ移していたら、そちらへ
+/// 流してはいけない ＝ 「打ち先はどこか」を 2 度別々に判断しない。
+///
 /// **門番が立っていなければ何もしない。** セッションを起こさない供給元（撮影用）は
 /// 門番を立てずにここへ合流するので、そこでフォーカスを動かすと
 /// 「起動したのにキーがサイドバーへ行く」という直したはずの問題が戻る
@@ -3556,11 +3646,15 @@ fn lift_input_gate(app: &mut App, destination: Option<&SessionId>) {
     if app.input_gate.take().is_none() {
         return;
     }
-    if !destination.is_some_and(|id| app.showing(id)) {
-        // 宛先が居ない。フォーカスを戻せばキーはサイドバー操作になり、
-        // ユーザーは打ち先を選び直せる（Alt+→ / 行を開く）
-        app.set_focus(Focus::Sidebar);
+    if destination.is_some_and(|id| app.showing(id)) {
+        flush_held_input(app);
+        return;
     }
+    // 宛先が居ない。フォーカスを戻せばキーはサイドバー操作になり、
+    // ユーザーは打ち先を選び直せる（Alt+→ / 行を開く）。
+    // 溜めた入力は流し先が無いので捨てる（黙っては捨てない）
+    app.set_focus(Focus::Sidebar);
+    discard_held_input(app);
 }
 
 /// 応答しない起動から入力を取り戻す（run ループが毎周見る）。降ろしたら `true`。
@@ -3571,6 +3665,10 @@ fn lift_input_gate(app: &mut App, destination: Option<&SessionId>) {
 /// なり ↑↓ で選択だけが動く ＝ ペインが無反応に見える）。`-r` の再開は transcript が
 /// 大きいほど遅く、期限を超えること自体は珍しくないので、**期限切れ ＝ 異常**とは
 /// 扱わない（報告も分ける。宛先が居る間は [`set_hint`] ＝ error.log に残さない）。
+///
+/// **溜めた入力もここで流れる**（宛先が居れば）。期限切れは「もう素通しさせる」
+/// という決定なので、以降の打鍵が生の PTY へ行く以上、それより前に打たれた
+/// 入力だけを捨てる理由が無い（捨てると順序も壊れる）。
 ///
 /// **窓は閉じない。** 子は生きているかもしれない（読み込みが長い `-r` など）ので、
 /// 生死の判断は `child.try_wait()` に任せる ＝ ここが決めるのは入力の行き先だけ
@@ -3585,7 +3683,11 @@ fn expire_input_gate(app: &mut App) -> bool {
     // **`shown_session` は定義上「打ち先として成立している行」**（[`App::showing`]
     // が見るのと同じ 1 つの表示）なので、居るかどうかがそのまま報告の分かれ目になる
     let shown = app.shown_session().cloned();
-    lift_input_gate(app, shown.as_ref());
+    // **報告を先に置くのは、溜めた入力を捨てたときの報告を消さないため。**
+    // 通知は 1 つしか出せない（[`App::notice`]）ので、後から出す側が勝つ。
+    // ここで伝えたいのは「遅い / 応答しない」だが、**打った文字が消えたことの方が
+    // 利用者にとって取り返しがつかない**ので、そちらを後に出す
+    // （[`discard_held_input`] は error.log にも残す）
     if shown.is_some() {
         // 遅いだけで打ち先は生きている。**フォーカスは端末に残る**ので、
         // 以降の打鍵はそのペインへ届く（異常ではない ＝ error.log には残さない）
@@ -3600,6 +3702,7 @@ fn expire_input_gate(app: &mut App) -> bool {
             "session start is not responding — input moved back to the sidebar".to_string(),
         );
     }
+    lift_input_gate(app, shown.as_ref());
     true
 }
 
@@ -3750,7 +3853,7 @@ fn ensure_window(app: &mut App, id: &SessionId, size: (u16, u16)) -> bool {
             app.stopped_at.remove(id);
             app.windows.push(window);
             // 再開は transcript の読み直しに時間がかかりうる。子が端末を掴むまでの
-            // 打鍵は捨てる（[`drop_input_while_starting`]）
+            // 打鍵は溜める（[`hold_input_while_starting`]）
             app.input_gate = Some(std::time::Instant::now());
             true
         }
@@ -3780,6 +3883,12 @@ mod tests {
             term_size,
             ..Default::default()
         }
+    }
+
+    /// 起動中に打つ 1 打鍵。門番（[`hold_input_while_starting`]）は「今の入力」を
+    /// 関数で受けるので、素の打鍵を渡すだけのテストはこれを使う
+    fn typed(c: char) -> impl FnOnce() -> HeldInput {
+        move || HeldInput::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
     }
 
     fn open(app: &mut App, kind: PopupKind, anchor_y: u16) {
@@ -6101,27 +6210,86 @@ mod tests {
         );
     }
 
-    /// **子が端末を掴むまでに打った文字は、どのセッションへも届かない。**
+    /// **子が端末を掴むまでに打った文字は、素通しもせず捨てもせず溜める。**
     /// フォーカスは端末へ移っているが claude はまだ raw mode に入っていないので、
     /// 素通しすると打った文字が読み捨てられたりエコーに混ざったりする。
-    /// 捨てたことは下部バーで伝える（無反応に見せない）
+    /// かといって捨てると、transcript が大きくて再開の遅い環境では
+    /// 「打ったのに何も起きない」が常態になる。
+    ///
+    /// **打鍵と貼り付けが打った順のまま 1 本の列に載る**ことをここで固定する:
+    /// 種類ごとに列を分けると「貼り付けてから Enter」が壊れる。
+    /// バイト列の並びと形は [`crate::keys::encode_held`] のテストが受け持つ
     #[test]
-    fn input_typed_while_a_session_is_starting_reaches_no_session() {
+    fn input_typed_while_a_session_is_starting_is_held_in_the_order_it_was_typed() {
         let mut app = test_app(34, TERM);
         open(&mut app, project("C:\\dev\\api", false), 5);
         handle_popup_key(&mut app, KeyCode::Enter); // 先頭 = new session
         // 撮影用の供給元は実際に claude を起こさないので、起動直後の状態を作る
         app.input_gate = Some(std::time::Instant::now());
         assert!(
-            drop_input_while_starting(&mut app),
+            hold_input_while_starting(&mut app, typed('h')),
             "input typed while a session is starting flows straight to the PTY"
         );
-        assert!(app.notice.is_some(), "dropping the input was not reported");
+        assert!(hold_input_while_starting(&mut app, || HeldInput::Paste(
+            "ls".to_string()
+        )));
+        assert!(hold_input_while_starting(&mut app, || HeldInput::Key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        )));
+        assert_eq!(
+            app.held_input,
+            vec![
+                HeldInput::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+                HeldInput::Paste("ls".to_string()),
+                HeldInput::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ],
+            "the held input is not what was typed, in the order it was typed"
+        );
+        assert!(app.notice.is_some(), "holding the input was not reported");
         // 子が端末を掴めば素通しに戻る（門番が残り続けるとタイプできない画面になる）
         app.input_gate = None;
         assert!(
-            !drop_input_while_starting(&mut app),
-            "input is still dropped after the launch finished"
+            !hold_input_while_starting(&mut app, typed('x')),
+            "input is still held after the launch finished"
+        );
+    }
+
+    /// **溜めるのは有界。** 応答しない子を相手に無制限に溜めると、
+    /// 貼り付け 1 回で何 MB でも積める（[`HeldInput::weight`] が文字数で測る理由）。
+    ///
+    /// **上限を超えたら新しい方から捨てる**（古い方を押し出さない）: 頭を落とすと
+    /// 送信の `\r` だけが生き残り、切れたプロンプトがそのまま送信される。
+    /// **捨てたことは下部バーで伝える**（黙って消さない）
+    #[test]
+    fn holding_stops_at_a_bound_and_says_what_it_dropped() {
+        let mut app = test_app(34, TERM);
+        app.input_gate = Some(std::time::Instant::now());
+        assert!(hold_input_while_starting(&mut app, typed('h')));
+        // 上限ちょうどまでは受ける（境界の内側）
+        let fits = "x".repeat(HELD_INPUT_LIMIT - 1);
+        assert!(hold_input_while_starting(&mut app, || HeldInput::Paste(
+            fits.clone()
+        )));
+        assert_eq!(app.held_input.len(), 2, "the paste that fits was refused");
+
+        // これ以上は入らない。**素通しはしない**（門番の理由は消えていない）
+        assert!(
+            hold_input_while_starting(&mut app, typed('y')),
+            "input flows straight to the PTY once the buffer is full"
+        );
+        assert_eq!(
+            app.held_input.first(),
+            Some(&HeldInput::Key(KeyEvent::new(
+                KeyCode::Char('h'),
+                KeyModifiers::NONE
+            ))),
+            "the newest input pushed out what was typed first"
+        );
+        assert_eq!(app.held_input.len(), 2, "the input that does not fit was held");
+        let (msg, _) = app.notice.as_ref().expect("the drop was not reported");
+        assert!(
+            msg.contains("dropped"),
+            "the notice does not say the input was dropped: {msg:?}"
         );
     }
 
@@ -6135,8 +6303,8 @@ mod tests {
         // 起動を試していない（撮影用の供給元）＝ 待つものが無いので門番は降りる
         apply_launch(&mut app, "C:\\dev\\api".to_string(), Ok(None));
         assert!(
-            !drop_input_while_starting(&mut app),
-            "input is dropped even though the launch is done"
+            !hold_input_while_starting(&mut app, typed('a')),
+            "input is held even though the launch is done"
         );
     }
 
@@ -6162,7 +6330,7 @@ mod tests {
         // 期限内は門番が効いている（有界 ＝ 即座に降りる、ではない）
         assert!(!expire_input_gate(&mut app), "the gate lifted before its deadline");
         assert!(
-            drop_input_while_starting(&mut app),
+            hold_input_while_starting(&mut app, typed('a')),
             "input typed while a session is starting flows straight to the PTY"
         );
 
@@ -6170,13 +6338,24 @@ mod tests {
         app.input_gate = Some(instant_ago(INPUT_GATE_LIMIT));
         assert!(expire_input_gate(&mut app), "the gate does not lift past its deadline");
         assert!(
-            !drop_input_while_starting(&mut app),
+            !hold_input_while_starting(&mut app, typed('b')),
             "a hung launch kills input forever"
         );
         assert!(
             app.focus == Focus::Sidebar,
             "the gate lifted without moving focus back — typing would flow to the previous session"
         );
+        // 宛先が居ないので溜めた入力は捨てられ、**そちらが下部バーに残る**
+        // （打った文字が消えたことの方が取り返しがつかない。ハングそのものの
+        // 報告は [`set_notice`] ＝ error.log 側に残る）
+        let (msg, _) = app.notice.as_ref().expect("the drop was not reported");
+        assert!(
+            msg.contains("dropped"),
+            "the notice does not say the held input was dropped: {msg:?}"
+        );
+        // 溜めた入力が無ければ、ハングそのものの報告が下部バーに出る
+        app.input_gate = Some(instant_ago(INPUT_GATE_LIMIT));
+        assert!(expire_input_gate(&mut app), "the gate does not lift past its deadline");
         let (msg, _) = app.notice.as_ref().expect("the hang was not reported");
         assert!(
             msg.contains("not responding"),
@@ -6207,7 +6386,7 @@ mod tests {
 
         assert!(expire_input_gate(&mut app), "the gate does not lift past its deadline");
         assert!(
-            !drop_input_while_starting(&mut app),
+            !hold_input_while_starting(&mut app, typed('a')),
             "a slow launch kills input forever"
         );
         assert!(
@@ -6239,8 +6418,8 @@ mod tests {
             Err("session launch failed".to_string()),
         );
         assert!(
-            !drop_input_while_starting(&mut app),
-            "input is still dropped after the launch failed"
+            !hold_input_while_starting(&mut app, typed('a')),
+            "input is still held after the launch failed"
         );
         assert!(
             app.focus == Focus::Sidebar,
@@ -6248,32 +6427,114 @@ mod tests {
         );
     }
 
-    /// **宛先が居ないまま門番を降ろすと打ち先も戻る。** 起動には成功したのに
-    /// その窓が表示されていない（切替と削除が競合した等）状態でも、
-    /// 素通しに戻ると打った文字が別のセッションへ流れる。
+    /// **宛先が居ないまま門番を降ろすと打ち先も戻り、溜めた入力は捨てられる。**
+    /// 起動には成功したのにその窓が表示されていない（切替と削除が競合した等）
+    /// 状態でも、素通しに戻ると打った文字が別のセッションへ流れる。溜めた入力も
+    /// 同じで、流し先が無いのだから流してはいけない ＝ **捨てたことを伝える**。
     ///
     /// [`apply_launch`] 越しには書けない: 本物の子プロセス生成が要るため
     /// （portable-pty は存在しない cwd を `USERPROFILE` に差し替えて**成功させる**
     /// ＝ テストが本物の claude を起こしてしまう）。代わりに、その後の状態
     /// （宛先の窓が開いていない）をそのまま作って判断だけを検査する
     #[test]
-    fn lifting_the_gate_without_its_destination_gives_input_back_to_the_sidebar() {
+    fn lifting_the_gate_without_its_destination_drops_the_held_input() {
         let mut app = test_app(34, TERM);
         let id = SessionId::new("abc123");
         app.input_gate = Some(std::time::Instant::now());
         app.set_focus(Focus::Terminal);
+        assert!(hold_input_while_starting(&mut app, typed('a')));
         assert!(
             !app.showing(&id),
             "the destination window is open — the premise of this test broke"
         );
         lift_input_gate(&mut app, Some(&id));
         assert!(
-            !drop_input_while_starting(&mut app),
-            "input is still dropped after the gate lifted"
+            !hold_input_while_starting(&mut app, typed('b')),
+            "input is still held after the gate lifted"
         );
         assert!(
             app.focus == Focus::Sidebar,
             "the gate lifted but focus stayed on the terminal"
+        );
+        assert!(
+            app.held_input.is_empty(),
+            "the held input survived a lift that had nowhere to deliver it"
+        );
+        let (msg, _) = app.notice.as_ref().expect("the drop was not reported");
+        assert!(
+            msg.contains("dropped"),
+            "the input was dropped without saying so: {msg:?}"
+        );
+    }
+
+    /// **溜めている間に打ち先が別のセッションへ移っていたら、そちらへは流さない。**
+    /// 起動が終わるまでの間にユーザーはスロットを移せる（`Alt+←→` / クリック）ので、
+    /// 「起こしたときの宛先」をそのまま信じると、**別プロジェクトのセッションへ
+    /// 打ちかけのプロンプトが送られる**。宛先の確認は [`App::showing`] 1 つに
+    /// 寄せてあるので、フォーカスの行き先と溜めた入力の行き先が食い違わない
+    #[test]
+    fn held_input_never_goes_to_a_session_the_user_moved_to() {
+        let mut app = test_app(34, TERM);
+        let launched = SessionId::new("launched");
+        app.set_layout(crate::panes::Layout::One);
+        // 溜めている間にユーザーが別のセッションへ移った状態
+        app.slots[0] = Slot::Session(SessionId::new("another"));
+        app.set_focus(Focus::Terminal);
+        app.input_gate = Some(std::time::Instant::now());
+        assert!(hold_input_while_starting(&mut app, typed('a')));
+
+        lift_input_gate(&mut app, Some(&launched));
+        assert!(
+            app.held_input.is_empty(),
+            "the held input is still queued — it would land on whatever is shown next"
+        );
+        let (msg, _) = app.notice.as_ref().expect("the drop was not reported");
+        assert!(
+            msg.contains("dropped"),
+            "the input was dropped without saying so: {msg:?}"
+        );
+    }
+
+    /// **子が端末を掴んだら、溜めた入力はその窓へ実際に流れる。**
+    ///
+    /// 門番を置いた理由（掴む前の打鍵は読み捨てられる）は掴んだ時点で消えるので、
+    /// そこからは打った順に届かなければならない。ここは PTY への書き込みまで
+    /// 通す（[`Session::fake`] は本物の PTY 対を開く）＝ 「捨てずに溜めた」だけで
+    /// 終わっていないことを固定する。バイト列の並びと形は
+    /// [`crate::keys::encode_held`] のテストが受け持つ
+    #[test]
+    fn held_input_reaches_the_destination_once_the_child_takes_the_terminal() {
+        let mut app = test_app(34, TERM);
+        let id = SessionId::new("launched");
+        // slave は窓と同じ寿命で持つ（落とすと PTY が閉じて書き込みが失敗する）
+        let (window, _slave) = Session::fake(&id, 24, 80);
+        window.pretend_started();
+        app.windows.push(window);
+        app.set_layout(crate::panes::Layout::One);
+        app.slots[0] = Slot::Session(id.clone());
+        app.set_focus(Focus::Terminal);
+        app.input_gate = Some(std::time::Instant::now());
+        assert!(hold_input_while_starting(&mut app, typed('h')));
+        assert!(hold_input_while_starting(&mut app, || HeldInput::Paste(
+            "ls".to_string()
+        )));
+
+        lift_input_gate(&mut app, Some(&id));
+        assert!(
+            app.held_input.is_empty(),
+            "the held input never left the buffer"
+        );
+        assert!(
+            app.notice.is_none() || !app.notice.as_ref().unwrap().0.contains("dropped"),
+            "the input was dropped even though its destination was on screen: {:?}",
+            app.notice
+        );
+        // 書き込みに失敗していれば窓は閉じられている（[`send_to_active`]）＝
+        // 窓が残っていることが「宛先へ届いた」の証拠
+        assert_eq!(
+            app.windows.len(),
+            1,
+            "writing the held input to its session failed"
         );
     }
 

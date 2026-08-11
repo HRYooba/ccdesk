@@ -290,6 +290,52 @@ pub(crate) fn encode_paste(text: &str, parser: &Parser) -> Vec<u8> {
     }
 }
 
+/// 起動中（[`crate::app::App::input_gate`] が立っている間）に打たれた入力 1 つ。
+///
+/// **encode 済みのバイト列ではなく生のイベントで持つのが要点。** [`encode_key`] /
+/// [`encode_paste`] が形を決める材料（DECCKM・kitty keyboard・modifyOtherKeys・
+/// bracketed paste）はどれも**子が有効化して初めて確定する**ので、掴む前に
+/// encode すると古い前提のバイト列を後から流すことになる（kitty を名乗る子へ
+/// C0 を送る・包みを有効化した子へ裸の貼り付けを送る）。
+///
+/// **打鍵と貼り付けを 1 本の列に混ぜて持つ**のも要点で、種類ごとに列を分けると
+/// 「貼り付けてから Enter」の順序が壊れる（貼り付けだけ先に届く）
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum HeldInput {
+    Key(KeyEvent),
+    Paste(String),
+}
+
+impl HeldInput {
+    /// 溜めておく重さ（上限は [`crate::app::HELD_INPUT_LIMIT`]）。
+    ///
+    /// **貼り付けだけ文字数で測る。** 打鍵は打てる速さで頭打ちになるが、
+    /// 貼り付けは 1 つで何 MB にもなり得るので、個数で数えるとメモリが青天井になる
+    pub(crate) fn weight(&self) -> usize {
+        match self {
+            Self::Key(_) => 1,
+            Self::Paste(text) => text.len(),
+        }
+    }
+}
+
+/// 溜めた入力を、**流す直前の**プロトコルでまとめて VT バイト列にする。
+/// 溜めた順（＝ 打った順）にそのまま連結する。
+///
+/// 置き場所が [`encode_key`] / [`encode_paste`] と同じなのは、これも
+/// 「入力を VT バイト列にする」知識だから。run ループ側に書くと、素通しの経路だけ
+/// プロトコルの追従を直して**溜めた入力が取り残される**
+pub(crate) fn encode_held(held: &[HeldInput], parser: &Parser) -> Vec<u8> {
+    let mut out = Vec::new();
+    for item in held {
+        match item {
+            HeldInput::Key(key) => out.extend_from_slice(&encode_key(key, parser)),
+            HeldInput::Paste(text) => out.extend_from_slice(&encode_paste(text, parser)),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,5 +469,40 @@ mod tests {
         // 包みを有効化していない子には素のまま（sanitize は常に効く）
         let plain = parser_after("");
         assert_eq!(encode_paste("hi\x1b!", &plain), b"hi!");
+    }
+
+    /// **溜めた入力は「溜めた時点」ではなく「流す時点」のプロトコルで組む。**
+    ///
+    /// 起動中の打鍵を溜めるのは、子がまだ端末を掴んでいないから。掴んだ瞬間に
+    /// 初めてプロトコルが確定するので、溜める側がバイト列にしてしまうと
+    /// **子が有効化する前の形**が届く（kitty を名乗る子へ C0 の Ctrl+P、
+    /// bracketed paste を有効化した子へ裸の貼り付け）＝ 同じ列が相手によって
+    /// 別のバイト列になることをここで固定する。
+    ///
+    /// **打鍵と貼り付けが混ざっても順序が保たれる**ことも併せて固定する:
+    /// 種類ごとに列を分けると「貼り付けてから Enter」が壊れ、貼った内容が
+    /// 送信されないまま Enter だけが先に届く
+    #[test]
+    fn held_input_is_encoded_in_order_with_the_protocol_the_child_ended_up_with() {
+        let held = vec![
+            HeldInput::Key(key(KeyCode::Char('h'), KeyModifiers::NONE)),
+            HeldInput::Paste("ls".to_string()),
+            HeldInput::Key(key(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            HeldInput::Key(key(KeyCode::Enter, KeyModifiers::NONE)),
+        ];
+        // 何も有効化していない子（溜め始めた時点の姿）
+        let plain = parser_after("");
+        assert_eq!(
+            encode_held(&held, &plain),
+            b"hls\x10\r",
+            "the held input did not come out in the order it was typed"
+        );
+        // 掴んだ後に kitty と bracketed paste を有効化した子
+        let ready = parser_after("\x1b[>1u\x1b[?2004h");
+        assert_eq!(
+            encode_held(&held, &ready),
+            b"h\x1b[200~ls\x1b[201~\x1b[112;5u\r",
+            "the held input was encoded with a protocol the child never had"
+        );
     }
 }

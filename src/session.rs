@@ -202,8 +202,8 @@ pub(crate) struct Session {
     // PTY から新しい出力が来たら true（再描画が必要かの判定に使う）
     pub(crate) dirty: Arc<AtomicBool>,
     /// 子が一度でも出力したか（＝端末を掴んだ）。**一度立ったら戻らない**ので
-    /// `dirty`（毎周降ろす）とは別に持つ。起動直後の打鍵を捨てる門番
-    /// （[`crate::app`] の `input_gate`）が降りる合図に使う
+    /// `dirty`（毎周降ろす）とは別に持つ。起動直後の打鍵を溜めておく門番
+    /// （[`crate::app`] の `input_gate`）が降りて、溜めた入力が流れる合図に使う
     started: Arc<AtomicBool>,
     /// 子が DEC 2026 で「画面を作り替えている最中」と宣言している間 true
     /// （[`SyncScan`]）。宣言しない子のことは [`hold_frame`] が出力の途切れで見る
@@ -442,6 +442,91 @@ impl Session {
 
     pub(crate) fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// テスト用の窓。**子は起こさない**（テストが本物の agent を起こしてしまうため。
+    /// 同じ理由で [`crate::app`] のテストは起動そのものを通さない）。
+    ///
+    /// **PTY 対は本物を開く**ので、書き込み（[`Self::send`]）もパーサも本番と
+    /// 同じ経路を通る ＝ 「宛先の窓へ実際に流せたか」を PTY 越しに確かめられる。
+    /// 読み取りスレッドは持たないので `started` は立たない（掴んだ状態を作りたい
+    /// テストは [`Self::pretend_started`] を呼ぶ）。
+    ///
+    /// slave 側を一緒に返すのは、落とすと PTY が閉じて書き込みが失敗するため
+    /// （呼び手が窓と同じ寿命で持つ）
+    #[cfg(test)]
+    pub(crate) fn fake(
+        session_id: &SessionId,
+        rows: u16,
+        cols: u16,
+    ) -> (Self, Box<dyn portable_pty::SlavePty + Send>) {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty failed");
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(pair.master.take_writer().expect("take_writer failed")));
+        let window = Self {
+            session_id: session_id.clone(),
+            parser: Arc::new(Mutex::new(new_parser(rows, cols, SCROLLBACK))),
+            writer,
+            master: pair.master,
+            child: Box::new(NoChild),
+            size: (rows, cols),
+            started_at: now_ms(),
+            last_output: Arc::new(Mutex::new(std::time::Instant::now())),
+            dirty: Arc::new(AtomicBool::new(false)),
+            started: Arc::new(AtomicBool::new(false)),
+            updating: Arc::new(AtomicBool::new(false)),
+        };
+        (window, pair.slave)
+    }
+
+    /// テスト用に「子が端末を掴んだ」状態にする（本番で立てるのは読み取りスレッド）
+    #[cfg(test)]
+    pub(crate) fn pretend_started(&self) {
+        self.started.store(true, Ordering::Relaxed);
+    }
+}
+
+/// [`Session::fake`] が差す子。**居ない子**なので生きているとも死んでいるとも
+/// 言わない（`try_wait` は `Ok(None)` ＝ 生死スキャンが窓を片付けない）
+#[cfg(test)]
+#[derive(Debug)]
+struct NoChild;
+
+#[cfg(test)]
+impl portable_pty::ChildKiller for NoChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(NoChild)
+    }
+}
+
+#[cfg(test)]
+impl Child for NoChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        Ok(None)
+    }
+
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        Ok(portable_pty::ExitStatus::with_exit_code(0))
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+
+    #[cfg(windows)]
+    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        None
     }
 }
 
