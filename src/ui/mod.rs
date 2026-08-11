@@ -648,10 +648,12 @@ impl UpdateState {
         Self::RestartPending,
     ];
 
-    /// 右端に置く動詞。最新のときだけ空（やることが無い）。
+    /// 右端に置く語。最新のときだけ空（やることが無い）。**押せる行だけが動詞**で、
+    /// 押せない行（[`Self::action`] が `Inert`）は状態を述べる形にする ＝
+    /// 語の形そのものが「押して意味があるか」を伝える。
     ///
     /// **新しい版の番号は出さない。** 新旧を並べた `⟳ claude v2.1.218 → v2.1.220` に
-    /// 動詞まで足すと実測 35 桁で、既定幅（内側 32 桁）に収まらない。現行版と
+    /// 語まで足すと実測 35 桁で、既定幅（内側 32 桁）に収まらない。現行版と
     /// 「やること」のどちらも欠かせないので、落とすのは新版の番号にした
     fn verb(self) -> &'static str {
         match self {
@@ -661,10 +663,13 @@ impl UpdateState {
             // **動詞ではなく状態**（押せる行だが、押しても同じ結果になりうる）。
             // "update" のままだと、効かなかったことが行から読めない
             Self::Stalled => "stalled",
-            // 案内であって呼びかけではない: 押しても何も起きない（[`Self::action`]）。
-            // 語自体は変えない ＝ 「やることの名前」として読める（利用者が自分で
-            // ccdesk を終了・再起動する）。既定幅の版数字と並んでも収まる短さも兼ねる
-            Self::RestartPending => "restart",
+            // **動詞ではなく状態**（[`Self::Stalled`] と同じ判断）。裸の "restart" を
+            // 置いていた頃、押しても何も起きない行（[`Self::action`]）なのに
+            // 「押せばここから再起動できる」と読めるという指摘が利用者から来た。
+            // `on restart` なら呼びかけではなく「次に起動したときに入れ替わる」という
+            // 条件として読める。語を伸ばす方向（`needs restart` など）は取れない:
+            // 既定幅で最長の版数字と並ぶと右端で切られ、幅のテストが落ちる
+            Self::RestartPending => "on restart",
         }
     }
 
@@ -3413,6 +3418,26 @@ pub(crate) mod tests {
                 rows_of(state, state),
                 (SidebarRow::Inert, SidebarRow::Inert),
                 "{state:?}"
+            );
+        }
+    }
+
+    /// **押せない行の語を裸の動詞にしない。** 差し替え済みの行が右端に "restart" と
+    /// 出していた頃、押しても何も起きない行（[`UpdateState::action`]）なのに
+    /// 「押せばここから再起動できる」と読めるという指摘が利用者から来た。
+    /// 押せない行は「今どうなっているか」を述べる形 ＝ 語をつないだ句（`on restart`）か
+    /// 進行の省略記号付き（`updating…`）にする。**押せるかどうかは実装から引く**ので、
+    /// 状態を足しても手で一覧を足す必要はない
+    #[test]
+    fn an_unclickable_version_row_never_words_itself_as_a_command() {
+        for state in UpdateState::ALL {
+            let verb = state.verb();
+            if verb.is_empty() || state.action(RowAction::UpdateCcdesk) != SidebarRow::Inert {
+                continue;
+            }
+            assert!(
+                verb.contains(' ') || verb.ends_with('…'),
+                "{state:?} labels an unclickable row with a bare command: {verb:?}"
             );
         }
     }
