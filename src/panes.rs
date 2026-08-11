@@ -29,6 +29,15 @@ impl Span {
             rows,
         }
     }
+
+    /// この範囲が `inner` を丸ごと含むか。**縮めた配置の当て先を決める判定**
+    /// （[`Layout::close_slot`]）で、空きを吸った側は元の範囲を含んだまま大きくなる
+    const fn covers(&self, inner: &Self) -> bool {
+        inner.col >= self.col
+            && inner.row >= self.row
+            && inner.col + inner.cols <= self.col + self.cols
+            && inner.row + inner.rows <= self.row + self.rows
+    }
 }
 
 /// 十字の位置（百分率）。境界ドラッグで動く。
@@ -357,6 +366,82 @@ impl Layout {
             layout,
             moved,
             halves: [index(first)?, index(second)?],
+        })
+    }
+
+    /// スロット `at` を配置から外した配置（外せないなら `None` ＝ 1 枚しか無い盤面）。
+    ///
+    /// **[`Self::split_slot`] の逆で、こちらも対応表を持たない。** 「残ったスロットが
+    /// 空いた範囲を吸って 2×2 を埋め直せる配置」を [`Self::ORDER`] から引くので、
+    /// 配置を足し引きしても「どれへ縮むか」の知識が古びない
+    /// （手で書いた `4 grid − 左上 → 3 wide top` の表は、配置を 1 つ足した日に黙って嘘になる）。
+    ///
+    /// **吸えるのは矩形のままでいられる相手だけ**なので、答えは 4 枚の盤面を除いて
+    /// 一意に決まる。4 枚だけは縦・横の 2 通りが立つので**横へ伸びる答えを採る**
+    /// （閉じた枠の空きは左右の相手が吸う ＝ 端末に要る桁が残る側）
+    pub(crate) fn close_slot(self, at: usize) -> Option<Shrunk> {
+        self.spans().get(at)?;
+        let keep: Vec<(usize, Span)> = self
+            .spans()
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(slot, _)| *slot != at)
+            .collect();
+        if keep.is_empty() {
+            return None; // 減らす先が無い（1 枚 ＝ これが最小の盤面）
+        }
+        Self::ORDER
+            .into_iter()
+            .filter(|l| l.slots() == keep.len())
+            .filter_map(|layout| Shrunk::absorbing(layout, &keep))
+            // 同点なら [`Self::ORDER`] の先（`min_by_key` は最初の最小を返す）
+            .min_by_key(|s| u8::from(!s.widened))
+    }
+}
+
+/// [`Layout::close_slot`] の答え。[`Grown`] と同じく**番号の振り直しまで含める**
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Shrunk {
+    /// 外した後の配置
+    pub(crate) layout: Layout,
+    /// 残ったスロットの `(旧番号, 新番号)`
+    pub(crate) moved: Vec<(usize, usize)>,
+    /// 空きを吸ったスロットの**新番号**（複数が伸びるときは読み順で先）。
+    /// 外したスロットを見ていたときの行き先 ＝ 消えた枠の跡地を持つ 1 枚
+    pub(crate) absorbed: usize,
+    /// 吸った側が**横に**伸びたか。4 枚の盤面で縦・横 2 通りが立つときの決め手
+    /// （[`Layout::close_slot`]）で、それ以外では答えが 1 つなので効かない
+    widened: bool,
+}
+
+impl Shrunk {
+    /// 残ったスロット `keep` が `layout` のどのスロットへ収まるか（収まらないなら `None`）。
+    ///
+    /// **収まりは包含で見る**（吸った側は元の範囲を含んだまま大きくなる）。
+    /// 行き先が重なる答えは捨てる: 1 枚が 2 枚を兼ねるのは「縮めた」ではなく
+    /// **触っていないセッションを画面から落とす**ことで、配置の縮小とは別の操作
+    fn absorbing(layout: Layout, keep: &[(usize, Span)]) -> Option<Self> {
+        let mut moved: Vec<(usize, usize)> = Vec::with_capacity(keep.len());
+        // 空きを吸った（大きくなった）スロット `(新番号, 横に伸びたか)`
+        let mut grew: Vec<(usize, bool)> = Vec::new();
+        for (old, span) in keep {
+            // 占有セルは重ならず盤面を埋め尽くすので、左上のセルの持ち主が唯一の当て先
+            let to = layout.slot_at(span.col, span.row)?;
+            let grown = *layout.spans().get(to)?;
+            if !grown.covers(span) || moved.iter().any(|(_, taken)| *taken == to) {
+                return None;
+            }
+            if grown != *span {
+                grew.push((to, grown.cols > span.cols));
+            }
+            moved.push((*old, to));
+        }
+        Some(Self {
+            layout,
+            moved,
+            absorbed: grew.iter().map(|(to, _)| *to).min()?,
+            widened: grew.iter().any(|(_, wider)| *wider),
         })
     }
 }
@@ -739,5 +824,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **枠を 1 つ閉じても、残りのスロットは画面から落ちない。**
+    /// どの配置のどのスロットを閉じても、残り全部に行き先が 1 つずつあり、
+    /// その行き先は元の範囲を含む（＝ 触っていないセッションは 1 つも消えない）。
+    /// 対応表ではなく導出なので、性質のまま全配置 × 全スロットで押さえる
+    #[test]
+    fn closing_a_slot_keeps_every_other_slot_on_screen() {
+        for layout in Layout::ORDER {
+            for at in 0..layout.slots() {
+                let Some(shrunk) = layout.close_slot(at) else {
+                    // 減らす先が無いのは 1 枚の盤面だけ
+                    assert_eq!(layout.slots(), 1, "{layout:?}: slot {at} refused to close");
+                    continue;
+                };
+                let want = layout.slots() - 1;
+                assert_eq!(shrunk.layout.slots(), want, "{layout:?} slot {at}: wrong count");
+                assert_eq!(shrunk.moved.len(), want, "{layout:?} slot {at}: lost a slot");
+                let mut targets: Vec<usize> = shrunk.moved.iter().map(|(_, to)| *to).collect();
+                targets.sort_unstable();
+                targets.dedup();
+                assert_eq!(
+                    targets.len(),
+                    want,
+                    "{layout:?} slot {at}: two slots landed on one"
+                );
+                for (from, to) in &shrunk.moved {
+                    assert_ne!(*from, at, "{layout:?} slot {at}: the closed slot survived");
+                    assert!(
+                        shrunk.layout.spans()[*to].covers(&layout.spans()[*from]),
+                        "{layout:?} slot {at}: slot {from} does not fit slot {to}"
+                    );
+                }
+                assert!(
+                    targets.contains(&shrunk.absorbed),
+                    "{layout:?} slot {at}: the room went to a slot that is not there"
+                );
+            }
+        }
+    }
+
+    /// **閉じた枠の空きは左右の相手が吸う。** 縦・横の 2 通りが立つのは 4 枚の盤面だけで、
+    /// そこでは横へ伸ばす ＝ 上段を閉じれば上段が、下段を閉じれば下段が全幅 1 枚になる
+    /// （端末は桁が要るので、全高の細い枠より全幅の枠を残す）
+    #[test]
+    fn the_room_a_closed_slot_leaves_goes_to_the_slot_beside_it() {
+        for at in 0..Layout::Four.slots() {
+            let shrunk = Layout::Four.close_slot(at).expect("the 4 grid shrinks");
+            // spans は読み順なので 0,1 が上段・2,3 が下段
+            let want = if at < 2 {
+                Layout::ThreeWideTop
+            } else {
+                Layout::ThreeWideBottom
+            };
+            assert_eq!(shrunk.layout, want, "closing slot {at} of the 4 grid");
+        }
+    }
+
+    /// **3 枚・2 枚の盤面は答えが 1 つしかない**（矩形のままで吸える相手が 1 通りだから）。
+    /// 画面で見える結果そのものなので、[`Layout::split_slot`] 側と同じ形で 1 本に書く
+    #[test]
+    fn closing_a_slot_shrinks_into_the_layout_the_remaining_cells_imply() {
+        let cases = [
+            // (元, 閉じるスロット, 縮んだ先)
+            (Layout::TwoColumns, 0, Layout::One),
+            (Layout::TwoRows, 1, Layout::One),
+            // 3 tall left の全高スロットを閉じる ＝ 右の 2 枚が左へ伸びて 2 rows
+            (Layout::ThreeTallLeft, 0, Layout::TwoRows),
+            // 右上を閉じる ＝ 右下が全高へ伸びて 2 columns
+            (Layout::ThreeTallLeft, 1, Layout::TwoColumns),
+            (Layout::ThreeWideTop, 0, Layout::TwoColumns),
+            (Layout::ThreeWideTop, 1, Layout::TwoRows),
+        ];
+        for (from, at, want) in cases {
+            let shrunk = from
+                .close_slot(at)
+                .unwrap_or_else(|| panic!("{from:?} slot {at} refused to close"));
+            assert_eq!(shrunk.layout, want, "{from:?} slot {at}");
+        }
+        // 1 枚は最小の盤面 ＝ 減らす先が無い（閉じる操作は中身を空けるだけになる）
+        assert_eq!(Layout::One.close_slot(0), None);
+        // 無い番号を閉じても配置は動かない
+        assert_eq!(Layout::TwoColumns.close_slot(2), None);
     }
 }

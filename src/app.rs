@@ -813,6 +813,61 @@ impl App {
         self.resize_sessions();
     }
 
+    /// **スロット `at` を配置から外す**（枠の右上の ✕）。
+    ///
+    /// **終わるものは何も無い。** ここで閉じるのは表示枠で、映していた
+    /// セッションは裏で走り続ける（[`crate::panes`] の書き出し ＝ ペインは
+    /// プロセスの入れ物ではない）。行もサイドバーに残るので、押し直せば戻る。
+    ///
+    /// 空いた範囲を誰が吸うかは [`crate::panes::Layout::close_slot`] が答え、
+    /// **残ったスロットの中身は番号の振り直しに沿って写す**（[`make_room`] と同じ作法）
+    /// ＝ 触っていないセッションは 1 つも画面から消えない。
+    ///
+    /// **1 枚の盤面には減らす先が無い**ので、そのときは中身だけ空ける
+    /// （枠が消えて右ペインが無くなる形は作らない）
+    pub(crate) fn close_slot(&mut self, at: usize) {
+        if at >= self.slots.len() {
+            return;
+        }
+        let Some(shrunk) = self.layout.close_slot(at) else {
+            self.put_in_slot(at, Slot::Empty);
+            return;
+        };
+        // **離れる窓へ focus out を送るのが先**（[`Self::place_session`] と同じ作法）
+        if self.focus == Focus::Terminal
+            && let Some(w) = self.focused_window()
+        {
+            self.windows[w].send_focus(false);
+        }
+        // **新しい並びを組み終えてから入れ替える**（[`make_room`] と同じ理由:
+        // 中身の欠けた並びを持たせると、そこで走るリサイズが触っていない窓まで潰す）
+        let mut before = std::mem::take(&mut self.slots);
+        let mut next: Vec<Slot> = (0..shrunk.layout.slots()).map(|_| Slot::Empty).collect();
+        for (from, to) in &shrunk.moved {
+            if let Some(slot) = before.get_mut(*from) {
+                next[*to] = std::mem::replace(slot, Slot::Empty);
+            }
+        }
+        // **フォーカスは番号の振り直しに沿って写す**（読み順が変わるので、
+        // 番号を据え置くと見ていたのと違うスロットへ焦点が移る）。
+        // 閉じた枠を見ていたなら、その跡地を持つスロット ＝ 空きを吸った 1 枚へ。
+        // **`apply_layout` より先に載せる**のが要点で、既読を合わせるのはあちら
+        // （後から動かすと、閉じる前のスロットの行を既読にしてしまう）
+        self.focus_slot = if self.focus_slot == at {
+            shrunk.absorbed
+        } else {
+            shrunk
+                .moved
+                .iter()
+                .find(|(from, _)| *from == self.focus_slot)
+                .map_or(shrunk.absorbed, |(_, to)| *to)
+        };
+        self.apply_layout(shrunk.layout, next);
+        self.focus_terminal_on(self.focus_slot);
+        // **配置ごと書き残す**（スロットだけ保存すると、次の起動で古い枚数が復元される）
+        save_layout(self);
+    }
+
     /// フォーカス中のスロットへ new session 画面を出す
     pub(crate) fn open_new_view(&mut self) {
         let state = NewState::browse(&self.dispatch_cwd);
@@ -2237,6 +2292,17 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         }
         _ if app.dragging => return Ok(false),
         _ => {}
+    }
+
+    // 枠右上の ✕（そのスロットを配置から外す）。**十字の掴み代より先**に見る:
+    // 下段スロットの上辺は横の境界そのものなので、後回しにすると印を押した操作が
+    // リサイズの掴みに化ける。**印の列は角の 1 桁内側**（[`crate::ui::close_zone`]）
+    // なので、縦の境界の掴み代（枠線 2 列）はここに食われない
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+        && let Some(at) = crate::ui::close_hit(app, mouse.column, mouse.row)
+    {
+        app.close_slot(at);
+        return Ok(false);
     }
 
     // 十字の境界ドラッグ（サイドバー幅の掴み代と同じ作法）。**スロットのクリック判定
@@ -7408,6 +7474,62 @@ mod tests {
         assert!(app.drag.is_some());
         handle_mouse(&mut app, &moved(5, 1)).unwrap();
         assert!(app.drag.is_none(), "the grab outlived the button");
+    }
+
+    /// **枠右上の ✕ は表示枠だけを閉じる。** 配置が 1 枚減り、残ったセッションは
+    /// 番号の振り直しに沿って画面に残り、PTY（[`App::windows`]）も生きたまま
+    /// （＝ 押して終わるものは何も無い）
+    #[test]
+    fn the_close_mark_drops_the_slot_from_the_layout_without_ending_anything() {
+        let mut app = app_with_row("s");
+        app.set_layout(crate::panes::Layout::TwoColumns);
+        let id = SessionId::new("s");
+        app.slots[1] = Slot::Session(id.clone());
+        let windows = app.windows.len();
+        // 左のスロットの ✕ を押す ＝ 残る右のスロットは 1 番から 0 番へ振り直される。
+        // **押す場所は当たり判定の正本から取る**（座標を手で書くと導出とずれる）
+        let (cols, row) = crate::ui::close_zone(app.slot_rects()[0]).expect("no close mark");
+        handle_mouse(&mut app, &click(*cols.end(), row)).unwrap();
+        assert_eq!(app.layout, crate::panes::Layout::One, "the layout did not shrink");
+        assert_eq!(app.slots.len(), 1, "the slots did not follow the layout");
+        assert_eq!(
+            app.slot_of(&id),
+            Some(0),
+            "the surviving session did not follow its new number"
+        );
+        assert_eq!(app.windows.len(), windows, "closing a frame killed a window");
+    }
+
+    /// **1 枚の盤面には減らす先が無い**ので、✕ は中身を空けるだけ（枠は残る）
+    #[test]
+    fn the_close_mark_only_empties_the_slot_when_one_pane_is_left() {
+        let mut app = app_with_row("s");
+        app.slots[0] = Slot::Session(SessionId::new("s"));
+        let (cols, row) = crate::ui::close_zone(app.slot_rects()[0]).expect("no close mark");
+        handle_mouse(&mut app, &click(*cols.end(), row)).unwrap();
+        assert_eq!(app.layout, crate::panes::Layout::One, "the last pane went away");
+        assert_eq!(app.slots.len(), 1);
+        assert!(
+            matches!(app.slots[0], Slot::Empty),
+            "the slot still shows the session"
+        );
+    }
+
+    /// **✕ は自分が乗っている掴み代に勝つ。** 下段スロットの上辺は横の境界そのもの
+    /// なので、判定の順序が崩れると印を押した操作がリサイズの掴みに化ける
+    #[test]
+    fn the_close_mark_wins_over_the_resize_grip_it_sits_on() {
+        let mut app = app_with_row("s");
+        app.set_layout(crate::panes::Layout::TwoRows);
+        let (cols, row) = crate::ui::close_zone(app.slot_rects()[1]).expect("no close mark");
+        // 掴み代に乗っていることを先に確かめる（前提が消えたらこの検査は無意味になる）
+        let (_, on_h) = app
+            .layout
+            .grab_at(crate::ui::pane_rect(&app), app.split, *cols.end(), row);
+        assert!(on_h, "the fixture no longer puts the mark on the height grip");
+        handle_mouse(&mut app, &click(*cols.end(), row)).unwrap();
+        assert!(app.cross_drag.is_none(), "the click started a resize instead");
+        assert_eq!(app.layout, crate::panes::Layout::One, "the layout did not shrink");
     }
 
     /// **スロットを減らしても何も終わらない。** 溢れたセッションは表示から

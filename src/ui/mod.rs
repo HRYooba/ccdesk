@@ -1979,6 +1979,72 @@ const PANE_TITLE_SEP: &str = " · ";
 /// **ここで数えておかないと ID が先に消える**（見出しの末尾に居るため）
 const PANE_TITLE_MARGIN: usize = 2;
 
+/// 枠の右上に出す閉じる印。**押すとそのスロットが配置から外れる**（[`close_zone`]）。
+/// セッションは止まらない ＝ ここで閉じるのは**表示枠**で、プロセスは裏で走り続ける
+/// （[`crate::panes`] の書き出し）。
+///
+/// **East Asian Ambiguous でない記号だけを選ぶ**のは [`MENU_MARK`] と同じ判断で、
+/// U+2715 は Neutral ＝ `width` / `width_cjk` の両方が 1 を返す（テストが直接測る）
+const CLOSE_MARK: &str = "✕";
+
+/// 閉じる印が食う桁（記号 + その左の空白）。**左の空白まで数えるのは
+/// [`MENU_COLS`] と同じ理由**（記号 1 桁だけだと突きにくい）で、
+/// 当たり判定（[`close_zone`]）も見出しの桁予算（[`pane_title`]）も同じ 2 桁を取る
+const CLOSE_COLS: u16 = 2;
+
+/// 閉じる印の当たり判定 `(桁の範囲, 行)`。印を出さない枠では `None` ＝
+/// **描く判断と押せる判断が同じ 1 箇所**（[`with_close_mark`] がこれを見て載せる）。
+///
+/// 右寄せの見出しは**右の角の 1 桁内側**で終わるので、印は角の列に乗らない。
+/// これは**十字の掴み代（隣り合う枠線 2 列）と重ならない**ための桁で、
+/// 左列・上段のスロットの印がリサイズの掴み代を食わない。
+///
+/// 行のほうは避けられない: 下段スロットの上辺は横の境界そのものなので、
+/// 掴み代に乗る。**押しの判定でこちらを先に見る**ことで決着させてある
+/// （[`crate::app`] の `handle_mouse`）
+pub(crate) fn close_zone(rect: Rect) -> Option<(std::ops::RangeInclusive<u16>, u16)> {
+    if close_cols(rect.width) == 0 || rect.height == 0 {
+        return None;
+    }
+    let right = rect.x + rect.width - 2;
+    Some((right + 1 - CLOSE_COLS..=right, rect.y))
+}
+
+/// 見出しが閉じる印へ譲る桁（印を出さない狭い枠では 0）。
+///
+/// **印を出すかは幅だけで決まる**ので、判断の式をここ 1 つに置いて
+/// [`close_zone`]（押せる場所）と [`pane_title`]（見出しの桁予算）が同じ答えを見る。
+/// 左右の角 1 桁ずつと印の桁が要る ＝ これより狭い枠に印は出さない
+/// （出しても押せる場所が角と重なる）
+const fn close_cols(pane_width: u16) -> usize {
+    if pane_width < 2 + CLOSE_COLS {
+        0
+    } else {
+        CLOSE_COLS as usize
+    }
+}
+
+/// 枠に閉じる印を載せる。**セッション・空・New 画面の 3 種の枠が同じここを通る**ので、
+/// 「印が出ている枠と押せる枠」が種類ごとにずれない。
+///
+/// **フォーカス中の枠だけ明るく出す**のはサイドバーの [`MENU_MARK`] と同じ作法
+/// （今の操作対象がどれかを、押せる入口の側でも示す）
+pub(crate) fn with_close_mark<'a>(block: Block<'a>, rect: Rect, focused: bool) -> Block<'a> {
+    if close_zone(rect).is_none() {
+        return block;
+    }
+    let color = if focused { ui().emph } else { MUTED_FG };
+    block.title_top(Line::styled(CLOSE_MARK, Style::default().fg(color)).right_aligned())
+}
+
+/// ✕ を押したスロット（どれでもなければ `None`）。
+/// **矩形の正本は [`App::slot_rects`]** ＝ 描画と同じ矩形から導く
+pub(crate) fn close_hit(app: &App, column: u16, row: u16) -> Option<usize> {
+    app.slot_rects().iter().position(|rect| {
+        close_zone(*rect).is_some_and(|(cols, at)| row == at && cols.contains(&column))
+    })
+}
+
 /// ペイン枠の見出し（`<タイトル> · <短い ID>`）。
 ///
 /// **ID を出すのは、名前に [`MIN_NAME_COLS`] 桁残るときだけ。** サイドバーの
@@ -1987,10 +2053,15 @@ const PANE_TITLE_MARGIN: usize = 2;
 /// スロットでは ID が消え、タイトルだけが残る）。
 ///
 /// **切るのは表示幅**（[`clip_to_width`]）: タイトルは会話から生成されるので
-/// 全角を含み得る
+/// 全角を含み得る。
+///
+/// **右上の閉じる印（[`close_cols`]）のぶんも先に引く。** 見出しは左寄せ・印は
+/// 右寄せで同じ 1 行に載るので、ここで数えないと長いタイトルが印を押し出す
 fn pane_title(name: &str, id: &SessionId, pane_width: u16) -> String {
     use unicode_width::UnicodeWidthStr;
-    let budget = (pane_width as usize).saturating_sub(PANE_TITLE_MARGIN);
+    let budget = (pane_width as usize)
+        .saturating_sub(PANE_TITLE_MARGIN)
+        .saturating_sub(close_cols(pane_width));
     let short = id.short();
     // 区切りと ID が食う桁。ID は ASCII 16 進なので文字数 = 表示桁
     let tail = PANE_TITLE_SEP.width() + short.width();
@@ -2101,10 +2172,14 @@ fn draw_slot(frame: &mut Frame, rect: Rect, app: &mut App, at: usize, focused: b
         // 空スロット（起動時・stop / close の直後）。枠だけだと「壊れている」
         // のか「ただ空」なのか見分かないので、案内を 1 行出す
         _ => {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title("no session")
-                .border_style(border_style(focused));
+            let block = with_close_mark(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("no session")
+                    .border_style(border_style(focused)),
+                rect,
+                focused,
+            );
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
             let mid = Layout::default()
@@ -2138,10 +2213,14 @@ fn draw_session_slot(
         .and_then(|id| app.windows.iter().find(|w| &w.session_id == id))
     else {
         frame.render_widget(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .border_style(Style::default().fg(ui().dim)),
+            with_close_mark(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(Style::default().fg(ui().dim)),
+                rect,
+                focused,
+            ),
             rect,
         );
         return FrameCursor::hidden_at(pane_fallback_pos(rect));
@@ -2157,10 +2236,14 @@ fn draw_session_slot(
     } else {
         title
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(border_style(focused));
+    let block = with_close_mark(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(border_style(focused)),
+        rect,
+        focused,
+    );
     let inner = block.inner(rect);
     // tui-term 独自の █ カーソル描画は無効化し、ネイティブカーソル
     // （set_cursor_position = 本家と同じ点滅バー）だけを使う
@@ -4091,8 +4174,9 @@ pub(crate) mod tests {
         // 見たいのは「1 文字 2 桁」であって字種ではない）
         for width in MIN_PANE..100 {
             let drawn = pane_title(&"\u{ac00}".repeat(80), &id, width);
+            // **右上の ✕ のぶんも空けたまま収まる**（見出しが印を押し出さない）
             assert!(
-                drawn.width() <= usize::from(width) - PANE_TITLE_MARGIN,
+                drawn.width() <= usize::from(width) - PANE_TITLE_MARGIN - close_cols(width),
                 "width {width} overflows the frame: {drawn:?}"
             );
             assert!(drawn.ends_with(&short), "width {width} dropped the id: {drawn:?}");
@@ -4102,6 +4186,74 @@ pub(crate) mod tests {
         let thin = pane_title("api probe", &id, 14);
         assert!(!thin.contains(&short), "the id squeezed the name: {thin:?}");
         assert!(!thin.is_empty(), "the title vanished: {thin:?}");
+    }
+
+    /// **閉じる印も桁の前提に乗るので実測して固定する**（[`MENU_MARK`] と同じ理由）。
+    /// Ambiguous な記号（`×` U+00D7 など）を選ぶと、端末とロケールで幅が変わり
+    /// 見出しと印が重なる
+    #[test]
+    fn the_close_mark_is_one_column_wide_in_every_locale() {
+        use unicode_width::UnicodeWidthStr as _;
+        assert_eq!(CLOSE_MARK.width(), 1, "the close mark is not 1 column wide");
+        assert_eq!(
+            CLOSE_MARK.width_cjk(),
+            1,
+            "the close mark is East Asian Ambiguous: {CLOSE_MARK:?}"
+        );
+        assert_eq!(
+            CLOSE_COLS as usize,
+            1 + CLOSE_MARK.width(),
+            "the close budget changed"
+        );
+    }
+
+    /// **見えている ✕ と押せる場所は同じ桁。** 枠の 3 種類（セッション・空・New 画面）を
+    /// 実際に描いて、印が [`close_zone`] の返す桁と行に載っていることを実物で見る
+    /// （導出を 1 つにしてあるので、どれか 1 種だけずれることはここで落ちる）
+    #[test]
+    fn the_close_mark_is_drawn_where_it_can_be_clicked() {
+        for slot in [
+            Slot::Empty,
+            Slot::Session(SessionId::new("0123456789abcdef-0123")),
+            Slot::New(new_view::NewState::browse("C:\\dev")),
+        ] {
+            let mut app = App {
+                term_size: (120, 30),
+                ..Default::default()
+            };
+            app.slots = vec![slot];
+            let rect = app.slot_rects()[0];
+            let (cols, row) = close_zone(rect).expect("the frame has no close mark");
+            assert_eq!(
+                drawn_cell(&mut app, *cols.end(), row),
+                CLOSE_MARK,
+                "the close mark is not on the column its hit test claims"
+            );
+        }
+    }
+
+    /// **閉じる印は縦のリサイズ掴み代を食わない。** 印は角の 1 桁内側に居るので、
+    /// 隣り合う枠線 2 列（縦の境界の掴み代）とは重ならない ＝ 左列のスロットの印が
+    /// あっても幅は掴める。
+    ///
+    /// 横の境界だけは下段スロットの上辺と同じ行なので重なる。そちらは押しの
+    /// 判定順（[`crate::app`] の `handle_mouse` が印を先に見る）で決着させてある
+    #[test]
+    fn the_close_mark_does_not_eat_the_vertical_resize_grip() {
+        let area = Rect::new(20, 0, 100, 40);
+        let split = crate::panes::Split::default();
+        for layout in crate::panes::Layout::ORDER {
+            for rect in layout.rects(area, split) {
+                let (cols, row) = close_zone(rect).expect("the slot has no close mark");
+                for column in cols {
+                    let (on_v, _) = layout.grab_at(area, split, column, row);
+                    assert!(
+                        !on_v,
+                        "{layout:?}: the close mark at {column} sits on the width grip"
+                    );
+                }
+            }
+        }
     }
 
     /// **止めた行は `Stopped`（行末の語も Stopped）。**
@@ -5046,6 +5198,20 @@ pub(crate) mod tests {
     fn drawn_hint_bar(app: &mut App) -> String {
         let y = app.term_size.1 - bottom_bar_rows(app);
         drawn_row(app, y)
+    }
+
+    /// 端末を 1 フレーム描いて、その 1 桁の文字を返す。
+    /// **行の文字列（[`drawn_row`]）では桁を数えられない**（2 桁の文字が 1 つ入ると
+    /// 文字数と桁がずれる）ので、桁を名指しで見る検査はこちらを使う
+    fn drawn_cell(app: &mut App, x: u16, y: u16) -> String {
+        let (w, h) = app.term_size;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("test terminal");
+        terminal.draw(|frame| {
+            draw(frame, app);
+        })
+        .expect("draw");
+        terminal.backend().buffer()[(x, y)].symbol().to_string()
     }
 
     /// 端末を 1 フレーム描いて、指定行の文字列を返す

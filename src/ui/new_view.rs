@@ -867,10 +867,16 @@ pub(crate) fn draw_new_view(
     starting: bool,
     can_leave: bool,
 ) -> FrameCursor {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("new session")
-        .border_style(border_style(focused));
+    // 枠の右上の ✕（このスロットを配置から外す）はセッションの枠と同じ導出を通す
+    // ＝ 種類ごとに「印が出る枠と押せる枠」がずれない（[`crate::ui::with_close_mark`]）
+    let block = crate::ui::with_close_mark(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("new session")
+            .border_style(border_style(focused)),
+        area,
+        focused,
+    );
     frame.render_widget(block, area);
 
     // 描画とマウス判定で同一のジオメトリを使う（フォーム型レイアウト）
