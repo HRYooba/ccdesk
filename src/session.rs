@@ -80,6 +80,45 @@ fn pty_hint(started: bool, since_output: Duration) -> PtyHint {
     }
 }
 
+/// 幅を縮める前に流す掃除シーケンス。**このバイト列だけが「縮めた瞬間に
+/// ペインが全消去される」を止めている**（PTY を開かずに試せるよう純関数にしてある）。
+///
+/// vt100 0.16 の `set_size` は各行を `Vec::resize` で切り詰めるだけなので、
+/// 新しい最終列に全角文字の前半（`is_wide`）が残ると、その相方の
+/// continuation セルだけが切り落とされる。次に子がその列へ書くと vt100 は
+/// 相方のセルを取りに行って `None` を掴み、内部の unwrap で panic する。
+/// 拾うのは [`Session::spawn`] の PTY リーダーで、そこはパーサを作り直す
+/// ＝ **そのペインの画面が丸ごと消える**（実ユーザーの error.log で毎日出ていた）。
+///
+/// 切り詰めの**前**に、新しい最終列から行末までを EL（`\e[K`）で消しておけば
+/// 半端なセルは生まれない。この時点のグリッドはまだ健全なので、EL は
+/// 消す先が continuation なら相方も一緒に消してくれる。**後からでは遅い**:
+/// 半端なセルができた後に EL を打つと、相方を消しに行った先が範囲外で、
+/// 今度は別の panic になる（これも実際に踏んだ）。
+///
+/// 原点モード（DECOM）を落としてから走査するのは、子がスクロール領域を
+/// 立てていると CUP が領域内へ丸められて領域外の行を掃除し損ねるため。
+/// `\e7` / `\e8`（DECSC/DECRC）はカーソル位置・属性と一緒に原点モードも
+/// 退避・復帰するので、子から見た状態は元へ戻る。
+///
+/// 掃除できるのは**表示中のグリッドだけ**。裏のグリッド（代替画面と通常画面の
+/// もう一方）にも `set_size` は効くが、escape では触れず、`\e[?1049h` で
+/// 行き来すると vt100 は代替グリッドを消してしまう。裏に残った半端は
+/// リーダー側の catch_unwind が受ける（画面切替を挟まない限り踏まない）
+fn shrink_cleanup(rows: u16, old_cols: u16, new_cols: u16) -> String {
+    // 広げる・同じなら切り詰めが起きない ＝ 半端なセルも生まれない。
+    // 0 桁は CUP の桁 0 が 1 と解釈されて別の行を壊すので触らない
+    if new_cols == 0 || new_cols >= old_cols {
+        return String::new();
+    }
+    let mut seq = String::from("\x1b7\x1b[?6l");
+    for row in 1..=rows {
+        seq.push_str(&format!("\x1b[{row};{new_cols}H\x1b[K"));
+    }
+    seq.push_str("\x1b8");
+    seq
+}
+
 /// DEC private mode 2026（synchronized output）
 const SYNC_MODE: u32 = 2026;
 
@@ -437,7 +476,13 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         });
-        self.parser.lock_recover().screen_mut().set_size(rows, cols);
+        let mut parser = self.parser.lock_recover();
+        // 掃除と切り詰めは**同じロックの中で**続けて済ませる。間を空けると、
+        // その隙にリーダーが取り込んだ全角文字が新しい最終列へ座り直して、
+        // 掃除したはずの半端がまた生まれる
+        let (old_rows, old_cols) = parser.screen().size();
+        parser.process(shrink_cleanup(old_rows, old_cols, cols).as_bytes());
+        parser.screen_mut().set_size(rows, cols);
     }
 
     pub(crate) fn alive(&mut self) -> bool {
@@ -555,6 +600,73 @@ mod tests {
         assert!(hold_frame(false, OUTPUT_QUIET / 2, fresh));
         // 静まっていて宣言も無ければ掴む
         assert!(!hold_frame(false, OUTPUT_QUIET, fresh));
+    }
+
+    /// **ペインを縮めると画面が全消去される**症状を止める。
+    ///
+    /// 新しい最終列に全角文字の前半だけが残ると、次にその列へ書いた時点で
+    /// vt100 が panic し、リーダーがパーサを作り直す ＝ ペインが空になる。
+    /// 掃除を外すとこのテストは panic で落ちる（＝ 症状そのものを踏んでいる）
+    #[test]
+    fn a_pane_narrowed_across_a_wide_character_still_takes_the_next_write() {
+        // 表示幅 2 の「あ」。テストの入力データなのでエスケープで書く
+        // （日本語をコードへ書かない約束は tests/no_japanese_in_code.rs が見ている）
+        let wide = "\u{3042}";
+        let mut parser = ccdesk::new_parser(2, 10, SCROLLBACK);
+        // 5 文字でちょうど 10 桁。9 桁へ縮めると 5 文字目の後半だけが切れる
+        parser.process(wide.repeat(5).as_bytes());
+        parser.process(shrink_cleanup(2, 10, 9).as_bytes());
+        parser.screen_mut().set_size(2, 9);
+        parser.process(b"\x1b[1;9Hx");
+        // 失うのは新しい最終列にかかった 1 文字だけ（残りはそのまま）
+        let kept = format!("{}x", wide.repeat(4));
+        assert_eq!(
+            parser.screen().contents().lines().next(),
+            Some(kept.as_str()),
+            "the row lost more than the character that straddled the new edge"
+        );
+    }
+
+    /// **広げるときと同じ幅のときは何も流さない。** 切り詰めが起きない以上
+    /// 半端なセルも生まれず、EL は子が描いた最終列を消すだけの害になる
+    #[test]
+    fn a_pane_that_grows_or_keeps_its_width_is_left_alone() {
+        assert!(shrink_cleanup(24, 80, 80).is_empty());
+        assert!(shrink_cleanup(24, 80, 120).is_empty());
+        // 0 桁は CUP の桁 0 が 1 と解釈されて別の行を壊す
+        assert!(shrink_cleanup(24, 80, 0).is_empty());
+        assert!(
+            !shrink_cleanup(24, 80, 79).is_empty(),
+            "a narrowing pane was left without its cleanup"
+        );
+    }
+
+    /// **スクロール領域の外の行も掃除する。** 子が原点モード（DECOM）を
+    /// 立てていると CUP は領域内へ丸められるので、落としてから走査する。
+    /// `\e7` / `\e8` が原点モードごと退避・復帰するのが前提で、
+    /// これが崩れると子は自分が立てたはずの座標系を失う
+    #[test]
+    fn a_child_with_a_scroll_region_gets_the_rows_outside_it_cleaned_too() {
+        let mut parser = ccdesk::new_parser(4, 10, SCROLLBACK);
+        // 2〜3 行目を領域にして原点モードへ。1 行目は領域の外
+        parser.process(b"\x1b[2;3r\x1b[?6h");
+        let wide = "\u{3042}";
+        parser.process(format!("\x1b[?6l\x1b[1;1H{}\x1b[?6h", wide.repeat(5)).as_bytes());
+        parser.process(shrink_cleanup(4, 10, 9).as_bytes());
+        parser.screen_mut().set_size(4, 9);
+        // 子から見た座標系は掃除の前後で変わらない（1 行目 ＝ 領域の先頭）
+        parser.process(b"\x1b[1;1Hy");
+        assert_eq!(
+            parser.screen().cell(1, 0).map(vt100::Cell::contents),
+            Some("y"),
+            "origin mode did not survive the cleanup"
+        );
+        // 領域の外も掃除できている（漏れていればここで vt100 が panic する）
+        parser.process(b"\x1b[?6l\x1b[1;9Hz");
+        assert_eq!(
+            parser.screen().cell(0, 8).map(vt100::Cell::contents),
+            Some("z")
+        );
     }
 
     /// **見送りは必ず終わる。** `\e[?2026l` が来なくても、出力が一度も途切れなくても、
