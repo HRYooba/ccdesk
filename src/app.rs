@@ -3565,7 +3565,12 @@ fn lift_input_gate(app: &mut App, destination: Option<&SessionId>) {
 
 /// 応答しない起動から入力を取り戻す（run ループが毎周見る）。降ろしたら `true`。
 ///
-/// 打ち先の扱いは [`lift_input_gate`]（宛先は無い ＝ サイドバーへ戻る）。
+/// **宛先はフォーカススロットの表示が答える。** 期限切れは「宛先が消えた」ではなく
+/// 「まだ掴んでいない」なので、**窓が出ているならフォーカスは動かさない**:
+/// ここで奪うと、子が生きて見えているペインへ打てなくなる（キーはサイドバー操作に
+/// なり ↑↓ で選択だけが動く ＝ ペインが無反応に見える）。`-r` の再開は transcript が
+/// 大きいほど遅く、期限を超えること自体は珍しくないので、**期限切れ ＝ 異常**とは
+/// 扱わない（報告も分ける。宛先が居る間は [`set_hint`] ＝ error.log に残さない）。
 ///
 /// **窓は閉じない。** 子は生きているかもしれない（読み込みが長い `-r` など）ので、
 /// 生死の判断は `child.try_wait()` に任せる ＝ ここが決めるのは入力の行き先だけ
@@ -3576,12 +3581,25 @@ fn expire_input_gate(app: &mut App) -> bool {
     {
         return false;
     }
-    lift_input_gate(app, None);
-    // ハングしていることを伝える（下部バーと error.log の両方。ここは異常）
-    set_notice(
-        app,
-        "session start is not responding — input moved back to the sidebar".to_string(),
-    );
+    // 打ち先の判断は [`lift_input_gate`] 1 箇所に残す（ここは宛先を渡すだけ）。
+    // **`shown_session` は定義上「打ち先として成立している行」**（[`App::showing`]
+    // が見るのと同じ 1 つの表示）なので、居るかどうかがそのまま報告の分かれ目になる
+    let shown = app.shown_session().cloned();
+    lift_input_gate(app, shown.as_ref());
+    if shown.is_some() {
+        // 遅いだけで打ち先は生きている。**フォーカスは端末に残る**ので、
+        // 以降の打鍵はそのペインへ届く（異常ではない ＝ error.log には残さない）
+        set_hint(
+            app,
+            "session start is slow — keys are delivered again".to_string(),
+        );
+    } else {
+        // 宛先が居ないまま期限を過ぎた（下部バーと error.log の両方。ここは異常）
+        set_notice(
+            app,
+            "session start is not responding — input moved back to the sidebar".to_string(),
+        );
+    }
     true
 }
 
@@ -6129,10 +6147,11 @@ mod tests {
     /// **既存の全セッションへのタイプがその間ずっと死ぬ**。
     /// 期限（[`INPUT_GATE_LIMIT`]）を超えたら門番を降ろす。
     ///
-    /// **降りた後も、打った文字は直前まで見ていたセッションへ流れない**:
-    /// フォーカスがサイドバーへ戻るので、キーはサイドバー操作として処理される
-    /// （キーが PTY へ行くのは `focus == Terminal` のときだけ）。
-    /// 打ち先はユーザーが選び直す
+    /// **降りた後の打ち先は「フォーカススロットに窓が出ているか」で決まる。**
+    /// ここは窓を 1 枚も持たない ＝ 宛先が居ないので、フォーカスがサイドバーへ戻り、
+    /// キーはサイドバー操作として処理される（キーが PTY へ行くのは
+    /// `focus == Terminal` のときだけ）。打ち先はユーザーが選び直す。
+    /// **窓が出ている場合は奪わない**（[`a_slow_launch_keeps_the_focus_on_its_pane`]）
     #[test]
     fn a_hung_launch_gives_input_back_within_a_bounded_time() {
         let mut app = test_app(34, TERM);
@@ -6165,6 +6184,41 @@ mod tests {
         );
         // 2 度目は何もしない（毎周通知を出し直さない）
         assert!(!expire_input_gate(&mut app), "an already lifted gate was lifted again");
+    }
+
+    /// **遅いだけの起動からフォーカスを奪わない。**
+    ///
+    /// 期限切れが意味するのは「宛先が消えた」ではなく「まだ端末を掴んでいない」。
+    /// 窓はフォーカススロットに出ていて子も生きているので、ここでサイドバーへ戻すと
+    /// **見えているペインへ打てなくなる**（↑↓ が一覧の選択を動かすだけで、
+    /// ペインが完全に無反応に見える ＝ クリックか `Alt+→` を押すまで戻せない）。
+    ///
+    /// `-r` の再開は transcript が大きいほど遅く、期限を超えること自体は珍しくない
+    /// （実機の `error.log` にはこの経路の記録が数十件溜まっていた）＝
+    /// **期限切れを異常として報告しない**のもここで固定する
+    #[test]
+    fn a_slow_launch_keeps_the_focus_on_its_pane() {
+        let mut app = test_app(34, TERM);
+        app.set_layout(crate::panes::Layout::One);
+        app.slots[0] = Slot::Session(SessionId::new("s"));
+        app.set_focus(Focus::Terminal); // dispatch_session と同じ状態
+        // 期限ぶん前に起こした状態（時刻を注入して待たずに検査する）
+        app.input_gate = Some(instant_ago(INPUT_GATE_LIMIT));
+
+        assert!(expire_input_gate(&mut app), "the gate does not lift past its deadline");
+        assert!(
+            !drop_input_while_starting(&mut app),
+            "a slow launch kills input forever"
+        );
+        assert!(
+            app.focus == Focus::Terminal,
+            "the focus left a pane that is still showing its session — typing would go to the sidebar"
+        );
+        let (msg, _) = app.notice.as_ref().expect("the slow start was not reported");
+        assert!(
+            !msg.contains("not responding"),
+            "a launch that is only slow is reported as a hang: {msg:?}"
+        );
     }
 
     /// **起動に失敗したときも、打った文字は直前まで見ていたセッションへ届かない。**
