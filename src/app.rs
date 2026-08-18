@@ -11,7 +11,7 @@ use ccdesk::{log_error, now_ms, same_dir, LockExt};
 
 use crate::hooks::HookStates;
 use crate::keys::{encode_key, forward_mouse, HeldInput};
-use crate::poll::{AgentInfo, FooterInfo, Grouping};
+use crate::poll::{row_state, AgentInfo, FooterInfo, Grouping, Run, State};
 use crate::usage::Usage;
 use std::collections::BTreeMap;
 
@@ -507,6 +507,14 @@ pub(crate) struct App {
     /// 窓を持たない行を「動いている」ものとして描くためだけにある
     /// （[`crate::source::DataSource::fixed_states`]）
     pub(crate) fixed_states: std::collections::HashMap<SessionId, crate::poll::State>,
+    /// 入力待ちになった行を OS の通知で知らせるか（`config.json` の `"notify"`。
+    /// 既定は false ＝ [`crate::notify`]）。**設定を読むのは `main` だけ**で、
+    /// ここに載っているのはその結果
+    pub(crate) notify: crate::notify::Wanted,
+    /// 前の周で見た行の有効 state。**通知は「変わり目」で撃つ**ので、比べる相手が要る
+    /// （[`crate::notify`]）。起動直後は空 ＝ **既に待っている行はこの周で
+    /// 「待ちになった」ものとして 1 度撃ち、既に終わっている行は撃たない**
+    pub(crate) last_states: std::collections::HashMap<SessionId, State>,
     /// 最後に見た hook 受け渡しファイルの見え方（長さ・更新時刻）。
     /// **中身ではなく「変わったか」だけを持つ**ので、run ループが毎周見ても安い。
     /// 変わった周は周期を待たずに一覧を読み直す ＝ ペイン内の `/resume` `/clear` が
@@ -689,6 +697,8 @@ impl Default for App {
             sessions: Vec::new(),
             hook_states: HookStates::default(),
             fixed_states: std::collections::HashMap::new(),
+            notify: crate::notify::Wanted::default(),
+            last_states: std::collections::HashMap::new(),
             hook_stamp: None,
             titles: Titles::default(),
             last_scan: std::time::Instant::now(),
@@ -1286,6 +1296,7 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             // 動かしているものが無いので、そのまま Stopped として描かれる
             while let Some(pos) = app.windows.iter_mut().position(|w| !w.alive()) {
                 remove_window(app, pos);
+                force_draw = true;
             }
             app.last_live_scan = std::time::Instant::now();
         }
@@ -1318,6 +1329,18 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         // **一覧と名前を確定させた後に置く**: 公開する名前は直前の
         // `refresh_transcripts` の結果で、逆にすると 1 周古い名前を公開する
         serve_relay(app);
+        // 押された OS 通知が指していた行を開く。**押された瞬間ではなくここで開く**:
+        // クリックは WinRT のイベントスレッドで届くので、そこから `App` を触らない
+        // （[`crate::notify`]）。
+        //
+        // **前面へ戻すのは行が開けたかに関わらず。** 押した人が求めているのは
+        // 「ccdesk を見せること」で、開けなかった理由（別の窓で動いている等）は
+        // 下部バーに出る ＝ 前に出ていなければその通知も読めない
+        for id in crate::notify::clicked() {
+            crate::notify::raise_terminal();
+            let _ = open_session(app, &id);
+            force_draw = true;
+        }
         // 起こした子が端末を掴んだら門番を降ろす（前景では宛先は起動の時点で
         // 決まっているので、待つのは「子が入力を読める状態になるまで」だけ）
         if app.input_gate.is_some()
@@ -1416,6 +1439,11 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             app.agents = snapshot.agents;
             app.agents_observed_at = snapshot.observed_at;
             force_draw = true;
+        }
+        // 通知は hook の変化ではなく、画面と同じ有効 state の変わり目で撃つ。
+        // status による許可解除、窓の停止、一覧の増減もここなら取りこぼさない
+        if force_draw {
+            update_notifications(app);
         }
         // claude が画面を作り替えている最中は掴まない（[`Session::holds_frame`]）。
         // 途中で掴むとカーソルが中間位置で確定し、IME の変換窓がそこへ飛ぶ。
@@ -1540,7 +1568,13 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             Event::Resize(w, h) => resize_terminal(app, w, h),
             // ホスト端末のフォーカス変化をアクティブ PTY へ中継
             // （ターミナルペインがフォーカス中のときだけ意味を持つ）
-            Event::FocusGained => forward_host_focus(app, true),
+            Event::FocusGained => {
+                // **前面に居るウィンドウを控える唯一の契機。** 端末がフォーカスを
+                // 得た瞬間なら、前面のウィンドウは ccdesk を映しているそれ
+                // （通知クリックで戻す先。[`crate::notify`]）
+                crate::notify::remember_terminal_window();
+                forward_host_focus(app, true);
+            }
             Event::FocusLost => forward_host_focus(app, false),
             _ => {}
         }
@@ -1904,6 +1938,151 @@ fn adopt_hook_states(app: &mut App) {
     if let Some(id) = shown {
         mark_read(app, &id);
     }
+}
+
+/// 画面と通知が共有する、その行の現在の有効 state。
+///
+/// hook・ライブ status・PTY・別インスタンス救済の組み立てをここ 1 箇所に置き、
+/// 通知だけが画面と違う古い状態を見ることを防ぐ。
+pub(crate) fn effective_row_states(app: &mut App) -> std::collections::HashMap<SessionId, State> {
+    struct WindowView {
+        session_id: SessionId,
+        alive: bool,
+        pty: crate::poll::PtyHint,
+        launched_at: u64,
+    }
+    let windows: Vec<WindowView> = app
+        .windows
+        .iter_mut()
+        .map(|window| WindowView {
+            session_id: window.session_id.clone(),
+            alive: window.alive(),
+            pty: window.pty_hint(),
+            launched_at: window.started_at,
+        })
+        .collect();
+    let mut states = std::collections::HashMap::new();
+    for row in &app.sessions {
+        let window = windows.iter().find(|window| window.session_id == row.session_id);
+        let (status, status_at) = live_status(&app.agents, row.conversation.id());
+        let has_live_status = row.kind.backend().has_live_status();
+        let record_grew_since = row
+            .conversation
+            .id()
+            .map_or(0, |conversation| app.titles.grew_since(conversation));
+        let run = window
+            .filter(|window| window.alive)
+            .map(|window| Run {
+                hook: app
+                    .hook_states
+                    .get(&row.session_id, Some(window.launched_at)),
+                status,
+                status_at,
+                pty: Some(window.pty),
+                has_live_status,
+                record_grew_since,
+            })
+            .or_else(|| {
+                app.fixed_states.get(&row.session_id).map(|state| Run {
+                    hook: Some((*state, 0)),
+                    status: "",
+                    status_at: 0,
+                    pty: None,
+                    has_live_status,
+                    record_grew_since: 0,
+                })
+            })
+            .or_else(|| {
+                let stopped_at = app.stopped_at.get(&row.session_id).copied().unwrap_or(0);
+                (!status.is_empty() && app.agents_observed_at > stopped_at).then_some(Run {
+                    hook: None,
+                    status,
+                    status_at,
+                    pty: None,
+                    has_live_status,
+                    record_grew_since,
+                })
+            });
+        states.insert(row.session_id.clone(), row_state(run));
+    }
+    states
+}
+
+/// 行の出来事を OS の通知へ流す（[`crate::notify`]）。
+///
+/// **撃つのは状態の変わり目**で、状態そのものではない。待ちは解決したら消える
+/// （通知は時間で引っ込むので取り下げは持たない）が、完了（Idle）は何時間も続く
+/// ので、状態を「今そうである集合」として扱うと完了通知が毎周撃たれる。
+///
+/// 材料は画面と同じ [`effective_row_states`] ＝ **通知だけが違う状態を見ない**。
+/// 前の周の写しは [`App::last_states`] が持つ
+fn update_notifications(app: &mut App) {
+    if !app.notify.any() {
+        return;
+    }
+    let states = effective_row_states(app);
+    for (id, kind) in announcements(&app.last_states, &states, app.notify) {
+        let Some(row) = app.sessions.iter().find(|row| row.session_id == id) else {
+            continue;
+        };
+        let project = crate::ui::leaf_name(&row.cwd).unwrap_or_else(|| row.cwd.clone());
+        crate::notify::post(kind, &project, &app.titles.of(row), &id);
+    }
+    app.last_states = states;
+}
+
+/// 前の周と今の周を比べて、知らせる出来事を並べる。
+///
+/// | 変わり方 | 知らせる |
+/// |:--|:--|
+/// | 待ち以外 → 待ち | [`crate::notify::Kind::NeedsInput`] |
+/// | 動作中・入力待ち → 手が空いた | [`crate::notify::Kind::Finished`] |
+///
+/// **完了は「動いていた行が止まった」ときだけ**拾う。`Stopped`（窓を閉じた）や
+/// 起動直後の `Idle` を拾うと、**何もしていない行が「終わりました」と名乗る**。
+/// **入力待ちからの遷移も数える**: 許可に答えた直後にターンが終わると、
+/// 間の `Working` が 1 周期に収まって観測されないことがある（実測で取り逃がした）。
+/// 待ちの方は「前が待ちでない」だけを見る ＝ 起動した時点で待っている行も
+/// 1 度は知らせる（前の写しが空なので `!= Waiting` が成り立つ）
+fn announcements(
+    last: &std::collections::HashMap<SessionId, State>,
+    now: &std::collections::HashMap<SessionId, State>,
+    wanted: crate::notify::Wanted,
+) -> Vec<(SessionId, crate::notify::Kind)> {
+    let mut out: Vec<(SessionId, crate::notify::Kind)> = now
+        .iter()
+        .filter_map(|(id, state)| {
+            let before = last.get(id).copied();
+            let kind = match (before, *state) {
+                (before, State::Waiting) if before != Some(State::Waiting) => {
+                    wanted.waiting.then_some(crate::notify::Kind::NeedsInput)
+                }
+                (Some(State::Working | State::Waiting), State::Idle) => {
+                    wanted.finished.then_some(crate::notify::Kind::Finished)
+                }
+                _ => None,
+            }?;
+            Some((id.clone(), kind))
+        })
+        .collect();
+    // **並びを固定する**（`HashMap` の走査順は実行ごとに変わる ＝ 同じ入力で
+    // 同じ順に撃たないとテストが揺れ、通知の並び順も理由なく入れ替わる）
+    out.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    out
+}
+
+/// ライブ状態と時刻は必ず対で取り出す。照合の鍵は行 ID ではなく会話 ID。
+pub(crate) fn live_status<'a>(
+    agents: &'a [AgentInfo],
+    conversation: Option<&str>,
+) -> (&'a str, u64) {
+    let Some(conversation) = conversation else {
+        return ("", 0);
+    };
+    agents
+        .iter()
+        .find(|agent| agent.is_interactive() && agent.session_id == conversation)
+        .map_or(("", 0), |agent| (agent.status.as_str(), agent.status_at))
 }
 
 /// hook が名乗った会話を行へ写す（[`crate::sessions::Conversation::Observed`]）。
@@ -3873,6 +4052,76 @@ mod tests {
     use crate::ui::MIN_SIDEBAR;
 
     const TERM: (u16, u16) = (120, 40);
+
+    /// **通知は状態の変わり目で撃つ。** 起動時から待っている行は 1 度知らせ、
+    /// 待ったままの行は毎周撃たない。完了は `Working` からの遷移だけを拾う
+    /// （何もしていない行が「終わりました」と名乗らない）
+    #[test]
+    fn notifications_fire_on_the_change_not_on_the_state() {
+        use crate::notify::{Kind, Wanted};
+
+        let all = Wanted { waiting: true, finished: true };
+        let states = |pairs: &[(&str, State)]| {
+            pairs
+                .iter()
+                .map(|(id, state)| (SessionId::new(*id), *state))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let kinds = |last: &[(&str, State)], now: &[(&str, State)], wanted: Wanted| {
+            announcements(&states(last), &states(now), wanted)
+                .into_iter()
+                .map(|(id, kind)| (id.as_str().to_string(), kind))
+                .collect::<Vec<_>>()
+        };
+
+        // 起動直後（前の写しが無い）に待っている行は 1 度だけ知らせる
+        let waiting = [("s", State::Waiting)];
+        assert_eq!(kinds(&[], &waiting, all), vec![("s".into(), Kind::NeedsInput)]);
+        // 待ったままなら撃たない
+        assert!(kinds(&waiting, &waiting, all).is_empty());
+        // 解けて再び待てば、また知らせる
+        assert_eq!(
+            kinds(&[("s", State::Working)], &waiting, all),
+            vec![("s".into(), Kind::NeedsInput)]
+        );
+
+        // 完了は Working からの遷移だけ
+        let idle = [("s", State::Idle)];
+        assert_eq!(
+            kinds(&[("s", State::Working)], &idle, all),
+            vec![("s".into(), Kind::Finished)]
+        );
+        // **起動直後の Idle は完了ではない**（前の写しが無い ＝ 何も終わっていない）
+        assert!(kinds(&[], &idle, all).is_empty());
+        // 窓を閉じた行が Idle へ戻っても完了ではない
+        assert!(kinds(&[("s", State::Stopped)], &idle, all).is_empty());
+        // **待ちから直に終わっても完了**（間の Working を観測し損ねた周）
+        assert_eq!(
+            kinds(&[("s", State::Waiting)], &idle, all),
+            vec![("s".into(), Kind::Finished)]
+        );
+
+        // 設定で選んだ種類だけが出る
+        let only_waiting = Wanted { waiting: true, finished: false };
+        assert!(kinds(&[("s", State::Working)], &idle, only_waiting).is_empty());
+        let only_done = Wanted { waiting: false, finished: true };
+        assert!(kinds(&[], &waiting, only_done).is_empty());
+        assert_eq!(
+            kinds(&[("s", State::Working)], &idle, only_done),
+            vec![("s".into(), Kind::Finished)]
+        );
+
+        // **並びは行 ID 順に固定**（HashMap の走査順に引きずられない）
+        let two = kinds(
+            &[("b", State::Working), ("a", State::Working)],
+            &[("b", State::Idle), ("a", State::Idle)],
+            all,
+        );
+        assert_eq!(
+            two.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
 
     /// ポップアップ・ヒットテスト判定に必要な最小の App。
     /// 中立値は `App` の [`Default`]（構造体定義の直後）が持つので、ここは

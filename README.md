@@ -103,10 +103,10 @@ fail and print the candidates rather than pick one.
 
 ## Optional features
 
-Both are off by default, and each is one line in `~/.ccdesk/config.json`:
+All of them are off by default, and each is one line in `~/.ccdesk/config.json`:
 
 ```json
-{ "codex": "on", "usage_display": "on" }
+{ "codex": "on", "usage_display": "on", "notify": ["waiting", "done"] }
 ```
 
 ### Codex
@@ -137,6 +137,39 @@ machine, so you can look before turning it on.
 
 Both usage endpoints are undocumented and unsupported — enabling this is at your own
 risk.
+
+### Desktop notifications
+
+**Windows only.** ccdesk raises a toast naming the project and the session, so you can
+walk away from a long turn and be called back. You choose what is worth interrupting
+you for:
+
+| value | fires when |
+|:--|:--|
+| `waiting` | the session needs you — a permission prompt, a plan to approve |
+| `done` | the turn finished |
+
+Both agents report both events, so a codex row is called out the same way a claude one
+is. The one gap is codex's own: it has no event for waits other than tool permission,
+so a codex session blocked on something else stays silent.
+
+Clicking the toast opens that session in ccdesk and brings its terminal to the front.
+A toast lives as long as Windows gives it — around half a minute on screen, then the
+notification center. ccdesk never withdraws one: a finished turn has nothing to
+withdraw it for, and one rule for both kinds beats two.
+
+The first notification registers ccdesk under `HKCU\Software\Classes\AppUserModelId`
+so Windows has a name to show. That also puts ccdesk in Settings > Notifications,
+where you can mute it without touching this config.
+
+Three limits come from Windows, not ccdesk:
+
+- The small icon beside the app name is the one Windows picks for whatever console
+  host ccdesk runs under; an app cannot override it. The ccdesk mark is the image
+  inside the toast instead.
+- Once a toast leaves the screen, clicking it in the notification center does nothing
+  — reaching a running app from there needs a COM activator ccdesk does not register.
+- If ccdesk sits in a background tab, the window comes forward but the tab does not.
 
 ## License
 

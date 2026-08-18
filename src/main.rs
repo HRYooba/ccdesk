@@ -20,6 +20,7 @@ mod cli;
 mod git;
 mod hooks;
 mod keys;
+mod notify;
 mod panes;
 mod poll;
 mod relay;
@@ -151,6 +152,24 @@ fn main() -> anyhow::Result<()> {
     // **設定を読むのはここだけ。** 以降は供給元（`source.kinds()`）が答えるので、
     // 撮影用の供給元は設定に触れずに全 agent を返せる
     let live_kinds = backend::Kind::enabled(load_setting);
+    // OS の通知で何を知らせるか（`~/.ccdesk/config.json` の
+    // `"notify": ["waiting", "done"]`）。値の意味は [`crate::notify::wanted`]。
+    //
+    // **既定で出さないのは、通知が端末の外へ出る唯一の出力だから。** 画面の中の
+    // 表示と違い、他の作業へ割り込む ＝ 入れた覚えのない割り込みを誰にも起こさない。
+    // **撮影用の供給元では常に off**（画面を撮っている最中にトーストを出さない）。
+    //
+    // **単値でも読む。** 配列で書く設定はこれが最初なので、`"notify": "on"` と
+    // 書いた人の config を黙って無効にしない（意味は [`crate::notify::wanted`] が持つ）。
+    // **判断はここ 1 箇所**で、以降は `App::notify` が答える
+    let notify = if demo {
+        notify::Wanted::default()
+    } else {
+        let settings = ccdesk::settings_snapshot();
+        let mut values = settings.list("notify");
+        values.extend(settings.string("notify"));
+        notify::wanted(&values)
+    };
     // 使用率の更新を run ループへ伝える旗と、クリック起点の取得が進行中か。
     // 供給元と App が同じものを持つ
     let usage_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -235,6 +254,8 @@ fn main() -> anyhow::Result<()> {
         sessions,
         hook_states,
         fixed_states,
+        notify,
+        last_states: std::collections::HashMap::new(),
         // 起動時の見え方を先に控える（run ループの 1 周目が「変わった」と誤解しない）
         hook_stamp: source.hook_stamp(),
         titles: source.titles(),
@@ -341,7 +362,18 @@ fn main() -> anyhow::Result<()> {
     // 端末フォーカスを伝えるのはここ 1 回だけ（受け取るのはフォーカススロットの窓）
     app.set_focus(Focus::Terminal);
 
-    let result = run(&mut terminal, &mut app);
+    // **起動時にも端末のウィンドウを控える**（通知クリックで前面へ戻す先。
+    // [`crate::notify`]）。`FocusGained` だけに任せると、**前面の端末で起動した
+    // 場合はフォーカスが変わらないので一度も届かない** ＝ 起動してすぐ来た通知が
+    // 画面を前へ出せない。ここの推測が外れていても、次に端末がフォーカスを
+    // 得た時点で正しい窓に置き換わる
+    notify::remember_terminal_window();
+
+    // panic でも通知・子プロセス・端末を通常終了と同じ順序で片付ける。
+    // 強制終了だけは OS が unwind を許さないため、この経路では捕捉できない
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run(&mut terminal, &mut app)
+    }));
 
     // 終了時に子プロセスを残さない。**行は残す**（`sessions.json` はそのまま ＝
     // 次の起動で一覧に出て `claude -r` で再開できる）
@@ -362,7 +394,10 @@ fn main() -> anyhow::Result<()> {
     // `?25h` を出す）。alt screen を出た後に出さないと通常画面に効かない端末があるため、
     // restore() の後で明示的に drop する（この順序は意味を持つので暗黙の drop に任せない）
     drop(terminal);
-    result
+    match result {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// `ccdesk read <session> [-n <count>] [--screen]`。
