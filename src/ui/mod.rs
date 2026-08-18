@@ -16,7 +16,7 @@ use crate::app::{
     Slot, SidebarRow,
 };
 use crate::backend::Kind;
-use crate::poll::{row_state, AccountStatus, State, Grouping, Run};
+use crate::poll::{AccountStatus, State, Grouping};
 use crate::sessions::SessionId;
 use crate::theme::{
     ui, usage_color, FOCUS_BORDER, MUTED_FG,
@@ -857,7 +857,8 @@ impl ProjectRow {
 }
 
 /// 末端ディレクトリ名。表示名と並べ替えキーの共通の材料
-fn leaf_name(cwd: &str) -> Option<String> {
+/// （OS 通知に出すプロジェクト名も同じ材料 ＝ [`crate::notify`]）
+pub(crate) fn leaf_name(cwd: &str) -> Option<String> {
     #[cfg(test)]
     count_key_call(&LEAF_NAME_CALLS);
     std::path::Path::new(cwd)
@@ -1456,16 +1457,6 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, app: &App) {
 /// **照合は会話 ID。** ライブ状態が名乗るのは claude 側の `sessionId` ＝ 会話で、
 /// ccdesk の行 ID はそこに出てこない（`CCDESK_ROW` 以外のどこにも出さない）。
 /// 会話を知らない行は未観測（`("", 0)`）で、状態は hook と PTY だけで決まる
-fn live_status<'a>(agents: &'a [crate::poll::AgentInfo], conversation: Option<&str>) -> (&'a str, u64) {
-    let Some(conversation) = conversation else {
-        return ("", 0);
-    };
-    agents
-        .iter()
-        .find(|a| a.is_interactive() && a.session_id == conversation)
-        .map_or(("", 0), |a| (a.status.as_str(), a.status_at))
-}
-
 pub(crate) fn pane_rect(app: &App) -> Rect {
     let (w, h) = (app.term_size.0, app.term_size.1);
     let sidebar = sidebar_cols(app).min(w);
@@ -1490,27 +1481,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // Working の明滅の位相もここで取る時刻（`ccdesk::now_ms`）から決める
     let now_ms = ccdesk::now_ms();
 
-    // 窓ごとの観測を**先に**確定させる（生死と出力ヒューリスティックは可変借用が要る）。
-    // 以降は行の一覧を不変で回せるので、行の組み立ては 1 本のループで済む
-    struct WindowView {
-        session_id: crate::sessions::SessionId,
-        alive: bool,
-        pty: crate::poll::PtyHint,
-        /// この窓が claude を起こした時刻（hook の新旧判断の材料）
-        launched_at: u64,
-    }
-    let windows: Vec<WindowView> = app
-        .windows
-        .iter_mut()
-        .map(|w| WindowView {
-            session_id: w.session_id.clone(),
-            // 生死の観測（try_wait = プロセス状態の syscall）は**窓 1 つにつき
-            // 1 フレーム 1 回**。pty_hint は出力時刻を見るだけで生死を見ない
-            alive: w.alive(),
-            pty: w.pty_hint(),
-            launched_at: w.started_at,
-        })
-        .collect();
+    // 通知もこの写しを使う。状態材料の裁定を描画だけに閉じると、承認後に
+    // status が hook を追い越したとき通知だけ Waiting のまま残る
+    let effective_states = crate::app::effective_row_states(app);
     // **今どれかのスロットに出ている行**（印を付ける対象）。フォーカス中の 1 枚だけ
     // ではないのが要点で、4 枚並べたら 4 行に印が付く
     let on_screen: Vec<crate::sessions::SessionId> = app
@@ -1531,75 +1504,16 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     let kinds = app.kinds.clone();
     let mut data: Vec<RowData> = Vec::new();
     for row in app.sessions.iter().filter(|row| kinds.contains(&row.kind)) {
-        let window = windows
-            .iter()
-            .enumerate()
-            .find(|(_, w)| w.session_id == row.session_id);
-        let (status, status_at) = live_status(&app.agents, row.conversation.id());
-        // **その行を動かしている実行**。自分の窓（＝ ccdesk の子プロセス）が
-        // 生きている行が主で、無ければ撮影用の固定表、それも無ければ
-        // ライブ状態が拾っている前景セッション（＝ 別インスタンスや
-        // ccdesk の外で動いている実行）を実行として扱う
-        // hook を取り逃したときに代用の材料（PTY の無音・記録の伸び）が要るか
-        // （agent が答える。[`crate::backend::Backend::has_live_status`]）
-        let has_live_status = row.kind.backend().has_live_status();
-        // 記録が伸びたかは会話に付く（会話を知らない行は代用の材料も持てない）
-        let record_grew_since = row
-            .conversation
-            .id()
-            .map_or(0, |conversation| app.titles.grew_since(conversation));
-        let run = window
-            .filter(|(_, w)| w.alive)
-            .map(|(_, w)| Run {
-                hook: app.hook_states.get(&row.session_id, Some(w.launched_at)),
-                status,
-                status_at,
-                pty: Some(w.pty),
-                has_live_status,
-                record_grew_since,
-            })
-            .or_else(|| {
-                app.fixed_states.get(&row.session_id).map(|state| Run {
-                    // 撮影用の固定 state は時刻を持たない（status も空なので
-                    // 観測に追い越されることが起き得ない）
-                    hook: Some((*state, 0)),
-                    status: "",
-                    status_at: 0,
-                    pty: None,
-                    has_live_status,
-                    record_grew_since: 0,
-                })
-            })
-            .or_else(|| {
-                // 別インスタンスで動いている行を Stopped と描かない（Stopped の行は
-                // open で `claude -r` を起こすので、嘘の Stopped は二重再開の入口になる）。
-                // hook の記録は起動時刻で新旧を判断できない（他人の窓）ので使わない。
-                //
-                // **ただし、ccdesk 自身がこの行を止めた直後は例外。** ライブ状態
-                // の観測は最大 2 秒古く、今 kill したばかりの自分のセッションがまだ
-                // 載っていることがある。観測時刻（[`App::agents_observed_at`]）が
-                // 停止時刻（[`App::stopped_at`]）より新しくなるまでは、この救済を
-                // 「他インスタンスの実行」として採らない ＝ Stopped のまま描く
-                // （採ってしまうと、次のポーリングで残像が消えるまでの一瞬だけ
-                // Waiting 等を経由してから Stopped になる）
-                let stopped_at = app.stopped_at.get(&row.session_id).copied().unwrap_or(0);
-                (!status.is_empty() && app.agents_observed_at > stopped_at).then_some(Run {
-                    hook: None,
-                    status,
-                    status_at,
-                    has_live_status,
-                    record_grew_since,
-                    // 他インスタンスの実行 ＝ こちらに窓が無い（材料は status）
-                    pty: None,
-                })
-            });
         // **未読は状態の材料でもある**（[`crate::poll::State::group`]）: 手が要らない行は
         // 「まだ見ていない（Done）」と「見終わった（Idle）」に割れる
         let unread = app.hook_states.unread(row);
         data.push(RowData {
             action: RowAction::Open(row.session_id.clone()),
             id: row.session_id.clone(),
-            group: row_state(run),
+            group: effective_states
+                .get(&row.session_id)
+                .copied()
+                .unwrap_or(State::Stopped),
             kind: row.kind,
             cwd: row.cwd.clone(),
             label: app.titles.of(row),
@@ -2299,7 +2213,8 @@ fn terminal_cursor_pos(pane: Rect, inner: Rect, crow: u16, ccol: u16) -> Positio
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::poll::{PtyHint, State};
+    use crate::app::live_status;
+    use crate::poll::{row_state, PtyHint, Run, State};
 
     // 語彙の別名（綴りの正本は [`State::as_str`]）
     const WORKING: State = State::Working;
