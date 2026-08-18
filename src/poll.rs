@@ -847,6 +847,27 @@ pub(crate) enum PtyHint {
     Quiet,
 }
 
+/// 行の有効 state と、**その値を誰が名乗ったか**。
+///
+/// `reported` が false ＝ hook も status も 1 つも無く、[`row_state`] が PTY から
+/// 推した値 ＝ **まだ起動中**。この 1 ビットが無いと「起動の Working」と
+/// 「ターン中の Working」が同じ値になり、**窓を開けただけの行が Idle へ落ちた瞬間に
+/// 「ターンが終わりました」と名乗る**（[`crate::app`] の通知）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct RowState {
+    pub(crate) state: State,
+    pub(crate) reported: bool,
+}
+
+/// [`row_state`] に出どころを添えて返す。**材料の一覧を持つのはここ 1 箇所**で、
+/// 判定に使う材料が増えたら `reported` の条件も同じ関数の中で直る
+pub(crate) fn row_view(run: Option<Run<'_>>) -> RowState {
+    let reported = run
+        .as_ref()
+        .is_some_and(|run| run.hook.is_some() || state_of_status(run.status).is_some());
+    RowState { state: row_state(run), reported }
+}
+
 /// 1 行に出す状態を決める。**行に保存せず、そのつど導く。**
 ///
 /// ```text

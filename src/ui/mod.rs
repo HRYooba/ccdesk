@@ -1512,8 +1512,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
             id: row.session_id.clone(),
             group: effective_states
                 .get(&row.session_id)
-                .copied()
-                .unwrap_or(State::Stopped),
+                .map_or(State::Stopped, |view| view.state),
             kind: row.kind,
             cwd: row.cwd.clone(),
             label: app.titles.of(row),

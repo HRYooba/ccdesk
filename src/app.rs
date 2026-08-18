@@ -11,7 +11,7 @@ use ccdesk::{log_error, now_ms, same_dir, LockExt};
 
 use crate::hooks::HookStates;
 use crate::keys::{encode_key, forward_mouse, HeldInput};
-use crate::poll::{row_state, AgentInfo, FooterInfo, Grouping, Run, State};
+use crate::poll::{AgentInfo, FooterInfo, Grouping, Run, State};
 use crate::usage::Usage;
 use std::collections::BTreeMap;
 
@@ -511,10 +511,10 @@ pub(crate) struct App {
     /// 既定は false ＝ [`crate::notify`]）。**設定を読むのは `main` だけ**で、
     /// ここに載っているのはその結果
     pub(crate) notify: crate::notify::Wanted,
-    /// 前の周で見た行の有効 state。**通知は「変わり目」で撃つ**ので、比べる相手が要る
-    /// （[`crate::notify`]）。起動直後は空 ＝ **既に待っている行はこの周で
-    /// 「待ちになった」ものとして 1 度撃ち、既に終わっている行は撃たない**
-    pub(crate) last_states: std::collections::HashMap<SessionId, State>,
+    /// 前の周で見た行の姿。**通知は「変わり目」で撃つ**ので、比べる相手が要る
+    /// （[`crate::notify`]）。**起動直後は空 ＝ その周は 1 つも撃たない**:
+    /// 前の姿を知らない行は「変わった」と言えない（[`announce`]）
+    pub(crate) last_states: std::collections::HashMap<SessionId, Seen>,
     /// 最後に見た hook 受け渡しファイルの見え方（長さ・更新時刻）。
     /// **中身ではなく「変わったか」だけを持つ**ので、run ループが毎周見ても安い。
     /// 変わった周は周期を待たずに一覧を読み直す ＝ ペイン内の `/resume` `/clear` が
@@ -1944,7 +1944,9 @@ fn adopt_hook_states(app: &mut App) {
 ///
 /// hook・ライブ status・PTY・別インスタンス救済の組み立てをここ 1 箇所に置き、
 /// 通知だけが画面と違う古い状態を見ることを防ぐ。
-pub(crate) fn effective_row_states(app: &mut App) -> std::collections::HashMap<SessionId, State> {
+pub(crate) fn effective_row_states(
+    app: &mut App,
+) -> std::collections::HashMap<SessionId, crate::poll::RowState> {
     struct WindowView {
         session_id: SessionId,
         alive: bool,
@@ -2003,7 +2005,7 @@ pub(crate) fn effective_row_states(app: &mut App) -> std::collections::HashMap<S
                     record_grew_since,
                 })
             });
-        states.insert(row.session_id.clone(), row_state(run));
+        states.insert(row.session_id.clone(), crate::poll::row_view(run));
     }
     states
 }
@@ -2015,60 +2017,102 @@ pub(crate) fn effective_row_states(app: &mut App) -> std::collections::HashMap<S
 /// ので、状態を「今そうである集合」として扱うと完了通知が毎周撃たれる。
 ///
 /// 材料は画面と同じ [`effective_row_states`] ＝ **通知だけが違う状態を見ない**。
-/// 前の周の写しは [`App::last_states`] が持つ
+/// 前の周の写しは [`App::last_states`] が持ち、撃つ物と次の写しは [`announce`] が
+/// 同時に返す
 fn update_notifications(app: &mut App) {
     if !app.notify.any() {
         return;
     }
     let states = effective_row_states(app);
-    for (id, kind) in announcements(&app.last_states, &states, app.notify) {
+    let (announcements, seen) = announce(&app.last_states, &states, app.notify);
+    for (id, kind) in announcements {
         let Some(row) = app.sessions.iter().find(|row| row.session_id == id) else {
             continue;
         };
         let project = crate::ui::leaf_name(&row.cwd).unwrap_or_else(|| row.cwd.clone());
         crate::notify::post(kind, &project, &app.titles.of(row), &id);
     }
-    app.last_states = states;
+    app.last_states = seen;
 }
 
-/// 前の周と今の周を比べて、知らせる出来事を並べる。
+/// 前の周に見た行の姿。**通知が覚えているのはこれで全部**（画面はこれを読まない）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Seen {
+    /// その周の有効 state
+    pub(crate) state: State,
+    /// **今の実行で 1 度でも「手が空いた」と agent 自身が名乗った**か
+    /// ＝ その行の起動が終わるのを見届けた。
+    ///
+    /// 窓を起こしてから最初の `SessionStart`（[`crate::hooks`]）が届くまでの間、
+    /// 行は材料が無いまま PTY から `Working` と推されている。そこから `Idle` へ
+    /// 落ちる瞬間は**「ターンが終わった」と見た目が全く同じ**で、この 1 ビットが
+    /// 無いとセッションを開くたび・`stop` を解除するたびに完了通知が鳴る（報告
+    /// された症状）。
+    ///
+    /// **条件を「起動から N 秒」ではなく「自分でそう名乗った」に置く**のが要点で、
+    /// 起動の速さにも、起動直後に最初へ載る値が `busy` か `idle` かにも依存しない
+    pub(crate) settled: bool,
+}
+
+/// 前の周の写しと今の周の観測を突き合わせ、**知らせる出来事**と**次の周の写し**を
+/// 同時に作る。
 ///
-/// | 変わり方 | 知らせる |
-/// |:--|:--|
-/// | 待ち以外 → 待ち | [`crate::notify::Kind::NeedsInput`] |
-/// | 動作中・入力待ち → 手が空いた | [`crate::notify::Kind::Finished`] |
+/// | 前の周 | 今の周 | 知らせる |
+/// |:--|:--|:--|
+/// | 待ち以外 | 入力待ち | [`crate::notify::Kind::NeedsInput`] |
+/// | 動作中・入力待ち | 手が空いた | [`crate::notify::Kind::Finished`] |
 ///
-/// **完了は「動いていた行が止まった」ときだけ**拾う。`Stopped`（窓を閉じた）や
-/// 起動直後の `Idle` を拾うと、**何もしていない行が「終わりました」と名乗る**。
-/// **入力待ちからの遷移も数える**: 許可に答えた直後にターンが終わると、
-/// 間の `Working` が 1 周期に収まって観測されないことがある（実測で取り逃がした）。
-/// 待ちの方は「前が待ちでない」だけを見る ＝ 起動した時点で待っている行も
-/// 1 度は知らせる（前の写しが空なので `!= Waiting` が成り立つ）
-fn announcements(
-    last: &std::collections::HashMap<SessionId, State>,
-    now: &std::collections::HashMap<SessionId, State>,
+/// **どちらも [`Seen::settled`] が立っている行にしか起きない。** 起動を見届けて
+/// いない行の変化は、起動そのものか、起動前から続いていた何か ＝ **ユーザーを
+/// 呼び出す理由にならない**。これで消える誤報は 3 つとも実際に鳴っていたもの:
+/// ccdesk の起動（写しが空の周に、一覧に並んだ待ち行が一斉に名乗る）、
+/// セッションの起動、`stop` の解除（後の 2 つは `Working` → `Idle` に見える）。
+///
+/// **入力待ちからの完了も数える**: 許可に答えた直後にターンが終わると、間の
+/// `Working` が 1 周期に収まって観測されないことがある（実測で取り逃がした）。
+///
+/// 判定と写しの更新を 1 つの関数が返すのは、**2 つに割ると食い違うから**
+/// （撃った出来事と、次の周が比べる相手とが、別々の規則で決まる形にしない）
+fn announce(
+    last: &std::collections::HashMap<SessionId, Seen>,
+    now: &std::collections::HashMap<SessionId, crate::poll::RowState>,
     wanted: crate::notify::Wanted,
-) -> Vec<(SessionId, crate::notify::Kind)> {
-    let mut out: Vec<(SessionId, crate::notify::Kind)> = now
-        .iter()
-        .filter_map(|(id, state)| {
-            let before = last.get(id).copied();
-            let kind = match (before, *state) {
-                (before, State::Waiting) if before != Some(State::Waiting) => {
-                    wanted.waiting.then_some(crate::notify::Kind::NeedsInput)
-                }
-                (Some(State::Working | State::Waiting), State::Idle) => {
-                    wanted.finished.then_some(crate::notify::Kind::Finished)
-                }
-                _ => None,
-            }?;
-            Some((id.clone(), kind))
-        })
-        .collect();
+) -> (
+    Vec<(SessionId, crate::notify::Kind)>,
+    std::collections::HashMap<SessionId, Seen>,
+) {
+    let mut out: Vec<(SessionId, crate::notify::Kind)> = Vec::new();
+    let mut seen = std::collections::HashMap::with_capacity(now.len());
+    for (id, view) in now {
+        let before = last.get(id);
+        let settled = match view.state {
+            // 窓が無くなった行は「起動を見届けていない」へ戻る（`stop` と、その解除）
+            State::Stopped => false,
+            // **PTY から推しただけの Idle は数えない**（[`crate::poll::RowState`]）
+            State::Idle if view.reported => true,
+            _ => before.is_some_and(|before| before.settled),
+        };
+        seen.insert(id.clone(), Seen { state: view.state, settled });
+        let Some(before) = before.filter(|before| before.settled) else {
+            continue;
+        };
+        let kind = match (before.state, view.state) {
+            (before, State::Waiting) if before != State::Waiting => {
+                wanted.waiting.then_some(crate::notify::Kind::NeedsInput)
+            }
+            (State::Working | State::Waiting, State::Idle) => {
+                wanted.finished.then_some(crate::notify::Kind::Finished)
+            }
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            out.push((id.clone(), kind));
+        }
+    }
     // **並びを固定する**（`HashMap` の走査順は実行ごとに変わる ＝ 同じ入力で
     // 同じ順に撃たないとテストが揺れ、通知の並び順も理由なく入れ替わる）
     out.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
-    out
+    (out, seen)
 }
 
 /// ライブ状態と時刻は必ず対で取り出す。照合の鍵は行 ID ではなく会話 ID。
@@ -4053,68 +4097,106 @@ mod tests {
 
     const TERM: (u16, u16) = (120, 40);
 
-    /// **通知は状態の変わり目で撃つ。** 起動時から待っている行は 1 度知らせ、
-    /// 待ったままの行は毎周撃たない。完了は `Working` からの遷移だけを拾う
-    /// （何もしていない行が「終わりました」と名乗らない）
+    /// **通知は状態の変わり目で撃つ。** しかも起動を見届けた行の変わり目だけで、
+    /// ccdesk の起動・セッションの起動・`stop` の解除では撃たない
+    /// （どれも実際に鳴った誤報。[`announce`]）
     #[test]
     fn notifications_fire_on_the_change_not_on_the_state() {
         use crate::notify::{Kind, Wanted};
+        use crate::poll::RowState;
 
         let all = Wanted { waiting: true, finished: true };
-        let states = |pairs: &[(&str, State)]| {
-            pairs
-                .iter()
-                .map(|(id, state)| (SessionId::new(*id), *state))
-                .collect::<std::collections::HashMap<_, _>>()
+        // agent 自身（hook・status）が名乗った state
+        let live = |state| RowState { state, reported: true };
+        // 窓を起こした直後、材料がまだ 1 つも無く PTY から推しただけの state
+        let booting = |state| RowState { state, reported: false };
+        // 周を順に食わせて、その間に撃った物を全部並べる（1 周だけの判定では
+        // 起動を見届けたかどうかが表せない ＝ この機能のバグは全部そこにあった）
+        let fired = |rounds: &[Vec<(&str, RowState)>], wanted| {
+            let mut last = std::collections::HashMap::new();
+            let mut all = Vec::new();
+            for round in rounds {
+                let now = round
+                    .iter()
+                    .map(|(id, view)| (SessionId::new(*id), *view))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let (out, seen) = announce(&last, &now, wanted);
+                all.extend(out.into_iter().map(|(id, kind)| (id.as_str().to_string(), kind)));
+                last = seen;
+            }
+            all
         };
-        let kinds = |last: &[(&str, State)], now: &[(&str, State)], wanted: Wanted| {
-            announcements(&states(last), &states(now), wanted)
-                .into_iter()
-                .map(|(id, kind)| (id.as_str().to_string(), kind))
-                .collect::<Vec<_>>()
+        let round = |view| vec![vec![("s", view)]];
+        let after = |views: &[RowState]| {
+            views.iter().map(|view| vec![("s", *view)]).collect::<Vec<_>>()
         };
 
-        // 起動直後（前の写しが無い）に待っている行は 1 度だけ知らせる
-        let waiting = [("s", State::Waiting)];
-        assert_eq!(kinds(&[], &waiting, all), vec![("s".into(), Kind::NeedsInput)]);
-        // 待ったままなら撃たない
-        assert!(kinds(&waiting, &waiting, all).is_empty());
-        // 解けて再び待てば、また知らせる
-        assert_eq!(
-            kinds(&[("s", State::Working)], &waiting, all),
-            vec![("s".into(), Kind::NeedsInput)]
-        );
+        // **ccdesk を起動した周は 1 つも撃たない。** 既に待っている行も既に終わって
+        // いる行も、一覧に並んで見えている ＝ 呼び出す理由が無い
+        assert!(fired(&round(live(State::Waiting)), all).is_empty());
+        assert!(fired(&round(live(State::Idle)), all).is_empty());
+        // 起動直後の 1 周目に `busy` が載っていても、その行はまだ何も終えていない
+        assert!(fired(&after(&[live(State::Working), live(State::Idle)]), all).is_empty());
 
-        // 完了は Working からの遷移だけ
-        let idle = [("s", State::Idle)];
+        // **セッションの起動は仕事ではない**: PTY 起因の Working から
+        // `SessionStart` の Idle へ落ちるのは完了ではない
+        assert!(fired(&after(&[booting(State::Working), live(State::Idle)]), all).is_empty());
+
+        // 起動を見届けた行が動いて止まれば、そこからは撃つ
+        let boot = [booting(State::Working), live(State::Idle)];
+        let turn = |tail: &[RowState]| {
+            after(&[boot.as_slice(), tail].concat())
+        };
         assert_eq!(
-            kinds(&[("s", State::Working)], &idle, all),
+            fired(&turn(&[live(State::Working), live(State::Idle)]), all),
             vec![("s".into(), Kind::Finished)]
         );
-        // **起動直後の Idle は完了ではない**（前の写しが無い ＝ 何も終わっていない）
-        assert!(kinds(&[], &idle, all).is_empty());
-        // 窓を閉じた行が Idle へ戻っても完了ではない
-        assert!(kinds(&[("s", State::Stopped)], &idle, all).is_empty());
+        // 許可待ちに入れば知らせ、待ったままなら撃たず、解けて終われば完了
+        assert_eq!(
+            fired(
+                &turn(&[
+                    live(State::Working),
+                    live(State::Waiting),
+                    live(State::Waiting),
+                    live(State::Idle),
+                ]),
+                all
+            ),
+            vec![("s".into(), Kind::NeedsInput), ("s".into(), Kind::Finished)]
+        );
         // **待ちから直に終わっても完了**（間の Working を観測し損ねた周）
         assert_eq!(
-            kinds(&[("s", State::Waiting)], &idle, all),
-            vec![("s".into(), Kind::Finished)]
+            fired(&turn(&[live(State::Waiting), live(State::Idle)]), all),
+            vec![("s".into(), Kind::NeedsInput), ("s".into(), Kind::Finished)]
         );
+
+        // **`stop` の解除でも撃たない**: 窓を閉じた行は見届けをやり直す
+        assert!(fired(
+            &turn(&[
+                live(State::Stopped),
+                booting(State::Working),
+                live(State::Idle),
+            ]),
+            all
+        )
+        .is_empty());
 
         // 設定で選んだ種類だけが出る
         let only_waiting = Wanted { waiting: true, finished: false };
-        assert!(kinds(&[("s", State::Working)], &idle, only_waiting).is_empty());
+        assert!(fired(&turn(&[live(State::Working), live(State::Idle)]), only_waiting).is_empty());
         let only_done = Wanted { waiting: false, finished: true };
-        assert!(kinds(&[], &waiting, only_done).is_empty());
         assert_eq!(
-            kinds(&[("s", State::Working)], &idle, only_done),
+            fired(&turn(&[live(State::Waiting), live(State::Idle)]), only_done),
             vec![("s".into(), Kind::Finished)]
         );
 
         // **並びは行 ID 順に固定**（HashMap の走査順に引きずられない）
-        let two = kinds(
-            &[("b", State::Working), ("a", State::Working)],
-            &[("b", State::Idle), ("a", State::Idle)],
+        let two = fired(
+            &[
+                vec![("b", live(State::Idle)), ("a", live(State::Idle))],
+                vec![("b", live(State::Working)), ("a", live(State::Working))],
+                vec![("b", live(State::Idle)), ("a", live(State::Idle))],
+            ],
             all,
         );
         assert_eq!(
