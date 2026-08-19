@@ -217,6 +217,49 @@ struct Entry {
     conversation: Option<String>,
 }
 
+impl Entry {
+    /// この項目を書いたのが**ターンの終わりを名乗るイベント**（`Stop` /
+    /// `StopFailure`）か。
+    ///
+    /// **state だけでは足りない。** [`HOOK_EVENTS`] で `Idle` を書くイベントは
+    /// 3 つ（`SessionStart` / `Stop` / `StopFailure`）あり、`SessionStart` は
+    /// ターンの終わりではない ＝ これを混ぜると**ペインの中の `/clear` `/resume`
+    /// が完了通知になる**（[`crate::poll::RowState::interrupted`]）。
+    ///
+    /// 材料は `activity_at` で足りる: activity を持つ hook は `at` と同じ時刻で
+    /// これを更新し、持たない hook は前回値を引き継ぐ（[`record`]）＝ 一致は
+    /// 「この項目を書いたイベントが activity 付きだった」と同義。そして `Idle` を
+    /// 書く 3 つのうち **activity を持たないのは `SessionStart` だけ**。
+    ///
+    /// この対応は表（[`HOOK_EVENTS`]）を書き換えれば崩れるので、崩れたら
+    /// `only_a_turn_ending_event_marks_the_entry_as_ended` が落ちるようにしてある
+    fn ended(&self) -> bool {
+        self.state == State::Idle && self.activity_at == Some(self.at)
+    }
+}
+
+/// hook が名乗った 1 件。**state と「誰が名乗ったか」を割らない**
+/// （割ると、撃つ判断と写しの更新が別々の規則で決まる形になる）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Reported {
+    pub(crate) state: State,
+    /// 受けた時刻（epoch ms）。`status` の観測時刻とどちらが新しいかを見る材料
+    pub(crate) at: u64,
+    /// **ターンの終わりを名乗るイベントが書いたか**（[`Entry::ended`]）。
+    /// 通知はこれを見て「完了」と「手が空いただけ」を分ける
+    pub(crate) ended: bool,
+}
+
+#[cfg(test)]
+impl Reported {
+    /// テスト用: **ターンの終わりを名乗った** hook 1 件（`Idle` は `Stop` 相当）。
+    /// `SessionStart` の `Idle`（＝ 終わりではない）を作るテストは
+    /// 構造体リテラルで `ended: false` を明示する
+    pub(crate) fn new(state: State, at: u64) -> Self {
+        Self { state, at, ended: state == State::Idle }
+    }
+}
+
 /// hook が書いた state の写し（`session_id` → [`Entry`]）
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct HookStates(BTreeMap<SessionId, Entry>);
@@ -237,11 +280,16 @@ impl HookStates {
     /// 2 秒周期で遅れて届くので、それを材料にすると `stop` 直後の**正当な
     /// `stopped` が捨てられ**、前の state（`blocked` ＝ Needs input）に戻る
     ///
-    /// 返り値は (state, 記録時刻)。時刻は `status` の観測時刻とどちらが新しいかを
-    /// 見る材料（[`crate::poll::row_state`]）
-    pub(crate) fn get(&self, id: &SessionId, launched: Option<u64>) -> Option<(State, u64)> {
+    /// 返り値は [`Reported`]（state・記録時刻・ターンの終わりを名乗ったか）。
+    /// 時刻は `status` の観測時刻とどちらが新しいかを見る材料
+    /// （[`crate::poll::row_state`]）
+    pub(crate) fn get(&self, id: &SessionId, launched: Option<u64>) -> Option<Reported> {
         let entry = self.0.get(id)?;
-        (entry.at >= launched?).then_some((entry.state, entry.at))
+        (entry.at >= launched?).then_some(Reported {
+            state: entry.state,
+            at: entry.at,
+            ended: entry.ended(),
+        })
     }
 
     /// その行が**最後に名乗った会話**。
@@ -756,7 +804,7 @@ mod tests {
     /// [`a_hook_state_belongs_to_the_run_that_was_launched_before_it`] が固定する**ので、
     /// 保管の読み書きを見る他のテストは起動時刻 0（＝ 何でも受ける）で引く
     fn stored(states: &HookStates, id: &SessionId) -> Option<State> {
-        states.get(id, Some(0)).map(|(state, _)| state)
+        states.get(id, Some(0)).map(|hook| hook.state)
     }
 
     /// **注入する表と受け口が同じ表を読む。** 片方だけ知っているイベントがあると、
@@ -1087,15 +1135,54 @@ mod tests {
     fn a_hook_state_belongs_to_the_run_that_was_launched_before_it() {
         let states = HookStates::from_entries([("s", STOPPED, 2_000)]);
         // 起動より後に記録された ＝ 今の実行のもの（記録時刻も一緒に返る）
-        assert_eq!(states.get(&id("s"), Some(1_000)), Some((STOPPED, 2_000)));
+        assert_eq!(states.get(&id("s"), Some(1_000)), Some(Reported::new(STOPPED, 2_000)));
         // 起動と同時刻も今の実行（時計の分解能で同じ ms に並び得る）
-        assert_eq!(states.get(&id("s"), Some(2_000)), Some((STOPPED, 2_000)));
+        assert_eq!(states.get(&id("s"), Some(2_000)), Some(Reported::new(STOPPED, 2_000)));
         // 起動より前に記録された ＝ 前回の実行の残骸
         assert_eq!(states.get(&id("s"), Some(3_000)), None);
         // 窓が無い行は動いていない ＝ 保管の値は過去の実行のもの
         assert_eq!(states.get(&id("s"), None), None);
         // 記録の無い行はいつでも None（hook が一度も来ていない）
         assert_eq!(states.get(&id("other"), Some(0)), None);
+    }
+
+    /// **ターンの終わりを名乗るイベントだけが `ended` を立てる。**
+    ///
+    /// [`Entry::ended`] は `activity_at == at` を「activity 付きのイベントが
+    /// 書いた」の代わりに読む。その読み替えが成り立つのは **`Idle` を書く 3 つの
+    /// うち activity を持たないのが `SessionStart` だけ**という表
+    /// （[`HOOK_EVENTS`]）の性質のおかげなので、表を書き換えたらここが落ちる。
+    ///
+    /// これが崩れると**ペインの中の `/clear` `/resume` が完了通知になる**
+    /// （`SessionStart` の `Idle` を「ターンが終わった」と読む）
+    #[test]
+    fn only_a_turn_ending_event_marks_the_entry_as_ended() {
+        let ends_the_turn = |event: &str| matches!(event, "Stop" | "StopFailure");
+        for row in HOOK_EVENTS {
+            let temp = TempStore::new("ended");
+            let (state, activity) =
+                resolve(row.event, Some(row.state.as_str())).expect("the pair is not in the table");
+            record(&temp.path(), &id("s"), state, activity, 1_000, None);
+            let stored = states_at(&temp.path()).get(&id("s"), Some(0)).expect("nothing stored");
+            assert_eq!(
+                stored.ended,
+                ends_the_turn(row.event),
+                "{} {} was read as ended={}",
+                row.event,
+                row.state.as_str(),
+                stored.ended
+            );
+        }
+        // **前のイベントの activity は引き継がれるが、`ended` には化けない**:
+        // `Stop(idle)` の直後に `SessionStart(idle)` が来ても終わり扱いにしない
+        // （`/clear` `/resume` がこの順で書く）
+        let temp = TempStore::new("cleared");
+        record(&temp.path(), &id("s"), IDLE, true, 1_000, None);
+        record(&temp.path(), &id("s"), IDLE, false, 2_000, None);
+        let stored = states_at(&temp.path()).get(&id("s"), Some(0)).expect("nothing stored");
+        assert!(!stored.ended, "a new session inherited the finished turn");
+        // 未読の記録の方は引き継ぐ（[`Entry::activity_at`]）
+        assert_eq!(stored.at, 2_000);
     }
 
     /// **未読は「ユーザーの見るべき出来事が、最後に開いた後に起きたか」。**

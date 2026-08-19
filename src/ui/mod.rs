@@ -2213,7 +2213,8 @@ fn terminal_cursor_pos(pane: Rect, inner: Rect, crow: u16, ccol: u16) -> Positio
 pub(crate) mod tests {
     use super::*;
     use crate::app::live_status;
-    use crate::poll::{row_state, PtyHint, Run, State};
+    use crate::hooks::Reported;
+    use crate::poll::{row_state, row_view, PtyHint, Run, State};
 
     // 語彙の別名（綴りの正本は [`State::as_str`]）
     const WORKING: State = State::Working;
@@ -2830,7 +2831,7 @@ pub(crate) mod tests {
     fn a_quiet_pane_only_clears_working_for_an_agent_with_no_live_status() {
         let view = |has_live_status, pty| {
             row_state(Some(Run {
-                hook: Some((WORKING, 1_000)),
+                hook: Some(Reported::new(WORKING, 1_000)),
                 status: "",
                 status_at: 0,
                 pty: Some(pty),
@@ -2856,7 +2857,7 @@ pub(crate) mod tests {
     fn no_amount_of_pty_output_clears_waiting() {
         let view = |pty| {
             row_state(Some(Run {
-                hook: Some((WAITING, 1_000)),
+                hook: Some(Reported::new(WAITING, 1_000)),
                 status: "",
                 status_at: 0,
                 pty: Some(pty),
@@ -2882,7 +2883,7 @@ pub(crate) mod tests {
     fn a_record_that_grows_after_the_prompt_ends_the_wait() {
         let view = |has_live_status, record_grew_since| {
             row_state(Some(Run {
-                hook: Some((WAITING, 1_000)),
+                hook: Some(Reported::new(WAITING, 1_000)),
                 status: "",
                 status_at: 0,
                 pty: Some(PtyHint::Writing),
@@ -2911,17 +2912,82 @@ pub(crate) mod tests {
             row_state(Some(Run { hook, status, status_at, pty: None, has_live_status: true, record_grew_since: 0 }))
         };
         // 観測の方が新しい → 観測が勝つ
-        assert_eq!(view(Some((WORKING, 1_000)), "idle", 2_000), IDLE);
-        assert_eq!(view(Some((IDLE, 1_000)), "busy", 2_000), WORKING);
+        assert_eq!(view(Some(Reported::new(WORKING, 1_000)), "idle", 2_000), IDLE);
+        assert_eq!(view(Some(Reported::new(IDLE, 1_000)), "busy", 2_000), WORKING);
         // **赤の固着そのもの**: 陳腐化した busy より新しい idle hook が勝つ
-        assert_eq!(view(Some((IDLE, 2_000)), "busy", 1_000), IDLE);
-        assert_eq!(view(Some((State::Idle, 1_000)), "waiting", 2_000), WAITING);
+        assert_eq!(view(Some(Reported::new(IDLE, 2_000)), "busy", 1_000), IDLE);
+        assert_eq!(view(Some(Reported::new(State::Idle, 1_000)), "waiting", 2_000), WAITING);
         // hook の方が新しい（または同時刻）→ hook が勝つ
-        assert_eq!(view(Some((WORKING, 1_000)), "idle", 999), WORKING);
-        assert_eq!(view(Some((WORKING, 1_000)), "idle", 1_000), WORKING);
+        assert_eq!(view(Some(Reported::new(WORKING, 1_000)), "idle", 999), WORKING);
+        assert_eq!(view(Some(Reported::new(WORKING, 1_000)), "idle", 1_000), WORKING);
         // 片方しか無いときはある方
-        assert_eq!(view(Some((WAITING, 1_000)), "", 2_000), WAITING);
+        assert_eq!(view(Some(Reported::new(WAITING, 1_000)), "", 2_000), WAITING);
         assert_eq!(view(None, "busy", 2_000), WORKING);
+    }
+
+    /// **手が空いたことと、ターンが終わったことは別**（通知が使う 1 ビット ＝
+    /// [`crate::poll::RowState::interrupted`]）。
+    ///
+    /// claude は Esc 中断で `Stop` を撃たないので、中断した行は「hook は
+    /// `working` のまま・`status` は `idle`」という形で残る。state はどちらも
+    /// Idle なので、この区別が無いと**中断が完了通知になる**（報告された症状）
+    #[test]
+    fn an_idle_row_is_only_finished_when_its_own_hook_said_so() {
+        let view = |hook, status: &str, status_at| {
+            row_view(Some(Run {
+                hook,
+                status,
+                status_at,
+                pty: None,
+                has_live_status: true,
+                record_grew_since: 0,
+            }))
+        };
+        // Esc 中断: `Stop` は来ず、観測の `idle` だけが載る
+        let stopped_early = view(Some(Reported::new(WORKING, 1_000)), "idle", 2_000);
+        assert_eq!(stopped_early.state, IDLE, "the row should still read as idle");
+        assert!(stopped_early.interrupted, "an interrupted turn passed as finished");
+        // 許可に答えた後の中断も同じ（hook の最後の一言は `waiting`）
+        assert!(view(Some(Reported::new(WAITING, 1_000)), "idle", 2_000).interrupted);
+        // 本物の完了: `Stop` が名乗っている（観測が後から追いついても変わらない）
+        assert!(!view(Some(Reported::new(IDLE, 1_000)), "idle", 2_000).interrupted);
+        assert!(!view(Some(Reported::new(IDLE, 2_000)), "", 0).interrupted);
+        // **`SessionStart` の `Idle` は完了ではない**（ペインの中の `/clear` `/resume`）。
+        // state だけを見ると本物の完了と区別が付かない
+        let cleared = Reported { state: IDLE, at: 2_000, ended: false };
+        assert!(
+            view(Some(cleared), "idle", 2_000).interrupted,
+            "a new conversation passed as a finished turn"
+        );
+        // **hook を持たない行では立たない**（他インスタンスの行 ＝ 材料が status だけ。
+        // 中断と完了を分ける材料が無いので撃つ側に倒す）
+        assert!(!view(None, "idle", 2_000).interrupted);
+        // 動いている行は中断ではない
+        assert!(!view(Some(Reported::new(WORKING, 2_000)), "busy", 1_000).interrupted);
+        // 窓が無い行（Stopped）も中断ではない
+        assert!(!row_view(None).interrupted);
+    }
+
+    /// **自分の窓が動かしている行だけが `owned`。**
+    ///
+    /// 判定材料は `pty` の有無 1 つで、これは [`crate::poll::Run::pty`] を持てるのが
+    /// 自分の子（窓）だけという構造から来る。通知はこれを見て「持ち主だけが撃つ」を
+    /// 決める（他インスタンスの行を撃つと、中断を完了と誤報したうえ 2 回鳴る）
+    #[test]
+    fn only_a_row_this_ccdesk_runs_is_owned() {
+        let run = |pty| Run {
+            hook: None,
+            status: "idle",
+            status_at: 1_000,
+            pty,
+            has_live_status: true,
+            record_grew_since: 0,
+        };
+        assert!(row_view(Some(run(Some(PtyHint::Quiet)))).owned);
+        // 他インスタンスの行（`status` 救済）と撮影用の固定 state は pty を持たない
+        assert!(!row_view(Some(run(None))).owned);
+        // 窓が 1 つも無い行
+        assert!(!row_view(None).owned);
     }
 
     /// **行に渡す時刻は claude が status を書いた時刻**で、ccdesk がそれを読んだ
@@ -2969,11 +3035,11 @@ pub(crate) mod tests {
             row_state(Some(Run { hook, status, status_at: 2_000, pty: None, has_live_status: true, record_grew_since: 0 }))
         };
         // Esc 中断: working のまま固着していた行が、次の観測で赤を降りる
-        assert_eq!(view(Some((WORKING, 1_000)), "idle"), IDLE);
+        assert_eq!(view(Some(Reported::new(WORKING, 1_000)), "idle"), IDLE);
         // 許可した直後: waiting のまま固着していた行が、次の観測で動き出す
-        assert_eq!(view(Some((WAITING, 1_000)), "busy"), WORKING);
+        assert_eq!(view(Some(Reported::new(WAITING, 1_000)), "busy"), WORKING);
         // ダイアログが開いたままなら黄のまま（claude 自身が waiting と言う）
-        assert_eq!(view(Some((WAITING, 1_000)), "waiting"), WAITING);
+        assert_eq!(view(Some(Reported::new(WAITING, 1_000)), "waiting"), WAITING);
     }
 
     /// **バックグラウンド作業は「入力待ち」ではない。**
@@ -2989,7 +3055,7 @@ pub(crate) mod tests {
         };
         for status in ["idle", "shell"] {
             assert_eq!(view(None, status), IDLE, "{status:?} asks for input");
-            assert_eq!(view(Some((WORKING, 1_000)), status), IDLE, "{status:?}");
+            assert_eq!(view(Some(Reported::new(WORKING, 1_000)), status), IDLE, "{status:?}");
         }
         // 知らない値だけは「動いているらしい」へ倒す（呼びつけるよりは害が小さい）
         assert_eq!(view(None, "something-new"), WORKING);
@@ -3159,7 +3225,7 @@ pub(crate) mod tests {
     #[test]
     fn a_stopped_hook_ends_the_run_instead_of_labelling_a_live_one() {
         let view = row_state(Some(Run {
-            hook: Some((STOPPED, 0)),
+            hook: Some(Reported::new(STOPPED, 0)),
             status: "idle",
             status_at: 0,
             pty: None,
@@ -3171,7 +3237,7 @@ pub(crate) mod tests {
 
         // 他の state はそのまま生きている実行として出る（畳まれるのは stopped だけ）
         assert_eq!(
-            row_state(Some(Run { hook: Some((WORKING, 0)), status: "", status_at: 0, pty: None, has_live_status: true, record_grew_since: 0 })),
+            row_state(Some(Run { hook: Some(Reported::new(WORKING, 0)), status: "", status_at: 0, pty: None, has_live_status: true, record_grew_since: 0 })),
             State::Working
         );
     }

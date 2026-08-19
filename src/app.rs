@@ -1338,7 +1338,14 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         // 下部バーに出る ＝ 前に出ていなければその通知も読めない
         for id in crate::notify::clicked() {
             crate::notify::raise_terminal();
-            let _ = open_session(app, &id);
+            // **通知は引っ込むまで押せる ＝ その間に行が消えていることがある。**
+            // 消えた行で `open_session` が黙って false を返すと、端末だけが前へ
+            // 出て何も起きない ＝ 押した人には固まったように見える。開けない
+            // 他の理由（別の窓で動いている等）は `ensure_window` が下部バーへ
+            // 出すので、ここが足すのは「もう一覧に無い」1 つだけ
+            if !open_session(app, &id) && app.row(&id).is_none() {
+                set_notice(app, format!("session {id} is no longer in the list"));
+            }
             force_draw = true;
         }
         // 起こした子が端末を掴んだら門番を降ろす（前景では宛先は起動の時点で
@@ -1986,7 +1993,9 @@ pub(crate) fn effective_row_states(
             })
             .or_else(|| {
                 app.fixed_states.get(&row.session_id).map(|state| Run {
-                    hook: Some((*state, 0)),
+                    // 撮影用の固定 state は「その行を動かしている実行」の代役なので、
+                    // ターンの終わりを名乗った扱いにする（撮影では通知は常に off）
+                    hook: Some(crate::hooks::Reported { state: *state, at: 0, ended: true }),
                     status: "",
                     status_at: 0,
                     pty: None,
@@ -2038,7 +2047,8 @@ fn update_notifications(app: &mut App) {
 /// 前の周に見た行の姿。**通知が覚えているのはこれで全部**（画面はこれを読まない）
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Seen {
-    /// その周の有効 state
+    /// その周の有効 state。**中断された Idle だけは例外**で、その周は前の姿を
+    /// 残す（理由は [`announce`]）
     pub(crate) state: State,
     /// **今の実行で 1 度でも「手が空いた」と agent 自身が名乗った**か
     /// ＝ その行の起動が終わるのを見届けた。
@@ -2060,7 +2070,17 @@ pub(crate) struct Seen {
 /// | 前の周 | 今の周 | 知らせる |
 /// |:--|:--|:--|
 /// | 待ち以外 | 入力待ち | [`crate::notify::Kind::NeedsInput`] |
-/// | 動作中・入力待ち | 手が空いた | [`crate::notify::Kind::Finished`] |
+/// | 動作中・入力待ち | 手が空いた（agent が終わったと名乗った） | [`crate::notify::Kind::Finished`] |
+///
+/// **撃つのは自分の窓が動かしている行だけ**（[`crate::poll::RowState::owned`]）。
+/// 他インスタンスの行は hook を実行へ紐づけられないので中断と完了を分けられず、
+/// しかも持ち主の ccdesk も同じ遷移を見ている（2 プロセスで 2 回鳴る）。
+/// **写しの更新は続ける**ので、その行をこちらで開いた後は普通に撃てる。
+///
+/// **完了は「Idle になったこと」ではなく「終わったと名乗ったこと」で撃つ。**
+/// Esc で中断された行も手は空く（`status` に `idle` が載る）が、それは呼び出す
+/// 理由ではない ＝ [`crate::poll::RowState::interrupted`] の行は撃たない
+/// （報告された症状: **Esc で止めても完了通知が来る**）。
 ///
 /// **どちらも [`Seen::settled`] が立っている行にしか起きない。** 起動を見届けて
 /// いない行の変化は、起動そのものか、起動前から続いていた何か ＝ **ユーザーを
@@ -2092,7 +2112,21 @@ fn announce(
             State::Idle if view.reported => true,
             _ => before.is_some_and(|before| before.settled),
         };
-        seen.insert(id.clone(), Seen { state: view.state, settled });
+        // **中断された Idle は写しに残さない**（前の姿のまま据え置く）。ここで Idle を
+        // 覚えると、後から `Stop` が届いても「もう Idle だった」＝ 変わり目が消える。
+        // 据え置けば、遅れて届いた `Stop` がそこで変わり目になる ＝ hook の記録が
+        // `status` の観測に 1 周負けた本物の完了を落とさない
+        let state = if view.interrupted {
+            before.map_or(view.state, |before| before.state)
+        } else {
+            view.state
+        };
+        seen.insert(id.clone(), Seen { state, settled });
+        // **持ち主だけが撃つ。** 写しはここまでで更新済み ＝ こちらで開いた後の
+        // 最初の変わり目から、見届け（`settled`）をやり直さずに撃てる
+        if !view.owned {
+            continue;
+        }
         let Some(before) = before.filter(|before| before.settled) else {
             continue;
         };
@@ -2100,7 +2134,7 @@ fn announce(
             (before, State::Waiting) if before != State::Waiting => {
                 wanted.waiting.then_some(crate::notify::Kind::NeedsInput)
             }
-            (State::Working | State::Waiting, State::Idle) => {
+            (State::Working | State::Waiting, State::Idle) if !view.interrupted => {
                 wanted.finished.then_some(crate::notify::Kind::Finished)
             }
             _ => None,
@@ -4107,9 +4141,13 @@ mod tests {
 
         let all = Wanted { waiting: true, finished: true };
         // agent 自身（hook・status）が名乗った state
-        let live = |state| RowState { state, reported: true };
+        let live = |state| RowState { state, reported: true, interrupted: false, owned: true };
         // 窓を起こした直後、材料がまだ 1 つも無く PTY から推しただけの state
-        let booting = |state| RowState { state, reported: false };
+        let booting = |state| RowState { state, reported: false, interrupted: false, owned: true };
+        // Esc で止められた行（手は空いたが agent は終わったと名乗っていない）
+        let cut = RowState { state: State::Idle, reported: true, interrupted: true, owned: true };
+        // 他インスタンスが動かしている行（この ccdesk に窓が無い ＝ 材料は status だけ）
+        let foreign = |state| RowState { state, reported: true, interrupted: false, owned: false };
         // 周を順に食わせて、その間に撃った物を全部並べる（1 周だけの判定では
         // 起動を見届けたかどうかが表せない ＝ この機能のバグは全部そこにあった）
         let fired = |rounds: &[Vec<(&str, RowState)>], wanted| {
@@ -4180,6 +4218,45 @@ mod tests {
             all
         )
         .is_empty());
+
+        // **Esc 中断は完了ではない**: 手が空いても撃たず、中断が続く周でも撃たない
+        // （報告されたバグ。[`crate::poll::RowState::interrupted`]）
+        assert!(fired(&turn(&[live(State::Working), cut]), all).is_empty());
+        // 続く周も撃たない。**中断の後の `/clear` `/resume` もここへ来る**:
+        // 新しい会話の `SessionStart` は `Idle` を書くが終わりではない ＝ 同じ
+        // `interrupted` になる（何が `interrupted` かを決めるのは
+        // [`crate::hooks::Entry::ended`]）
+        assert!(fired(&turn(&[live(State::Working), cut, cut]), all).is_empty());
+        // 中断の後は前の姿で据え置く ＝ **遅れて届いた `Stop` がそこで変わり目になる**
+        // （hook の記録が status の観測に 1 周負けた本物の完了を落とさない）
+        assert_eq!(
+            fired(&turn(&[live(State::Working), cut, live(State::Idle)]), all),
+            vec![("s".into(), Kind::Finished)]
+        );
+        // 中断したまま次のターンを回せば、その終わりは撃つ（抑制は据え置かれない）
+        assert_eq!(
+            fired(
+                &turn(&[live(State::Working), cut, live(State::Working), live(State::Idle)]),
+                all
+            ),
+            vec![("s".into(), Kind::Finished)]
+        );
+        // 中断された行が許可待ちへ入れば、それは知らせる
+        assert_eq!(
+            fired(&turn(&[live(State::Working), cut, live(State::Waiting)]), all),
+            vec![("s".into(), Kind::NeedsInput)]
+        );
+
+        // **他インスタンスの行は撃たない**（中断と完了を分ける材料が無く、
+        // 持ち主の ccdesk も同じ遷移を見ている ＝ 2 回鳴る）
+        assert!(fired(&after(&[foreign(State::Idle), foreign(State::Working), foreign(State::Idle)]), all).is_empty());
+        assert!(fired(&after(&[foreign(State::Idle), foreign(State::Waiting)]), all).is_empty());
+        // **こちらで開けばそこから撃つ**（写しは撃たない周も更新されているので、
+        // 見届けをやり直さない）
+        assert_eq!(
+            fired(&after(&[foreign(State::Idle), foreign(State::Working), live(State::Idle)]), all),
+            vec![("s".into(), Kind::Finished)]
+        );
 
         // 設定で選んだ種類だけが出る
         let only_waiting = Wanted { waiting: true, finished: false };
@@ -7092,7 +7169,7 @@ mod tests {
         assert_eq!(app.sessions, rows, "a leftover hook wrote to the row");
         // 写しそのものは取り直されている（表示はここから導く）
         assert_eq!(
-            app.hook_states.get(&SessionId::new("s"), Some(0)).map(|(state, _)| state),
+            app.hook_states.get(&SessionId::new("s"), Some(0)).map(|hook| hook.state),
             Some(crate::poll::State::Waiting)
         );
     }

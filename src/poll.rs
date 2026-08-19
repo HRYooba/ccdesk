@@ -806,10 +806,10 @@ pub(crate) fn state_of_status(status: &str) -> Option<State> {
 /// 実行は `~/.claude/sessions/` の status 経由で、撮影用の供給元は固定表で名乗る
 /// （材料をどこから集めるかは描画側 ＝ [`crate::ui`] が持つ）
 pub(crate) struct Run<'a> {
-    /// その実行が hook で報告した最新の (state, 記録時刻)（一度も来ていなければ None）。
+    /// その実行が hook で報告した最新の 1 件（一度も来ていなければ None）。
     /// 前回の実行の残骸を捨てる判断は [`crate::hooks::HookStates::get`] が
     /// 窓の起動時刻で済ませてあるので、ここへ来るのは今の実行が書いたものだけ
-    pub(crate) hook: Option<(State, u64)>,
+    pub(crate) hook: Option<crate::hooks::Reported>,
     /// `~/.claude/sessions/` の `status` の生値（空 ＝ ポーラーがまだ拾っていない、
     /// または値を載せないセッション）。語彙への翻訳は [`state_of_status`]
     pub(crate) status: &'a str,
@@ -853,10 +853,39 @@ pub(crate) enum PtyHint {
 /// 推した値 ＝ **まだ起動中**。この 1 ビットが無いと「起動の Working」と
 /// 「ターン中の Working」が同じ値になり、**窓を開けただけの行が Idle へ落ちた瞬間に
 /// 「ターンが終わりました」と名乗る**（[`crate::app`] の通知）
+///
+/// `interrupted` が true ＝ **手は空いたが、agent は「ターンが終わった」と
+/// 名乗っていない**（下記）
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct RowState {
     pub(crate) state: State,
     pub(crate) reported: bool,
+    /// **Idle だが、その実行の hook の最後の一言が Idle ではない** ＝ ターンは
+    /// 終わったのではなく**途中で止められた**（Esc 中断）。
+    ///
+    /// 完了は agent 自身が名乗る出来事（`Stop` / `StopFailure`）で、`status` の
+    /// `idle` は**理由を持たない現在値**にすぎない。中断でも `idle` は載るので、
+    /// state だけを見ると中断が完了と同じ形になる（上の [`row_state`] が言う
+    /// 「claude は Esc 中断のとき `Stop` を撃たない」の裏返し ＝ 報告された症状:
+    /// **Esc で止めても「ターンが終わりました」と通知が来る**）。
+    ///
+    /// **hook の記録が 1 つも無い行では立たない**（他インスタンスの行 ＝ 材料が
+    /// `status` だけ）。そこは中断と完了を区別する材料がそもそも無いので、
+    /// 撃つ側に倒す ＝ この修正で通知が減るのは hook を持つ行だけ。
+    ///
+    /// 表示は読まない（Idle は Idle として描く）＝ **通知だけが使う 1 ビット**
+    pub(crate) interrupted: bool,
+    /// **この ccdesk の窓がその行を動かしているか。**
+    ///
+    /// 材料は `pty` の有無 1 つ。[`Run::pty`] を持てるのは自分の子（窓）だけで、
+    /// 他インスタンスの行（`status` 救済）と撮影用の固定 state は必ず `None` ＝
+    /// 「自分の実行か」はここから構造的に導ける。
+    ///
+    /// 通知が使う（[`crate::app`] の `announce`）: 自分が動かしていない行は
+    /// hook を実行へ紐づけられない ＝ 中断と完了を分ける材料が無く、しかも
+    /// 同じ遷移を持ち主の ccdesk も見ている（2 プロセスで 2 回鳴る）。
+    /// **一覧には従来どおり出る**（撃たないだけ）
+    pub(crate) owned: bool,
 }
 
 /// [`row_state`] に出どころを添えて返す。**材料の一覧を持つのはここ 1 箇所**で、
@@ -865,7 +894,16 @@ pub(crate) fn row_view(run: Option<Run<'_>>) -> RowState {
     let reported = run
         .as_ref()
         .is_some_and(|run| run.hook.is_some() || state_of_status(run.status).is_some());
-    RowState { state: row_state(run), reported }
+    let hook = run.as_ref().and_then(|run| run.hook);
+    let run_pty = run.as_ref().and_then(|run| run.pty);
+    // **hook を持つ行の Idle は、ターンの終わりを名乗るイベントが裏打ちしている
+    // ときだけ「終わった」。** `state == Idle` で足りると思うと `SessionStart` を
+    // 数えてしまい、ペインの中の `/clear` `/resume` が完了になる
+    // （[`crate::hooks::Entry::ended`]）
+    let state = row_state(run);
+    let interrupted = state == State::Idle && matches!(hook, Some(hook) if !hook.ended);
+    let owned = run_pty.is_some();
+    RowState { state, reported, interrupted, owned }
 }
 
 /// 1 行に出す状態を決める。**行に保存せず、そのつど導く。**
@@ -909,7 +947,7 @@ pub(crate) fn row_view(run: Option<Run<'_>>) -> RowState {
 /// 遅れは構造的に有界: hook は 0 遅延で入るので押した瞬間に色が変わり、hook を
 /// 取り逃しても最大ポーリング 1 周期（[`spawn_agents_poller`]）で観測が追い越す
 pub(crate) fn row_state(run: Option<Run<'_>>) -> State {
-    let Some(run) = run.filter(|run| run.hook.map(|(state, _)| state) != Some(State::Stopped))
+    let Some(run) = run.filter(|run| run.hook.map(|hook| hook.state) != Some(State::Stopped))
     else {
         return State::Stopped;
     };
@@ -917,8 +955,8 @@ pub(crate) fn row_state(run: Option<Run<'_>>) -> State {
     // 同時刻なら hook を採る（hook はそのセッション自身が turn の境目で書くので、
     // 同じ ms に並んだ 2 秒周期の観測よりも出所が確か）
     let newest = match (run.hook, observed) {
-        (Some((_, at)), Some(observed @ (_, seen))) if seen > at => Some(observed),
-        (Some(hook), _) => Some(hook),
+        (Some(hook), Some(observed @ (_, seen))) if seen > hook.at => Some(observed),
+        (Some(hook), _) => Some((hook.state, hook.at)),
         (None, observed) => observed,
     };
     match newest {
