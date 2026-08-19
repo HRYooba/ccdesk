@@ -39,14 +39,18 @@
 //! 別タブに居る ccdesk はウィンドウが前に出ても背面のタブのまま残る。
 //!
 //! **複数の ccdesk は同じ AppUserModelID・group・tag を共有する。** 同じ行の
-//! 遷移を両方が見れば両方が撃つ（後のものが前を置き換えるので画面には 1 枚しか
-//! 残らないが、鳴るのは 2 回）。所有者を決めるプロセス間調停は未実装。
+//! 遷移を両方が見れば両方が撃つことになる（後のものが前を置き換えるので画面には
+//! 1 枚しか残らないが、鳴るのは 2 回）＝ **撃つ側で持ち主を決める**:
+//! 通知を出すのはその行を動かしている窓を持つプロセスだけで、他インスタンスの
+//! 行は一覧に出るが撃たない（[`crate::poll::RowState::owned`]）。
+//! プロセス間の調停は要らない ＝ 窓は 1 つの行に 1 つしか無い。
 //!
 //! # 失敗は画面に出さない
 //!
 //! 通知が出ないこと自体は作業を止めないので下部バーへは出さず、原因は
-//! `~/.ccdesk/error.log` へ**失敗種別ごとに 1 プロセス 1 度だけ**残す（通知は turn
+//! `~/.ccdesk/error.log` へ**同じ文面につき 1 プロセス 1 度だけ**残す（通知は turn
 //! ごとに撃つので、出せない環境では毎回書くとログがそれで埋まる）。
+//! **数えるのが種類ではなく文面**な理由は [`report`]。
 
 use crate::sessions::SessionId;
 
@@ -164,16 +168,30 @@ pub(crate) fn post(kind: Kind, project: &str, session: &str, id: &SessionId) {
     });
 }
 
+/// 通知用スレッドへ積める上限。**満杯なら捨てる**（[`send`]）。
+///
+/// 撃つのは行の変わり目なので、通常は 1 周に多くても行数ぶんしか積まれない ＝
+/// この数に届くのは worker が詰まっている状況だけ。そこで待つ（無界に積む）と
+/// 描画ループが通知に引きずられ、メモリも上限を失う
+#[cfg(windows)]
+const QUEUE_LIMIT: usize = 64;
+
 #[cfg(windows)]
 fn send(request: Request) -> bool {
-    if let Err(error) = sender().send(request) {
-        report(
-            ErrorKind::Worker,
-            &format!("desktop notification worker is unavailable: {error}"),
-        );
-        false
-    } else {
-        true
+    use std::sync::mpsc::TrySendError;
+
+    match sender().try_send(request) {
+        Ok(()) => true,
+        // **待たずに捨てる。** 詰まっているときに積み足しても、出るのは
+        // 「もう終わった出来事」の列。捨てた事実はログに 1 度だけ残す
+        Err(TrySendError::Full(_)) => {
+            report("dropped a desktop notification: the worker is behind");
+            false
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            report("desktop notification worker is unavailable: the channel is closed");
+            false
+        }
     }
 }
 
@@ -186,25 +204,23 @@ fn send(request: Request) -> bool {
 /// （実測でこうなった）。ここで MTA のスレッドを 1 本作り、
 /// 出すのも受けるのもそのスレッドに閉じる。
 ///
-/// **送りっぱなしで良い**（受け手が居なくなることは無い ＝ このスレッドは
-/// プロセスと同じだけ生きる）。表示には 10ms 程度かかるので、
-/// 描画ループから外れること自体にも意味がある
+/// **積むだけで待たない**（[`QUEUE_LIMIT`] で満杯なら捨てる）。表示には 10ms
+/// 程度かかるので、描画ループから外れること自体にも意味がある
 #[cfg(windows)]
-fn sender() -> &'static std::sync::mpsc::Sender<Request> {
+fn sender() -> &'static std::sync::mpsc::SyncSender<Request> {
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
-    static SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<Request>> =
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::SyncSender<Request>> =
         std::sync::OnceLock::new();
     SENDER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Request>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Request>(QUEUE_LIMIT);
         std::thread::spawn(move || {
             // このスレッドを MTA にする ＝ 押下は既定のスレッドプールへ配送される
             // （STA だと配送先が「回していないポンプ」になる）
             if let Err(error) = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() } {
-                report(
-                    ErrorKind::Initialize,
-                    &format!("could not initialize the desktop notification worker: {error}"),
-                );
+                report(&format!(
+                    "could not initialize the desktop notification worker: {error}"
+                ));
                 return;
             }
             while let Ok(request) = rx.recv() {
@@ -234,10 +250,7 @@ fn show(kind: Kind, project: &str, session: &str, id: &SessionId) {
         return;
     };
     if let Err(e) = try_show(kind, project, session, id, icon) {
-        report(
-            ErrorKind::Show,
-            &format!("could not show a desktop notification: {e}"),
-        );
+        report(&format!("could not show a desktop notification: {e}"));
     }
 }
 
@@ -371,10 +384,7 @@ pub(crate) fn remember_terminal_window() {
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
     }
     let Some(started_at) = process_started_at(pid) else {
-        report(
-            ErrorKind::Raise,
-            "could not identify the terminal window owner",
-        );
+        report("could not identify the terminal window owner");
         return;
     };
     if let Ok(mut remembered) = terminal_window().lock() {
@@ -414,10 +424,7 @@ pub(crate) fn raise_terminal() {
             if let Ok(mut remembered) = terminal_window().lock() {
                 *remembered = None;
             }
-            report(
-                ErrorKind::Raise,
-                "the remembered terminal window is no longer owned by the same process",
-            );
+            report("the remembered terminal window is no longer owned by the same process");
             return;
         }
         // 最小化されていると前面化だけでは戻らない
@@ -425,7 +432,7 @@ pub(crate) fn raise_terminal() {
             // 戻り値は直前に可視だったかで、失敗値ではない。復元後の状態を検証する
             let _was_visible = ShowWindow(hwnd, SW_RESTORE).as_bool();
             if IsIconic(hwnd).as_bool() {
-                report(ErrorKind::Raise, "could not restore the terminal window");
+                report("could not restore the terminal window");
             }
         }
         if !SetForegroundWindow(hwnd).as_bool() {
@@ -438,10 +445,7 @@ pub(crate) fn raise_terminal() {
             };
             // 戻り値は呼び出し前にアクティブだったかを表し、成否値ではない
             let _was_active = FlashWindowEx(&flash).as_bool();
-            report(
-                ErrorKind::Raise,
-                "could not foreground the terminal window; flashed it instead",
-            );
+            report("could not foreground the terminal window; flashed it instead");
         }
     }
 }
@@ -491,20 +495,17 @@ fn process_started_at(pid: u32) -> Option<u64> {
 /// **None は「通知を出せない」**。
 ///
 /// 登録が要るのは名前のため: 通知に出る送り主の名前はこの `DisplayName` から来る
-/// （**アイコンは来ない** ＝ [`needs_input`]）。登録の無い ID では通知そのものが出せない
+/// （**アイコンは来ない** ＝ [`show`]）。登録の無い ID では通知そのものが出せない
 #[cfg(windows)]
 fn registered() -> Option<&'static std::path::Path> {
     static DONE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     DONE.get_or_init(|| match register() {
         Ok(icon) => Some(icon),
         Err(e) => {
-            report(
-                ErrorKind::Register,
-                &format!(
-                    "could not register the notification app id: {e}; \
-                     desktop notifications stay off for this run"
-                ),
-            );
+            report(&format!(
+                "could not register the notification app id: {e}; \
+                 desktop notifications stay off for this run"
+            ));
             None
         }
     })
@@ -539,37 +540,34 @@ fn icon_file() -> anyhow::Result<std::path::PathBuf> {
     Ok(path)
 }
 
-/// 失敗の種類ごとに 1 プロセス 1 度だけ書く。軽微な前面化失敗で、後から起きた
-/// worker 停止や登録失敗まで隠さない。
+/// 書いた文面の上限。届いたら以後は何も書かない。
+///
+/// 上限が要るのは、通知が turn ごとに撃たれるため ＝ 毎回違う文面になる失敗
+/// （OS のエラーコードが混ざる等）で `error.log` を埋めない
 #[cfg(windows)]
-#[derive(Clone, Copy)]
-enum ErrorKind {
-    Initialize,
-    Worker,
-    Register,
-    Show,
-    Raise,
-}
+const REPORT_LIMIT: usize = 32;
 
+/// 通知の失敗を `~/.ccdesk/error.log` へ書く（**同じ文面は 1 プロセス 1 度**）。
+///
+/// **数えるのは文面で、失敗の種類ではない。** 種類ごとに 1 度だと、同じ種類の中の
+/// **別の原因**が最初の 1 件に隠れて永久に出ない（前面化なら「OS に拒否された」と
+/// 「控えた窓が別プロセスのものになった」、表示ならペイロード・tag・notifier の
+/// どれで落ちたか ＝ 実際に 1 つの旗を共有していた）。
+///
+/// 通知が出ないこと自体は作業を止めないので、下部バーへは出さない（module の頭）
 #[cfg(windows)]
-fn report(kind: ErrorKind, message: &str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
+fn report(message: &str) {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
 
-    static INITIALIZE: AtomicBool = AtomicBool::new(false);
-    static WORKER: AtomicBool = AtomicBool::new(false);
-    static REGISTER: AtomicBool = AtomicBool::new(false);
-    static SHOW: AtomicBool = AtomicBool::new(false);
-    static RAISE: AtomicBool = AtomicBool::new(false);
-    let reported = match kind {
-        ErrorKind::Initialize => &INITIALIZE,
-        ErrorKind::Worker => &WORKER,
-        ErrorKind::Register => &REGISTER,
-        ErrorKind::Show => &SHOW,
-        ErrorKind::Raise => &RAISE,
+    static SEEN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    let Ok(mut seen) = SEEN.lock() else {
+        return;
     };
-    if !reported.swap(true, Ordering::Relaxed) {
-        ccdesk::log_error(message);
+    if seen.len() >= REPORT_LIMIT || !seen.insert(message.to_string()) {
+        return;
     }
+    ccdesk::log_error(message);
 }
 
 #[cfg(test)]
