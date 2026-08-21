@@ -28,9 +28,11 @@ conversation. OpenAI's `codex` CLI works the same way — [opt in](#codex-opt-in
   choosing a row moves that session into the focused slot, and only that one moves —
   the slot it came from goes empty. Nothing is ever killed by rearranging
 - **Mouse-first, keyboard-light** — click to switch, the `⋮` at the end of a row for
-  everything else, drag the cross between slots to resize, the `✕` at the top-right of
-  a pane to drop that pane — the layout closes up around it and the session it was
-  showing keeps running. ccdesk reserves
+  everything else, drag the cross between slots to resize, click the 8-digit id in a
+  pane's title to copy it (the same value `ccdesk list` prints, so it pastes straight
+  into `ccdesk send`), the `✕` at the top-right of a pane to drop that pane — the
+  layout closes up around it and the session it was showing keeps running. ccdesk
+  reserves
   `Ctrl+Q`, `Alt+←/→` (sidebar ⇄ main view) and `Alt+Shift+←/→/↑/↓` (move between
   slots) — and **every other key goes to the agent untouched**
 - **ccdesk never modifies your agent's config or files.** It installs its status hooks

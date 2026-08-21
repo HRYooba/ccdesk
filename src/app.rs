@@ -2586,6 +2586,16 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         return Ok(false);
     }
 
+    // 枠左上の短い ID（押すと 8 桁がクリップボードへ）。**十字の掴み代より先**に
+    // 見るのは ✕ と同じ理由（下段スロットの上辺は横の境界そのもの）で、
+    // ID の桁は角の内側 ＝ 縦の境界の掴み代（枠線 2 列）とも重ならない
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+        && let Some(id) = crate::ui::id_hit(app, mouse.column, mouse.row)
+    {
+        copy_session_id(app, &id);
+        return Ok(false);
+    }
+
     // 十字の境界ドラッグ（サイドバー幅の掴み代と同じ作法）。**スロットのクリック判定
     // より先**に見るのが要点で、境界はスロットの枠線に重なっているため、後回しにすると
     // 掴み代がフォーカス移動に化ける。交点をつかめば縦横が同時に動く
@@ -4070,6 +4080,25 @@ fn recover_conversation(app: &mut App, id: &SessionId) {
         .is_some_and(|row| row.conversation.observed().is_some())
     {
         refresh_transcripts(app);
+    }
+}
+
+/// 見出しの短い ID をクリップボードへ（押せる場所は [`crate::ui::id_zone`]）。
+///
+/// **載せるのは 8 桁**（`ccdesk list` が並べる値 ＝ `ccdesk send` が前置き一致で
+/// 受ける値）なので、貼ればそのまま宛先として打てる。フル ID を載せても
+/// 同じ宛先を指せるが、見えている文字と載る文字が違うと「何をコピーしたのか」が
+/// 画面から読めない。
+///
+/// **フォーカスは動かさない**（✕ と同じ）: コピーは今打っている先を変えない操作で、
+/// ここでスロットを掴むと打鍵の行き先が黙って移る。
+/// 失敗（クリップボードを取れない環境）は下部バーへ ＝ 押したのに何も起きない、を作らない
+fn copy_session_id(app: &mut App, id: &SessionId) {
+    let short = id.short();
+    if ccdesk::set_clipboard(&short) {
+        set_hint(app, format!("copied {short}"));
+    } else {
+        set_notice(app, format!("could not copy {short} to the clipboard"));
     }
 }
 

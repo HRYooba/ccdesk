@@ -1993,6 +1993,22 @@ pub(crate) fn close_hit(app: &App, column: u16, row: u16) -> Option<usize> {
 /// **右上の閉じる印（[`close_cols`]）のぶんも先に引く。** 見出しは左寄せ・印は
 /// 右寄せで同じ 1 行に載るので、ここで数えないと長いタイトルが印を押し出す
 fn pane_title(name: &str, id: &SessionId, pane_width: u16) -> String {
+    pane_title_parts(name, id, pane_width).text
+}
+
+/// 見出しの文字列と、**その中で短い ID が占める桁**（見出しの先頭を 0 とする）。
+///
+/// 桁を一緒に返すのが要点: ID は押すとクリップボードへ載る
+/// （[`id_zone`] → [`crate::app`] のマウス処理）ので、**見えている場所と押せる場所を
+/// 同じ 1 つの計算から出す**（描画側だけが知っている桁割りを当たり判定へ書き写すと、
+/// 名前の切り方を変えた日に黙ってずれる）
+struct PaneTitle {
+    text: String,
+    /// 見出しの先頭から数えた ID の開始桁。None ＝ この幅では ID を出していない
+    id_at: Option<usize>,
+}
+
+fn pane_title_parts(name: &str, id: &SessionId, pane_width: u16) -> PaneTitle {
     use unicode_width::UnicodeWidthStr;
     let budget = (pane_width as usize)
         .saturating_sub(PANE_TITLE_MARGIN)
@@ -2001,12 +2017,53 @@ fn pane_title(name: &str, id: &SessionId, pane_width: u16) -> String {
     // 区切りと ID が食う桁。ID は ASCII 16 進なので文字数 = 表示桁
     let tail = PANE_TITLE_SEP.width() + short.width();
     if budget < MIN_NAME_COLS + tail {
-        return clip_to_width(name, budget as u16);
+        return PaneTitle {
+            text: clip_to_width(name, budget as u16),
+            id_at: None,
+        };
     }
-    format!(
-        "{}{PANE_TITLE_SEP}{short}",
-        clip_to_width(name, (budget - tail) as u16)
-    )
+    let name = clip_to_width(name, (budget - tail) as u16);
+    PaneTitle {
+        id_at: Some(name.width() + PANE_TITLE_SEP.width()),
+        text: format!("{name}{PANE_TITLE_SEP}{short}"),
+    }
+}
+
+/// 見出しの短い ID の当たり判定 `(桁の範囲, 行)`。ID を出していない幅では `None`
+/// ＝ **見えていないものは押せない**（[`close_zone`] と同じ作法）。
+///
+/// 見出しは枠の左上（角の 1 桁内側）から左詰めで描かれるので、桁は
+/// 「矩形の左端 + 1 + [`PaneTitle::id_at`]」から決まる
+pub(crate) fn id_zone(
+    rect: Rect,
+    name: &str,
+    id: &SessionId,
+) -> Option<(std::ops::RangeInclusive<u16>, u16)> {
+    use unicode_width::UnicodeWidthStr;
+    if rect.height == 0 {
+        return None;
+    }
+    let at = pane_title_parts(name, id, rect.width).id_at?;
+    let left = rect.x + 1 + at as u16;
+    let cols = id.short().width() as u16;
+    Some((left..=left + cols - 1, rect.y))
+}
+
+/// 短い ID を押したスロットのセッション（どのスロットの ID でもなければ `None`）。
+/// **矩形の正本は [`App::slot_rects`]**、見出しの組み方は [`pane_title_parts`] ＝
+/// 描画と同じ導出から答える
+pub(crate) fn id_hit(app: &App, column: u16, row: u16) -> Option<SessionId> {
+    app.slot_rects()
+        .into_iter()
+        .enumerate()
+        .find_map(|(at, rect)| {
+            let id = app.slots.get(at).and_then(Slot::session)?;
+            let name = app
+                .row(id)
+                .map_or_else(|| crate::title::UNTITLED.to_string(), |r| app.titles.of(r));
+            let (cols, at_row) = id_zone(rect, &name, id)?;
+            (row == at_row && cols.contains(&column)).then(|| id.clone())
+        })
 }
 
 /// 右ペイン: スロットを並べて描く。
@@ -4285,6 +4342,48 @@ pub(crate) mod tests {
         }
     }
 
+    /// **見えている ID と押せる場所は同じ桁**（✕ と同じ作法）。
+    ///
+    /// 実際に描いて、[`id_zone`] が返す桁に短い ID が並んでいることを実物で見る ＝
+    /// 見出しの組み方（名前の切り方・区切りの桁）を変えた日にここで落ちる。
+    /// あわせて [`id_hit`] が同じ桁でその行を答えることも固定する
+    /// （矩形と見出しを 2 度組む経路なので、どちらかだけずれ得る）
+    #[test]
+    fn the_short_id_is_drawn_where_it_can_be_copied() {
+        let id = SessionId::new("0123456789abcdef-0123");
+        let mut app = App {
+            term_size: (120, 30),
+            sessions: vec![named_session("0123456789abcdef-0123", "C:\\dev\\api", "api probe")],
+            titles: fixed_titles(),
+            ..Default::default()
+        };
+        app.slots = vec![Slot::Session(id.clone())];
+        let rect = app.slot_rects()[0];
+        let name = app.titles.of(&app.sessions[0]);
+        let (cols, row) = id_zone(rect, &name, &id).expect("the frame shows no id");
+
+        assert_eq!(
+            drawn_span(&mut app, cols.clone(), row),
+            id.short(),
+            "the id is not on the columns its hit test claims"
+        );
+        for column in [*cols.start(), *cols.end()] {
+            assert_eq!(
+                id_hit(&app, column, row).as_ref(),
+                Some(&id),
+                "column {column} of the id does not answer with the session"
+            );
+        }
+        // 見出しの外（区切りの左・ID の右）は当たらない
+        assert!(id_hit(&app, cols.start() - 1, row).is_none(), "the separator is clickable");
+        assert!(id_hit(&app, cols.end() + 1, row).is_none(), "past the id is clickable");
+        // 細いスロットでは ID を出さない ＝ 押せる場所も無い（見えないものは押せない）
+        assert!(
+            id_zone(Rect::new(rect.x, rect.y, 14, rect.height), &name, &id).is_none(),
+            "a frame too thin for the id still offers a hit zone"
+        );
+    }
+
     /// **閉じる印は縦のリサイズ掴み代を食わない。** 印は角の 1 桁内側に居るので、
     /// 隣り合う枠線 2 列（縦の境界の掴み代）とは重ならない ＝ 左列のスロットの印が
     /// あっても幅は掴める。
@@ -5257,6 +5356,12 @@ pub(crate) mod tests {
     /// **行の文字列（[`drawn_row`]）では桁を数えられない**（2 桁の文字が 1 つ入ると
     /// 文字数と桁がずれる）ので、桁を名指しで見る検査はこちらを使う
     fn drawn_cell(app: &mut App, x: u16, y: u16) -> String {
+        drawn_span(app, x..=x, y)
+    }
+
+    /// 描いた画面の 1 行のうち、桁の範囲ぶんの表示文字列。
+    /// **当たり判定が返す桁範囲をそのまま渡せる**（[`close_zone`] / [`id_zone`]）
+    fn drawn_span(app: &mut App, cols: std::ops::RangeInclusive<u16>, y: u16) -> String {
         let (w, h) = app.term_size;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("test terminal");
@@ -5264,7 +5369,8 @@ pub(crate) mod tests {
             draw(frame, app);
         })
         .expect("draw");
-        terminal.backend().buffer()[(x, y)].symbol().to_string()
+        let buffer = terminal.backend().buffer().clone();
+        cols.map(|x| buffer[(x, y)].symbol().to_string()).collect()
     }
 
     /// 端末を 1 フレーム描いて、指定行の文字列を返す

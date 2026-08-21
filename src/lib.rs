@@ -529,6 +529,107 @@ fn short_path_impl(_path: &str) -> Option<String> {
     None
 }
 
+/// 文字列をクリップボードへ載せる。**載せられたときだけ true**
+/// （呼び手は失敗を黙らせない: 押したのに何も起きないのが一番分からない）。
+///
+/// **端末は経由しない**（Windows）: ccdesk が動く端末は Windows Terminal・
+/// conhost・IDE の端末と幅があり、OSC 52 を捨てる端末では「押しても何も起きない」に
+/// なる。ccdesk はユーザーの機械で走るので、OS のクリップボードがそのまま
+/// ユーザーの手元のクリップボードである
+pub fn set_clipboard(text: &str) -> bool {
+    set_clipboard_impl(text)
+}
+
+#[cfg(windows)]
+fn set_clipboard_impl(text: &str) -> bool {
+    use std::ffi::c_void;
+
+    /// UTF-16 のテキスト形式
+    const CF_UNICODETEXT: u32 = 13;
+    /// クリップボードへ渡す確保は移動可能ハンドルで行う（Win32 の作法）
+    const GMEM_MOVEABLE: u32 = 0x0002;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn OpenClipboard(owner: *mut c_void) -> i32;
+        fn EmptyClipboard() -> i32;
+        fn SetClipboardData(format: u32, mem: *mut c_void) -> *mut c_void;
+        fn CloseClipboard() -> i32;
+    }
+    unsafe extern "system" {
+        fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
+        fn GlobalLock(mem: *mut c_void) -> *mut c_void;
+        fn GlobalUnlock(mem: *mut c_void) -> i32;
+        fn GlobalFree(mem: *mut c_void) -> *mut c_void;
+    }
+
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: 確保した領域へ終端付きの UTF-16 をちょうどの長さだけ書き、
+    // 渡せたハンドルは**解放しない**（所有権はクリップボード側へ移る）。
+    // 渡せなかった経路だけ自分で解放し、どの経路でも Close まで通す
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return false;
+        }
+        let mem = GlobalAlloc(GMEM_MOVEABLE, wide.len() * std::mem::size_of::<u16>());
+        if mem.is_null() {
+            CloseClipboard();
+            return false;
+        }
+        let dst = GlobalLock(mem);
+        if dst.is_null() {
+            GlobalFree(mem);
+            CloseClipboard();
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), dst.cast::<u16>(), wide.len());
+        GlobalUnlock(mem);
+        EmptyClipboard();
+        let handed_over = !SetClipboardData(CF_UNICODETEXT, mem).is_null();
+        if !handed_over {
+            GlobalFree(mem);
+        }
+        CloseClipboard();
+        handed_over
+    }
+}
+
+#[cfg(not(windows))]
+fn set_clipboard_impl(text: &str) -> bool {
+    use std::io::Write;
+
+    // OSC 52 ＝ 端末に「これをクリップボードへ」と頼む唯一の携帯可能な手段
+    // （ssh 越しでも手元のクリップボードへ届く）。**書けたかどうかしか分からない**:
+    // 捨てる端末は黙って捨てるので、そこは端末の設定の話として呼び手には成功を返す
+    let mut out = std::io::stdout();
+    let payload = base64(text.as_bytes());
+    write!(out, "]52;c;{payload}")
+        .and_then(|()| out.flush())
+        .is_ok()
+}
+
+/// OSC 52 の本文（[`set_clipboard_impl`] 専用なので最小限）。
+/// 依存を 1 つ増やすほどの処理ではない
+#[cfg(not(windows))]
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let mut word = 0u32;
+        for (at, byte) in chunk.iter().enumerate() {
+            word |= u32::from(*byte) << (16 - 8 * at);
+        }
+        // 3 バイト = 4 文字。端数は書いたぶんだけ出し、残りを `=` で埋める
+        for at in 0..=chunk.len() {
+            out.push(TABLE[(word >> (18 - 6 * at) & 0x3f) as usize] as char);
+        }
+        for _ in chunk.len()..3 {
+            out.push('=');
+        }
+    }
+    out
+}
+
 /// 現在時刻の epoch ms。**行の時刻・hook の時刻はすべてこの単位**
 /// （`SessionRow` と `hook-states.json` が同じ物差しを使う）
 pub fn now_ms() -> u64 {
