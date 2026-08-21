@@ -3999,7 +3999,8 @@ fn expire_input_gate(app: &mut App) -> bool {
 /// 会話は行の cwd から `-r` を打っても見つからない
 /// （`/resume` のピッカーに出ないのと同じ範囲の話）。
 ///
-/// 副作用を持たないので単体で検査できる
+/// **材料を揃えるのはここではない**（[`recover_conversation`]）: この関数は
+/// 「材料がこうなら、こう起こす」だけを言う ＝ 副作用を持たないので単体で検査できる
 fn relaunch<'a>(
     titles: &crate::title::Titles,
     row: &'a SessionRow,
@@ -4011,6 +4012,64 @@ fn relaunch<'a>(
     match titles.resume_cwd(row) {
         Some(cwd) => (Launch::Resume { id }, std::borrow::Cow::Owned(cwd)),
         None => (Launch::New { prompt: "" }, here),
+    }
+}
+
+/// 1 行を起こすときに決まっていること（[`launch_plan`] の答え）。
+///
+/// **起動先の cwd は行の cwd と別物**（走行中に git worktree へ移った会話は
+/// そちらで開く。[`relaunch`]）なので、決めた側が持って回る
+struct LaunchPlan<'a> {
+    kind: crate::backend::Kind,
+    launch: Launch<'a>,
+    cwd: String,
+}
+
+/// **起こし直し方を決める唯一の口。** 材料を揃えてから [`relaunch`] に聞く
+/// （揃える中身は [`recover_conversation`]）。
+///
+/// 揃える段を [`relaunch`] の外に置いたのは、あちらが副作用を持たない純関数だから
+/// （表の 3 段は「材料がこうならこう起こす」だけを言う）。逆に、揃える段を
+/// [`ensure_window`] に直に書くと、行を借りる前後の順番と混ざって読めなくなる
+fn launch_plan<'a>(app: &'a mut App, id: &SessionId) -> Option<LaunchPlan<'a>> {
+    recover_conversation(app, id);
+    let row = app.row(id)?;
+    let kind = row.kind;
+    let (launch, cwd) = relaunch(&app.titles, row);
+    Some(LaunchPlan { kind, launch, cwd: cwd.into_owned() })
+}
+
+/// 起こし直す前に、**会話を知っている材料を全部使う**（hook の記録 → 記録の解決）。
+///
+/// 行の会話は `sessions.json` だけが持っているのではない: hook の記録
+/// （`hook-states.json`。鍵は行 ID）もその行が最後に名乗った会話を覚えていて、
+/// 周期処理（[`adopt_hook_states`]）が 2 秒ごとにそれを行へ写している。
+/// **起こし直しはその周期を待たない**ので、写す前に起こすと保管に会話が
+/// 載っていない行が「確かめていない行」として `claude -r`（値なし ＝ agent の
+/// 選択画面）で開く ＝ **ccdesk を再起動すると、前回動いていたセッションが
+/// resume の選択画面になる**（報告されたバグ。起動列は前回のスロットを
+/// 復元してから最初の周期を回すので、この経路が必ず先に来る）。
+///
+/// **記録の解決までやり直す**のが要点: [`relaunch`] は記録の在り処から起動先を
+/// 決めるので、会話だけ戻して記録が無いままだと*新規*で起こしてしまう
+/// （会話が分からない行の記録は [`crate::title`] が落とす ＝ 会話を失った行は
+/// 記録も失っている）。
+///
+/// 確かめ済みの行では何もしない（起こし直しのたびに走査を増やさない）
+fn recover_conversation(app: &mut App, id: &SessionId) {
+    if app
+        .row(id)
+        .is_none_or(|row| row.conversation.observed().is_some())
+    {
+        return;
+    }
+    adopt_conversations(app);
+    // 会話が戻った行だけ記録を引き直す（戻らなければ走査する理由も無い）
+    if app
+        .row(id)
+        .is_some_and(|row| row.conversation.observed().is_some())
+    {
+        refresh_transcripts(app);
     }
 }
 
@@ -4095,13 +4154,12 @@ fn ensure_window(app: &mut App, id: &SessionId, size: (u16, u16)) -> bool {
     // `&mut App` が要り、`relaunch` が返す `Launch` は行を借り続ける）
     let injection = hook_settings(app);
     let inject = injection.as_ref().map(as_inject);
-    let Some(row) = app.row(id) else {
+    let Some(plan) = launch_plan(app, id) else {
         return false; // 再読み込みで消えた行（クリックと削除の競合）は何もしない
     };
-    let kind = row.kind;
-    let (launch, cwd) = relaunch(&app.titles, row);
-    let cwd = cwd.into_owned();
-    let spawn = kind.spawn_command(id, &cwd, launch, inject.as_ref());
+    let spawn = plan
+        .kind
+        .spawn_command(id, &plan.cwd, plan.launch, inject.as_ref());
     let conversation = spawn.conversation;
     let (rows, cols) = size;
     match Session::spawn(id, spawn.cmd, rows, cols) {
@@ -5996,6 +6054,55 @@ mod tests {
             "resumed with something other than the observed conversation"
         );
         assert_eq!(cwd, row.cwd);
+    }
+
+    /// **再起動しても、前回動いていた行は会話へ戻る（選択画面にならない）。**
+    ///
+    /// 保管（`sessions.json`）に会話が載っていない行でも、hook の記録は
+    /// その行が最後に名乗った会話を覚えている。起こし直しがそれを使わないと
+    /// `claude -r`（値なし ＝ agent の選択画面）で開く ＝ 報告されたバグ
+    /// （ccdesk を再起動すると、前回動いていた claude が resume の選択画面で開く）。
+    ///
+    /// **記録の解決までやり直すことも一緒に固定する**: 会話だけ戻して記録が
+    /// 無いままだと [`relaunch`] は*新規*で起こす ＝ 前回の会話は開かない
+    #[test]
+    fn a_row_whose_conversation_only_the_hooks_know_is_resumed_not_picked() {
+        let temp = crate::title::tests::TempProjects::new("recover_conversation_before_relaunch");
+        let mut app = App {
+            titles: temp.titles(),
+            // hook は前回の会話を覚えている（受け渡しファイルは再起動をまたぐ）
+            hook_states: HookStates::from_records([(
+                "s",
+                crate::poll::State::Idle,
+                5_000,
+                Some("conv-s"),
+            )]),
+            ..app_with_row("s")
+        };
+        // 前回の実行が残した記録（claude 側の持ち物なので再起動では消えない）
+        let recorded = SessionRow {
+            conversation: Conversation::Observed("conv-s".to_string()),
+            ..app.sessions[0].clone()
+        };
+        app.titles.write_transcript(&recorded, "{\"type\":\"user\"}
+");
+        // 保管が会話を持たないまま起動した姿（`Assigned` はディスクに載らない ＝
+        // hook が一度も保存へ届かなかった行はここに居る）
+        app.sessions[0].conversation = Conversation::Unknown;
+        app.sessions[0].transcript = None;
+
+        // 前提: このまま聞けば選択画面（＝ バグの姿）
+        assert!(
+            matches!(relaunch(&app.titles, &app.sessions[0]).0, Launch::Pick),
+            "the fixture's premise broke"
+        );
+
+        let plan = launch_plan(&mut app, &SessionId::new("s")).expect("the row vanished");
+
+        assert!(
+            matches!(plan.launch, Launch::Resume { id } if id == "conv-s"),
+            "the row the hooks still know was opened with the agent's picker"
+        );
     }
 
     /// **セッションの中で `/rename` した結果がそのままサイドバーへ出る。**
