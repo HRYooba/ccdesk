@@ -649,8 +649,8 @@ impl UpdateState {
     ];
 
     /// 右端に置く語。最新のときだけ空（やることが無い）。**押せる行だけが動詞**で、
-    /// 押せない行（[`Self::action`] が `Inert`）は状態を述べる形にする ＝
-    /// 語の形そのものが「押して意味があるか」を伝える。
+    /// 押せない行（[`Self::action`] が `Inert`）は命令形を避けて、再起動が何を
+    /// もたらすかを述べる句にする ＝ 語の形そのものが「押して意味があるか」を伝える。
     ///
     /// **新しい版の番号は出さない。** 新旧を並べた `⟳ claude v2.1.218 → v2.1.220` に
     /// 語まで足すと実測 35 桁で、既定幅（内側 32 桁）に収まらない。現行版と
@@ -663,14 +663,30 @@ impl UpdateState {
             // **動詞ではなく状態**（押せる行だが、押しても同じ結果になりうる）。
             // "update" のままだと、効かなかったことが行から読めない
             Self::Stalled => "stalled",
-            // **動詞ではなく状態**（[`Self::Stalled`] と同じ判断）。裸の "restart" を
-            // 置いていた頃、押しても何も起きない行（[`Self::action`]）なのに
-            // 「押せばここから再起動できる」と読めるという指摘が利用者から来た。
-            // `on restart` なら呼びかけではなく「次に起動したときに入れ替わる」という
-            // 条件として読める。語を伸ばす方向（`needs restart` など）は取れない:
-            // 既定幅で最長の版数字と並ぶと右端で切られ、幅のテストが落ちる
-            Self::RestartPending => "on restart",
+            // **claude 本体と同じ綴り**（あちらは差し替え後に
+            // "Update installed / Restart to update" と出す）。同じ出来事に同じ語を
+            // 使う ＝ 利用者が 2 つの綴りを対応付けなくていい。
+            //
+            // 裸の "restart" にしないのは、押しても何も起きない行
+            // （[`Self::action`]）なのに「押せばここから再起動できる」と読めるという
+            // 指摘が利用者から来たため。`restart to update` は再起動が何をもたらすかを
+            // 述べる句なので、その誤読が起きない。
+            //
+            // **この綴りは版番号と並べると既定幅（内側 32 桁）に入らない**ので、
+            // この状態だけ版番号を出さない（[`Self::shows_version`]）
+            Self::RestartPending => "restart to update",
         }
+    }
+
+    /// 版番号を行に出すか。**出さないのは差し替え済みのときだけ。**
+    ///
+    /// あの状態の右端の語（`restart to update`）は 17 桁あり、版番号と並べると
+    /// 既定幅（内側 32 桁）で切られる。両方は置けないので、落とすのは番号にした:
+    /// 伝えたいのは「新しい版はもう入っていて、あとは起動し直すだけ」で、
+    /// **走っている版の番号はその判断に効かない**（新版の番号はそもそも幅の都合で
+    /// どの状態でも出していない）。番号が要るときは `ccdesk --version` が答える
+    fn shows_version(self) -> bool {
+        self != Self::RestartPending
     }
 
     /// 押したときの動作（＝行に付ける [`RowAction`]）。押して意味があるのは
@@ -710,7 +726,8 @@ impl UpdateState {
 /// **この桁が一覧の凡例を兼ねる。** セッション行のドットは形で agent を表すが、
 /// 形と綴りが並ぶ場所はここしかない（一覧の行に綴りを戻すと名前の桁を食う）。
 ///
-/// 版が未取得（起動直後・CLI 失敗）なら番号を出さない ＝ 誤情報を出さない
+/// 版が未取得（起動直後・CLI 失敗）なら番号を出さない ＝ 誤情報を出さない。
+/// **差し替え済みの行も番号を出さない**（右端の語に桁を譲る。[`UpdateState::shows_version`]）
 fn version_row(
     glyph: &str,
     name: &str,
@@ -724,7 +741,7 @@ fn version_row(
     } else {
         UPDATE_MARK
     };
-    let left = if version.is_empty() {
+    let left = if version.is_empty() || !state.shows_version() {
         format!("{mark} {glyph} {name}")
     } else {
         format!("{mark} {glyph} {name} v{version}")
@@ -3261,7 +3278,16 @@ pub(crate) mod tests {
         ] {
             let rows = version_rows(ccdesk, &agents(claude, "2.1.220"), DEFAULT_INNER);
             assert_eq!(rows.len(), total, "expected one row per agent + 1 separator");
-            assert!(rows[0].0.contains(env!("CARGO_PKG_VERSION")), "{:?}", rows[0].0);
+            // 版番号を出すかは状態が決める（差し替え済みだけ出さない ＝
+            // [`UpdateState::shows_version`]）。**どちらでも行は 1 本**
+            assert_eq!(
+                rows[0].0.contains(env!("CARGO_PKG_VERSION")),
+                ccdesk.shows_version(),
+                "{:?}",
+                rows[0].0
+            );
+            assert!(rows[0].0.contains("ccdesk"), "{:?}", rows[0].0);
+            // agent 行は差し替え済みにならない（claude は次の --version で最新へ戻る）
             assert!(rows[1].0.contains("claude v2.1.220"), "{:?}", rows[1].0);
             assert!(rows[2].0.contains("codex v2.1.220"), "{:?}", rows[2].0);
             assert_eq!(rows[total - 1].0, separator_text(DEFAULT_INNER));
@@ -3302,7 +3328,13 @@ pub(crate) mod tests {
             assert!(!verb.is_empty(), "{state:?} has nothing to say at the right edge");
             assert!(text.starts_with(UPDATE_MARK), "{text:?}");
             assert!(text.ends_with(verb), "{text:?} does not end with {verb:?}");
-            assert!(text.contains("ccdesk v0.5.0"), "{text:?}");
+            // 名前は必ず出る。番号は状態が決める（差し替え済みは右端の語へ桁を譲る）
+            assert!(text.contains("ccdesk"), "{text:?}");
+            assert_eq!(
+                text.contains("v0.5.0"),
+                state.shows_version(),
+                "{state:?} disagrees with shows_version: {text:?}"
+            );
             verbs.push(verb);
         }
         let unique: std::collections::BTreeSet<_> = verbs.iter().collect();
@@ -3320,6 +3352,22 @@ pub(crate) mod tests {
         );
         // 状態が行から読める（"update" のままだと効かなかったことが伝わらない）
         assert_ne!(UpdateState::Stalled.verb(), UpdateState::Available.verb());
+    }
+
+    /// **差し替え済みの行は claude 本体と同じ綴りで、版番号を右端の語に譲る。**
+    /// 綴りを揃えるのは同じ出来事（新しい版は入った / 反映は再起動から）に 2 つの
+    /// 言い方を作らないため。番号を落とすのは幅の都合で、両方は既定幅に入らない
+    #[test]
+    fn the_restart_pending_row_reads_like_the_agent_it_mirrors() {
+        use unicode_width::UnicodeWidthStr;
+        let text = version_row(" ", "ccdesk", "0.23.2", UpdateState::RestartPending, DEFAULT_INNER);
+        assert!(text.ends_with("restart to update"), "{text:?}");
+        assert!(text.contains("ccdesk"), "{text:?}");
+        assert!(!text.contains("0.23.2"), "the version was not yielded: {text:?}");
+        assert!(text.width() <= DEFAULT_INNER as usize, "{text:?} ({} columns)", text.width());
+        // 版を出す状態では番号が残る（落としたのは差し替え済みだけ）
+        let available = version_row(" ", "ccdesk", "0.23.2", UpdateState::Available, DEFAULT_INNER);
+        assert!(available.contains("ccdesk v0.23.2"), "{available:?}");
     }
 
     /// **最新のときもマーカー桁を確保する。** 更新が出た瞬間に名前が横へずれると、
@@ -3405,7 +3453,7 @@ pub(crate) mod tests {
     /// **押せない行の語を裸の動詞にしない。** 差し替え済みの行が右端に "restart" と
     /// 出していた頃、押しても何も起きない行（[`UpdateState::action`]）なのに
     /// 「押せばここから再起動できる」と読めるという指摘が利用者から来た。
-    /// 押せない行は「今どうなっているか」を述べる形 ＝ 語をつないだ句（`on restart`）か
+    /// 押せない行は「今どうなっているか」を述べる形 ＝ 語をつないだ句（`restart to update`）か
     /// 進行の省略記号付き（`updating…`）にする。**押せるかどうかは実装から引く**ので、
     /// 状態を足しても手で一覧を足す必要はない
     #[test]
