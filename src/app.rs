@@ -1395,9 +1395,21 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 .footer_shared
                 .lock_recover()
                 .clone();
+            // **据え置きの旗は「新しい版がまだある」ことが前提**
+            // （[`update_left_the_version_behind`] の 3 条件目）。latest が消えたら
+            // 更新するものが無くなった ＝ 据え置きも終わっているので、ここで降ろす。
+            // 降ろさないと、agent が自分で更新した（claude のネイティブ版は既定で
+            // 自動更新する）あと次の新版が出たときに、一度も押していない行が
+            // "stalled" を名乗る
+            for (kind, stalled) in &app.agent_update_stalled {
+                if app.footer.version(*kind).latest.is_none() {
+                    stalled.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             force_draw = true;
         }
-        // ccdesk 自身の更新の失敗を下部バーへ出す。成功は版行の "on restart" が伝えるので
+        // ccdesk 自身の更新の失敗を下部バーへ出す。成功は版行の案内
+        // （"restart to update"）が伝えるので
         // ここでは扱わない（Idle へ戻すので、失敗した更新はもう一度押せる）
         let failure = {
             let mut state = app
