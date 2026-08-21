@@ -547,6 +547,26 @@ fn account_step(
     next_account(shown, fetched)
 }
 
+/// 取得できた版を共有側へ **kind ごとに** 取り込む。1 つでも書き換えたら true。
+///
+/// **丸ごと代入にしない。** 取得に失敗した agent は呼び手の filter で `fetched` から
+/// 落ちているので、代入すると**落ちた側の項目まで消える** ＝ その版行が
+/// 「版番号なし・更新マーカーなし」で次の周期（1 時間）まで固まる。
+/// filter で防いだつもりだったことを、代入が元に戻していた
+fn merge_versions(
+    current: &mut BTreeMap<Kind, AgentVersion>,
+    fetched: BTreeMap<Kind, AgentVersion>,
+) -> bool {
+    let mut changed = false;
+    for (kind, version) in fetched {
+        if current.get(&kind) != Some(&version) {
+            current.insert(kind, version);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// フッター情報のバックグラウンド取得。
 /// アカウントとバージョンは変化の速さが違うので別々の周期で回す:
 /// - アカウント: 認証ファイルの変化で即時 + 60s フォールバック
@@ -613,10 +633,7 @@ pub(crate) fn spawn_footer_poller(
                 if !fetched.is_empty() {
                     let mut guard = shared
                         .lock_recover();
-                    if guard.versions != fetched {
-                        guard.versions = fetched;
-                        updated = true;
-                    }
+                    updated |= merge_versions(&mut guard.versions, fetched);
                 }
                 // ccdesk 自身の版。**取得できなかった回は書かない**（claude 側と
                 // 同じ判断。1 回の空振りで版行の ⟳ が 1 時間消えるのを防ぐ）。
@@ -1577,4 +1594,34 @@ mod tests {
         );
     }
 
+    /// **1 周で取れなかった agent の版行を消さない。** 版の取得は agent ごとに
+    /// 独立して失敗しうる（`--version` が一時的に転ける・npm のシムが差し替え中）。
+    /// 呼び手は失敗した分を落として渡すので、取り込み側が丸ごと代入すると
+    /// 落ちた側の版番号と更新マーカーが次の周期（1 時間）まで消える
+    #[test]
+    fn a_version_that_failed_this_round_keeps_the_one_already_shown() {
+        let v = |current: &str, latest: Option<&str>| AgentVersion {
+            current: current.to_string(),
+            latest: latest.map(str::to_string),
+        };
+        let mut shown: BTreeMap<Kind, AgentVersion> = [
+            (Kind::Claude, v("2.1.237", None)),
+            (Kind::Codex, v("0.148.0", Some("0.149.0"))),
+        ]
+        .into();
+        // claude だけ取れた周（codex は current が空だったので呼び手が落とした）
+        let changed = merge_versions(&mut shown, [(Kind::Claude, v("2.1.238", None))].into());
+        assert!(changed);
+        assert_eq!(shown.get(&Kind::Claude), Some(&v("2.1.238", None)));
+        assert_eq!(
+            shown.get(&Kind::Codex),
+            Some(&v("0.148.0", Some("0.149.0"))),
+            "the agent that failed this round lost the version row it already had"
+        );
+        // 同じ値なら書き換えたと言わない（描き直しの合図を無駄に立てない）
+        assert!(!merge_versions(&mut shown, [(Kind::Claude, v("2.1.238", None))].into()));
+        // 空の周でも消さない
+        assert!(!merge_versions(&mut shown, BTreeMap::new()));
+        assert_eq!(shown.len(), 2);
+    }
 }

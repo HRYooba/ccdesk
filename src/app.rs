@@ -1395,9 +1395,21 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 .footer_shared
                 .lock_recover()
                 .clone();
+            // **据え置きの旗は「新しい版がまだある」ことが前提**
+            // （[`update_left_the_version_behind`] の 3 条件目）。latest が消えたら
+            // 更新するものが無くなった ＝ 据え置きも終わっているので、ここで降ろす。
+            // 降ろさないと、agent が自分で更新した（claude のネイティブ版は既定で
+            // 自動更新する）あと次の新版が出たときに、一度も押していない行が
+            // "stalled" を名乗る
+            for (kind, stalled) in &app.agent_update_stalled {
+                if app.footer.version(*kind).latest.is_none() {
+                    stalled.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             force_draw = true;
         }
-        // ccdesk 自身の更新の失敗を下部バーへ出す。成功は版行の "on restart" が伝えるので
+        // ccdesk 自身の更新の失敗を下部バーへ出す。成功は版行の案内
+        // （"restart to update"）が伝えるので
         // ここでは扱わない（Idle へ戻すので、失敗した更新はもう一度押せる）
         let failure = {
             let mut state = app
@@ -3566,7 +3578,7 @@ pub(crate) fn move_selection(app: &mut App, dir: i32) {
 /// **走ったまま差し替えられる。** Windows は実行中の exe を上書きできないが改名は
 /// できるので、update.rs の 3 段改名（`.new` へ置く → 現行を `.old` へ退避 →
 /// `.new` を本体へ）がそのまま成立する。反映は次回起動なので、成功後は版行が
-/// "on restart" の案内を出すだけに留める（自動では再起動しない ＝
+/// "restart to update" の案内を出すだけに留める（自動では再起動しない ＝
 /// [`crate::ui::UpdateState::RestartPending`]）。利用者が自分のタイミングで
 /// ccdesk を終了・起動し直すと新しい版が動く。`SelfUpdate::Done` はこのセッション中戻らない。
 /// 数 MB のダウンロードと SHA-256 検証が入るため別スレッドで行う
@@ -5225,7 +5237,7 @@ mod tests {
         assert_eq!(app.sidebar_width, 34, "sidebar width must not change");
     }
 
-    /// 版行の右端に置く語（`update` / `on restart`）は内容の最右列で終わるので、
+    /// 版行の右端に置く語（`update` / `restart to update`）は内容の最右列で終わるので、
     /// **幅変更のつかみ代（境界線の 2 列）には掛からない**。1 桁でも外すと
     /// 右端の語のクリックがサイドバー幅変更に化ける
     #[test]
@@ -5769,7 +5781,7 @@ mod tests {
     /// 差し替え済み（`Done`）の版行は案内だけで、押しても何も起きない。
     ///
     /// **自動再起動はやめた**: 走ったまま自プロセスを起こすとコンソールを
-    /// 親子で奪い合いマウスが効かなくなる不具合が実機で出たため、案内（"on restart"）
+    /// 親子で奪い合いマウスが効かなくなる不具合が実機で出たため、案内（"restart to update"）
     /// を出すだけに留め、利用者が自分のタイミングで終了・起動し直す運用にした
     /// （[`crate::ui::UpdateState::RestartPending`]）。
     #[test]
