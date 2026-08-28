@@ -1,4 +1,4 @@
-//! 子の claude から ccdesk へ状態を戻す口（`--settings` で注入する hook）。
+//! 子の agent から ccdesk へ出来事を戻す口（注入する hook）。
 //!
 //! **hook の実体は ccdesk 自身のサブコマンド**（`ccdesk hook <event>`）。外部スクリプトを
 //! 撒かないので、ccdesk を置き換えれば hook も一緒に入れ替わり、「古いスクリプトが
@@ -8,18 +8,21 @@
 //! 書き方（advisory lock と tmp → rename）は lib 側の 1 実装を使う
 //! （[`ccdesk::Lock`] / [`ccdesk::write_json_atomically`]）。
 //!
-//! **hook はイベント、`~/.claude/sessions/` の `status` は現在値。**
+//! **hook はイベント、agent が名乗る現在値はもう 1 つの材料。**
 //! 行の状態は 2 つを同じ語彙へ揃えたうえで**新しい方**を採る
-//! （[`crate::poll::row_state`]）。hook の取り柄は 0 遅延、`status` の取り柄は
+//! （[`crate::poll::row_state`]）。hook の取り柄は 0 遅延、現在値の取り柄は
 //! 取りこぼしても次の観測で必ず正しくなること ＝ どちらが欠けても縮退で済む。
 //! **受けた state を行へ写さない**のが要点で、写していた頃は
 //! 保管（`sessions.json`）と hook が食い違い、しかもどちらが新しいかが行ごとに
 //! 逆になっていた（[`crate::sessions::SessionRow`]）。
 //!
-//! ここが答えるのは 2 つ。どちらも**行に保存せず、そのつど引く**:
-//! 状態（[`HookStates::get`]）・未読（[`HookStates::unread`]）。
+//! ここが答えるのは 3 つ。どれも**行に保存せず、そのつど引く**:
+//! 状態（[`HookStates::get`]）・未読（[`HookStates::unread`]）・
+//! ユーザーを呼ぶ出来事（[`HookStates::alert`]）。
 //!
-//! **注入する settings はここが 1 箇所で組む**（[`inject_settings`]）。載るのは hook だけ。
+//! **注入する内容はここが 1 箇所で組む**（[`HOOK_EVENTS`]）。**どの agent が
+//! どのイベントを持つかも同じ表**（`agents` 列）で、claude 用の settings
+//! （[`inject_settings`]）も codex 用の TOML（`crate::backend::codex`）もそれを読む。
 //!
 //! **`statusLine` を載せてはいけない。** `--settings` の値はキー単位でユーザー設定を
 //! 上書きする（公式仕様）ので、書いた瞬間にそのセッションのユーザー自身の statusline が
@@ -35,6 +38,7 @@ use serde_json::{json, Value};
 
 use ccdesk::{lock_path_for, now_ms, write_json_atomically, Lock, LOCK_STALE};
 
+use crate::backend::Kind;
 use crate::poll::State;
 use crate::sessions::{SessionId, SessionRow};
 
@@ -84,11 +88,41 @@ pub(crate) struct HookEvent {
     pub(crate) matcher: Option<&'static str>,
     /// この hook が意味する state。**要約文は持たない**（行に出るのは状態だけ）
     pub(crate) state: State,
-    /// この hook が**ユーザーの見るべき新しい出来事**か（未読 `●` の材料）。
-    /// 状態と未読を同じ時刻で判定していた頃は、`SessionEnd` の記録が
-    /// 「claude が何か言った」に数えられ、stop しただけの行が再起動後に未読になった
-    pub(crate) activity: bool,
+    /// この hook は**ユーザーを呼ぶ出来事**か。None ＝ 呼ばない。
+    ///
+    /// **1 つの列が 2 つを兼ねる**: 未読 `●` の材料（`Some` の hook だけが
+    /// `activity_at` を進める）と、OS 通知の種類（[`crate::app`] の
+    /// `update_notifications`）。両者は「ユーザーの見るべき出来事か」という
+    /// 同じ問いなので、別々の列に割ると片方だけ直した状態が作れてしまう。
+    ///
+    /// **`SessionEnd` が None なのが効く**: 状態と未読を同じ時刻で判定していた頃は、
+    /// 終了の記録が「agent が何か言った」に数えられ、stop しただけの行が再起動後に
+    /// 未読になった。
+    ///
+    /// **`Interrupt` も None**: 中断はユーザー自身の操作なので、呼び戻す理由が無い
+    pub(crate) alert: Option<crate::notify::Kind>,
+    /// このイベントを持つ agent。**知らない名前を注入すると壊れる**ので、
+    /// 誰に注入するかはここが正本（claude は settings、codex は `-c` の TOML）。
+    ///
+    /// **一覧を backend 側に別で持たない。** 持っていた頃は「表」と「部分集合の
+    /// 一覧」が 2 箇所にあり、表に 1 行足して一覧を直し忘れると**そのイベントが
+    /// 黙って注入されない**（起動は成功し、行の状態が 1 つ縮むだけなので気づけない）
+    pub(crate) agents: &'static [Kind],
 }
+
+impl HookEvent {
+    /// その agent がこのイベントを持つか
+    pub(crate) fn has(&self, kind: Kind) -> bool {
+        self.agents.contains(&kind)
+    }
+}
+
+/// 両方の agent が持つイベント（表を読みやすくするためだけの別名）
+const BOTH: &[Kind] = &[Kind::Claude, Kind::Codex];
+/// claude だけが持つイベント
+const CLAUDE_ONLY: &[Kind] = &[Kind::Claude];
+/// codex だけが持つイベント
+const CODEX_ONLY: &[Kind] = &[Kind::Codex];
 
 /// 注入する hook の表。同じイベント名を複数載せてよい（matcher で発火を分ける形を
 /// 注入・受け口とも受け付ける）。
@@ -104,7 +138,7 @@ pub(crate) struct HookEvent {
 /// ものを除いた 1 回だけ）。turn より頻繁になり得るのは事実だが、頻度の実体は
 /// 「ユーザーへの割り込み」であって「道具の呼び出し」ではないので、この原則が
 /// 避けたい害（turn の何倍もプロセスを起こす）には当たらない
-pub(crate) const HOOK_EVENTS: [HookEvent; 7] = [
+pub(crate) const HOOK_EVENTS: [HookEvent; 8] = [
     // 起動直後・再開直後は**プロンプトで待機している**（claude は動いておらず、
     // ユーザーへの要求も無い）。ユーザー自身の操作なので未読にはしない。
     //
@@ -112,9 +146,9 @@ pub(crate) const HOOK_EVENTS: [HookEvent; 7] = [
     // 開き直すと（止める前が Idle でも）黄「Needs input」に変わり、そのまま
     // 固着していた。claude 自身もこの状態を `idle` と報告する（`waitingFor` は無い
     // ＝ 何も待っていない）ので、[`crate::poll::state_of_status`] の写し先と一致する
-    HookEvent { event: "SessionStart", matcher: None, state: State::Idle, activity: false },
-    HookEvent { event: "UserPromptSubmit", matcher: None, state: State::Working, activity: false },
-    HookEvent { event: "Notification", matcher: Some(ATTENTION_MATCHER), state: State::Waiting, activity: true },
+    HookEvent { event: "SessionStart", matcher: None, state: State::Idle, alert: None, agents: BOTH },
+    HookEvent { event: "UserPromptSubmit", matcher: None, state: State::Working, alert: None, agents: BOTH },
+    HookEvent { event: "Notification", matcher: Some(ATTENTION_MATCHER), state: State::Waiting, alert: Some(crate::notify::Kind::NeedsInput), agents: CLAUDE_ONLY },
     // 道具の許可ダイアログが実際に表示されるときだけ飛ぶ（公式カタログ:
     // "Run before permission prompt"）。`Notification` の 2 つの matcher
     // （`permission_prompt` / `worker_permission_prompt`）と役割が重なるが、
@@ -128,19 +162,28 @@ pub(crate) const HOOK_EVENTS: [HookEvent; 7] = [
     // かつてはここが「未検証のリスク」だった: ダイアログを意図的に出す手段が
     // 無かったため実測できず、`waitingFor` という専用フィールドの存在を傍証に
     // 置いていた。claude 本体の実装を読んで裏が取れたので、その但し書きは外した
-    HookEvent { event: "PermissionRequest", matcher: None, state: State::Waiting, activity: true },
-    HookEvent { event: "Stop", matcher: None, state: State::Idle, activity: true },
+    HookEvent { event: "PermissionRequest", matcher: None, state: State::Waiting, alert: Some(crate::notify::Kind::NeedsInput), agents: BOTH },
+    HookEvent { event: "Stop", matcher: None, state: State::Idle, alert: Some(crate::notify::Kind::Finished), agents: BOTH },
     // Stop の代わりに、API エラー（rate limit・認証失敗・max_output_tokens 等）で
     // ターンが終わったときだけ飛ぶ（claude の公式カタログに文書化: "Fires instead of
     // Stop when an API error ended the turn"）。**state は Stop と同じ idle**:
     // ターンが終わった以上その行に手は要らないので、成功でもエラーでもここに収まる。
     // 成否を区別する別の State を新設するのは、その区別を
     // 導入するための State 全体の設計変更になり、この 1 件のためには釣り合わない。
-    // activity も Stop と同じ true: max_output_tokens（出力が長くて打ち切られた）が
+    // alert も Stop と同じ完了: max_output_tokens（出力が長くて打ち切られた）が
     // 含まれるのが効く経路で、ユーザーが見るべき出来事という点は Stop と変わらない
-    HookEvent { event: "StopFailure", matcher: None, state: State::Idle, activity: true },
-    // プロセスの終了は「claude が何か言った」ではない
-    HookEvent { event: "SessionEnd", matcher: None, state: State::Stopped, activity: false },
+    HookEvent { event: "StopFailure", matcher: None, state: State::Idle, alert: Some(crate::notify::Kind::Finished), agents: CLAUDE_ONLY },
+    // **Esc 中断（codex 0.150 で増えた）。** これが無かった間、中断した codex の行は
+    // 永久に Working のままだった（[codex#22858](https://github.com/openai/codex/issues/22858)
+    // ＝ 中断のとき `Stop` は飛ばない）。
+    //
+    // **state は Stop と同じ Idle で、alert は None。** 手が空いたのは同じだが、
+    // 止めたのはユーザー自身なので呼び戻す理由が無い ＝ 「Esc で止めても
+    // 完了通知が来る」（報告された症状）が表の 1 マスで消える。
+    // claude には無いイベントなので codex だけに注入する
+    HookEvent { event: "Interrupt", matcher: None, state: State::Idle, alert: None, agents: CODEX_ONLY },
+    // プロセスの終了は「agent が何か言った」ではない
+    HookEvent { event: "SessionEnd", matcher: None, state: State::Stopped, alert: None, agents: BOTH },
 ];
 
 /// state 引数を持たない旧形式 `ccdesk hook <event>` の解決表。
@@ -165,6 +208,9 @@ const STATES_KEY: &str = "states";
 const STATE_KEY: &str = "state";
 const AT_KEY: &str = "at";
 const ACTIVITY_AT_KEY: &str = "activity_at";
+/// [`ACTIVITY_AT_KEY`] を進めた hook が**どちら向けの呼び出し**だったか
+/// （[`HookEvent::alert`]）。無い ＝ 旧形式の保管、または呼び出しではなかった
+const ALERT_KEY: &str = "alert";
 /// その hook が名乗った**会話 ID**（payload の `session_id`）。保管のキー ＝
 /// ccdesk の行とは別物で、ペインの中の `/clear` `/resume` でこちらだけが変わる
 const CONVERSATION_KEY: &str = "conversation";
@@ -202,12 +248,17 @@ struct Entry {
     state: State,
     /// 受けた時刻（epoch ms）。**書き手（[`record`]）と同じ時計**
     at: u64,
-    /// **ユーザーの見るべき新しい出来事**が最後に起きた時刻（未読 `●` の材料）。
-    /// activity を持たない hook（[`HookEvent::activity`] が false）は前回の値を
-    /// 引き継ぐ ＝ `Stop(idle)` の後に `SessionEnd(stopped)` が来ても
-    /// 「まだ見ていない完了」の記録は消えない。None は一度も起きていない
-    /// （旧形式の保管を含む）
+    /// **ユーザーを呼ぶ出来事**が最後に起きた時刻（未読 `●` と OS 通知の材料）。
+    /// 呼ばない hook（[`HookEvent::alert`] が None）は前回の値を引き継ぐ ＝
+    /// `Stop(idle)` の後に `SessionEnd(stopped)` が来ても「まだ見ていない完了」の
+    /// 記録は消えない。None は一度も起きていない（旧形式の保管を含む）
     activity_at: Option<u64>,
+    /// [`Self::activity_at`] を進めた hook が名乗った**呼び出しの種類**。
+    ///
+    /// **通知はこれと `activity_at` の対だけを見る**（[`crate::app`] の
+    /// `update_notifications`）。行の state の変わり目ではなく、agent が
+    /// 「呼んでいる」「終わった」と**自分で名乗った出来事**が通知の材料
+    alert: Option<crate::notify::Kind>,
     /// その hook が名乗った**会話 ID**（payload の `session_id`）。
     ///
     /// **キーとは別物。** 保管のキーは ccdesk の行 ID（`CCDESK_ROW`）で、
@@ -217,47 +268,18 @@ struct Entry {
     conversation: Option<String>,
 }
 
-impl Entry {
-    /// この項目を書いたのが**ターンの終わりを名乗るイベント**（`Stop` /
-    /// `StopFailure`）か。
-    ///
-    /// **state だけでは足りない。** [`HOOK_EVENTS`] で `Idle` を書くイベントは
-    /// 3 つ（`SessionStart` / `Stop` / `StopFailure`）あり、`SessionStart` は
-    /// ターンの終わりではない ＝ これを混ぜると**ペインの中の `/clear` `/resume`
-    /// が完了通知になる**（[`crate::poll::RowState::interrupted`]）。
-    ///
-    /// 材料は `activity_at` で足りる: activity を持つ hook は `at` と同じ時刻で
-    /// これを更新し、持たない hook は前回値を引き継ぐ（[`record`]）＝ 一致は
-    /// 「この項目を書いたイベントが activity 付きだった」と同義。そして `Idle` を
-    /// 書く 3 つのうち **activity を持たないのは `SessionStart` だけ**。
-    ///
-    /// この対応は表（[`HOOK_EVENTS`]）を書き換えれば崩れるので、崩れたら
-    /// `only_a_turn_ending_event_marks_the_entry_as_ended` が落ちるようにしてある
-    fn ended(&self) -> bool {
-        self.state == State::Idle && self.activity_at == Some(self.at)
-    }
-}
-
-/// hook が名乗った 1 件。**state と「誰が名乗ったか」を割らない**
-/// （割ると、撃つ判断と写しの更新が別々の規則で決まる形になる）
+/// hook が名乗った 1 件。
+///
+/// **「ターンの終わりを名乗ったか」の 1 ビットは持たない。** かつては通知が
+/// 「完了」と「手が空いただけ」を分けるために持っていたが、通知が state の
+/// 変わり目ではなく hook の出来事そのもの（[`HookStates::alert`]）を見るように
+/// なった今、その区別は表（[`HOOK_EVENTS`] の `alert` 列）の側にある
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Reported {
     pub(crate) state: State,
-    /// 受けた時刻（epoch ms）。`status` の観測時刻とどちらが新しいかを見る材料
+    /// 受けた時刻（epoch ms）。記録から読んだ現在値の時刻とどちらが新しいかを
+    /// 見る材料（[`crate::poll::row_state`]）
     pub(crate) at: u64,
-    /// **ターンの終わりを名乗るイベントが書いたか**（[`Entry::ended`]）。
-    /// 通知はこれを見て「完了」と「手が空いただけ」を分ける
-    pub(crate) ended: bool,
-}
-
-#[cfg(test)]
-impl Reported {
-    /// テスト用: **ターンの終わりを名乗った** hook 1 件（`Idle` は `Stop` 相当）。
-    /// `SessionStart` の `Idle`（＝ 終わりではない）を作るテストは
-    /// 構造体リテラルで `ended: false` を明示する
-    pub(crate) fn new(state: State, at: u64) -> Self {
-        Self { state, at, ended: state == State::Idle }
-    }
 }
 
 /// hook が書いた state の写し（`session_id` → [`Entry`]）
@@ -288,8 +310,24 @@ impl HookStates {
         (entry.at >= launched?).then_some(Reported {
             state: entry.state,
             at: entry.at,
-            ended: entry.ended(),
         })
+    }
+
+    /// その行で最後に起きた**ユーザーを呼ぶ出来事**（種類と時刻）。
+    ///
+    /// **OS 通知が読むのはこれだけ**（[`crate::app`] の `update_notifications`）。
+    /// 撃つ材料を行の state の変わり目から切り離すのが要点で、state は
+    /// 「今どうなっているか」しか答えない ＝ **ユーザー自身が開いたダイアログでも
+    /// 変わる**（claude は `/config` `/resume` を含むどのダイアログでも
+    /// `status: waiting` を書く。決定条件は [`crate::claude_format`]）。
+    /// 変わり目で撃っていた頃は、`/config` を開くと「Needs input」、閉じると
+    /// 「Turn finished」が鳴っていた（報告された症状）。
+    ///
+    /// **`launched` で絞らない**（[`Self::get`] との違い）: 前回の実行の呼び出しを
+    /// 撃たないのは呼び手の仕事で、そこは「窓を起こした時刻より後か」1 本で決まる
+    pub(crate) fn alert(&self, id: &SessionId) -> Option<(crate::notify::Kind, u64)> {
+        let entry = self.0.get(id)?;
+        Some((entry.alert?, entry.activity_at?))
     }
 
     /// その行が**最後に名乗った会話**。
@@ -337,7 +375,7 @@ impl HookStates {
     /// - **ccdesk を起動し直しただけでも未読にならない**（`last_opened_at` は
     ///   保管されるので、記録がそれより古ければ既読のまま）
     /// - **stop やアプリ終了でも未読にならない**（`SessionEnd` は状態を stopped に
-    ///   するだけで activity を持たない。`at` で判定していた頃は、終了の記録が
+    ///   するだけで呼び出しを持たない。`at` で判定していた頃は、終了の記録が
     ///   「claude が何か言った」に数えられ、再起動後に未読が生えた）
     pub(crate) fn unread(&self, row: &SessionRow) -> bool {
         self.0
@@ -346,8 +384,9 @@ impl HookStates {
             .is_some_and(|at| at > row.last_opened_at)
     }
 
-    /// テスト用の組み立て。**activity_at は at と同じ値**で入る（「その hook が
-    /// 未読の材料でもある」素朴な形。区別が要るテストは [`record`] を通して作る）
+    /// テスト用の組み立て。**ユーザーを呼んだ hook が書いた素朴な形**
+    /// （`activity_at` は `at` と同じ値、呼び出しは 1 件立っている）。
+    /// 種類や引き継ぎの区別が要るテストは [`record`] を通して作る
     #[cfg(test)]
     pub(crate) fn from_entries<'a>(
         entries: impl IntoIterator<Item = (&'a str, State, u64)>,
@@ -370,6 +409,7 @@ impl HookStates {
                             state,
                             at,
                             activity_at: Some(at),
+                            alert: Some(crate::notify::Kind::Finished),
                             conversation: conversation.map(str::to_string),
                         },
                     )
@@ -403,12 +443,12 @@ const RENAMED_HOOK_STATES: [(&str, &str, State); 3] = [
     ("StopFailure", "completed", State::Idle),
 ];
 
-/// (イベント名, state 引数) → (state, activity)。**受理するのは [`HOOK_EVENTS`] に
+/// (イベント名, state 引数) → (state, alert)。**受理するのは [`HOOK_EVENTS`] に
 /// ある組だけ**（知らない名前・表に無い組で呼ばれても何も書かない ＝ 表が正本のまま）。
 ///
 /// 引数の解決は 3 段: 改名された綴り（[`RENAMED_HOOK_STATES`]）→ 今の綴り →
 /// 引数なしの旧形式（[`LEGACY_HOOK_STATES`]）
-fn resolve(event: &str, state: Option<&str>) -> Option<(State, bool)> {
+fn resolve(event: &str, state: Option<&str>) -> Option<(State, Option<crate::notify::Kind>)> {
     let state = match state {
         Some(text) => renamed(event, text).or_else(|| State::parse(text))?,
         None => {
@@ -421,7 +461,7 @@ fn resolve(event: &str, state: Option<&str>) -> Option<(State, bool)> {
     HOOK_EVENTS
         .iter()
         .find(|row| row.event == event && row.state == state)
-        .map(|row| (row.state, row.activity))
+        .map(|row| (row.state, row.alert))
 }
 
 /// 改名前の綴りで呼ばれていたら、今の値。そうでなければ None
@@ -453,7 +493,7 @@ pub(crate) fn run_hook(event: &str, state: Option<&str>) -> anyhow::Result<()> {
             &path,
             &entry.row,
             entry.state,
-            entry.activity,
+            entry.alert,
             now_ms(),
             Some(entry.conversation.as_str()),
         );
@@ -468,7 +508,7 @@ pub(crate) fn run_hook(event: &str, state: Option<&str>) -> anyhow::Result<()> {
 /// 知らないイベント / 表に無い (event, state) / `session_id` が読めない入力 /
 /// **`CCDESK_ROW` が無い**呼び出しは None（何も書かない）
 fn hook_entry(event: &str, state: Option<&str>, input: &str) -> Option<HookRecord> {
-    let (state, activity) = resolve(event, state)?;
+    let (state, alert) = resolve(event, state)?;
     let conversation = session_id_of(input)?;
     // **行を名指しできるのは env だけ。** payload が運ぶのは会話 ID で、行 ID は
     // どこにも出さない（[`ROW_ENV`]）。**payload へ落ちるフォールバックは持たない**:
@@ -486,7 +526,7 @@ fn hook_entry(event: &str, state: Option<&str>, input: &str) -> Option<HookRecor
         row,
         conversation,
         state,
-        activity,
+        alert,
     })
 }
 
@@ -499,7 +539,7 @@ struct HookRecord {
     /// その時点で agent が動かしている会話（再開に使う）
     conversation: String,
     state: State,
-    activity: bool,
+    alert: Option<crate::notify::Kind>,
 }
 
 /// ccdesk が起動時に立てた行 ID（[`ROW_ENV`]）。**空文字は無いものとして扱う**
@@ -523,8 +563,10 @@ fn session_id_of(input: &str) -> Option<String> {
 /// （hook は複数のセッションから同時に走るので、読みと書きの間に他の hook の
 /// 書き込みが挟まると、その turn の state が落ちる）。
 ///
-/// activity を持たない hook は前回の `activity_at` を引き継ぐ（状態の上書きで
-/// 未読の記録を消さない。[`Entry::activity_at`]）。
+/// 呼び出しでない hook（[`HookEvent::alert`] が None）は前回の `activity_at` と
+/// `alert` を**対のまま**引き継ぐ（状態の上書きで未読・通知の記録を消さない。
+/// [`Entry::activity_at`]）。片方だけ引き継ぐと「種類は分かるが時刻が古い」
+/// 呼び出しが作れてしまう。
 ///
 /// 古い項目はここで落とす（[`KEEP`]）。掃除の契機を別に持たないのは、
 /// 書くのがこの 1 箇所だけで、**書くたびに掃除すれば積もらない**ため
@@ -532,7 +574,7 @@ fn record(
     path: &Path,
     session_id: &SessionId,
     state: State,
-    activity: bool,
+    alert: Option<crate::notify::Kind>,
     now: u64,
     conversation: Option<&str>,
 ) {
@@ -541,10 +583,11 @@ fn record(
     };
     let mut entries = read_entries(path, now);
     entries.retain(|_, entry| now.saturating_sub(entry.at) < KEEP.as_millis() as u64);
-    let activity_at = if activity {
-        Some(now)
-    } else {
-        entries.get(session_id).and_then(|entry| entry.activity_at)
+    let (activity_at, alert) = match alert {
+        Some(kind) => (Some(now), Some(kind)),
+        None => entries
+            .get(session_id)
+            .map_or((None, None), |entry| (entry.activity_at, entry.alert)),
     };
     // **取れなかったら前回の値を残す**（1 回でも拾えていれば再開できる）
     let conversation = conversation.map(str::to_string).or_else(|| {
@@ -558,6 +601,7 @@ fn record(
             state,
             at: now,
             activity_at,
+            alert,
             conversation,
         },
     );
@@ -568,6 +612,7 @@ fn record(
                 STATE_KEY: entry.state.as_str(),
                 AT_KEY: entry.at,
                 ACTIVITY_AT_KEY: entry.activity_at,
+                ALERT_KEY: entry.alert.map(crate::notify::Kind::as_str),
                 CONVERSATION_KEY: entry.conversation,
             })))
             .collect::<serde_json::Map<_, _>>()
@@ -604,6 +649,12 @@ fn read_entries(path: &Path, now: u64) -> BTreeMap<SessionId, Entry> {
             // 旧形式の保管（キーが無い）は None で読む ＝ 未読は付かない。
             // 移行データ（KEEP=7日）としてそのまま許容する
             let activity_at = entry.get(ACTIVITY_AT_KEY).and_then(Value::as_u64);
+            // 旧形式の保管（キーが無い）は None ＝ その行の呼び出しは 1 度撃たれない。
+            // 移行データ（[`KEEP`]）としてそのまま許容する
+            let alert = entry
+                .get(ALERT_KEY)
+                .and_then(Value::as_str)
+                .and_then(crate::notify::Kind::parse);
             let conversation = entry
                 .get(CONVERSATION_KEY)
                 .and_then(Value::as_str)
@@ -616,6 +667,7 @@ fn read_entries(path: &Path, now: u64) -> BTreeMap<SessionId, Entry> {
                         state,
                         at,
                         activity_at,
+                        alert,
                         conversation,
                     },
                 )
@@ -744,7 +796,8 @@ fn settings_document(exe_fwd: &str) -> Value {
     // イベント名をキーに、表の行を**配列へ足し込む**（同名イベントを 2 枚
     // 載せられる形。キー単位の `.collect()` だと同名の後の行が前の行を黙って潰す）
     let mut hooks = serde_json::Map::new();
-    for row in &HOOK_EVENTS {
+    // **claude が持つイベントだけを載せる**（誰が持つかの正本は表の `agents` 列）
+    for row in HOOK_EVENTS.iter().filter(|row| row.has(Kind::Claude)) {
         // matcher を持つ行だけ `matcher` を載せる。
         // **空文字を載せない**（`""` は「何にも一致しない」とも
         // 「全部に一致」とも読めるので、意図が伝わらない形にしない）
@@ -785,6 +838,17 @@ mod tests {
     const IDLE: State = State::Idle;
     const STOPPED: State = State::Stopped;
 
+    // 通知の種類の別名（綴りの正本は [`crate::notify::Kind`]）
+    const NEEDS_INPUT: crate::notify::Kind = crate::notify::Kind::NeedsInput;
+    const FINISHED: crate::notify::Kind = crate::notify::Kind::Finished;
+
+    /// テスト用: 「ユーザーを呼ぶ hook だったか」だけを言う。**種類そのものが
+    /// 効くテストは [`crate::notify::Kind`] を直に渡す**（未読・保管の掃除など、
+    /// 呼ぶかどうかしか関係しないテストがほとんどなので、その形を短く書ける）
+    fn calling(yes: bool) -> Option<crate::notify::Kind> {
+        yes.then_some(FINISHED)
+    }
+
     /// テスト専用の保管先。**実ユーザーの `~/.ccdesk` を絶対に触らない**ための境界
     /// （安全な置き場の実装は [`crate::testutil::TempDir`] 1 つ）
     struct TempStore(crate::testutil::TempDir);
@@ -813,13 +877,20 @@ mod tests {
     /// **注入する表と受け口が同じ表を読む。** 片方だけ知っているイベントがあると、
     /// 注入したのに何も起きない（または登録されていない口が残る）。
     /// 同名イベント（`Notification` の 2 枚）は**同じキーの配列に並ぶ**
-    /// （キー単位で潰すと後の行が前の行を黙って消す）
+    /// （キー単位で潰すと後の行が前の行を黙って消す）。
+    ///
+    /// **claude が持つイベントだけが載る**（`agents` 列。知らない名前を settings に
+    /// 書くと claude 側の読み込みが落ちうる）
     #[test]
     fn every_injected_event_is_understood_by_the_receiver() {
         let document = settings_document("C:/bin/ccdesk.exe");
         let hooks = document.get("hooks").and_then(Value::as_object).unwrap();
+        assert!(
+            !hooks.contains_key("Interrupt"),
+            "an event claude does not have was injected into its settings"
+        );
         let mut seen = 0;
-        for row in &HOOK_EVENTS {
+        for row in HOOK_EVENTS.iter().filter(|row| row.has(Kind::Claude)) {
             let groups = hooks[row.event].as_array().unwrap();
             let group = groups
                 .iter()
@@ -836,10 +907,10 @@ mod tests {
                 row.event,
                 row.state.as_str()
             );
-            // 注入した組は受け口が受理し、activity まで表のとおりに引ける
+            // 注入した組は受け口が受理し、alert まで表のとおりに引ける
             assert_eq!(
                 resolve(row.event, Some(row.state.as_str())),
-                Some((row.state, row.activity)),
+                Some((row.state, row.alert)),
                 "the receiver doesn't accept {} {}",
                 row.event,
                 row.state.as_str()
@@ -856,12 +927,12 @@ mod tests {
     /// **`StopFailure` は Stop の代わりに、API エラーでターンが終わったときだけ飛ぶ。**
     /// state は Stop と同じ `idle`（ターンが終わった行に手は要らない
     /// であって「成功した」ではないので、エラーで終わったターンもここに収まる）。
-    /// activity も Stop と同じ true（max_output_tokens 等、ユーザーが見るべき出来事
+    /// alert も Stop と同じ完了（max_output_tokens 等、ユーザーが見るべき出来事
     /// という点は変わらない）。旧形式（[`LEGACY_HOOK_STATES`]）には無い ＝
     /// この hook を知らない旧セッションが呼ぶことは無いので、後方互換の組は要らない
     #[test]
     fn stop_failure_is_treated_like_stop() {
-        assert_eq!(resolve("StopFailure", Some(IDLE.as_str())), Some((IDLE, true)));
+        assert_eq!(resolve("StopFailure", Some(IDLE.as_str())), Some((IDLE, Some(FINISHED))));
         assert!(
             !LEGACY_HOOK_STATES.iter().any(|(event, _)| *event == "StopFailure"),
             "StopFailure does not need a legacy form (it is a new hook)"
@@ -883,7 +954,7 @@ mod tests {
             .expect("PermissionRequest is not registered");
         assert_eq!(row.matcher, None, "PermissionRequest should not filter by tool");
         assert_eq!(row.state, WAITING);
-        assert!(row.activity, "a permission wait is something the user should see");
+        assert_eq!(row.alert, Some(NEEDS_INPUT), "a permission wait is something the user should see");
         assert!(
             !LEGACY_HOOK_STATES.iter().any(|(event, _)| *event == "PermissionRequest"),
             "PermissionRequest does not need a legacy form (it is a new hook)"
@@ -947,7 +1018,7 @@ mod tests {
             );
         }
         // 旧形式の Notification は waiting（入力待ちの通知でしか注入されていなかった）
-        assert_eq!(resolve("Notification", None), Some((WAITING, true)));
+        assert_eq!(resolve("Notification", None), Some((WAITING, Some(NEEDS_INPUT))));
     }
 
     /// **合図は「新しく `idle` になった」こと。**
@@ -1077,11 +1148,15 @@ mod tests {
     /// [`LEGACY_HOOK_STATES`] は引数**なし**の形しか救わないので、この口が要る
     #[test]
     fn a_state_value_from_an_older_binary_still_resolves() {
-        for (event, activity) in [("SessionStart", false), ("Stop", true), ("StopFailure", true)] {
+        for (event, alert) in [
+            ("SessionStart", None),
+            ("Stop", Some(FINISHED)),
+            ("StopFailure", Some(FINISHED)),
+        ] {
             let old = if event == "SessionStart" { "waiting" } else { "completed" };
             assert_eq!(
                 resolve(event, Some(old)),
-                Some((IDLE, activity)),
+                Some((IDLE, alert)),
                 "an old binary's {event} {old} is dropped instead of being read as idle"
             );
         }
@@ -1114,8 +1189,8 @@ mod tests {
     /// セッションが呼ぶ後方互換の口も同じ値にする ＝ 片側だけ古い意味で残さない）
     #[test]
     fn starting_a_session_is_idle_not_a_request_for_input() {
-        assert_eq!(resolve("SessionStart", Some(IDLE.as_str())), Some((IDLE, false)));
-        assert_eq!(resolve("SessionStart", None), Some((IDLE, false)), "the legacy form disagrees");
+        assert_eq!(resolve("SessionStart", Some(IDLE.as_str())), Some((IDLE, None)));
+        assert_eq!(resolve("SessionStart", None), Some((IDLE, None)), "the legacy form disagrees");
         // 表そのものが「入力待ち」を名乗っていないこと（改名の読み替え
         // ([`RENAMED_HOOK_STATES`]) が下の口を開けているので、resolve では検査できない）
         assert!(
@@ -1133,15 +1208,15 @@ mod tests {
         let temp = TempStore::new("a_recorded_state_reaches_the_reader");
         assert_eq!(states_at(&temp.path()), HookStates::default(), "not empty for a missing file");
 
-        record(&temp.path(), &id("s-1"), WORKING, true, 1_000, None);
-        record(&temp.path(), &id("s-2"), WAITING, true, 1_000, None);
+        record(&temp.path(), &id("s-1"), WORKING, calling(true), 1_000, None);
+        record(&temp.path(), &id("s-2"), WAITING, calling(true), 1_000, None);
         assert_eq!(
             states_at(&temp.path()),
             HookStates::from_entries([("s-1", WORKING, 1_000), ("s-2", WAITING, 1_000)])
         );
 
         // 同じセッションの次のイベントは上書き（状態は最後に受けたものが正しい）
-        record(&temp.path(), &id("s-1"), IDLE, true, 2_000, None);
+        record(&temp.path(), &id("s-1"), IDLE, calling(true), 2_000, None);
         let states = states_at(&temp.path());
         assert_eq!(stored(&states, &id("s-1")), Some(IDLE));
         assert_eq!(
@@ -1162,9 +1237,9 @@ mod tests {
     fn a_hook_state_belongs_to_the_run_that_was_launched_before_it() {
         let states = HookStates::from_entries([("s", STOPPED, 2_000)]);
         // 起動より後に記録された ＝ 今の実行のもの（記録時刻も一緒に返る）
-        assert_eq!(states.get(&id("s"), Some(1_000)), Some(Reported::new(STOPPED, 2_000)));
+        assert_eq!(states.get(&id("s"), Some(1_000)), Some(Reported { state: STOPPED, at: 2_000 }));
         // 起動と同時刻も今の実行（時計の分解能で同じ ms に並び得る）
-        assert_eq!(states.get(&id("s"), Some(2_000)), Some(Reported::new(STOPPED, 2_000)));
+        assert_eq!(states.get(&id("s"), Some(2_000)), Some(Reported { state: STOPPED, at: 2_000 }));
         // 起動より前に記録された ＝ 前回の実行の残骸
         assert_eq!(states.get(&id("s"), Some(3_000)), None);
         // 窓が無い行は動いていない ＝ 保管の値は過去の実行のもの
@@ -1173,43 +1248,49 @@ mod tests {
         assert_eq!(states.get(&id("other"), Some(0)), None);
     }
 
-    /// **ターンの終わりを名乗るイベントだけが `ended` を立てる。**
+    /// **「ユーザーを呼ぶ hook」だけが呼び出しを立てる**（表の `alert` 列そのもの）。
     ///
-    /// [`Entry::ended`] は `activity_at == at` を「activity 付きのイベントが
-    /// 書いた」の代わりに読む。その読み替えが成り立つのは **`Idle` を書く 3 つの
-    /// うち activity を持たないのが `SessionStart` だけ**という表
-    /// （[`HOOK_EVENTS`]）の性質のおかげなので、表を書き換えたらここが落ちる。
-    ///
-    /// これが崩れると**ペインの中の `/clear` `/resume` が完了通知になる**
-    /// （`SessionStart` の `Idle` を「ターンが終わった」と読む）
+    /// これが崩れると**ペインの中の `/clear` `/resume` や起動そのものが通知になる**
+    /// （`SessionStart` も `Idle` を書くので、state だけでは完了と見分けが付かない）。
+    /// 通知が state ではなくこの列を見ているのが今の設計
     #[test]
-    fn only_a_turn_ending_event_marks_the_entry_as_ended() {
-        let ends_the_turn = |event: &str| matches!(event, "Stop" | "StopFailure");
+    fn only_an_event_that_calls_the_user_arms_an_alert() {
         for row in HOOK_EVENTS {
-            let temp = TempStore::new("ended");
-            let (state, activity) =
+            let temp = TempStore::new("alert");
+            let (state, alert) =
                 resolve(row.event, Some(row.state.as_str())).expect("the pair is not in the table");
-            record(&temp.path(), &id("s"), state, activity, 1_000, None);
-            let stored = states_at(&temp.path()).get(&id("s"), Some(0)).expect("nothing stored");
+            record(&temp.path(), &id("s"), state, alert, 1_000, None);
             assert_eq!(
-                stored.ended,
-                ends_the_turn(row.event),
-                "{} {} was read as ended={}",
+                states_at(&temp.path()).alert(&id("s")),
+                row.alert.map(|kind| (kind, 1_000)),
+                "{} {} armed the wrong alert",
                 row.event,
-                row.state.as_str(),
-                stored.ended
+                row.state.as_str()
             );
         }
-        // **前のイベントの activity は引き継がれるが、`ended` には化けない**:
-        // `Stop(idle)` の直後に `SessionStart(idle)` が来ても終わり扱いにしない
-        // （`/clear` `/resume` がこの順で書く）
+        // **呼ばない hook は、前の呼び出しを消しも進めもしない。**
+        // `Stop(idle)` の直後に `SessionStart(idle)` が来ても（`/clear` `/resume` が
+        // この順で書く）、撃つ材料は `Stop` の時刻のまま ＝ 撃ち直しにならない
         let temp = TempStore::new("cleared");
-        record(&temp.path(), &id("s"), IDLE, true, 1_000, None);
-        record(&temp.path(), &id("s"), IDLE, false, 2_000, None);
-        let stored = states_at(&temp.path()).get(&id("s"), Some(0)).expect("nothing stored");
-        assert!(!stored.ended, "a new session inherited the finished turn");
-        // 未読の記録の方は引き継ぐ（[`Entry::activity_at`]）
-        assert_eq!(stored.at, 2_000);
+        record(&temp.path(), &id("s"), IDLE, calling(true), 1_000, None);
+        record(&temp.path(), &id("s"), IDLE, calling(false), 2_000, None);
+        let states = states_at(&temp.path());
+        assert_eq!(states.alert(&id("s")), Some((FINISHED, 1_000)));
+        // state の方は新しい hook のもの
+        assert_eq!(states.get(&id("s"), Some(0)).map(|r| r.at), Some(2_000));
+    }
+
+    /// **呼び出しの種類は保管を往復しても変わらない。** hook は別プロセスなので、
+    /// 種類はファイルの綴り（[`ALERT_KEY`]）を通ってしか TUI へ届かない ＝
+    /// 読みと書きで綴りがずれると**通知だけが黙って止まる**（行の表示は何も
+    /// 変わらないので気づけない）
+    #[test]
+    fn the_kind_of_call_survives_the_round_trip_through_the_file() {
+        for kind in [NEEDS_INPUT, FINISHED] {
+            let temp = TempStore::new("alert-round-trip");
+            record(&temp.path(), &id("s"), WAITING, Some(kind), 1_000, None);
+            assert_eq!(states_at(&temp.path()).alert(&id("s")), Some((kind, 1_000)));
+        }
     }
 
     /// **未読は「ユーザーの見るべき出来事が、最後に開いた後に起きたか」。**
@@ -1249,8 +1330,8 @@ mod tests {
             ..SessionRow::new(id("s"), "C:\\dev\\app", 0)
         };
         // 質問ダイアログ表示（waiting・未読の材料）→ 回答（working・材料ではない）
-        record(&temp.path(), &id("s"), WAITING, true, 1_000, None);
-        record(&temp.path(), &id("s"), WORKING, false, 2_000, None);
+        record(&temp.path(), &id("s"), WAITING, calling(true), 1_000, None);
+        record(&temp.path(), &id("s"), WORKING, calling(false), 2_000, None);
         let states = states_at(&temp.path());
         assert_eq!(stored(&states, &id("s")), Some(WORKING), "the answer did not resume the state");
         // 未読の起点は質問の時刻のまま（回答の時刻に進まない）
@@ -1271,8 +1352,8 @@ mod tests {
             ..SessionRow::new(id("s"), "C:\\dev\\app", 0)
         };
         // ターン完了（未読の材料）→ stop（材料ではない）
-        record(&temp.path(), &id("s"), IDLE, true, 1_000, None);
-        record(&temp.path(), &id("s"), STOPPED, false, 2_000, None);
+        record(&temp.path(), &id("s"), IDLE, calling(true), 1_000, None);
+        record(&temp.path(), &id("s"), STOPPED, calling(false), 2_000, None);
         let states = states_at(&temp.path());
         assert_eq!(stored(&states, &id("s")), Some(STOPPED));
         // 完了を見ていない ＝ stop 後も未読のまま
@@ -1280,15 +1361,15 @@ mod tests {
         // 完了を見た後に stop ＝ 未読は生えない（stop の時刻 2_000 では判定しない）
         assert!(!states.unread(&row(1_500)), "the stop itself created an unread mark");
 
-        // 一度も activity が無い行（起動して stop しただけ）はいつでも既読
-        record(&temp.path(), &id("t"), WAITING, false, 3_000, None);
-        record(&temp.path(), &id("t"), STOPPED, false, 4_000, None);
+        // 一度も呼び出しが無い行（起動して stop しただけ）はいつでも既読
+        record(&temp.path(), &id("t"), WAITING, calling(false), 3_000, None);
+        record(&temp.path(), &id("t"), STOPPED, calling(false), 4_000, None);
         assert!(
             !states_at(&temp.path()).unread(&SessionRow {
                 last_opened_at: 0,
                 ..SessionRow::new(id("t"), "C:\\dev\\app", 0)
             }),
-            "a row with no activity became unread"
+            "a row with no call for the user became unread"
         );
     }
 
@@ -1297,8 +1378,8 @@ mod tests {
     #[test]
     fn the_activity_time_survives_a_round_trip() {
         let temp = TempStore::new("the_activity_time_survives_a_round_trip");
-        record(&temp.path(), &id("s"), IDLE, true, 1_000, None);
-        record(&temp.path(), &id("s"), STOPPED, false, 2_000, None);
+        record(&temp.path(), &id("s"), IDLE, calling(true), 1_000, None);
+        record(&temp.path(), &id("s"), STOPPED, calling(false), 2_000, None);
         let row = SessionRow {
             last_opened_at: 500,
             ..SessionRow::new(id("s"), "C:\\dev\\app", 0)
@@ -1355,7 +1436,7 @@ mod tests {
     #[test]
     fn the_conversation_survives_a_round_trip() {
         let temp = TempStore::new("the_conversation_survives_a_round_trip");
-        record(&temp.path(), &id("row"), WORKING, true, 1_000, Some("conv-1"));
+        record(&temp.path(), &id("row"), WORKING, calling(true), 1_000, Some("conv-1"));
         assert_eq!(
             states_at(&temp.path()),
             HookStates::from_records([("row", WORKING, 1_000, Some("conv-1"))])
@@ -1363,13 +1444,13 @@ mod tests {
         assert_eq!(states_at(&temp.path()).conversation(&id("row")), Some("conv-1"));
 
         // **同じ行の会話が差し替わる**（ペインの中の `/clear`）。行は増えない
-        record(&temp.path(), &id("row"), IDLE, true, 2_000, Some("conv-2"));
+        record(&temp.path(), &id("row"), IDLE, calling(true), 2_000, Some("conv-2"));
         let states = states_at(&temp.path());
         assert_eq!(states.conversation(&id("row")), Some("conv-2"));
         assert_eq!(states, HookStates::from_records([("row", IDLE, 2_000, Some("conv-2"))]));
 
         // **取れなかった回は前の値を残す**（1 回でも拾えていれば再開できる）
-        record(&temp.path(), &id("row"), STOPPED, false, 3_000, None);
+        record(&temp.path(), &id("row"), STOPPED, calling(false), 3_000, None);
         assert_eq!(states_at(&temp.path()).conversation(&id("row")), Some("conv-2"));
         // 一度も名乗っていない行には答えない
         assert_eq!(states_at(&temp.path()).conversation(&id("other")), None);
@@ -1386,9 +1467,9 @@ mod tests {
                 .map(|m| (m.len(), m.modified().ok()))
         };
         assert_eq!(stamp(&temp.path()), None, "answered for a missing file");
-        record(&temp.path(), &id("s"), WORKING, true, 1_000, None);
+        record(&temp.path(), &id("s"), WORKING, calling(true), 1_000, None);
         let before = stamp(&temp.path()).expect("no stamp after a write");
-        record(&temp.path(), &id("s-2"), WAITING, true, 2_000, None);
+        record(&temp.path(), &id("s-2"), WAITING, calling(true), 2_000, None);
         assert_ne!(stamp(&temp.path()), Some(before), "the stamp did not move");
     }
 
@@ -1399,10 +1480,10 @@ mod tests {
     fn recording_drops_entries_older_than_the_keep_window() {
         let temp = TempStore::new("recording_drops_entries_older_than_the_keep_window");
         let keep = KEEP.as_millis() as u64;
-        record(&temp.path(), &id("old"), IDLE, true, 0, None);
-        record(&temp.path(), &id("fresh"), WORKING, true, keep, None);
+        record(&temp.path(), &id("old"), IDLE, calling(true), 0, None);
+        record(&temp.path(), &id("fresh"), WORKING, calling(true), keep, None);
         // old は keep をちょうど過ぎた時点で落ちる
-        record(&temp.path(), &id("now"), WAITING, true, keep + 1, None);
+        record(&temp.path(), &id("now"), WAITING, calling(true), keep + 1, None);
         let states = states_at(&temp.path());
         assert_eq!(stored(&states, &id("old")), None, "an entry past the keep window remains");
         assert_eq!(
@@ -1422,7 +1503,7 @@ mod tests {
     fn records_from_a_future_clock_are_ignored_and_swept() {
         let temp = TempStore::new("records_from_a_future_clock_are_ignored_and_swept");
         let skew = FUTURE_SKEW.as_millis() as u64;
-        record(&temp.path(), &id("future"), STOPPED, true, 1_000_000, None);
+        record(&temp.path(), &id("future"), STOPPED, calling(true), 1_000_000, None);
 
         // 時計が 1_000 まで巻き戻った世界では、その記録は見えない
         assert_eq!(
@@ -1437,7 +1518,7 @@ mod tests {
         );
 
         // 巻き戻った時計で次の記録が載ると、未来の記録はファイルからも落ちる
-        record(&temp.path(), &id("s"), WORKING, true, 1_000, None);
+        record(&temp.path(), &id("s"), WORKING, calling(true), 1_000, None);
         assert_eq!(
             stored(&states_at(&temp.path()), &id("future")),
             None,
@@ -1497,7 +1578,7 @@ mod tests {
     #[test]
     fn writes_land_atomically_without_leaving_a_tmp_or_a_lock() {
         let temp = TempStore::new("writes_land_atomically_without_leaving_a_tmp_or_a_lock");
-        record(&temp.path(), &id("s"), WORKING, true, 1_000, None);
+        record(&temp.path(), &id("s"), WORKING, calling(true), 1_000, None);
         let leftovers: Vec<_> = std::fs::read_dir(temp.0.path())
             .unwrap()
             .flatten()
@@ -1513,19 +1594,19 @@ mod tests {
     #[test]
     fn a_held_lock_makes_the_hook_give_up_instead_of_waiting() {
         let temp = TempStore::new("a_held_lock_makes_the_hook_give_up_instead_of_waiting");
-        record(&temp.path(), &id("s"), WORKING, true, 1_000, None);
+        record(&temp.path(), &id("s"), WORKING, calling(true), 1_000, None);
         let before = std::fs::read(temp.path()).unwrap();
 
         let held = Lock::acquire(&lock_path_for(&temp.path()), Duration::ZERO, LOCK_STALE).unwrap();
         let started = std::time::Instant::now();
-        record(&temp.path(), &id("s"), IDLE, true, 2_000, None);
+        record(&temp.path(), &id("s"), IDLE, calling(true), 2_000, None);
         let waited = started.elapsed();
         drop(held);
 
         assert!(waited < Duration::from_secs(5), "wait was not bounded: {waited:?}");
         assert_eq!(std::fs::read(temp.path()).unwrap(), before, "wrote even though the lock wasn't acquired");
         // 解放後は通常どおり載る（ロックが理由で壊れているわけではない）
-        record(&temp.path(), &id("s"), IDLE, true, 2_000, None);
+        record(&temp.path(), &id("s"), IDLE, calling(true), 2_000, None);
         assert_eq!(stored(&states_at(&temp.path()), &id("s")), Some(IDLE));
     }
 }

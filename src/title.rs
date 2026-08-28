@@ -41,7 +41,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::backend::{Candidate, Kind, NameIndex, Span};
+use crate::backend::{Candidate, Kind, Mark, NameIndex, Span};
+use crate::poll::State;
 use crate::sessions::{SessionId, SessionRow};
 
 /// 畳んだ名前として**保持する**文字数の上限。
@@ -268,8 +269,45 @@ impl ConversationNames {
 
 /// バイト列を走査して候補を拾う。**位置の計算は生バイトで済ませ、ここで初めて
 /// 文字列にする**（壊れたバイトは lossy で受ける ＝ 途中から読んでも失敗しない）
-fn scan_bytes(bytes: &[u8], records: &[Candidate], spans: &[Span], found: &mut Found) {
-    scan_into(&String::from_utf8_lossy(bytes), records, spans, found);
+fn scan_bytes(bytes: &[u8], records: &Records<'_>, spans: &[Span], into: &mut Picked) {
+    scan_into(&String::from_utf8_lossy(bytes), records, spans, into);
+}
+
+/// 1 本の記録から拾うもの（agent が何を持つかの宣言）。**2 つを 1 つの走査で
+/// 拾うためにある**: 記録は 1 MB を超えることがあり、名前のためにもう一周、
+/// 状態のためにもう一周と読むと走査の回数がそのまま起動の重さになる
+struct Records<'a> {
+    /// 会話に名前を与えうる記録（[`crate::backend::Backend::title_records`]）
+    titles: &'a [Candidate],
+    /// その会話の現在値を名乗る記録（[`crate::backend::Backend::record_states`]）
+    states: &'a [Mark],
+    /// 記録の 1 行が書かれた時刻の読み方
+    /// （[`crate::backend::Backend::record_time`]）を持つ実装
+    backend: &'a dyn crate::backend::Backend,
+}
+
+impl Records<'_> {
+    fn of(kind: Kind) -> Records<'static> {
+        let backend = kind.backend();
+        Records {
+            titles: backend.title_records(),
+            states: backend.record_states(),
+            backend,
+        }
+    }
+}
+
+/// 走査 1 回で拾えたもの
+#[derive(Default)]
+struct Picked {
+    /// 候補ごとの表示名（[`Records::titles`] と同じ長さ）
+    found: Found,
+    /// 最後に見つかった現在値（[`Records::states`]。None ＝ 記録の中に無かった）
+    live: Option<(State, u64)>,
+    /// **記録が最後に書かれた時刻**（0 ＝ 見ていない）。
+    /// 使い道と、なぜ turn の切れ目だけでは足りないのかは
+    /// [`crate::backend::Backend::record_time`]
+    moved_at: u64,
 }
 
 /// 範囲 `text` を走査して候補を拾う。`spans` に載る性質の候補だけを見るので、
@@ -282,36 +320,66 @@ fn scan_bytes(bytes: &[u8], records: &[Candidate], spans: &[Span], found: &mut F
 ///
 /// **JSON を組む前に印の文字列で弾く**のが速さの要点: 記録は 1 MB を
 /// 超えることがあり、全行をパースすると走査 1 回に行数ぶんの時間がかかる
-fn scan_into(text: &str, records: &[Candidate], spans: &[Span], found: &mut Found) {
+fn scan_into(text: &str, records: &Records<'_>, spans: &[Span], into: &mut Picked) {
     let wanted = |span: Span| spans.contains(&span);
+    // **現在値は「末尾へ向かって読む範囲」でしか拾わない。** [`Span::Rare`] だけの
+    // 走査（[`Titles::drain_head`]）は末尾から**遡って**読むので、そこで拾うと
+    // 古い turn の値が新しい値を上書きする
+    let live_here = wanted(Span::Appended);
     for line in text.lines() {
         let line = line.trim();
         if !line.starts_with('{') {
             continue;
         }
-        if !records
+        let title_here = records
+            .titles
             .iter()
-            .any(|c| wanted(c.span) && line.contains(c.marker))
-        {
+            .any(|c| wanted(c.span) && line.contains(c.marker));
+        let mark_here =
+            live_here && records.states.iter().any(|m| line.contains(m.marker));
+        if !title_here && !mark_here {
             continue;
         }
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue; // 壊れた行（書き込みの途中で読んだ場合を含む）
         };
-        for (i, candidate) in records.iter().enumerate() {
+        for (i, candidate) in records.titles.iter().enumerate() {
             if !wanted(candidate.span) {
                 continue;
             }
             // 先頭に 1 度だけ書かれる候補は、最初に拾った値が答え
-            if candidate.span == Span::Head && found[i].is_some() {
+            if candidate.span == Span::Head && into.found[i].is_some() {
                 continue;
             }
             let text = (candidate.text)(&value).map(title_text);
             if let Some(text) = text.filter(|t| !t.is_empty()) {
-                found[i] = Some(text);
+                into.found[i] = Some(text);
+            }
+        }
+        if mark_here {
+            // **後から現れた行が勝つ**（記録は追記なので、後ろほど新しい）
+            if let Some(live) = records.states.iter().find_map(|m| (m.read)(&value)) {
+                into.live = Some(live);
             }
         }
     }
+    // **塊の最後の行の時刻だけを見る**（全行のパースにしない ＝ 記録は 1 MB を
+    // 超えることがあり、そこを舐めると走査 1 回が行数に比例する）。
+    // 状態を名乗る記録を持たない agent はここも空振りするだけ
+    if live_here && !records.states.is_empty() {
+        into.moved_at = into.moved_at.max(last_record_time(text, records));
+    }
+}
+
+/// その範囲の**最後の行**が書かれた時刻（0 ＝ 読めなかった）
+fn last_record_time(text: &str, records: &Records<'_>) -> u64 {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with('{'))
+        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .and_then(|value| records.backend.record_time(&value))
+        .unwrap_or(0)
 }
 
 /// 拾った候補から表示名を選ぶ。順は agent の [`Candidate`] の並び（＝ 優先順）で、
@@ -354,21 +422,14 @@ struct Scan {
     /// （[`Titles::append_scan`]）。そこだけは行の途中を指し、頭の欠けた行は
     /// JSON として捨てられる
     scanned: u64,
-    /// そこまでで見つかった候補
-    found: Found,
+    /// そこまでで拾えたもの（表示名の候補と、記録が名乗った現在値）
+    picked: Picked,
     /// どのファイルを読んでいたか（解決し直されたら走査もやり直す）
     path: PathBuf,
     /// 初回に読み残した先頭側の範囲（[`Span::Rare`] ＝ リネーム記録の探索）。
     /// 予算（[`SCAN_BUDGET`]）の範囲で**末尾側からさかのぼって**消化する
     /// （[`Titles::drain_head`]）。None ＝ 読み残し無し
     head_pending: Option<std::ops::Range<u64>>,
-    /// 最後に stat した時刻（epoch ms）。**[`Self::grew_since`] を出すためだけ**に
-    /// 持つ ＝ 走査そのものには使わない
-    seen_at: u64,
-    /// **この時刻より後に記録が伸びた**（epoch ms。意味と使い道は
-    /// [`Titles::grew_since`]）。表示名とは無関係だが、記録を stat しているのが
-    /// ここ 1 箇所なので同じ周期に相乗りする
-    grew_since: u64,
 }
 
 /// transcript が前回から変わったかの判定材料（長さ・更新時刻）
@@ -453,7 +514,7 @@ impl Titles {
         // ＝ claude と codex が同じ 2 段を通る（`match Kind` が要らない）
         self.names
             .get(conversation)
-            .or_else(|| self.scans.get(conversation).and_then(|s| pick(&s.found)).map(String::as_str))
+            .or_else(|| self.scans.get(conversation).and_then(|s| pick(&s.picked.found)).map(String::as_str))
             .unwrap_or(UNTITLED)
             .to_string()
     }
@@ -526,11 +587,11 @@ impl Titles {
             }
         }
         for row in rows.iter() {
-            let records = row.kind.backend().title_records();
+            let records = Records::of(row.kind);
             if let Some(conversation) = row.conversation.id()
                 && let Some(scan) = self.scans.get_mut(conversation)
             {
-                Self::drain_head(scan, records, budget);
+                Self::drain_head(scan, &records, budget);
             }
         }
         // **どの行も指していない会話の走査結果を落とす。** 鍵が行から会話へ移った
@@ -564,25 +625,23 @@ impl Titles {
             return (None, resolved_changed);
         };
         let stamp = (meta.len(), meta.modified().ok());
-        let records = row.kind.backend().title_records();
+        let records = Records::of(row.kind);
         let scan = self.scans.entry(conversation).or_default();
         // 別のファイルへ解決し直された / 縮んだ（追記ではなく作り直された）／
         // 候補の数が変わった（版が上がった）なら、覚えた範囲も候補も当てにならない
-        if scan.path != path || meta.len() < scan.scanned || scan.found.len() != records.len() {
+        if scan.path != path
+            || meta.len() < scan.scanned
+            || scan.picked.found.len() != records.titles.len()
+        {
             *scan = Scan {
                 path: path.clone(),
-                found: empty_found(records),
+                picked: Picked {
+                    found: empty_found(records.titles),
+                    ..Picked::default()
+                },
                 ..Scan::default()
             };
         }
-        // **記録が伸びたこと自体を、名前とは別に覚える**（[`Self::grew_since`]）。
-        // 覚えるのが「いつ伸びたか」ではなく「いつより後に伸びたか」なのが要点で、
-        // 理由はあちらの doc。ここでやるのは、**この周期の stat が唯一の stat** で、
-        // 別に stat を足すと同じ syscall とパス解決が 2 系統になるため
-        if scan.stamp.is_some_and(|(seen, _)| stamp.0 > seen) {
-            scan.grew_since = scan.seen_at;
-        }
-        scan.seen_at = ccdesk::now_ms();
         let stage = match scan.stamp {
             None => Some(Stage::First),
             Some(seen) if seen != stamp => Some(Stage::Append),
@@ -591,24 +650,33 @@ impl Titles {
         (stage.map(|stage| (stage, stamp)), resolved_changed)
     }
 
-    /// **その会話の記録が「いつより後に」伸びたか**（epoch ms。0 ＝ 一度も見ていない）。
+    /// **その会話の記録が最後に名乗った現在値**と、それが記録された時刻
+    /// （None ＝ 記録が状態を語らない agent、または末尾窓にまだ出ていない）。
     ///
-    /// 返すのは伸びを見つけた時刻ではなく、**その 1 つ前に見たときの時刻**。
-    /// 読み手（[`crate::poll::row_state`]）は `grew_since(conv) > hook の時刻` で
-    /// 「その hook より後に伸びた」と判断するので、境目が跨がる形だと嘘になる:
-    /// 記録は許可を聞く直前にも伸びる（道具の呼び出しが書かれる）ので、**その伸びと
-    /// hook が同じ周期に入ると、見つけた時刻は hook より後になってしまう**
-    /// ＝ 許可ダイアログが出た瞬間に黄が消える。前回の観測時刻を返せば、
-    /// 「前に見たときには無く、今ある」＝ その区間で伸びたと言い切れる。
+    /// **時刻は記録自身のもの**（ccdesk が読んだ時刻ではない）。読み手
+    /// （[`crate::poll::row_state`]）は hook の時刻と比べて新しい方を採るので、
+    /// 読んだ時刻で代用するとその値は常に「今」になり、**記録が hook に必ず勝つ**
+    /// ＝ 0 遅延の hook を 1 周期遅れの走査が毎回上書きすることになる。
     ///
-    /// 代償は最大 1 周期の遅れ（許可の直後 1 回だけは降ろさない）で、
-    /// **降ろし損ねる側へ倒れる**のが正しい: 呼ばれない害の方が大きい。
-    ///
-    /// **長さだけを見る（更新時刻は見ない）。** Windows では codex が開いたままの
-    /// rollout の mtime が進まない（実測: 全 10 本で最大 82 秒の遅れ）。
-    /// 長さは同じ状況でもライブに伸びる（実測）
-    pub(crate) fn grew_since(&self, conversation: &str) -> u64 {
-        self.scans.get(conversation).map_or(0, |scan| scan.grew_since)
+    /// **かつてここは `grew_since`（伸びたかどうか）だった。** 状態を言わない
+    /// 材料から状態を推していたので、「伸びた ＝ 待たれていない」という 1 方向の
+    /// 救済にしか使えず、Working の固着は別の材料（PTY の無音）に任せるほか
+    /// なかった。記録が状態そのものを持つと分かった今は、両方向がこの 1 つで足りる
+    pub(crate) fn live_state(&self, conversation: &str) -> Option<(State, u64)> {
+        let picked = &self.scans.get(conversation)?.picked;
+        let (state, at) = picked.live?;
+        Some(match state {
+            // **turn の途中は「最後に書かれた時刻」まで進める。** turn の切れ目の
+            // 時刻で止めると、その後に来た `PermissionRequest` の hook に永久に
+            // 負ける ＝ 許可に答えても黄「入力待ち」が turn の終わりまで残る
+            // （報告された症状）。記録は許可を待っている間だけ伸びが止まるので、
+            // 「最後に書かれた時刻」がそのまま「その時刻には動いていた」の証拠
+            State::Working => (state, at.max(picked.moved_at)),
+            // **終わった turn の時刻は進めない。** 記録は turn の外でも
+            // （設定の適用などで）伸びるので、そこまで進めると次の打鍵の
+            // hook を追い越して一瞬 Idle に見える
+            _ => (state, at),
+        })
     }
 
     /// その段でこの 1 行に許す読み取り量（`left` ＝ その段に残っている行数）。
@@ -642,13 +710,13 @@ impl Titles {
 
     /// [`Self::plan`] が決めた読み取りを実行する
     fn run(&mut self, conversation: &str, kind: Kind, stage: Stage, stamp: Stamp, budget: &mut u64) {
-        let records = kind.backend().title_records();
+        let records = Records::of(kind);
         let Some(scan) = self.scans.get_mut(conversation) else {
             return;
         };
         match stage {
-            Stage::First => Self::first_scan(scan, records, stamp, budget),
-            Stage::Append => Self::append_scan(scan, records, stamp, budget),
+            Stage::First => Self::first_scan(scan, &records, stamp, budget),
+            Stage::Append => Self::append_scan(scan, &records, stamp, budget),
         }
     }
 
@@ -660,11 +728,11 @@ impl Titles {
     /// 窓を半端に読むと追記型の候補（ai-title / last-prompt）が読み残し側へ落ちて
     /// **どの段も拾わない** ＝ その行の名前が永久に出ない。
     /// 窓が予算より大きくなることは無い（[`SCAN_BUDGET`] の直下で固定してある）
-    fn first_scan(scan: &mut Scan, records: &[Candidate], stamp: Stamp, budget: &mut u64) {
+    fn first_scan(scan: &mut Scan, records: &Records<'_>, stamp: Stamp, budget: &mut u64) {
         let len = stamp.0;
         // **先頭窓は、先頭にしか現れない候補を持つ agent だけが読む**（codex）。
         // 先頭は追記されないので、読むのは 1 会話につきこの 1 回きり
-        if records.iter().any(|c| c.span == Span::Head) {
+        if records.titles.iter().any(|c| c.span == Span::Head) {
             let want = HEAD_BYTES.min(len);
             if *budget < want {
                 return; // 次の周期へ（窓は必ず丸ごと読む）
@@ -672,7 +740,7 @@ impl Titles {
             if let Some(bytes) = read_range(&scan.path, 0, want) {
                 *budget = budget.saturating_sub(want);
                 let complete = end_of_complete_lines(&bytes);
-                scan_bytes(&bytes[..complete], records, &[Span::Head], &mut scan.found);
+                scan_bytes(&bytes[..complete], records, &[Span::Head], &mut scan.picked);
             }
         }
         let from = len.saturating_sub(TAIL_BYTES);
@@ -688,7 +756,7 @@ impl Titles {
         // 読み残しに含まれるので、取りこぼしにはならない）
         let skip = if from > 0 { after_first_newline(&bytes) } else { 0 };
         let complete = end_of_complete_lines(&bytes[skip..]);
-        scan_bytes(&bytes[skip..skip + complete], records, &TAIL_SPANS, &mut scan.found);
+        scan_bytes(&bytes[skip..skip + complete], records, &TAIL_SPANS, &mut scan.picked);
         let start = from + skip as u64;
         scan.stamp = Some(stamp);
         scan.scanned = start + complete as u64;
@@ -697,6 +765,7 @@ impl Titles {
         // 6 行 35.6 MB。しかもその 6 行は `custom-title` を 1 つも持っていない）
         let rare_from = len.saturating_sub(RARE_BYTES);
         scan.head_pending = records
+            .titles
             .iter()
             .any(|c| c.span == Span::Rare)
             .then(|| (start > rare_from).then_some(rare_from..start))
@@ -716,7 +785,7 @@ impl Titles {
     /// なら読まずに次の周期へ回す。区別せずに塊を飛ばしていた頃は、周期の終わりに
     /// 当たった**ごく普通の長さの行**が候補を持っていると二度と拾えなかった
     /// （次の周期は行の途中から読み始め、頭の欠けた行は JSON として捨てられる）
-    fn append_scan(scan: &mut Scan, records: &[Candidate], stamp: Stamp, budget: &mut u64) {
+    fn append_scan(scan: &mut Scan, records: &Records<'_>, stamp: Stamp, budget: &mut u64) {
         let delta = stamp.0.saturating_sub(scan.scanned);
         if delta == 0 {
             scan.stamp = Some(stamp); // 中身は増えていない（更新時刻だけ動いた）
@@ -733,7 +802,7 @@ impl Titles {
         // 走査するのは行が完結している範囲まで（書きかけの最終行は次回に回す）
         let complete = end_of_complete_lines(&bytes);
         // 追記ぶんに [`Span::Head`] は現れない（先頭に 1 度だけ書かれる候補）
-        scan_bytes(&bytes[..complete], records, &TAIL_SPANS, &mut scan.found);
+        scan_bytes(&bytes[..complete], records, &TAIL_SPANS, &mut scan.picked);
         if take < delta {
             // まだ EOF に届いていない。**[`TAIL_BYTES`] 読んで改行が 1 つも無い ＝
             // 予算では追えない長さの 1 行**なので、その行は諦めて先へ進む
@@ -752,9 +821,9 @@ impl Titles {
     /// Rare の答えは「ファイル中で最後に現れた値」なので、末尾に近い塊から読めば
     /// **最初に見つかった値が答え**になり、見つかった時点で残りは読まずに済む
     /// （末尾スキャンで既に見つかっていれば先頭側は 1 バイトも読まない）
-    fn drain_head(scan: &mut Scan, records: &[Candidate], budget: &mut u64) {
+    fn drain_head(scan: &mut Scan, records: &Records<'_>, budget: &mut u64) {
         while let Some(range) = scan.head_pending.clone() {
-            if range.is_empty() || !rare_missing(&scan.found, records) {
+            if range.is_empty() || !rare_missing(&scan.picked.found, records.titles) {
                 scan.head_pending = None;
                 return;
             }
@@ -778,12 +847,15 @@ impl Titles {
             } else {
                 0
             };
-            let mut fresh = empty_found(records);
+            let mut fresh = Picked {
+                found: empty_found(records.titles),
+                ..Picked::default()
+            };
             scan_bytes(&bytes[skip..], records, &[Span::Rare], &mut fresh);
-            for (i, candidate) in records.iter().enumerate() {
+            for (i, candidate) in records.titles.iter().enumerate() {
                 // 既にある値（末尾側 ＝ より新しい塊で見つけたもの）は上書きしない
-                if candidate.span == Span::Rare && scan.found[i].is_none() {
-                    scan.found[i] = fresh[i].take();
+                if candidate.span == Span::Rare && scan.picked.found[i].is_none() {
+                    scan.picked.found[i] = fresh.found[i].take();
                 }
             }
             let new_end = if skip == bytes.len() && from > range.start {
@@ -900,10 +972,13 @@ impl Titles {
 /// 範囲を分けて走るので、範囲の話を抜きにした優先順の検査はこれを使う）
 #[cfg(test)]
 fn pick_title(text: &str) -> Option<String> {
-    let records = Kind::Claude.backend().title_records();
-    let mut found = empty_found(records);
-    scan_into(text, records, &TAIL_SPANS, &mut found);
-    pick(&found).cloned()
+    let records = Records::of(Kind::Claude);
+    let mut picked = Picked {
+        found: empty_found(records.titles),
+        ..Picked::default()
+    };
+    scan_into(text, &records, &TAIL_SPANS, &mut picked);
+    pick(&picked.found).cloned()
 }
 
 #[cfg(test)]
@@ -1142,45 +1217,134 @@ pub(crate) mod tests {
         );
     }
 
-    /// **記録が伸びたことは、伸びた区間まるごとが「いつより後か」で答える。**
+    /// **記録の末尾が現在値になる**（codex）。
     ///
-    /// [`Titles::grew_since`] が返すのは伸びを見つけた時刻ではなく **1 つ前に見た
-    /// 時刻**。読み手は `grew_since > hook の時刻` で判断するので、ここが
-    /// 見つけた時刻だと、**hook と同じ周期に入った伸びまで「hook より後」**に
-    /// なってしまう（記録は許可を聞く直前にも伸びる ＝ ダイアログが出た瞬間に
-    /// 黄が消える）。
+    /// hook はイベントなので取りこぼすと自己修復しないが、rollout は turn の
+    /// 切れ目を順に書くので、**次の走査で必ず正しくなる**。実機で固着していたのは
+    /// Esc 中断（`Stop` が飛ばない）で、そこは `turn_aborted` が答える。
     ///
-    /// **長さだけを見る。** Windows では codex が開いたままの rollout の mtime が
-    /// 進まない（実測: 全 10 本で最大 82 秒の遅れ）ので、更新時刻は材料にならない
+    /// **時刻は記録自身のもの**（走査した時刻ではない）。走査時刻で代用すると
+    /// 値が常に「今」になり、0 遅延の hook を 1 周期遅れの走査が毎回上書きする
     #[test]
-    fn a_record_reports_the_span_it_grew_in_not_the_moment_it_was_noticed() {
-        let temp = TempProjects::new("record_growth");
+    fn the_tail_of_a_codex_record_is_the_current_state() {
+        let temp = crate::testutil::TempDir::new("title", "codex_lifecycle");
+        let conversation = "019fc236-22c1-7bd3-8fcc-954de8d2ea9a";
+        let started = concat!(
+            r#"{"timestamp":"2026-08-02T11:22:35.000Z","type":"session_meta","payload":{"id":"019fc236-22c1-7bd3-8fcc-954de8d2ea9a"}}"#, "
+",
+            r#"{"timestamp":"2026-08-02T11:22:36.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#, "
+",
+        );
+        write_rollout(temp.path(), conversation, "2026-08-02T20-22-35", started);
+
+        let mut titles = Titles::with_root(Kind::Codex, temp.path().to_path_buf());
+        let mut row = SessionRow {
+            kind: Kind::Codex,
+            conversation: crate::sessions::Conversation::Observed(conversation.to_string()),
+            ..SessionRow::new(SessionId::new("row"), r"C:\dev\app", 1_000)
+        };
+        titles.title_now(&mut row);
+        assert_eq!(
+            titles.live_state(conversation),
+            Some((State::Working, 1_785_669_756_000)),
+            "a started turn is not read as working"
+        );
+
+        // **中断も「手が空いた」**（`Stop` は飛ばないので、これが無いと赤が固着する）
+        let aborted = format!(
+            "{started}{}
+",
+            r#"{"timestamp":"2026-08-02T11:23:00.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"t1","reason":"interrupted"}}"#
+        );
+        write_rollout(temp.path(), conversation, "2026-08-02T20-22-35", &aborted);
+        titles.title_now(&mut row);
+        assert_eq!(
+            titles.live_state(conversation),
+            Some((State::Idle, 1_785_669_780_000)),
+            "an interrupted turn stayed working"
+        );
+
+        // 完了も同じ経路（後から現れた行が勝つ）
+        let done = format!(
+            "{aborted}{}
+",
+            r#"{"timestamp":"2026-08-02T11:24:00.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t2","last_agent_message":"done"}}"#
+        );
+        write_rollout(temp.path(), conversation, "2026-08-02T20-22-35", &done);
+        titles.title_now(&mut row);
+        assert_eq!(titles.live_state(conversation), Some((State::Idle, 1_785_669_840_000)));
+    }
+
+    /// **turn の途中は「記録が最後に書かれた時刻」まで進む。**
+    ///
+    /// 許可を待つ hook（`PermissionRequest`）は `task_started` より後に来るので、
+    /// turn の切れ目の時刻で止めると記録は永久に hook に負ける ＝ 許可に答えても
+    /// 黄「入力待ち」が turn の終わりまで残る（報告された症状）。記録は
+    /// **許可を待っている間だけ**伸びが止まるので、伸びた時刻がそのまま
+    /// 「その時刻には動いていた」の証拠になる
+    #[test]
+    fn a_turn_in_progress_is_current_as_of_the_last_line_written() {
+        let temp = crate::testutil::TempDir::new("title", "codex_turn_moves");
+        let conversation = "019fc236-22c1-7bd3-8fcc-954de8d2ea9a";
+        let started = concat!(
+            r#"{"timestamp":"2026-08-02T11:22:36.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#, "
+",
+        );
+        let mut titles = Titles::with_root(Kind::Codex, temp.path().to_path_buf());
+        let mut row = SessionRow {
+            kind: Kind::Codex,
+            conversation: crate::sessions::Conversation::Observed(conversation.to_string()),
+            ..SessionRow::new(SessionId::new("row"), r"C:\dev\app", 1_000)
+        };
+        write_rollout(temp.path(), conversation, "2026-08-02T20-22-35", started);
+        titles.title_now(&mut row);
+        assert_eq!(titles.live_state(conversation), Some((State::Working, 1_785_669_756_000)));
+
+        // 許可に答えた後: 道具の出力が続く ＝ その時刻には動いていた
+        let moved = format!(
+            "{started}{}
+",
+            r#"{"timestamp":"2026-08-02T11:25:00.000Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":"ls"}}}"#
+        );
+        write_rollout(temp.path(), conversation, "2026-08-02T20-22-35", &moved);
+        titles.title_now(&mut row);
+        assert_eq!(
+            titles.live_state(conversation),
+            Some((State::Working, 1_785_669_900_000)),
+            "a turn in progress did not move with the record"
+        );
+
+        // **終わった turn の時刻は進めない**（turn の外でも記録は伸びるので、
+        // そこまで進めると次の打鍵の hook を追い越して一瞬 Idle に見える）
+        let ended = format!(
+            "{moved}{}
+{}
+",
+            r#"{"timestamp":"2026-08-02T11:26:00.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"done"}}"#,
+            r#"{"timestamp":"2026-08-02T11:27:00.000Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{}}}"#
+        );
+        write_rollout(temp.path(), conversation, "2026-08-02T20-22-35", &ended);
+        titles.title_now(&mut row);
+        assert_eq!(
+            titles.live_state(conversation),
+            Some((State::Idle, 1_785_669_960_000)),
+            "a finished turn drifted past its own end"
+        );
+    }
+
+    /// **記録が状態を語らない agent は None**（claude の現在値は transcript では
+    /// なく `~/.claude/sessions/` にある）。ここが値を返すと、同じ現在値を
+    /// 2 系統で導くことになる
+    #[test]
+    fn a_claude_record_never_claims_a_state() {
+        let temp = TempProjects::new("claude_has_no_record_state");
         let mut titles = temp.titles();
         let mut row = row("77777777-7777-4777-8777-777777777777");
         let conversation = row.conversation.id().expect("no conversation").to_string();
-
-        // 一度も見ていない会話は「伸びていない」（0 ＝ どの hook にも勝てない）
-        assert_eq!(titles.grew_since(&conversation), 0);
-
-        let first = format!("{}\n", line("last-prompt", "lastPrompt", "first"));
-        titles.write_transcript(&row, &first);
-        let before_first_look = ccdesk::now_ms();
+        titles.write_transcript(&row, &format!("{}
+", line("last-prompt", "lastPrompt", "hi")));
         titles.title_now(&mut row);
-        // 初回は「前に見たとき」が無い ＝ まだ何も言えない
-        assert_eq!(titles.grew_since(&conversation), 0, "the first look claimed a growth");
-
-        // 記録は追記されるだけ（縮んだら走査ごとやり直しになる ＝ 別の話）
-        let grown = format!("{first}{}\n", line("last-prompt", "lastPrompt", "second"));
-        titles.write_transcript(&row, &grown);
-        titles.title_now(&mut row);
-        let grew = titles.grew_since(&conversation);
-        assert!(grew >= before_first_look, "the growth span started before the previous look");
-        assert!(grew <= ccdesk::now_ms(), "the growth span starts in the future");
-
-        // 伸びない周期は値を動かさない（動かすと、待たれているだけの行が降りる）
-        let held = titles.grew_since(&conversation);
-        titles.title_now(&mut row);
-        assert_eq!(titles.grew_since(&conversation), held, "a quiet cycle moved the growth span");
+        assert_eq!(titles.live_state(&conversation), None);
     }
 
     /// テスト用: codex の rollout を本番と同じ形で置く
@@ -1712,16 +1876,19 @@ pub(crate) mod tests {
         // 実在するが範囲に足りないファイル ＝ 読み取りが必ず失敗する
         let path = temp.0.join("short.jsonl");
         std::fs::write(&path, "{}\n").expect("write failed");
-        let records = Kind::Claude.backend().title_records();
+        let records = Records::of(Kind::Claude);
         let mut scan = Scan {
             path,
             head_pending: Some(0..10_000),
-            found: empty_found(records),
+            picked: Picked {
+                found: empty_found(records.titles),
+                ..Picked::default()
+            },
             ..Scan::default()
         };
 
         let mut budget = 10_000;
-        Titles::drain_head(&mut scan, records, &mut budget);
+        Titles::drain_head(&mut scan, &records, &mut budget);
 
         assert_eq!(
             scan.head_pending,

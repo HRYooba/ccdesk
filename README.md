@@ -155,10 +155,11 @@ Both agents report both events, so a codex row is called out the same way a clau
 is. The one gap is codex's own: it has no event for waits other than tool permission,
 so a codex session blocked on something else stays silent.
 
-Nothing is announced for a session that is merely starting up — not when ccdesk
-launches, not when you open a session, not when you resume a stopped one. A row is
-only worth calling you about once ccdesk has seen it settle at rest under its current
-process.
+Notifications follow what the agent announced, never how a row happens to look right
+now. Only the two events above raise one, so nothing is announced for a session that
+is merely starting up, for a turn you interrupted with Esc, or for a dialog you opened
+yourself in the pane — `/config` and `/resume` put claude in the same "waiting" state a
+permission prompt does, and neither is a reason to call you back.
 
 Clicking the toast opens that session in ccdesk and brings its terminal to the front.
 A toast lives as long as Windows gives it — around half a minute on screen, then the

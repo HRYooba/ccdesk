@@ -216,27 +216,47 @@ pub(crate) trait Backend: Send + Sync {
     /// hook へ渡す env は共通の口（[`Kind::spawn_command`]）が立てる
     fn command(&self, cwd: &str, launch: Launch<'_>, inject: Option<&Inject>) -> Spawn;
 
-    /// **この agent は「今どうしているか」を外から読める現在値を持つか。**
+    /// 会話の記録の中で、**その会話の現在値を名乗る行**（空 ＝ 記録は状態を語らない）。
     ///
-    /// claude は持つ（`~/.claude/sessions/` の `status`。遷移のたびに上書きされる）。
-    /// codex は持たない。
+    /// **hook はイベントなので、取りこぼすと自己修復しない。** 現在値を別に読める
+    /// agent は次の観測で必ず正しくなるが、読めない agent は誰も直せず固着する。
+    /// 実際に固着した 2 通りは、どちらも「イベントが存在しない・飛ばない」だった:
     ///
-    /// **hook はイベントなので取りこぼすと自己修復しない。** ライブ状態がある側は
-    /// 次の観測で必ず正しくなるが、無い側は誰も直せず固着する。実際に 2 通り出た:
+    /// | 固着 | 起きる理由 |
+    /// |:--|:--|
+    /// | Working が残る | Esc 中断で `Stop` が飛ばない（[codex#22858](https://github.com/openai/codex/issues/22858)） |
+    /// | Waiting が残る | **許可が解除されたことを知らせる hook がそもそも無い** |
     ///
-    /// | 固着 | 起きる理由 | 持たない agent の直し方 |
-    /// |:--|:--|:--|
-    /// | Working が残る | Esc 中断で `Stop` が飛ばない（[codex#22858](https://github.com/openai/codex/issues/22858)） | PTY の無音 |
-    /// | Waiting が残る | **許可が解除されたことを知らせる hook がそもそも無い** | 記録が伸びたこと |
+    /// **claude は空を返す。** あちらの現在値は記録ではなく `~/.claude/sessions/` の
+    /// `status` にあり、読み口が別（[`crate::poll::fetch_agents`]）。codex は
+    /// rollout そのものが `task_started` / `task_complete` / `turn_aborted` を
+    /// 順に持つので、**記録の末尾が現在値になる**（実測 2026-08-28 / codex 0.150.1:
+    /// 2 日ぶんの rollout で `task_started` 46 件 ＝ `task_complete` 36 + `turn_aborted` 10）。
     ///
-    /// **代用の材料が 2 つに割れるのは、片方では区別が付かないから。** codex の TUI は
+    /// **PTY の無音では代用できない。** codex の TUI は考え込んでいる間も
     /// 承認ダイアログを出している間も 1 秒ごとにタイトルを書き換える（実測）ので、
-    /// PTY の出力では「動いている」と「待たれている」を分けられない。逆に記録
-    /// （rollout）は承認待ちの間だけ伸びが止まる（実測: 20 秒の停止）ので、
-    /// そちらが Waiting を降ろす材料になる。
+    /// 出力の有無は「動いている」と「待たれている」を分けない。
     ///
-    /// 判断そのものは [`crate::poll::row_state`]（この bool を読むのはあそこだけ）
-    fn has_live_status(&self) -> bool;
+    /// 読むのは [`crate::title::Titles`]（記録を tail しているのがあそこ 1 箇所）、
+    /// 使うのは [`crate::poll::row_state`]
+    fn record_states(&self) -> &'static [Mark];
+
+    /// 記録の 1 行が**書かれた時刻**（epoch ms。None ＝ 読めない／時刻を持たない）。
+    ///
+    /// **「記録が動いた」を状態の材料にするためにある。** turn の途中で
+    /// [`Self::record_states`] が更新されるのは turn の切れ目だけなので、
+    /// 切れ目の時刻だけでは**許可に答えた後**が表せない: 許可を待つ hook
+    /// （`PermissionRequest`）は `task_started` より後に来るので、記録の側は
+    /// 永久に古いまま ＝ 動いている間ずっと黄「入力待ち」のまま残る（実際に
+    /// 報告された症状）。
+    ///
+    /// **記録は許可を待っている間だけ伸びが止まる**（実測: 20 秒の停止）ので、
+    /// 「最後に書かれた時刻」がそのまま「その時刻には動いていた」の証拠になる。
+    /// 組み立ては [`crate::title::Titles::live_state`]。
+    ///
+    /// **1 塊につき 1 行しか読まない**（[`crate::title`]）ので、全行のパースには
+    /// ならない
+    fn record_time(&self, value: &serde_json::Value) -> Option<u64>;
 
     /// この agent の現行版と、それより新しい版があればその番号。
     ///
@@ -382,6 +402,25 @@ pub(crate) struct Candidate {
     /// 解析済みの 1 行から表示名を取り出す（None ＝ この候補ではない）
     pub(crate) text: fn(&serde_json::Value) -> Option<&str>,
     pub(crate) span: Span,
+}
+
+/// 会話の記録の中で**現在値を名乗る行**の 1 種類（[`Backend::record_states`]）。
+///
+/// **[`Candidate`] と形が似ているのに別の型なのは、答えるものが違うから。**
+/// あちらは会話 1 つに名前を 1 つ与える候補で、拾えるのは文字列。こちらは
+/// **状態と、その状態が記録された時刻**を対で返す ＝ 読み手（[`crate::poll::row_state`]）が
+/// hook とどちらが新しいかを比べられる形。時刻を落として state だけを返すと、
+/// 記録から拾った古い値が新しい hook に勝ってしまう。
+///
+/// **時刻の取り出しまで agent が答える。** 記録の 1 行がどこに時刻を持つかは
+/// agent ごとに違い（codex は封筒の `timestamp` ＝ RFC3339）、呼び手が組み立てると
+/// 記録の形の知識が層を越える
+pub(crate) struct Mark {
+    /// JSON を組む前の足切りに使う文字列（[`Candidate::marker`] と同じ役目）
+    pub(crate) marker: &'static str,
+    /// 解析済みの 1 行から (現在値, その値が記録された epoch ms) を取り出す
+    /// （None ＝ この行は状態を語らない）
+    pub(crate) read: fn(&serde_json::Value) -> Option<(crate::poll::State, u64)>,
 }
 
 /// agent 自身が**記録の外**に持っている会話名の索引（1 行 1 会話の JSONL）。
