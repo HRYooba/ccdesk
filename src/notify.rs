@@ -4,11 +4,18 @@
 //! （`["waiting", "done"]` ＝ [`wanted`]）。**待ちと完了で振る舞いを変えない**:
 //! どちらも同じ形で出て、同じように時間で引っ込む（[`show`]）。
 //!
-//! **撃つのは TUI であって hook ではない。** hook（`ccdesk hook <event>`）なら
-//! 0 遅延で撃てるが、行の**表示名を持たない**（名前は transcript から導くもので、
-//! [`crate::title`] の走査が要る）。通知が答えるのは「どのセッションが呼んで
-//! いるか」なので、名前と cwd を既に持っている側 ＝ TUI が、画面と同じ
-//! [`crate::poll::State`] の**変わり目**で撃つ（[`crate::app`]）。
+//! **材料は hook の出来事、撃つのは TUI。**
+//!
+//! 何を知らせるかは agent 自身が名乗る（[`crate::hooks::HOOK_EVENTS`] の `alert`
+//! 列 ＝ 「呼んでいる」「終わった」）。**行の state の変わり目は材料にしない**:
+//! state は「今どうなっているか」しか答えず、その中には**ユーザー自身が開いた
+//! ダイアログ**も入る（claude は `/config` `/resume` でも `status: waiting` を
+//! 書く）ので、変わり目で撃つと呼ばれてもいないのに呼び出される。
+//!
+//! **撃つのが hook 本体でないのは、行の表示名を持たないから**（名前は記録から
+//! 導くもので、[`crate::title`] の走査が要る）。通知が答えるのは「どのセッションが
+//! 呼んでいるか」なので、名前と cwd を既に持っている側 ＝ TUI が、hook が保管へ
+//! 書いた出来事を読んで撃つ（[`crate::app`] の `update_notifications`）。
 //!
 //! **`ccdesk` を名乗るには AppUserModelID の登録が要る。** Windows はトーストの
 //! 送り主をこの ID で識別し、通知に出る**名前**と「設定 > 通知」の行はそこに紐づく
@@ -42,7 +49,7 @@
 //! 遷移を両方が見れば両方が撃つことになる（後のものが前を置き換えるので画面には
 //! 1 枚しか残らないが、鳴るのは 2 回）＝ **撃つ側で持ち主を決める**:
 //! 通知を出すのはその行を動かしている窓を持つプロセスだけで、他インスタンスの
-//! 行は一覧に出るが撃たない（[`crate::poll::RowState::owned`]）。
+//! 行は一覧に出るが撃たない（[`crate::app`] の `update_notifications`）。
 //! プロセス間の調停は要らない ＝ 窓は 1 つの行に 1 つしか無い。
 //!
 //! # 失敗は画面に出さない
@@ -91,6 +98,25 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
+    /// **保管（`~/.ccdesk/hook-states.json`）に残る綴り。**
+    /// hook は別プロセスなので、撃つ材料はファイルを通って TUI へ渡る
+    /// （[`crate::hooks::HookStates::alert`]）。読みと書きが別々の綴りを持つと、
+    /// 片方だけ変えたときに**通知が黙って止まる**（行の表示は何も変わらないので
+    /// 気づけない種類の壊れ方）
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NeedsInput => "needs_input",
+            Self::Finished => "finished",
+        }
+    }
+
+    /// 保管値からの復元。**知らない綴りは None**（＝ その行の呼び出しは撃たれない）
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        [Self::NeedsInput, Self::Finished]
+            .into_iter()
+            .find(|kind| kind.as_str() == text)
+    }
+
     /// 通知の題の頭。**画面の状態名と同じ語**を使う（通知だけ別の呼び方をしない）
     #[cfg(windows)]
     fn headline(self) -> &'static str {
@@ -125,9 +151,17 @@ pub(crate) struct Wanted {
 }
 
 impl Wanted {
-    /// 1 つも出さないなら、状態の突き合わせ自体を回さなくてよい
+    /// 1 つも出さないなら、突き合わせ自体を回さなくてよい
     pub(crate) fn any(self) -> bool {
         self.waiting || self.finished
+    }
+
+    /// その種類を出すか。**設定の綴りと [`Kind`] の対応はここ 1 箇所**
+    pub(crate) fn wants(self, kind: Kind) -> bool {
+        match kind {
+            Kind::NeedsInput => self.waiting,
+            Kind::Finished => self.finished,
+        }
     }
 }
 

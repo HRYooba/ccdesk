@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::backend::{
-    codex_app_server, codex_index, AgentVersion, Backend, Candidate, Inject, Launch, Garbage,
+    codex_app_server, codex_index, AgentVersion, Backend, Candidate, Inject, Kind, Launch, Garbage,
     Message, NameIndex, Span, Spawn,
 };
 use crate::hooks::{HOOK_EVENTS, HOOK_TIMEOUT_SECS};
@@ -33,22 +33,6 @@ const PROGRAM: &str = "codex";
 /// GitHub の releases ではなくこちらを使うのは、返る値が `codex --version` と
 /// **同じ形**だから（GitHub のタグは `rust-v0.146.0` で、剥がし方が黙って腐る）
 const LATEST_VERSION_API: &str = "https://registry.npmjs.org/@openai/codex/latest";
-
-/// codex が持つ hook イベント。**[`HOOK_EVENTS`] の部分集合**で、State への対応も
-/// 同じ（実測 / codex 0.146.0）。
-///
-/// **一覧を持つ理由**: 知らないイベント名を `-c` に載せると codex が設定ごと
-/// 読み込みに失敗し、hook が 1 つも効かなくなる。claude 専用のイベント
-/// （`Notification` / `StopFailure`）をここで落とす。
-///
-/// (event, state) の対応そのものは [`HOOK_EVENTS`] が正本なので、ここには持たない
-const SUPPORTED_EVENTS: [&str; 5] = [
-    "SessionStart",
-    "UserPromptSubmit",
-    "PermissionRequest",
-    "Stop",
-    "SessionEnd",
-];
 
 /// trust の確認を飛ばすフラグ。
 ///
@@ -111,11 +95,21 @@ impl Backend for Codex {
         Spawn { cmd, conversation }
     }
 
-    /// **持たない。** codex に claude の `status` 相当のものは無い（`state_*.sqlite`
-    /// の `threads` は会話の索引であって、今どうしているかを言わない）。
-    /// 代用の材料と、それが要る理由は [`Backend::has_live_status`]
-    fn has_live_status(&self) -> bool {
-        false
+    /// **rollout の末尾が現在値。** codex に claude の `status` 相当のファイルは
+    /// 無いが、rollout は turn の始まりと終わりを順に持つ（[`LIFECYCLE`]）。
+    ///
+    /// **これが無いと Esc 中断が永久に赤で残る**（報告された症状）: 中断のとき
+    /// codex は `Stop` を撃たず（[codex#22858](https://github.com/openai/codex/issues/22858)）、
+    /// hook はイベントなので誰も降ろせない。記録は turn が終われば必ず
+    /// `turn_aborted` を書くので、次の走査で必ず正しくなる
+    fn record_states(&self) -> &'static [crate::backend::Mark] {
+        &LIFECYCLE
+    }
+
+    /// rollout は**全行が同じ封筒**（`{"timestamp":…,"type":…,"payload":…}`）を
+    /// 持つので、行の種類を問わず 1 つの読み方で時刻が出る
+    fn record_time(&self, value: &serde_json::Value) -> Option<u64> {
+        record_time(value.get("timestamp")?.as_str()?)
     }
 
     /// 最新版は codex の配布元（npm registry の `@openai/codex`、dist-tag `latest`）
@@ -252,61 +246,167 @@ impl Backend for Codex {
         codex_index::name_index()
     }
 
-    /// `{"type":"event_msg","payload":{"type":"user_message"|"agent_message",
-    /// "message":"…"}}` から発言を取る。
+    /// 記録の 1 行から発言を取る。**2 つの形を両方読む**（理由は [`TITLE_RECORDS`]）。
     ///
     /// **`response_item` は見ない。** 表示名のときと同じ理由で、あちらには
-    /// AGENTS.md や permissions の前置き・道具の出入りが同じ形で並ぶ
-    /// （[`USER_MESSAGE`]）。`event_msg` は codex が画面に出した出来事なので、
-    /// ここに載るのは人が読む発言だけになる
+    /// AGENTS.md や permissions の前置き・道具の出入りが同じ形で並ぶ。
+    /// `event_msg` は codex が画面に出した出来事なので、ここに載るのは人が読む
+    /// 発言だけになる
     fn message(&self, value: &serde_json::Value) -> Option<Message> {
         let payload = value.get("payload")?;
-        let from_user = match payload.get("type").and_then(serde_json::Value::as_str)? {
-            USER_MESSAGE => true,
-            AGENT_MESSAGE => false,
+        let (from_user, text) = match payload.get("type").and_then(serde_json::Value::as_str)? {
+            // 今の形（0.150〜）: 発言は完了した item として載る
+            ITEM_COMPLETED => {
+                let item = payload.get("item")?;
+                let from_user = match item.get("type").and_then(serde_json::Value::as_str)? {
+                    USER_ITEM => true,
+                    AGENT_ITEM => false,
+                    _ => return None,
+                };
+                (from_user, item_text(item)?)
+            }
+            // 旧い形（〜0.149）: 発言が payload に平らに載る
+            USER_MESSAGE => (true, payload.get("message")?.as_str()?.to_string()),
+            AGENT_MESSAGE => (false, payload.get("message")?.as_str()?.to_string()),
             _ => return None,
         };
-        let text = payload.get("message").and_then(serde_json::Value::as_str)?;
-        (!text.trim().is_empty()).then(|| Message {
-            from_user,
-            text: text.to_string(),
-        })
+        (!text.trim().is_empty()).then_some(Message { from_user, text })
     }
 }
 
 /// 表示名の候補。**索引（`thread_name`）が上、これは下段**（[`Backend::title_records`]）。
 ///
-/// 取り出しは 2 つとも同じ（rollout は打鍵を 1 種類の行でしか運ばない）で、
-/// **違うのは読む範囲だけ**。並びがそのまま優先順 ＝ 末尾で拾えたら先頭は見ない
-static TITLE_RECORDS: [Candidate; 2] = [
-    Candidate {
-        marker: USER_MESSAGE,
-        text: user_prompt,
-        span: Span::Appended,
-    },
-    Candidate {
-        marker: USER_MESSAGE,
-        text: user_prompt,
-        span: Span::Head,
-    },
+/// **rollout の形が 0.150 で変わった**（実測 2026-08-28 / codex 0.150.1）。
+/// ユーザーの打鍵は
+/// `{"payload":{"type":"user_message","message":…}}` から
+/// `{"payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"text":…}]}}}`
+/// へ移り、**旧い型名は 1 件も出なくなった**（直近 2 日の rollout 46 本で
+/// `user_message` は 0 件）＝ 索引に載らない会話（`/rename` していないもの）は
+/// **全部 `new session` のまま**になっていた。
+///
+/// **両方を残す。** 記録は消えないので、古い会話は古い形のまま在り続ける。
+/// 取り出しはどちらも [`user_prompt`] が吸収するので、候補が分かれるのは
+/// **足切りの印が別の文字列だから**だけ（[`Candidate::marker`] は 1 本しか持てない）。
+///
+/// 並びがそのまま優先順 ＝ 末尾（今やらせていること）で拾えたら先頭は見ない
+static TITLE_RECORDS: [Candidate; 4] = [
+    Candidate { marker: USER_ITEM, text: user_prompt, span: Span::Appended },
+    Candidate { marker: USER_MESSAGE, text: user_prompt, span: Span::Appended },
+    Candidate { marker: USER_ITEM, text: user_prompt, span: Span::Head },
+    Candidate { marker: USER_MESSAGE, text: user_prompt, span: Span::Head },
 ];
 
-/// rollout の中でユーザーの打鍵そのものを運ぶ行の型名。
+/// 発言を運ぶ**今の**行の型名（0.150〜）。中身は [`USER_ITEM`] / [`AGENT_ITEM`]
+const ITEM_COMPLETED: &str = "item_completed";
+
+/// ユーザーの打鍵を運ぶ item の型名（0.150〜）。
 ///
 /// **`role: "user"` の `response_item` は使わない。** あちらには AGENTS.md や
 /// permissions の前置きも同じ形で入るので、名前にすると前置きが行に出る
+const USER_ITEM: &str = "UserMessage";
+
+/// codex の答えを運ぶ item の型名（0.150〜）。**表示名には使わない**
+/// （名前は打鍵から採る）が、会話を読むには要る（[`Backend::message`]）
+const AGENT_ITEM: &str = "AgentMessage";
+
+/// 旧い形（〜0.149）でユーザーの打鍵を運んだ行の型名
 const USER_MESSAGE: &str = "user_message";
 
-/// codex の答えそのものを運ぶ行の型名。**表示名には使わない**（名前は打鍵から
-/// 採る）が、会話を読むには要る（[`Backend::message`]）
+/// 旧い形（〜0.149）で codex の答えを運んだ行の型名
 const AGENT_MESSAGE: &str = "agent_message";
 
-/// `{"type":"event_msg","payload":{"type":"user_message","message":"…"}}` から
-/// 打鍵を取り出す
+/// 記録の 1 行から打鍵を取り出す。**新旧どちらの形でも同じ答えを返す**
+/// （[`TITLE_RECORDS`]）
 fn user_prompt(value: &serde_json::Value) -> Option<&str> {
     let payload = value.get("payload")?;
-    (payload.get("type").and_then(serde_json::Value::as_str) == Some(USER_MESSAGE))
-        .then(|| payload.get("message").and_then(serde_json::Value::as_str))?
+    match payload.get("type")?.as_str()? {
+        ITEM_COMPLETED => {
+            let item = payload.get("item")?;
+            (item.get("type")?.as_str()? == USER_ITEM).then(|| first_text(item))?
+        }
+        USER_MESSAGE => payload.get("message")?.as_str(),
+        _ => None,
+    }
+}
+
+/// item の本文ブロックのうち**最初の中身のある `text`**。
+///
+/// **ブロックの型名では選ばない。** codex は同じ `content` の中で綴りを揃えて
+/// いない（実測: ユーザー側は `"type":"text"`、codex 側は `"type":"Text"`）ので、
+/// 型名で絞ると片側だけが拾えなくなる。持っている値（`text`）で選ぶ
+fn first_text(item: &serde_json::Value) -> Option<&str> {
+    item.get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|block| block.get("text")?.as_str())
+        .find(|text| !text.trim().is_empty())
+}
+
+/// item の本文ブロックを**全部**つないだもの（[`Backend::message`] 用）。
+/// 表示名は 1 行に畳むので先頭 1 つで足りるが、会話を読むほうは落とせない
+fn item_text(item: &serde_json::Value) -> Option<String> {
+    let joined = item
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|block| block.get("text")?.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!joined.trim().is_empty()).then_some(joined)
+}
+
+/// rollout が turn の切れ目に書く行（[`Backend::record_states`]）。
+///
+/// **`task_started` と、その turn が終わったことを言う 2 つ**で閉じる（実測
+/// 2026-08-28 / codex 0.150.1: 直近 2 日で 46 = 36 + 10 と過不足なく対応した）。
+/// 中断（`turn_aborted`）も**手が空いた**という意味では完了と同じ Idle:
+/// 「終わったのか止めたのか」は通知が見る区別で、それは hook の表
+/// （[`HOOK_EVENTS`]）が持つ ＝ ここは色が答えることだけを答える
+static LIFECYCLE: [crate::backend::Mark; 3] = [
+    crate::backend::Mark { marker: TASK_STARTED, read: task_started },
+    crate::backend::Mark { marker: TASK_COMPLETE, read: task_complete },
+    crate::backend::Mark { marker: TURN_ABORTED, read: turn_aborted },
+];
+
+/// turn が始まった
+const TASK_STARTED: &str = "task_started";
+/// turn が最後まで終わった
+const TASK_COMPLETE: &str = "task_complete";
+/// turn が中断された（`reason: "interrupted"` ＝ Esc）
+const TURN_ABORTED: &str = "turn_aborted";
+
+fn task_started(value: &serde_json::Value) -> Option<(crate::poll::State, u64)> {
+    lifecycle(value, TASK_STARTED, crate::poll::State::Working)
+}
+
+fn task_complete(value: &serde_json::Value) -> Option<(crate::poll::State, u64)> {
+    lifecycle(value, TASK_COMPLETE, crate::poll::State::Idle)
+}
+
+fn turn_aborted(value: &serde_json::Value) -> Option<(crate::poll::State, u64)> {
+    lifecycle(value, TURN_ABORTED, crate::poll::State::Idle)
+}
+
+/// その行が `payload.type == kind` なら (state, 記録された時刻)。
+///
+/// **時刻は封筒の `timestamp`**（RFC3339）で、payload の中の `started_at` /
+/// `completed_at` ではない: あちらは行ごとに綴りも粒度（秒）も違うが、封筒は
+/// rollout の全行が同じ形で持つ ＝ 1 つの読み方で全部に効く
+fn lifecycle(
+    value: &serde_json::Value,
+    kind: &str,
+    state: crate::poll::State,
+) -> Option<(crate::poll::State, u64)> {
+    (value.get("payload")?.get("type")?.as_str()? == kind).then_some(())?;
+    Some((state, record_time(value.get("timestamp")?.as_str()?)?))
+}
+
+/// rollout の封筒の時刻（`"2026-08-28T03:38:32.547Z"`）→ epoch ms。
+/// 読めなければ None ＝ その行は現在値として使わない（誤った時刻で hook に
+/// 勝たせるより、材料を 1 つ落とすほうが害が小さい）
+fn record_time(text: &str) -> Option<u64> {
+    let at = chrono::DateTime::parse_from_rfc3339(text).ok()?;
+    u64::try_from(at.timestamp_millis()).ok()
 }
 
 /// `-c` に渡す hook の定義（TOML）。**注入できない形なら None**（hook 無しで
@@ -323,10 +423,7 @@ fn hook_toml(exe: &str) -> Option<String> {
     // イベント名をキーに配列へ足し込む（同名イベントが 2 枚あっても後着が
     // 前着を潰さない。並びを固定するため BTreeMap を使う ＝ 同じ入力で同じ文字列）
     let mut by_event: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for row in HOOK_EVENTS
-        .iter()
-        .filter(|row| SUPPORTED_EVENTS.contains(&row.event))
-    {
+    for row in HOOK_EVENTS.iter().filter(|row| row.has(Kind::Codex)) {
         // SessionEnd だけ codex 側の上限が短い（[`SESSION_END_TIMEOUT_SECS`]）
         let timeout = if row.event == "SessionEnd" {
             HOOK_TIMEOUT_SECS.min(SESSION_END_TIMEOUT_SECS)
@@ -498,7 +595,10 @@ mod tests {
     }
 
     /// **claude 専用のイベントを載せない。** 知らない名前があると codex は設定ごと
-    /// 読み込みに失敗し、hook が 1 つも効かなくなる
+    /// 読み込みに失敗し、hook が 1 つも効かなくなる。
+    ///
+    /// **誰が持つかの正本は [`HOOK_EVENTS`] の 1 表**（かつてはここに部分集合の
+    /// 一覧を別に持っていて、表と 2 箇所で食い違い得た）
     #[test]
     fn only_the_events_codex_has_are_injected() {
         let toml = hook_toml("C:/ccdesk.exe").expect("no hooks were built");
@@ -506,12 +606,21 @@ mod tests {
             let present = toml.contains(&format!("{}=[", row.event));
             assert_eq!(
                 present,
-                SUPPORTED_EVENTS.contains(&row.event),
+                row.has(Kind::Codex),
                 "{} is {} in the injected TOML",
                 row.event,
                 if present { "present" } else { "missing" }
             );
         }
+    }
+
+    /// **Esc 中断は `Interrupt` が名乗る**（codex 0.150 で増えたイベント）。
+    /// これが落ちると中断の 0 遅延の材料が消え、記録の走査（1 周期の遅れ）
+    /// だけが Working を降ろすことになる
+    #[test]
+    fn the_interrupt_event_is_injected() {
+        let toml = hook_toml("C:/ccdesk.exe").expect("no hooks were built");
+        assert!(toml.contains("Interrupt=["), "{toml}");
     }
 
     /// **注入する値に二重引用符を 1 つも出さない。**
@@ -595,6 +704,108 @@ mod tests {
         Codex.message(&serde_json::from_str(line).expect("the test wrote invalid JSON"))
     }
 
+    /// **0.150 の形**（実測 2026-08-28 / codex 0.150.1）。発話は完了した item として
+    /// 載り、本文ブロックの型名は**ユーザー側と codex 側で綴りが違う**
+    /// （`"text"` と `"Text"`）ので、型名ではなく `text` の有無で選ぶ
+    #[test]
+    fn the_current_shape_of_a_rollout_is_read() {
+        assert_eq!(
+            message_of(
+                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"run the tests","text_elements":[]}]}}}"#
+            ),
+            Some(Message { from_user: true, text: "run the tests".to_string() })
+        );
+        assert_eq!(
+            message_of(
+                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"they pass"}]}}}"#
+            ),
+            Some(Message { from_user: false, text: "they pass".to_string() })
+        );
+        // 本文ブロックを持たない item は発言ではない（道具・思考は同じ形で並ぶ）
+        for line in [
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Reasoning","summary_text":[],"raw_content":[]}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":"ls"}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"  "}]}}}"#,
+        ] {
+            assert_eq!(message_of(line), None, "{line}");
+        }
+    }
+
+    /// **表示名は新旧どちらの形でも打鍵から採れる。**
+    ///
+    /// 0.150 で `user_message` が消え（直近 2 日の rollout 46 本で 0 件）、
+    /// 索引（`session_index.jsonl`）に載るのは `/rename` した会話だけなので、
+    /// ここが外れると **`/rename` していない codex の行は全部 `new session`** に
+    /// なる（報告された症状）。記録は消えないので旧い形も読み続ける
+    #[test]
+    fn a_prompt_is_found_in_both_shapes_of_the_record() {
+        let prompt = |line: &str| {
+            let value: serde_json::Value = serde_json::from_str(line).expect("invalid JSON");
+            user_prompt(&value).map(str::to_string)
+        };
+        assert_eq!(
+            prompt(r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"fix the login form"}]}}}"#)
+                .as_deref(),
+            Some("fix the login form")
+        );
+        assert_eq!(
+            prompt(r#"{"type":"event_msg","payload":{"type":"user_message","message":"fix the login form","images":[]}}"#)
+                .as_deref(),
+            Some("fix the login form")
+        );
+        // codex の答えは名前にしない（名前は打鍵から採る）
+        assert_eq!(
+            prompt(r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"done"}]}}}"#),
+            None
+        );
+        // **両方の形の印が候補に載っている**（印は 1 候補 1 本しか持てないので、
+        // どちらかを落とすとその形の記録が丸ごと拾えなくなる）
+        for marker in [USER_ITEM, USER_MESSAGE] {
+            for span in [Span::Appended, Span::Head] {
+                assert!(
+                    TITLE_RECORDS
+                        .iter()
+                        .any(|c| c.marker == marker && c.span == span),
+                    "{marker} is not searched in {span:?}"
+                );
+            }
+        }
+    }
+
+    /// **turn の切れ目が現在値になる。** 時刻は封筒の `timestamp` から採る
+    /// （payload 側の `started_at` / `completed_at` は行ごとに綴りも粒度も違う）。
+    ///
+    /// 中断（`turn_aborted`）が Idle なのが要点で、codex は中断のとき `Stop` を
+    /// 撃たない ＝ これが無いと行が永久に Working で固着する（報告された症状）
+    #[test]
+    fn the_turn_boundaries_in_a_rollout_are_the_current_state() {
+        let read = |line: &str| {
+            let value: serde_json::Value = serde_json::from_str(line).expect("invalid JSON");
+            LIFECYCLE.iter().find_map(|mark| (mark.read)(&value))
+        };
+        assert_eq!(
+            read(r#"{"timestamp":"2026-08-28T03:38:31.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t","started_at":1787888311}}"#),
+            Some((crate::poll::State::Working, 1_787_888_311_000))
+        );
+        assert_eq!(
+            read(r#"{"timestamp":"2026-08-28T03:38:32.547Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t","last_agent_message":"done"}}"#),
+            Some((crate::poll::State::Idle, 1_787_888_312_547))
+        );
+        assert_eq!(
+            read(r#"{"timestamp":"2026-08-28T03:38:33.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"t","reason":"interrupted"}}"#),
+            Some((crate::poll::State::Idle, 1_787_888_313_000))
+        );
+        // 状態を語らない行・時刻の読めない行は現在値にしない
+        for line in [
+            r#"{"timestamp":"2026-08-28T03:38:31.000Z","type":"event_msg","payload":{"type":"token_count","info":{}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t"}}"#,
+            r#"{"timestamp":"not a time","type":"event_msg","payload":{"type":"task_complete","turn_id":"t"}}"#,
+        ] {
+            assert_eq!(read(line), None, "{line}");
+        }
+    }
+
+    /// 旧い形（〜0.149）の発言も読み続ける（記録は消えない）
     #[test]
     fn both_sides_of_the_conversation_are_read() {
         assert_eq!(

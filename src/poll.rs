@@ -822,29 +822,27 @@ pub(crate) fn state_of_status(status: &str) -> Option<State> {
 /// その行を**今動かしている実行**の観測。窓 1 つが実行 1 つで、他インスタンスの
 /// 実行は `~/.claude/sessions/` の status 経由で、撮影用の供給元は固定表で名乗る
 /// （材料をどこから集めるかは描画側 ＝ [`crate::ui`] が持つ）
-pub(crate) struct Run<'a> {
+pub(crate) struct Run {
     /// その実行が hook で報告した最新の 1 件（一度も来ていなければ None）。
     /// 前回の実行の残骸を捨てる判断は [`crate::hooks::HookStates::get`] が
     /// 窓の起動時刻で済ませてあるので、ここへ来るのは今の実行が書いたものだけ
     pub(crate) hook: Option<crate::hooks::Reported>,
-    /// `~/.claude/sessions/` の `status` の生値（空 ＝ ポーラーがまだ拾っていない、
-    /// または値を載せないセッション）。語彙への翻訳は [`state_of_status`]
-    pub(crate) status: &'a str,
-    /// `status` を観測した時刻（ms）。hook の記録時刻とどちらが新しいかを見る。
-    /// 0 ＝ 一度も観測していない
-    pub(crate) status_at: u64,
-    /// PTY の出力の様子。**hook も status も無い行だけの最後の手段**
+    /// **agent 自身が名乗っている現在値と、それが書かれた時刻**（None ＝ まだ
+    /// 観測できていない）。
+    ///
+    /// **出どころは agent ごとに違うが、ここへ来る形は 1 つ。** claude は
+    /// `~/.claude/sessions/` の `status`（[`state_of_status`]）、codex は rollout の
+    /// 末尾（[`crate::backend::Backend::record_states`]）。**どちらを読むかは
+    /// 呼び手が決めない**: 両方を引いて新しい方を採れば、agent ごとの分岐が要らない
+    /// （行は片方しか持たないので、実際には必ず一方が None になる）。
+    ///
+    /// **hook との違いは自己修復するかどうか。** hook はイベントなので取りこぼすと
+    /// 誰も直せないが、こちらは現在値なので次の観測で必ず正しくなる
+    pub(crate) observed: Option<(State, u64)>,
+    /// PTY の出力の様子。**hook も現在値も無い行だけの最後の手段**
     /// （フォーカスの出入りや再描画でも動くので精度は低い）。
     /// `None` ＝ この行に窓が無い（材料は必ず他にあるので、この値は読まれない）
     pub(crate) pty: Option<PtyHint>,
-    /// この行の agent が現在値を外へ出しているか
-    /// （[`crate::backend::Backend::has_live_status`]）。**codex だけ false** ＝
-    /// hook を取り逃したときに下の 2 つの代用材料が効くのは codex の行だけ
-    pub(crate) has_live_status: bool,
-    /// **この時刻より後に会話の記録が伸びた**（epoch ms。0 ＝ 見ていない）。
-    /// 出どころと「なぜ伸びを見つけた時刻ではないのか」は
-    /// [`crate::title::Titles::grew_since`]
-    pub(crate) record_grew_since: u64,
 }
 
 /// 窓の PTY から見た様子。**2 値では足りない**のが要点で、「まだ 1 バイトも
@@ -862,65 +860,6 @@ pub(crate) enum PtyHint {
     Writing,
     /// 出力したことはあるが、いまは静か
     Quiet,
-}
-
-/// 行の有効 state と、**その値を誰が名乗ったか**。
-///
-/// `reported` が false ＝ hook も status も 1 つも無く、[`row_state`] が PTY から
-/// 推した値 ＝ **まだ起動中**。この 1 ビットが無いと「起動の Working」と
-/// 「ターン中の Working」が同じ値になり、**窓を開けただけの行が Idle へ落ちた瞬間に
-/// 「ターンが終わりました」と名乗る**（[`crate::app`] の通知）
-///
-/// `interrupted` が true ＝ **手は空いたが、agent は「ターンが終わった」と
-/// 名乗っていない**（下記）
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct RowState {
-    pub(crate) state: State,
-    pub(crate) reported: bool,
-    /// **Idle だが、その実行の hook の最後の一言が Idle ではない** ＝ ターンは
-    /// 終わったのではなく**途中で止められた**（Esc 中断）。
-    ///
-    /// 完了は agent 自身が名乗る出来事（`Stop` / `StopFailure`）で、`status` の
-    /// `idle` は**理由を持たない現在値**にすぎない。中断でも `idle` は載るので、
-    /// state だけを見ると中断が完了と同じ形になる（上の [`row_state`] が言う
-    /// 「claude は Esc 中断のとき `Stop` を撃たない」の裏返し ＝ 報告された症状:
-    /// **Esc で止めても「ターンが終わりました」と通知が来る**）。
-    ///
-    /// **hook の記録が 1 つも無い行では立たない**（他インスタンスの行 ＝ 材料が
-    /// `status` だけ）。そこは中断と完了を区別する材料がそもそも無いので、
-    /// 撃つ側に倒す ＝ この修正で通知が減るのは hook を持つ行だけ。
-    ///
-    /// 表示は読まない（Idle は Idle として描く）＝ **通知だけが使う 1 ビット**
-    pub(crate) interrupted: bool,
-    /// **この ccdesk の窓がその行を動かしているか。**
-    ///
-    /// 材料は `pty` の有無 1 つ。[`Run::pty`] を持てるのは自分の子（窓）だけで、
-    /// 他インスタンスの行（`status` 救済）と撮影用の固定 state は必ず `None` ＝
-    /// 「自分の実行か」はここから構造的に導ける。
-    ///
-    /// 通知が使う（[`crate::app`] の `announce`）: 自分が動かしていない行は
-    /// hook を実行へ紐づけられない ＝ 中断と完了を分ける材料が無く、しかも
-    /// 同じ遷移を持ち主の ccdesk も見ている（2 プロセスで 2 回鳴る）。
-    /// **一覧には従来どおり出る**（撃たないだけ）
-    pub(crate) owned: bool,
-}
-
-/// [`row_state`] に出どころを添えて返す。**材料の一覧を持つのはここ 1 箇所**で、
-/// 判定に使う材料が増えたら `reported` の条件も同じ関数の中で直る
-pub(crate) fn row_view(run: Option<Run<'_>>) -> RowState {
-    let reported = run
-        .as_ref()
-        .is_some_and(|run| run.hook.is_some() || state_of_status(run.status).is_some());
-    let hook = run.as_ref().and_then(|run| run.hook);
-    let run_pty = run.as_ref().and_then(|run| run.pty);
-    // **hook を持つ行の Idle は、ターンの終わりを名乗るイベントが裏打ちしている
-    // ときだけ「終わった」。** `state == Idle` で足りると思うと `SessionStart` を
-    // 数えてしまい、ペインの中の `/clear` `/resume` が完了になる
-    // （[`crate::hooks::Entry::ended`]）
-    let state = row_state(run);
-    let interrupted = state == State::Idle && matches!(hook, Some(hook) if !hook.ended);
-    let owned = run_pty.is_some();
-    RowState { state, reported, interrupted, owned }
 }
 
 /// 1 行に出す状態を決める。**行に保存せず、そのつど導く。**
@@ -941,8 +880,8 @@ pub(crate) fn row_view(run: Option<Run<'_>>) -> RowState {
 ///   実行として扱わない ＝ Stopped は必ず下の早期 return 1 本だけを通り、
 ///   色（[`State::color`]）も明滅（[`State::blinks`]）もその 1 つの値から導く
 ///
-/// 実行があるときの中身は **hook（イベント）と `status`（現在値）の新しい方**。
-/// 2 つは [`state_of_status`] で同じ語彙へ揃えてあるので、判断は新旧の比較だけで
+/// 実行があるときの中身は **hook（イベント）と現在値（[`Run::observed`]）の
+/// 新しい方**。2 つは同じ語彙（[`State`]）へ揃えてあるので、判断は新旧の比較だけで
 /// 足りる。どちらも無い間だけ PTY の出力変化から推す。
 ///
 /// # なぜ「新しい方」の 1 本だけで足りるのか
@@ -950,8 +889,8 @@ pub(crate) fn row_view(run: Option<Run<'_>>) -> RowState {
 /// hook は**イベント**（「その瞬間こうなった」）なので、取りこぼすと自己修復しない:
 /// claude は Esc 中断のとき `Stop` を撃たない（実データで中断ターンの 91%（113/124）が
 /// 未発火）し、許可プロンプトの**許可には「解除された」を知らせるイベントが存在しない**。
-/// 対して `status` は claude が遷移のたびに上書きする**現在値**なので、次の観測が
-/// 来れば必ず正しくなる。
+/// 対して現在値は agent 自身が遷移のたびに上書きするので、次の観測が来れば必ず
+/// 正しくなる。
 ///
 /// **以前はこの 2 つを別々の語彙のまま突き合わせていた**（hook は
 /// `working|waiting|completed`、`status` は `busy|waiting|shell|idle`）。
@@ -961,45 +900,36 @@ pub(crate) fn row_view(run: Option<Run<'_>>) -> RowState {
 /// 「非 `busy`」に含まれるため、**バックグラウンド実行中の行が入力待ちへ落ちる**という
 /// 副作用が付いていた。語彙を揃えると特例は 0 本になり、残るのは新旧の比較だけ。
 ///
+/// # かつてここに居た codex 専用の救済 2 本
+///
+/// codex は現在値を持たないものとして扱われていたので、hook を取り逃した行を
+/// 直す材料を代わりに 2 つ持っていた: **PTY の無音**で Working を降ろし、
+/// **記録が伸びたこと**で Waiting を降ろす。どちらも「状態を言わない材料から
+/// 状態を推す」形で、前者は codex の TUI が 1 秒ごとに書き続けるせいで
+/// **一度も発火しなかった**（Esc 中断が永久に赤のまま ＝ 報告された症状）。
+///
+/// 今は codex も現在値を持つ（rollout の
+/// [`crate::backend::Backend::record_states`]）ので、両方とも消えた。
+/// **状態は状態を名乗る材料からだけ導く。**
+///
 /// 遅れは構造的に有界: hook は 0 遅延で入るので押した瞬間に色が変わり、hook を
-/// 取り逃しても最大ポーリング 1 周期（[`spawn_agents_poller`]）で観測が追い越す
-pub(crate) fn row_state(run: Option<Run<'_>>) -> State {
+/// 取り逃しても最大 1 周期で観測が追い越す
+pub(crate) fn row_state(run: Option<Run>) -> State {
     let Some(run) = run.filter(|run| run.hook.map(|hook| hook.state) != Some(State::Stopped))
     else {
         return State::Stopped;
     };
-    let observed = state_of_status(run.status).map(|state| (state, run.status_at));
     // 同時刻なら hook を採る（hook はそのセッション自身が turn の境目で書くので、
-    // 同じ ms に並んだ 2 秒周期の観測よりも出所が確か）
-    let newest = match (run.hook, observed) {
+    // 後から拾い直す観測よりも出所が確か）
+    let newest = match (run.hook, run.observed) {
         (Some(hook), Some(observed @ (_, seen))) if seen > hook.at => Some(observed),
         (Some(hook), _) => Some((hook.state, hook.at)),
         (None, observed) => observed,
     };
     match newest {
-        // **hook を取り逃した Working は PTY の無音で降ろす。** ライブ状態を持たない
-        // agent（codex）は、これが無いと中断した行が赤のまま固着する
-        Some((State::Working, _))
-            if !run.has_live_status && run.pty == Some(PtyHint::Quiet) =>
-        {
-            State::Idle
-        }
-        // **許可された Waiting は記録の伸びで降ろす。** 許可されたことを知らせる
-        // hook はどの agent にも無く、ライブ状態を持つ側は次の観測で直るが、
-        // 持たない側（codex）は次の `Stop` まで黄が残る ＝ **動いている間ずっと
-        // 「入力待ち」と名乗る**（報告された症状）。記録（rollout）が伸びたなら
-        // 道具は動いた ＝ もうユーザーは待たれていない。
-        //
-        // **PTY では代用できない**（無音の側で降ろせない）: codex の TUI は
-        // ダイアログを出している間も 1 秒ごとにタイトルを書き換える（実測）ので
-        // 「動いている」と「待たれている」が同じ Writing になる。記録の方は
-        // 承認待ちの間だけ止まる（実測: 20 秒の停止）
-        Some((State::Waiting, at)) if !run.has_live_status && run.record_grew_since > at => {
-            State::Working
-        }
         Some((state, _)) => state,
         // 材料が 1 つも無い行 ＝ **自分の窓を起こした直後**（他インスタンスの行は
-        // status を、撮影用の行は hook を必ず持つ）。だから「まだ何も出していない」は
+        // 現在値を、撮影用の行は hook を必ず持つ）。だから「まだ何も出していない」は
         // 起動中であって、終わったわけではない
         None => match run.pty {
             Some(PtyHint::Starting | PtyHint::Writing) => State::Working,
