@@ -33,3 +33,18 @@ jobs:
 
       - name: Test (release)
         run: cargo test --release --locked
+
+      # doc リンクを機械検証にする。この木のコメントは `[`Type::method`]` で他所の
+      # 正本を指すことで「要約の写し」を避けているので、リンクが腐ると指し先を失う。
+      # ここで落とせば、指し先の改名・削除を人ではなく機械が見つける。
+      #
+      # lib と bin を別々に叩くのは、`cargo doc` が **lib と同名の bin を黙って
+      # 飛ばす**ため（このパッケージは lib も bin も `ccdesk`）。まとめて 1 回では
+      # bin 側のリンクが 1 つも検査されない。
+      # `--document-private-items` が要るのは、bin 側がほぼ全部非公開のため
+      - name: Doc links (deny broken intra-doc links)
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
+        run: |
+          cargo doc --no-deps --locked --lib --document-private-items
+          cargo doc --no-deps --locked --bin ccdesk --document-private-items
