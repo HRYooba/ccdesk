@@ -146,8 +146,38 @@ pub(crate) enum SelfUpdate {
     Idle,
     Running,
     /// 差し替え済み。反映は次回起動から（自動では再起動しない — 詳細は
-    /// [`crate::ui::UpdateState::RestartPending`]）ので、置いた先の exe パスは持たない
+    /// [`crate::ui`] の `UpdateState::RestartPending`）ので、置いた先の exe パスは持たない
     Done,
+    /// 失敗。run ループが下部バーへ 1 度出して Idle へ戻す
+    Failed(String),
+}
+
+/// agent 本体（`<agent> update`）の進行状態。**kind ごとに 1 つで、これが正本**。
+///
+/// 以前は「実行中の旗」「据え置きの旗」「失敗の文面」の 3 本に割れていて、版行は
+/// そこから状態を再合成し、run ループは「latest が消えたら据え置きを降ろす」という
+/// 照合規則を別に持っていた ＝ **同じ真実が 2 箇所にあり、間を規則で埋める形**。
+/// 1 つにすると在り得ない組（Running かつ Stalled）が表現できなくなり、
+/// 照合規則そのものが要らなくなる（[`SelfUpdate`] と同じ形）。
+///
+/// **`Done` を持たない**のは agent 側に再起動の案内が要らないため:
+/// 更新後は `<agent> --version` が新しい版を返して `footer.latest` が消え、
+/// 行が自然に最新表示へ戻る
+pub(crate) enum AgentUpdate {
+    /// 未実行、または失敗を通知し終えた後（＝押し直せる）
+    Idle,
+    Running,
+    /// 成功と報告されたのに版が動かなかった。
+    ///
+    /// **押した時点の版を持つ。** 「据え置きである」ことの成立条件が
+    /// 「今もその版のまま」だからで、条件を状態の中に持たせると、
+    /// 別経路で版が動いた場合（手で入れ直した・agent 自身の自動更新が通った）に
+    /// **降ろす規則を書かずに**行が最新表示へ戻る。
+    ///
+    /// `announced` は下部バーへ 1 度出したか。通知は 5 秒で消えるが押しても
+    /// 効かない状態は続くので、**状態は消さずに「出したか」だけを持つ**
+    /// （[`Failed`](Self::Failed) が Idle へ戻るのと同じ「1 度だけ出す」）
+    Stalled { version: String, announced: bool },
     /// 失敗。run ループが下部バーへ 1 度出して Idle へ戻す
     Failed(String),
 }
@@ -564,27 +594,13 @@ pub(crate) struct App {
     pub(crate) footer_shared: Arc<Mutex<FooterInfo>>,
     pub(crate) footer_dirty: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) footer_refresh: Arc<std::sync::atomic::AtomicBool>,
-    /// `<agent> update` 実行中の旗（行の連打防止と "updating…" 表示）。
+    /// agent 本体の更新の進行状態（[`AgentUpdate`]）。**バックグラウンドスレッドが
+    /// 書き、UI が読む正本**。
     ///
-    /// **agent ごとに 1 本。** 共有にすると片方の更新中にもう片方の版行まで
-    /// Running になり、押せなくなる（実機で踏んだ）
-    pub(crate) agent_updating: BTreeMap<Kind, Arc<std::sync::atomic::AtomicBool>>,
-    /// 直前の更新が**成功と報告されたのに版を動かさなかった**agent。
-    ///
-    /// 下部バーの通知は 5 秒で消えるが、押しても効かない状態は次の更新まで続く
-    /// ので、版行に残す材料をここに持つ（[`crate::ui::UpdateState::Stalled`]）。
-    /// **降ろすのは押し直したときだけ**でよい: 新しい版が無くなれば版行は
-    /// 旗を見ずに最新表示へ戻る（判定は [`crate::ui`] 側の 1 箇所）
-    pub(crate) agent_update_stalled: BTreeMap<Kind, Arc<std::sync::atomic::AtomicBool>>,
-    /// `<agent> update` の失敗。run ループが下部バーへ 1 度出して空へ戻す
-    /// （[`SelfUpdate::Failed`] と同じ作法）。
-    ///
-    /// **握り潰さないための置き場。** 更新は別スレッドで走るので失敗を
-    /// その場で通知できず、以前は捨てていた ＝ 起動すらできていない
-    /// （`codex` を PATH から引けない）ことに誰も気づけなかった。
-    /// agent ごとに分けないのは、文面が agent 名を含む ＝ どの行の失敗かは
-    /// 読めば分かり、同時に 2 つ失敗しても後の 1 つが出れば足りるため
-    pub(crate) agent_update_error: Arc<Mutex<Option<String>>>,
+    /// **agent ごとに 1 つ。** 共有にすると片方の更新中にもう片方の版行まで
+    /// Running になり、押せなくなる（実機で踏んだ）。
+    /// 多重起動の防止もこのロックの中で決まる（同じ知識を旗に分けない）
+    pub(crate) agent_update: BTreeMap<Kind, Arc<Mutex<AgentUpdate>>>,
     // ccdesk 自身の更新の進行状態（版行の表示と多重起動防止の正本）
     pub(crate) ccdesk_update: Arc<Mutex<SelfUpdate>>,
     // ccdesk 自身の新しいリリース（起動時 1 回のチェック）。
@@ -648,7 +664,7 @@ pub(crate) struct App {
     ///
     /// **材料は 2 つ束ねている**: 行のドットの明滅（[`crate::poll::State::blinks`]）と、
     /// 使用率の取得中スピナー（[`Self::usage_fetching`]。回るのは本物のブライユ点字
-    /// アニメ ＝ [`crate::ui::usage_spinner_frame`]）。どちらも「今フレームを
+    /// アニメ ＝ [`crate::ui`] の `usage_spinner_frame`）。どちらも「今フレームを
     /// 速く描き直す必要があるか」という同じ問いに答えるので、
     /// 名前を「spinner」に寄せず両方を指せる名前にしてある
     pub(crate) animating: bool,
@@ -721,16 +737,14 @@ impl Default for App {
             footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
             footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            agent_updating: agent_updating_flags(),
-            agent_update_stalled: agent_updating_flags(),
-            agent_update_error: Arc::new(Mutex::new(None)),
+            agent_update: agent_update_states(),
             ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
             ccdesk_latest: None,
             ccdesk_latest_shared: Arc::new(Mutex::new(None)),
             ccdesk_latest_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             usage: BTreeMap::new(),
             usage_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            usage_fetching: agent_updating_flags(),
+            usage_fetching: per_agent_flags(),
             usage_hovered: None,
             // 撮影用の供給元は state.json / config.json を書かないので、
             // テストが開発者の設定を踏まない
@@ -1395,17 +1409,9 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                 .footer_shared
                 .lock_recover()
                 .clone();
-            // **据え置きの旗は「新しい版がまだある」ことが前提**
-            // （[`update_left_the_version_behind`] の 3 条件目）。latest が消えたら
-            // 更新するものが無くなった ＝ 据え置きも終わっているので、ここで降ろす。
-            // 降ろさないと、agent が自分で更新した（claude のネイティブ版は既定で
-            // 自動更新する）あと次の新版が出たときに、一度も押していない行が
-            // "stalled" を名乗る
-            for (kind, stalled) in &app.agent_update_stalled {
-                if app.footer.version(*kind).latest.is_none() {
-                    stalled.store(false, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
+            // **据え置きを降ろす規則はここに要らない。** 成立条件（押した時点の版の
+            // まま）を [`AgentUpdate::Stalled`] 自身が持っているので、版が動けば
+            // 条件が外れて行が最新表示へ戻る
             force_draw = true;
         }
         // ccdesk 自身の更新の失敗を下部バーへ出す。成功は版行の案内
@@ -1429,8 +1435,26 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             force_draw = true;
         }
         // agent 本体（`<agent> update`）の失敗も同じ場所へ出す。**成功は版行が
-        // 伝える**（再取得した版が新しくなり ⟳ が消える）ので、ここは失敗だけ
-        let agent_failure = app.agent_update_error.lock_recover().take();
+        // 伝える**（再取得した版が新しくなり ⟳ が消える）ので、ここは失敗だけ。
+        // 出したら Idle へ戻す ＝ 失敗した更新はもう一度押せる（ccdesk 自身の
+        // 更新と同じ作法）。据え置き（Stalled）は版行に残す材料なので取らない
+        let agent_failure = app.agent_update.iter().find_map(|(kind, state)| {
+            let mut state = state.lock_recover();
+            match &mut *state {
+                AgentUpdate::Failed(msg) => {
+                    let msg = msg.clone();
+                    *state = AgentUpdate::Idle;
+                    Some(msg)
+                }
+                // 据え置きは**状態を消さない**（版行に残す材料）。出したことだけ記録する
+                AgentUpdate::Stalled { version, announced: announced @ false } => {
+                    let msg = stale_update_message(kind.backend().update_program(), version);
+                    *announced = true;
+                    Some(msg)
+                }
+                _ => None,
+            }
+        });
         if let Some(msg) = agent_failure {
             set_notice(app, msg);
             force_draw = true;
@@ -1706,7 +1730,8 @@ impl Enter {
 ///
 /// **キーボードの実行と下部バーの案内が読む唯一の写像。** 押しても何も起きない行は
 /// ここが `None` を返すことで表す ＝ 更新の無い版行（[`SidebarRow::Inert`]）と
-/// アカウント行（[`SidebarPos::Account`]）が同じ 1 つの答えを共有する
+/// 一覧の外を指す位置（かつてのアカウント行。[`SidebarPos::row`] が `Option` の
+/// まま残っている理由）が同じ 1 つの答えを共有する
 pub(crate) fn selected_enter(app: &App) -> Option<Enter> {
     let SidebarPos::Row(row) = app.selection;
     match app.sidebar_rows.get(row)?.action()? {
@@ -3179,7 +3204,7 @@ fn activate_popup(app: &mut App, index: usize) {
 }
 
 /// メニュー項目の実行。**副作用はここだけ**に集め、「どの項目が何を意味するか」の
-/// 判定は [`PopupKind::action`]（純関数）に置く
+/// 判定は [`PopupKind::entries`] が返す表（純関数）に置く
 fn run_popup_action(app: &mut App, action: PopupAction) {
     match action {
         // 開けたら打ち先はそのセッションなので、行クリックと同じくフォーカスを端末へ移す
@@ -3589,7 +3614,7 @@ pub(crate) fn move_selection(app: &mut App, dir: i32) {
 /// できるので、update.rs の 3 段改名（`.new` へ置く → 現行を `.old` へ退避 →
 /// `.new` を本体へ）がそのまま成立する。反映は次回起動なので、成功後は版行が
 /// "restart to update" の案内を出すだけに留める（自動では再起動しない ＝
-/// [`crate::ui::UpdateState::RestartPending`]）。利用者が自分のタイミングで
+/// [`crate::ui`] の `UpdateState::RestartPending`）。利用者が自分のタイミングで
 /// ccdesk を終了・起動し直すと新しい版が動く。`SelfUpdate::Done` はこのセッション中戻らない。
 /// 数 MB のダウンロードと SHA-256 検証が入るため別スレッドで行う
 fn start_ccdesk_update(app: &mut App) {
@@ -3617,13 +3642,24 @@ fn start_ccdesk_update(app: &mut App) {
     });
 }
 
-/// agent ごとの更新中の旗。**作るのはここ 1 箇所**なので、agent が増えても
-/// 旗を作り忘れた kind ができない（[`Kind::ORDER`] から導く）
-pub(crate) fn agent_updating_flags(
+/// agent ごとの旗。**作るのはここ 1 箇所**なので、agent が増えても
+/// 旗を作り忘れた kind ができない（[`Kind::ORDER`] から導く）。
+///
+/// 用途を名前に書かない: 使い手は使用率の取得中（[`App::usage_fetching`]）だけで、
+/// 「更新中の旗」という名前で通っていた頃は**名前が嘘をついていた**
+pub(crate) fn per_agent_flags(
 ) -> BTreeMap<Kind, Arc<std::sync::atomic::AtomicBool>> {
     Kind::ORDER
         .into_iter()
         .map(|kind| (kind, Arc::new(std::sync::atomic::AtomicBool::new(false))))
+        .collect()
+}
+
+/// agent ごとの更新状態（[`App::agent_update`]）。旗と同じ理由でここ 1 箇所
+pub(crate) fn agent_update_states() -> BTreeMap<Kind, Arc<Mutex<AgentUpdate>>> {
+    Kind::ORDER
+        .into_iter()
+        .map(|kind| (kind, Arc::new(Mutex::new(AgentUpdate::Idle))))
         .collect()
 }
 
@@ -3635,12 +3671,13 @@ pub(crate) fn agent_updating_flags(
 /// 並べて置く `codex`（sh のシム）と `codex.cmd` のうち実行できる方を掴めず
 /// `NotFound` で終わる。claude は native インストールで `claude.exe` があるため
 /// 露見せず、**codex の更新ボタンだけが無反応**になっていた
-fn run_agent_update(program: &str) -> Result<(), String> {
+fn run_agent_update(argv: (&str, &[&str])) -> Result<(), String> {
     use std::process::Stdio;
+    let (program, args) = argv;
     let resolved = ccdesk::resolve_program(program)
         .ok_or_else(|| format!("{program} update failed: {program} not found on PATH"))?;
     let out = std::process::Command::new(resolved)
-        .arg("update")
+        .args(args)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("{program} update failed: {e}"))?;
@@ -3666,57 +3703,61 @@ fn run_agent_update(program: &str) -> Result<(), String> {
 /// 公式仕様: 更新は次回起動時から有効で、実行中セッションは現行版のまま動き続ける。
 /// 完了後はフッターを再取得し、最新化されれば版行は最新表示へ戻る。
 ///
-/// 失敗は下部バーへ回す（[`App::agent_update_error`]）＝ ccdesk 自身の更新
-/// （[`SelfUpdate::Failed`]）と同じ扱いで、旗が降りるので押し直せる。
-/// **成功と報告されても版が動かないことがある**ので、そちらも同じ扱いで出す
-/// （[`update_left_the_version_behind`]）
+/// 結果は [`App::agent_update`] 1 つへ書く。失敗は下部バーへ回って Idle へ戻る
+/// （＝押し直せる）。**成功と報告されても版が動かないことがある**ので、そちらは
+/// [`AgentUpdate::Stalled`] として版行に残す（[`update_left_the_version_behind`]）
 fn start_agent_update(app: &mut App, kind: Kind) {
-    let Some(flag) = app.agent_updating.get(&kind).cloned() else {
+    let Some(state) = app.agent_update.get(&kind).cloned() else {
         return;
     };
-    if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        return; // その agent の更新が走っている間の連打を防ぐ
+    {
+        let mut guard = state.lock_recover();
+        // その agent の更新が走っている間の連打を防ぐ。**判断はロックの中**
+        // （多重起動の防止と状態の書き換えを別の場所に持たない）
+        if matches!(*guard, AgentUpdate::Running) {
+            return;
+        }
+        // 前回の据え置き・失敗は押し直しで降りる（行が Running へ入る ＝ やり直しが見える）
+        *guard = AgentUpdate::Running;
     }
     // **どのコマンドを叩くかは agent が答える**（[`crate::backend`]）
-    let program = kind.backend().update_program();
+    let argv = kind.backend().update_argv();
     // 押した時点の版。更新が本当に効いたかは、これと取り直した版の差でしか分からない
     let before = app.footer.version(kind).current;
-    // 前回の据え置きは押し直しで一度降ろす（行が Running へ入る ＝ やり直しが見える）
-    let stalled = app.agent_update_stalled.get(&kind).cloned();
-    if let Some(stalled) = &stalled {
-        stalled.store(false, std::sync::atomic::Ordering::Relaxed);
-    }
-    let updating = flag;
     let refresh = app.footer_refresh.clone();
     let dirty = app.footer_dirty.clone();
-    let failure = app.agent_update_error.clone();
     let footer = app.footer_shared.clone();
     std::thread::spawn(move || {
-        let outcome = run_agent_update(program);
-        // 旗を落とす**前に**版を取り直しておく。ここを飛ばして旗だけ落とすと、
+        // **更新の前後で残骸を片付ける。** 起動時の掃除（`main`）だけでは足りない:
+        // 塞ぐ残骸を作るのは更新そのものなので、掃除がそこに無いと
+        // **更新ボタンが「1 回効いて以降ずっと失敗する」**（塞ぐ残骸の意味は
+        // [`crate::backend::Garbage::blocks_next_update`]）。前も掃くのは、
+        // 押した時点で既に塞がっている場合（前回の更新のあと ccdesk を
+        // 再起動していない）のため
+        let sweep = || {
+            let _ = crate::update::sweep_agent_leftovers(&[kind]);
+        };
+        sweep();
+        let outcome = run_agent_update(argv);
+        sweep();
+        // 状態を書く**前に**版を取り直しておく。ここを飛ばして状態だけ戻すと、
         // 周期ポーラー（1 秒間隔）が追いつくまでの間、版行が古い `latest` を
         // 読んで一度 Available（"update"）へ戻ってしまう
         // （`Running → Available → Current` と一往復して見える不具合の原因）。
         // 取得に失敗した（current が空）場合は書かない ＝ 古い表示のまま
         // 周期ポーラーの再取得に委ねる（他の版取得と同じ「空振りは無視」の作法）
         let fresh = kind.backend().version();
-        // **書くのは伝えることがあるときだけ。** 毎回代入すると、run ループが
-        // 拾う前（33ms 周期）に別の agent の更新が成功して文面を消しうる
-        match outcome {
-            Err(msg) => *failure.lock_recover() = Some(msg),
+        let next = match outcome {
+            Err(msg) => AgentUpdate::Failed(msg),
             Ok(()) if update_left_the_version_behind(&before, &fresh) => {
-                *failure.lock_recover() = Some(stale_update_message(program, &before));
-                // 通知は 5 秒で消えるので、版行に残る材料も立てる
-                if let Some(stalled) = &stalled {
-                    stalled.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+                AgentUpdate::Stalled { version: before, announced: false }
             }
-            Ok(()) => {}
-        }
+            Ok(()) => AgentUpdate::Idle,
+        };
         if !fresh.current.is_empty() {
             footer.lock_recover().versions.insert(kind, fresh);
         }
-        updating.store(false, std::sync::atomic::Ordering::Relaxed);
+        *state.lock_recover() = next;
         refresh.store(true, std::sync::atomic::Ordering::Relaxed);
         dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     });
@@ -5756,7 +5797,7 @@ mod tests {
     /// 問題で失敗しうるので、どちらを直せばよいか分かる必要がある）
     #[test]
     fn an_agent_update_that_cannot_start_says_so_instead_of_going_quiet() {
-        let err = run_agent_update("ccdesk-no-such-agent-here")
+        let err = run_agent_update(("ccdesk-no-such-agent-here", &["update"]))
             .expect_err("a program that is not installed reported success");
         assert!(err.contains("ccdesk-no-such-agent-here"), "{err}");
         assert!(err.contains("PATH"), "the message does not say where it looked: {err}");
@@ -5795,8 +5836,8 @@ mod tests {
             None => dir.path().display().to_string(),
         };
         unsafe { std::env::set_var("PATH", prepended) };
-        let ok = run_agent_update("ccdesk-fake-agent");
-        let failed = run_agent_update("ccdesk-failing-agent");
+        let ok = run_agent_update(("ccdesk-fake-agent", &["update"]));
+        let failed = run_agent_update(("ccdesk-failing-agent", &["update"]));
         match saved {
             Some(path) => unsafe { std::env::set_var("PATH", path) },
             None => unsafe { std::env::remove_var("PATH") },
@@ -5870,7 +5911,7 @@ mod tests {
     /// **自動再起動はやめた**: 走ったまま自プロセスを起こすとコンソールを
     /// 親子で奪い合いマウスが効かなくなる不具合が実機で出たため、案内（"restart to update"）
     /// を出すだけに留め、利用者が自分のタイミングで終了・起動し直す運用にした
-    /// （[`crate::ui::UpdateState::RestartPending`]）。
+    /// （[`crate::ui`] の `UpdateState::RestartPending`）。
     #[test]
     fn the_done_row_offers_no_enter_and_does_nothing_when_pressed() {
         let mut app = app_with_every_row_kind();

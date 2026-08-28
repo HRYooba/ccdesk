@@ -74,7 +74,7 @@ pub(crate) struct AgentSnapshot {
 }
 
 /// [`fetch_agents`] の本体。**ディレクトリを引数で受ける**ので、テストが実ユーザーの
-/// `~/.claude` を読まずに済む（[`crate::testutil`]）
+/// `~/.claude` を読まずに済む（置き場は bin のテスト専用モジュール `crate::testutil`）
 pub(crate) fn read_sessions(dir: &std::path::Path) -> Option<AgentSnapshot> {
     let observed_at = ccdesk::now_ms();
     let entries = match std::fs::read_dir(dir) {
@@ -221,7 +221,7 @@ impl FooterInfo {
 
 /// ccdesk 自身の版チェック（起動時 1 回の使い捨てスレッド）。
 /// このビルドより新しいリリースタグがあれば共有状態へ書く（無ければ何も書かない
-/// ＝版行は最新表示のまま）。値の形は claude 側の [`FooterInfo::latest`] と同じ
+/// ＝版行は最新表示のまま）。値の形は claude 側の [`crate::backend::AgentVersion::latest`] と同じ
 /// 「新しい版があるときだけ Some」。
 ///
 /// **周期ポーリングはしない。** ccdesk のリリース頻度は低く、適用には再起動が
@@ -759,7 +759,7 @@ impl State {
     ///
     /// **小文字なのは、出る箇所を 1 つの綴りで賄うため。** かつては大文字始まりで
     /// 持ち、一部だけが `to_lowercase` を掛けていた ＝ 同じ語が 2 つの姿を持っていた。
-    /// ピン留めの節（[`crate::ui::PINNED_TITLE`]）が元から小文字なので、
+    /// ピン留めの節（[`crate::ui`] の `PINNED_TITLE`）が元から小文字なので、
     /// 揃える先は小文字側になる。
     ///
     /// **綴りの実体は [`Self::as_str`]**（[`crate::backend::Kind::title`] と同じ作り）。

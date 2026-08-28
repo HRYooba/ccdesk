@@ -188,7 +188,7 @@ pub fn new_parser(rows: u16, cols: u16, scrollback: usize) -> Parser {
 /// ホームディレクトリ（Windows 専用ツールなので USERPROFILE）。
 /// **環境変数を読む場所はここ 1 箇所**: フォールバック（`HOME` を見る等）を
 /// 足すことになったとき、直す場所が散らばらない
-fn home() -> Option<std::path::PathBuf> {
+pub fn home() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(std::env::var_os("USERPROFILE")?))
 }
 
@@ -493,7 +493,7 @@ fn alive_impl(_pid: u32) -> bool {
 /// **引用符を使えない場所へパスを埋めるためにある。** codex の hook は
 /// コマンドを 1 本の文字列で受けるが、その文字列に二重引用符を入れると
 /// npm の `.cmd` シムを通る間に `""` へ化ける（実測 2026-08-02。
-/// 詳細は [`crate::backend::codex`]）。引用符を使わずに済ませるには、
+/// 詳細は bin 側の `backend::codex`）。引用符を使わずに済ませるには、
 /// パス自体に空白が無いことが要る。
 ///
 /// **無効なボリュームでは長いパスがそのまま返る**（8.3 は既定で有効だが
@@ -1186,7 +1186,7 @@ pub fn save_setting(key: &str, value: &str) {
 /// config.json からキーを取り除く。
 ///
 /// **設定ではなかったものを設定ファイルから降ろす**ための口で、呼ぶのは
-/// 画面状態を state.json へ引き取る移行（[`crate::source::LiveSource::window_state`]）
+/// 画面状態を state.json へ引き取る移行（bin 側の `source::LiveSource::window_state`）
 /// だけ。config.json はユーザーが手で書くファイルなので、ccdesk がもう読まない
 /// キーを残しておくと「書けば効く」と読めてしまう ＝ 消すところまでが移行になる。
 /// 元から無ければ何もしない（何度呼んでも同じ）

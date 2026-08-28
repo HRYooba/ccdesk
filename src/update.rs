@@ -99,53 +99,172 @@ pub(crate) fn cleanup_old_exe() {
     }
 }
 
-/// agent が置き去りにした残骸を消す（[`crate::backend::Backend::update_leftovers`]）。
+/// agent が置き去りにした残骸を消す（[`crate::backend::Garbage`] の宣言に従う）。
 ///
 /// **自分の `<exe>.old` を消すのと同じ扱い**にする（[`cleanup_old_exe`] の隣で
 /// 呼ぶ）。ccdesk がセッションを常駐させるせいで agent 側の掃除が空振りする以上、
 /// 後始末は ccdesk の仕事になる。
 ///
-/// **消せなかったものはその場では残す**が、数は捨てずに [`Swept::held`] で返す。
-/// まだ掴まれている（そのイメージで動いているセッションがある）のが主な理由で、
-/// これは異常ではない: 次の起動でもう一度来る。
+/// **消せなかったものも数は捨てない**（[`Swept`]）。消せない理由は見ていないので
+/// 断定しないが、次の更新を塞ぐかどうかは backend が答えるので、塞ぐものだけ
+/// 場所を空ける。消せないこと自体は異常ではない: 次の起動でもう一度来る。
 /// 報告するのは `doctor` だけ（TUI の起動列は黙って進む）
 pub(crate) fn sweep_agent_leftovers(kinds: &[crate::backend::Kind]) -> Swept {
-    sweep(kinds.iter().flat_map(|kind| kind.backend().update_leftovers()))
-}
-
-/// [`sweep_agent_leftovers`] の結果。**「見つけたが消せなかった」を捨てない**:
-/// 消せた数だけだと、doctor が「掴まれて消せない」と「そもそも無い」を
-/// 区別できず、残骸があるのに "none to clear" と嘘をつく
-pub(crate) struct Swept {
-    /// 消せた数
-    pub(crate) cleared: usize,
-    /// 見つけたが消せず残った数
-    pub(crate) held: usize,
-}
-
-/// [`sweep_agent_leftovers`] の本体。パス列を引数で受けるので、実在の
-/// backend 走査（ユーザーのホーム配下）に触れずにテストできる
-fn sweep(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Swept {
-    let mut swept = Swept { cleared: 0, held: 0 };
-    for path in paths {
-        match remove_leftover(&path) {
-            true => swept.cleared += 1,
-            false => swept.held += 1,
+    let specs: Vec<_> = kinds
+        .iter()
+        .flat_map(|kind| kind.backend().garbage())
+        .collect();
+    let mut swept = Swept { deleted: 0, quarantined: 0, stuck: 0 };
+    // **退かした置き場を先に掃く。** 同じ sweep の中で新しく退かしたものを
+    // すぐ再走査しないためで、掴みが解けているものはここで消える
+    for held in held_dirs(&specs) {
+        for path in entries_in(&held) {
+            swept.add(collect(&path, false));
+        }
+        // 空になった置き場は畳む（`remove_dir` は空のときだけ通るので、
+        // 中身が残っているかを別に確かめなくてよい）
+        let _ = std::fs::remove_dir(&held);
+    }
+    for spec in &specs {
+        for path in crate::backend::leftovers_in(&spec.dir, &spec.prefix, &spec.rest_ok) {
+            swept.add(collect(&path, spec.blocks_next_update));
         }
     }
     swept
 }
 
-/// 残骸 1 つを消す（消せたら true）。
+/// 退かした残骸の置き場（[`quarantine`] の行き先と同じ集合）。
 ///
-/// **ファイルとディレクトリの両方が来る**: claude は退避した実行ファイルを残し、
-/// npm は作業ディレクトリごと残す。片方の消し方しか持たないと、もう片方が
-/// 毎回失敗して静かに溜まり続ける
-fn remove_leftover(path: &std::path::Path) -> bool {
+/// **重複を潰す。** `%TEMP%` の置き場は agent に属さないので、宣言ごとに掃くと
+/// 同じ中身を宣言の数だけ数える（実測: 3 件が "6" と報告された）。
+/// 同一ボリュームの置き場も、2 つの agent が同じディレクトリを指せば重なる
+fn held_dirs(specs: &[crate::backend::Garbage]) -> std::collections::BTreeSet<std::path::PathBuf> {
+    specs
+        .iter()
+        // **塞がない宣言には置き場ができない**（[`collect`] が退かさない）ので見に行かない
+        .filter(|spec| spec.blocks_next_update)
+        .map(|spec| spec.dir.join(HELD_DIR))
+        .chain([held_dir()])
+        .collect()
+}
+
+/// ディレクトリ直下の全て。**述語を持たない**: 退かした置き場に居るのは
+/// ccdesk が自分で動かしたものだけなので、名前から正体を推し量る必要が無い
+fn entries_in(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect()
+}
+
+/// 退かした残骸の置き場の名前。
+///
+/// **先頭ドット**にしてあるのは、置き場を agent のツリーの直下に作るため:
+/// パッケージ・設定として読まれる名前だと、agent 側のツールが中身を解釈しに来る
+const HELD_DIR: &str = ".ccdesk-held";
+
+/// 同一ボリュームに置けなかったときの行き先（[`quarantine`]）
+fn held_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(HELD_DIR)
+}
+
+/// [`sweep_agent_leftovers`] の結果。**3 つに分ける**:
+/// 消せた / 退かした（消せていないが次の更新は塞がない）/ 元の場所に残った。
+///
+/// 2 値だった頃は「動かしたが消せていない」と「元の場所に残った」が混ざっていた。
+/// **前者は無害で、後者だけが次の更新を壊す**ので、混ぜると doctor が
+/// 深刻さを取り違える
+pub(crate) struct Swept {
+    /// 消せた数
+    pub(crate) deleted: usize,
+    /// 消せなかったが、次の更新を塞がない場所へ動かした数
+    pub(crate) quarantined: usize,
+    /// 消せず、動かせもしなかった数（元の場所に残っている）
+    pub(crate) stuck: usize,
+}
+
+impl Swept {
+    /// 残骸 1 つぶんの結果を足し込む
+    fn add(&mut self, one: Collected) {
+        match one {
+            Collected::Deleted => self.deleted += 1,
+            Collected::Quarantined => self.quarantined += 1,
+            Collected::Stuck => self.stuck += 1,
+        }
+    }
+}
+
+/// 残骸 1 つの後始末の結果（[`Swept`] の 1 件ぶん）
+enum Collected {
+    Deleted,
+    Quarantined,
+    Stuck,
+}
+
+/// 残骸 1 つを片付ける。
+///
+/// 消せなかったとき、**塞ぐものだけ**退かす（[`crate::backend::Garbage`]）。
+/// 塞がないものを動かしても、述語で正体が分かる場所から出るだけで得が無い。
+///
+/// **退かした置き場の中身は必ず `blocks = false` で来る**（呼び手が渡す）ので、
+/// 退かしたものが退かし直されて名前が伸びる経路は存在しない
+fn collect(path: &std::path::Path, blocks_next_update: bool) -> Collected {
+    if delete(path) {
+        return Collected::Deleted;
+    }
+    if !blocks_next_update {
+        return Collected::Stuck;
+    }
+    // 動かしたうえでもう一度消しに行く（掴まれているのは中の 1 本だけのことが
+    // 多く、残りは消える）。**動かせただけでは deleted と数えない**:
+    // 消えていないものを「片付いた」と報告すると doctor が嘘をつく
+    match quarantine(path) {
+        Some(moved) => match delete(&moved) {
+            true => Collected::Deleted,
+            false => Collected::Quarantined,
+        },
+        None => Collected::Stuck,
+    }
+}
+
+/// 消す 1 手。**ファイルとディレクトリの両方が来る**: claude は退避した
+/// 実行ファイルと版ごとの実体を残し、npm は作業ディレクトリごと残す。
+/// 片方の消し方しか持たないと、もう片方が毎回失敗して静かに溜まり続ける
+fn delete(path: &std::path::Path) -> bool {
     match path.is_dir() {
         true => std::fs::remove_dir_all(path).is_ok(),
         false => std::fs::remove_file(path).is_ok(),
     }
+}
+
+/// 消せなかった残骸を隔離先へ動かす（動かせたら新しいパス）。
+///
+/// **Windows は掴まれたファイルを消せないが、改名（別ディレクトリへの移動を
+/// 含む）はできる**（実測 2026-08-27）。ccdesk 自身の実行ファイル差し替え
+/// （[`install_at`]）が既に頼っている性質で、走っているプロセスは掴んだ
+/// イメージのまま動き続ける。
+///
+/// 行き先は**同一ボリューム優先**（残骸の隣）。`rename` はボリュームをまたげない
+/// ので、`%TEMP%` を別ドライブへ向けている環境で `%TEMP%` だけを狙うと退避が
+/// 黙って失敗し、次の更新が落ち続ける形へ戻る。どちらも駄目なら動かさない。
+///
+/// 名前はプロセス ID + 呼び出し毎の連番。**既にある名前は使わない**
+/// （ccdesk を起動し直すと pid が再利用され連番も 0 から始まるので、
+/// 確かめずに `rename` すると前回退かした残骸を上書きしうる）
+fn quarantine(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let leaf = path.file_name()?.to_string_lossy().into_owned();
+    let dirs = [path.parent()?.join(HELD_DIR), held_dir()];
+    dirs.into_iter().find_map(|dir| {
+        std::fs::create_dir_all(&dir).ok()?;
+        (0..16).find_map(|_| {
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let moved = dir.join(format!("{}-{seq}-{leaf}", std::process::id()));
+            (!moved.exists() && std::fs::rename(path, &moved).is_ok()).then_some(moved)
+        })
+    })
 }
 
 /// 指定タグの実行ファイルを取得して現行版と差し替える。
@@ -707,7 +826,7 @@ mod tests {
     }
 
     /// 残骸はファイルとディレクトリの**両方**が来る。片方の消し方しか持たないと、
-    /// もう片方（npm の作業場は 285MB のディレクトリ）が毎回失敗して溜まり続ける
+    /// もう片方（npm の作業場はディレクトリ）が毎回失敗して溜まり続ける
     #[test]
     fn leftovers_are_removed_whether_they_are_files_or_directories() {
         let ws = Workspace::new("sweep");
@@ -716,33 +835,123 @@ mod tests {
         std::fs::create_dir_all(dir.join("node_modules")).unwrap();
         std::fs::write(dir.join("node_modules").join("big.bin"), "x").unwrap();
 
-        assert!(remove_leftover(&file), "a parked exe was not removed");
-        assert!(remove_leftover(&dir), "a non-empty work directory was not removed");
+        assert!(matches!(collect(&dir, true), Collected::Deleted));
+        assert!(matches!(collect(&file, false), Collected::Deleted));
         assert!(!file.exists() && !dir.exists());
-        // 無いものを消しても落ちない（掴まれていて消せなかった場合と同じ扱い ＝ false）
-        assert!(!remove_leftover(&file));
+        // 無いものを消しても落ちない（消せなかった場合と同じ扱い）
+        assert!(matches!(collect(&file, false), Collected::Stuck));
     }
 
-    /// 消せた数と「掴まれて消せなかった数」を分けて数える。消せた数しか返さないと、
-    /// 残骸を見つけたのに doctor が "none to clear" と報告する（実際に起きた嘘）
+    /// **次の更新を塞ぐ残骸だけ場所を空ける。** npm の退避先は `retire-path.js` が
+    /// パスの sha1 から導く決定論的な名前なので、掴まれた実行ファイル 1 本が
+    /// そこに残ると次の `codex update` が `EBUSY` で落ちる（実測）。
+    /// 消せないままでも「元の場所から居なくなる」ことをここで固定する
     #[test]
-    fn sweeping_counts_held_leftovers_separately() {
+    fn a_blocking_leftover_that_cannot_be_deleted_is_moved_out_of_the_way() {
+        let ws = Workspace::new("sweep_quarantine");
+        let dir = ws.0.join(".codex-g3ieL94X");
+        std::fs::create_dir_all(&dir).unwrap();
+        let running = RunningImage::spawn_in(&dir);
+
+        // 消せていないので Deleted にはならない。**それでも退避先は空く**
+        assert!(matches!(collect(&dir, true), Collected::Quarantined));
+        assert!(!dir.exists(), "the retire path is still occupied");
+        // 行き先は**同一ボリューム優先** ＝ 残骸の隣（`%TEMP%` ではない）
+        let beside = ws.0.join(HELD_DIR);
+        assert_eq!(entries_in(&beside).len(), 1, "the leftover did not land beside its own tree");
+        assert!(entries_in(&held_dir()).iter().all(|p| !p.starts_with(ws.0.path())));
+
+        // **退かしたものは退かし直さない**（掃除のたびに名前が伸びる経路を作らない）。
+        // 呼び手は置き場の中身を必ず「塞がない」として渡す
+        let moved = entries_in(&beside).pop().unwrap();
+        assert!(matches!(collect(&moved, false), Collected::Stuck));
+        assert_eq!(entries_in(&beside).len(), 1, "the quarantined leftover multiplied");
+
+        // 掴んでいたセッションが終われば消える
+        drop(running);
+        assert!(matches!(collect(&moved, false), Collected::Deleted));
+        assert!(entries_in(&beside).is_empty());
+    }
+
+    /// **塞がない残骸は動かさない。** claude の退避 exe は名前にミリ秒を持つので
+    /// 次の更新と衝突しない ＝ 動かしても、述語で正体が分かる場所から出るだけで
+    /// 何も得られない。消せなければ元の場所で次の掃除を待つ
+    #[test]
+    fn a_leftover_that_does_not_block_the_next_update_stays_where_it_is() {
         let ws = Workspace::new("sweep_held");
-        let free = ws.write("claude.exe.old.1", "PARKED");
-        let held = ws.write("claude.exe.old.2", "STILL RUNNING");
+        let held_one = ws.write("claude.exe.old.2", "STILL RUNNING");
         // 「そのイメージで動いているセッションがいる」を再現する:
         // 削除共有なしで開いている間、remove_file は共有違反で失敗する
         use std::os::windows::fs::OpenOptionsExt;
         let _handle = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(1) // FILE_SHARE_READ（削除を許さない）
-            .open(&held)
+            .open(&held_one)
             .unwrap();
 
-        let swept = sweep([free.clone(), held.clone()]);
-        assert_eq!(swept.cleared, 1, "the unheld leftover was not cleared");
-        assert_eq!(swept.held, 1, "the held leftover was not counted");
-        assert!(!free.exists() && held.exists());
+        assert!(matches!(collect(&held_one, false), Collected::Stuck));
+        assert!(held_one.exists(), "a leftover that blocks nothing was moved for no gain");
+        assert!(entries_in(&ws.0.join(HELD_DIR)).is_empty());
+    }
+
+    /// **置き場は 1 度しか掃かない。** `%TEMP%` の置き場は agent に属さないので、
+    /// 宣言ごとに掃くと同じ中身を宣言の数だけ数える（実測: 3 件が "6" と報告された）。
+    /// **塞がない宣言には置き場ができない**ので、そこは見に行かない
+    #[test]
+    fn the_quarantine_directories_are_visited_once_each() {
+        let spec = |dir: &str, blocks| crate::backend::Garbage {
+            dir: std::path::PathBuf::from(dir),
+            prefix: String::new(),
+            rest_ok: Box::new(|_| true),
+            blocks_next_update: blocks,
+        };
+        // 同じ場所を指す 2 つの宣言（2 agent が同じツリーに居る場合）
+        let dirs = held_dirs(&[spec("C:/a", true), spec("C:/a", true), spec("C:/b", false)]);
+        assert_eq!(
+            dirs,
+            [std::path::PathBuf::from("C:/a").join(HELD_DIR), held_dir()]
+                .into_iter()
+                .collect(),
+            "a quarantine directory was visited twice, or a non-blocking one was visited at all"
+        );
+    }
+
+    /// 掴まれた実行ファイルを**本物のプロセス**で作る。
+    ///
+    /// **共有指定を手で真似られない**: 走っているプロセスのイメージは
+    /// 「消せないが改名できる」組み合わせで開かれていて、
+    /// `OpenOptions::share_mode` では再現できない（`FILE_SHARE_DELETE` を
+    /// 落とすと改名も拒まれ、入れると POSIX 意味論で消せてしまう）。
+    /// Drop で確実に終わらせるので、テストが落ちても子が残らない
+    struct RunningImage(std::process::Child);
+
+    impl RunningImage {
+        /// `dir` の中へ実行ファイルを 1 本置いて起こす。中身は何でもよく、
+        /// 「そこそこ生き続ける」「stdin を読まない」ことだけが要る
+        fn spawn_in(dir: &std::path::Path) -> Self {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+            let exe = dir.join("codex.exe");
+            std::fs::copy(
+                std::path::Path::new(&root).join("System32").join("PING.EXE"),
+                &exe,
+            )
+            .expect("could not stage an executable to hold");
+            let child = std::process::Command::new(&exe)
+                .args(["-n", "60", "127.0.0.1"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("could not start the process that holds the image");
+            Self(child)
+        }
+    }
+
+    impl Drop for RunningImage {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     /// ローカルビルドがリリースより新しいときに更新を勧めない
