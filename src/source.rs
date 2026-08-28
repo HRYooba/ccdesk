@@ -213,6 +213,18 @@ pub(crate) trait DataSource: Send + Sync {
     /// 名前を [`Titles::fixed`] で差し替えるのと同じ形
     fn fixed_states(&self) -> std::collections::HashMap<SessionId, State>;
 
+    /// 子の agent へ注入する hook 設定（`--settings`）の**置き場**。
+    ///
+    /// **None ＝ この供給元は注入しない**（書けなかった、ではない）。既定を None に
+    /// してあるので、**実ファイルへ書く供給元だけが明示で名乗る** ＝ 撮影
+    /// （[`DemoSource`]）とテストが実ユーザーの `~/.ccdesk` を踏むことがない。
+    /// 以前は [`crate::hooks::inject_settings`] が自分でホームを引いており、
+    /// `cargo test` が開発者の注入ファイルをテストバイナリのパスで上書きしていた
+    /// （`store_sessions` が撮影で書かないのと同じ約束を、注入ファイルにも通す）
+    fn hook_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// hook の受け渡しファイルの見え方（長さ・更新時刻）。**中身を読まずに
     /// 「変わったか」だけを答える**口で、run ループが毎周見て、変わった周だけ
     /// 一覧を読み直す（ペイン内の `/resume` `/clear` に周期を待たずに気づく）。
@@ -473,6 +485,11 @@ impl DataSource for LiveSource {
 
     fn hook_states(&self) -> HookStates {
         crate::hooks::read_states()
+    }
+
+    /// 実データだけが注入する（置き場は hook の受け渡しと同じ `~/.ccdesk`）
+    fn hook_dir(&self) -> Option<std::path::PathBuf> {
+        ccdesk::ccdesk_dir()
     }
 
     fn fixed_states(&self) -> std::collections::HashMap<SessionId, State> {

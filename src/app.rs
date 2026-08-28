@@ -3304,11 +3304,18 @@ fn menu_close(app: &mut App, id: &SessionId) {
 }
 
 /// hook 注入ファイルのパス（実体は [`crate::hooks::inject_settings`]）。
-/// **書けなかったことを黙らせない**: hooks 無しで起動したセッションは状態報告が
+///
+/// **注入するかどうかは供給元が決める**（[`crate::source::DataSource::hook_dir`]）:
+/// 置き場を持たない供給元（撮影・テスト）では**黙って None** ＝ 書けなかったのでは
+/// なく、書く先が無い。ここで実ホームを引かないのが、テストが実ユーザーの
+/// `~/.ccdesk/inject-settings.json` を上書きしない唯一の担保。
+///
+/// **書けなかったことは黙らせない**: hooks 無しで起動したセッションは状態報告が
 /// 縮退する（入力待ち・完了が導出できなくなる）ので、下部バーへ 1 行出す。
 /// セッション自体は hooks 無しで起動を続ける（起動を止めるほどの失敗ではない）
 fn hook_settings(app: &mut App) -> Option<crate::hooks::Injection> {
-    let settings = crate::hooks::inject_settings();
+    let dir = app.source.hook_dir()?;
+    let settings = crate::hooks::inject_settings(&dir);
     if settings.is_none() {
         set_notice(
             app,
@@ -6023,6 +6030,34 @@ mod tests {
             "reported the session as opened"
         );
         assert!(app.windows.is_empty(), "spawned a second claude anyway");
+    }
+
+    /// **テストの供給元は hook 設定を注入しない。**
+    ///
+    /// 上の 3 つのように `open_session` を通るテストは、そのまま
+    /// [`hook_settings`] へ落ちる。ここが実ホームを引いていた頃は、`cargo test` の
+    /// たびに開発者の `~/.ccdesk/inject-settings.json` が**テストバイナリのパス**へ
+    /// 書き換わり、その後 ccdesk が起こした claude の hook が libtest の
+    /// ハーネスを起動していた ＝ **state も会話も記録されず、`stop` した行を
+    /// 開くと `-r` のピッカーが出る**（報告されたバグの原因）。
+    ///
+    /// **書く先が無いことは失敗ではない**ので下部バーにも出さない
+    /// （出すと、撮影とテストが毎回「hook を書けなかった」と言い出す）
+    #[test]
+    fn a_source_that_names_no_hook_dir_injects_nothing_and_does_not_complain() {
+        let mut app = test_app(34, TERM);
+        assert!(
+            app.source.hook_dir().is_none(),
+            "the test source offered a directory to write the injection into"
+        );
+        assert!(
+            hook_settings(&mut app).is_none(),
+            "an injection was written for a source that has nowhere to write it"
+        );
+        assert!(
+            app.notice.is_none(),
+            "having nowhere to inject was reported as a failure"
+        );
     }
 
     /// **止めた行も公開に載る。** 載せないと、相手が終わった瞬間に宛先ごと消えて
