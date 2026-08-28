@@ -247,21 +247,33 @@ pub(crate) trait Backend: Send + Sync {
     /// ネットワークへ出るので、呼ぶのは周期取得のスレッドだけ
     fn version(&self) -> AgentVersion;
 
-    /// 更新を走らせるコマンド（`<program> update`）。**版行の更新導線**
-    fn update_program(&self) -> &'static str;
+    /// 更新を走らせる起動列（プログラム名と引数）。**版行の更新導線**。
+    ///
+    /// **引数まで agent が答える。** サブコマンドを呼び手が書き足していた頃は、
+    /// たまたま両方 `update` だったから通っていただけで、別の綴りを使う agent が
+    /// 来た日に UI 側を直すことになる（＝ agent 固有の知識が層を越える）
+    fn update_argv(&self) -> (&'static str, &'static [&'static str]);
+
+    /// 更新コマンドのプログラム名（表示と PATH 解決に使う）。
+    /// **[`Self::update_argv`] から導く**ので、2 つが食い違うことはない
+    fn update_program(&self) -> &'static str {
+        self.update_argv().0
+    }
 
     /// この agent が更新のたびに置き去りにする残骸（今あるものだけ）。
     ///
     /// **これは ccdesk が引き取るべき後始末。** agent の更新は古い実行ファイルを
     /// 消そうとするが、ccdesk はセッションを常駐させるので**そのファイルを掴んだ
     /// プロセスが残り続ける**。ターミナルで 1 本起動して閉じる使い方なら次の更新で
-    /// 消えるものが、ccdesk の下でだけ溜まり続ける（実測: claude 側 1.1GB /
-    /// codex 側 285MB）。作るのは agent でも、消えない状況を作っているのは ccdesk。
+    /// 消えるものが、ccdesk の下でだけ溜まり続ける。**1 世代あたり数百 MB** ある
+    /// ので放置できない（実際に見た量と日付は各実装の doc が持つ）。
+    /// 作るのは agent でも、消えない状況を作っているのは ccdesk。
     ///
     /// **消してよいと確信できるものだけを返す。** 判断は各実装が持ち、迷うものは
     /// 返さない: 掃除しそこねてもディスクが減らないだけだが、取り違えれば
-    /// 動いているインストールを壊す。掃除そのものは [`crate::update::sweep`]
-    fn update_leftovers(&self) -> Vec<std::path::PathBuf>;
+    /// 動いているインストールを壊す。掃除そのものは
+    /// [`crate::update::sweep_agent_leftovers`]
+    fn garbage(&self) -> Vec<Garbage>;
 
     /// 使用率（枠の残り）。**取得の作法は agent ごとに違う**が、どちらも
     /// ターンを起こさず・課金せず・記録を残さない経路を通る
@@ -394,9 +406,43 @@ pub(crate) struct AgentVersion {
     pub(crate) latest: Option<String>,
 }
 
+/// 残骸の在り処の**宣言**。走査も削除も共有側（[`crate::update`]）が持ち、
+/// backend が答えるのはデータだけ。
+///
+/// **場所を 2 度書かない。** 以前は「残骸の一覧」と「残骸が生まれる場所の一覧」を
+/// 別々のメソッドで返していたが、両者が同じ場所を指すことをコメントで手約束して
+/// いるだけだった ＝ 一方に 3 箇所目を足してもう一方を忘れると、退かした残骸が
+/// **永久に掃除されないまま何も落ちない**。`dir` を 1 つ持てばズレようがない:
+///
+/// ```text
+///   Backend::garbage() ─┬─ dir + prefix + rest_ok ──> leftovers_in()（走査は 1 実装）
+///                       └─ dir/<隔離先> ────────────> 退かした残骸の再走査
+/// ```
+pub(crate) struct Garbage {
+    /// 走査先。**退かした残骸の置き場もこの直下**に作る
+    pub(crate) dir: std::path::PathBuf,
+    /// 名前の前置き。全部が対象なら空
+    pub(crate) prefix: String,
+    /// 前置きの後ろがどうあるべきか。**前置きだけで拾わない**のが規律で、
+    /// ここを緩めると動いているインストールを巻き込む（[`leftovers_in`]）
+    pub(crate) rest_ok: Box<dyn Fn(&str) -> bool>,
+    /// **この場所の名前が決定論的で、残っていると次の更新が落ちるか。**
+    ///
+    /// codex(npm) は true: 退避先の名前が `@npmcli/arborist` の
+    /// `retire-path.js` によって**インストール先のパスから一意に決まる**ので、
+    /// そこが埋まっていると次の `codex update` が `EBUSY` で落ちる
+    /// （実測 2026-08-27、`@npmcli/arborist` は npm 同梱版）。
+    /// claude は false: 退避名がミリ秒・版番号で毎回別名になり、塞がらない。
+    ///
+    /// **true のときだけ**、消せなかった残骸を退かす価値がある
+    /// （[`crate::update::sweep_agent_leftovers`]）。false のものを動かしても、
+    /// 述語で正体が分かる場所から出るだけで何も得られない
+    pub(crate) blocks_next_update: bool,
+}
+
 /// `dir` の直下で、名前が `prefix` で始まり**残りが `rest_ok` を満たす**ものを集める。
 ///
-/// **残骸を拾う走査はここ 1 実装**（[`Backend::update_leftovers`] の材料）。
+/// **残骸を拾う走査はここ 1 実装**（[`Garbage`] の宣言を食う唯一の場所）。
 /// 前置きだけで拾わないのが要点で、`claude.exe.old.` の後ろは世代を表す数字、
 /// npm の `.codex-` の後ろはランダムな英数と決まっている。ここを緩めると
 /// **動いているインストールを巻き込む**（`claude.exe` そのもの、正規の `codex`）ので、

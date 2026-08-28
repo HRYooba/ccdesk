@@ -142,21 +142,33 @@ fn check_claude_cli() -> Check {
     }
 }
 
-/// agent が置き去りにした残骸を掃除して、片付いた数を報告する。
+/// agent が置き去りにした残骸を掃除して、**観測した事実だけ**を報告する。
 ///
 /// **診断ではなく後始末**だが doctor に置く: TUI を開かずに `ccdesk doctor` だけ
 /// 叩く使い方があり、自分の `<exe>.old` を同じ入口で消しているのと理由が揃う。
-/// 消せず残ったものは warn で数を伝える（掴まれているだけで次の起動でもう一度
-/// 来るが、「見つけたのに none to clear」と嘘をつかない）
+///
+/// **原因を断定しない。** 以前は消せなかったものを "still held by running sessions"
+/// と報告していたが、ccdesk が観測しているのは削除が失敗したことだけで、
+/// 誰が掴んでいるかは見ていない（削除失敗の理由は他にもある）。
+///
+/// 深刻度は退かせたかで分ける: 退かせたものは次の更新を塞がないので Ok、
+/// 元の場所に残ったものだけが**次の更新を落とす**ので Warn
 fn check_agent_leftovers() -> Check {
     let swept = crate::update::sweep_agent_leftovers(&crate::backend::Kind::ORDER);
-    match (swept.cleared, swept.held) {
-        (0, 0) => Check::Ok("agent leftovers: none to clear".to_string()),
-        (n, 0) => Check::Ok(format!("agent leftovers: cleared {n}")),
-        (0, h) => Check::Warn(format!("agent leftovers: {h} still held by running sessions")),
-        (n, h) => Check::Warn(format!(
-            "agent leftovers: cleared {n}, {h} still held by running sessions"
-        )),
+    let mut done = Vec::new();
+    if swept.deleted > 0 {
+        done.push(format!("deleted {}", swept.deleted));
+    }
+    if swept.quarantined > 0 {
+        done.push(format!("{} could not be deleted, moved aside", swept.quarantined));
+    }
+    match (done.is_empty(), swept.stuck) {
+        (true, 0) => Check::Ok("agent leftovers: none to clear".to_string()),
+        (false, 0) => Check::Ok(format!("agent leftovers: {}", done.join(", "))),
+        (_, stuck) => {
+            done.push(format!("{stuck} could not be deleted or moved"));
+            Check::Warn(format!("agent leftovers: {}", done.join(", ")))
+        }
     }
 }
 

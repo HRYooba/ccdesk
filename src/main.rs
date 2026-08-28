@@ -123,10 +123,16 @@ fn main() -> anyhow::Result<()> {
     // こちらの仕事になる。ここが一番よく消せる瞬間でもある: 前回のセッションは
     // もう終わっていて、今回のセッションはまだ起こしていない。
     //
-    // **設定で出していない agent も見る。** 走査は PATH を引いて read_dir するだけで
-    // プロセスを起こさないし、codex を off にした人の環境に残った残骸を
-    // 取り逃す理由が無い
-    let _ = update::sweep_agent_leftovers(&backend::Kind::ORDER);
+    // **設定で出していない agent も見る。** codex を off にした人の環境に残った
+    // 残骸を取り逃す理由が無い。
+    //
+    // **別スレッドで走らせる。** 走査は read_dir だけでは済まず、agent へ版を
+    // 聞きに行くものがある（claude の保管庫は「現行版より古いもの」しか消せない
+    // ＝ 現行版を知る必要がある）。前景でやると agent の起動 1 回ぶん TUI の
+    // 表示が遅れる。掃除は何度やっても同じ結果なので、遅れて終わって困らない
+    std::thread::spawn(|| {
+        let _ = update::sweep_agent_leftovers(&backend::Kind::ORDER);
+    });
 
     // 使用率表示の opt-in（`~/.ccdesk/config.json` の `"usage_display": "on"`）。
     //
@@ -174,7 +180,7 @@ fn main() -> anyhow::Result<()> {
     // 供給元と App が同じものを持つ
     let usage_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // 取得中スピナーの旗は agent ごと（押した行だけが回る）
-    let usage_fetching = app::agent_updating_flags();
+    let usage_fetching = app::per_agent_flags();
     // demo / 実データの選択はこの 1 箇所だけ。以降のコードは供給元を通すので
     // 「今 demo か」を問う分岐を持たない（＝分岐の書き漏らしで実データが漏れない）
     let source: Arc<dyn DataSource> = if demo {
@@ -283,9 +289,7 @@ fn main() -> anyhow::Result<()> {
         footer_shared: Arc::new(Mutex::new(FooterInfo::default())),
         footer_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         footer_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        agent_updating: app::agent_updating_flags(),
-        agent_update_stalled: app::agent_updating_flags(),
-        agent_update_error: Arc::new(Mutex::new(None)),
+        agent_update: app::agent_update_states(),
         ccdesk_update: Arc::new(Mutex::new(SelfUpdate::Idle)),
         ccdesk_latest: None,
         ccdesk_latest_shared: Arc::new(Mutex::new(None)),

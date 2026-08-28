@@ -608,7 +608,7 @@ pub(crate) fn menu_zone(sidebar_cols: u16) -> std::ops::RangeInclusive<u16> {
 const UPDATE_MARK: &str = "⟳";
 
 /// バージョン行の更新状態。マーカー桁と右端の動詞はこれだけで決まる。
-/// ccdesk 側（[`SelfUpdate`]）と agent 側（`agent_updating` + `FooterInfo::version`）で
+/// ccdesk 側（[`SelfUpdate`]）と agent 側（[`crate::app::AgentUpdate`] + `FooterInfo::version`）で
 /// 進行状態の持ち方が違うので、表示の語彙をここに 1 つだけ置いて両方を寄せる
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum UpdateState {
@@ -928,23 +928,21 @@ fn ccdesk_update_state(app: &App) -> UpdateState {
 /// 最新表示へ戻るため。ネイティブインストールは既定で自動更新するので、
 /// 何もしなくてもこの行が消えることもある（公式仕様）
 fn agent_update_state(app: &App, kind: Kind) -> UpdateState {
-    let flag = |flags: &std::collections::BTreeMap<Kind, std::sync::Arc<std::sync::atomic::AtomicBool>>| {
-        flags
-            .get(&kind)
-            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
-    };
-    // **旗は agent ごと**（片方の更新中にもう片方の行まで止めない）
-    if flag(&app.agent_updating) {
-        UpdateState::Running
-    } else if app.footer.version(kind).latest.is_none() {
-        // **新しい版が無いなら据え置きも解けている。** 旗を明示的に降ろさずに
-        // 済むのが要点で、別経路で更新された場合（手で入れ直した・agent 自身の
-        // 自動更新が通った）も次の版取得だけで行が最新表示へ戻る
-        UpdateState::Current
-    } else if flag(&app.agent_update_stalled) {
-        UpdateState::Stalled
-    } else {
-        UpdateState::Available
+    // **状態は agent ごと**（片方の更新中にもう片方の行まで止めない）
+    let state = app.agent_update.get(&kind).map(|s| s.lock_recover());
+    let version = app.footer.version(kind);
+    match state.as_deref() {
+        Some(crate::app::AgentUpdate::Running) => UpdateState::Running,
+        // **据え置きは「押した時点の版のまま」であることが条件。** 版が動けば
+        // （手で入れ直した・agent 自身の自動更新が通った）条件が外れて行が
+        // 最新表示へ戻る ＝ 旗を降ろす規則をどこにも書かなくてよい
+        Some(crate::app::AgentUpdate::Stalled { version: at, .. })
+            if version.current == *at && version.latest.is_some() =>
+        {
+            UpdateState::Stalled
+        }
+        _ if version.latest.is_none() => UpdateState::Current,
+        _ => UpdateState::Available,
     }
 }
 
@@ -5213,10 +5211,10 @@ pub(crate) mod tests {
     fn a_selected_version_row_keeps_its_state_color_while_updating() {
         let mut app = App {
             term_size: (120, 30),
-            agent_updating: crate::app::agent_updating_flags(),
+            agent_update: crate::app::agent_update_states(),
             ..Default::default()
         };
-        app.agent_updating[&Kind::Claude].store(true, std::sync::atomic::Ordering::Relaxed);
+        *app.agent_update[&Kind::Claude].lock_recover() = crate::app::AgentUpdate::Running;
         // claude の版行はヘッダー 2 行目（y=1 が ccdesk, y=2 が claude）
         app.selection = SidebarPos::Row(1);
         assert!(
@@ -5229,15 +5227,15 @@ pub(crate) mod tests {
     /// 効かない状態は次の更新まで続く ＝ 通知を見逃すと「押しても何も起きない行」に
     /// 戻ってしまう（claude が 5 日間更新されないまま気づかれなかった）。
     ///
-    /// **旗を明示的に降ろす経路は要らない**ことも同時に見る: 新しい版が無くなれば
-    /// （別経路で入った・手で入れ直した）行は旗を見ずに最新表示へ戻る
+    /// **据え置きを降ろす経路は要らない**ことも同時に見る: 状態が「押した時点の版」を
+    /// 持つので、版が動けば（別経路で入った・手で入れ直した）条件が外れて
+    /// 行は最新表示へ戻る
     #[test]
     fn a_stalled_update_stays_on_the_row_until_the_version_moves() {
+        use crate::app::AgentUpdate;
         use crate::backend::AgentVersion;
-        use std::sync::atomic::Ordering::Relaxed;
         let mut app = App {
-            agent_updating: crate::app::agent_updating_flags(),
-            agent_update_stalled: crate::app::agent_updating_flags(),
+            agent_update: crate::app::agent_update_states(),
             ..Default::default()
         };
         let behind = AgentVersion {
@@ -5248,10 +5246,13 @@ pub(crate) mod tests {
         assert_eq!(agent_update_state(&app, Kind::Claude), UpdateState::Available);
 
         // 更新を試して版が動かなかった ＝ 行に残る
-        app.agent_update_stalled[&Kind::Claude].store(true, Relaxed);
+        *app.agent_update[&Kind::Claude].lock_recover() = AgentUpdate::Stalled {
+            version: "2.1.225".to_string(),
+            announced: true,
+        };
         assert_eq!(agent_update_state(&app, Kind::Claude), UpdateState::Stalled);
 
-        // **旗は立てたまま**版が上がれば、行は最新表示へ戻る
+        // **状態は据え置きのまま**版が上がれば、行は最新表示へ戻る
         app.footer.versions.insert(
             Kind::Claude,
             AgentVersion {
@@ -5265,22 +5266,37 @@ pub(crate) mod tests {
             "the row stayed stalled after the version actually moved"
         );
 
+        // **版が動いたあと次の新版が出ても、押していない行は据え置きを名乗らない**
+        // （据え置きは「あの版のまま」であることが条件なので、条件が外れたら消える）
+        app.footer.versions.insert(
+            Kind::Claude,
+            AgentVersion {
+                current: "2.1.226".to_string(),
+                latest: Some("2.1.227".to_string()),
+            },
+        );
+        assert_eq!(
+            agent_update_state(&app, Kind::Claude),
+            UpdateState::Available,
+            "a row that was never pressed at this version called itself stalled"
+        );
+
         // 押し直している間は Running が勝つ（やり直しが行から見える）
         app.footer.versions.insert(Kind::Claude, behind);
-        app.agent_updating[&Kind::Claude].store(true, Relaxed);
+        *app.agent_update[&Kind::Claude].lock_recover() = AgentUpdate::Running;
         assert_eq!(agent_update_state(&app, Kind::Claude), UpdateState::Running);
     }
 
-    /// **更新中の旗は agent ごと。** 共有にすると、片方を更新している間に
+    /// **更新の状態は agent ごと。** 共有にすると、片方を更新している間に
     /// もう片方の版行まで Running になって押せなくなる（実機で踏んだ）
     #[test]
     fn updating_one_agent_leaves_the_other_agents_row_pressable() {
         let app = App {
-            agent_updating: crate::app::agent_updating_flags(),
+            agent_update: crate::app::agent_update_states(),
             ..Default::default()
         };
         // claude だけ更新中にする
-        app.agent_updating[&Kind::Claude].store(true, std::sync::atomic::Ordering::Relaxed);
+        *app.agent_update[&Kind::Claude].lock_recover() = crate::app::AgentUpdate::Running;
 
         assert_eq!(agent_update_state(&app, Kind::Claude), UpdateState::Running);
         assert_ne!(

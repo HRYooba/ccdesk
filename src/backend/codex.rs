@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::backend::{
-    codex_app_server, codex_index, AgentVersion, Backend, Candidate, Inject, Launch, Message,
-    NameIndex, Span, Spawn,
+    codex_app_server, codex_index, AgentVersion, Backend, Candidate, Inject, Launch, Garbage,
+    Message, NameIndex, Span, Spawn,
 };
 use crate::hooks::{HOOK_EVENTS, HOOK_TIMEOUT_SECS};
 
@@ -138,21 +138,31 @@ impl Backend for Codex {
         AgentVersion { current, latest }
     }
 
-    fn update_program(&self) -> &'static str {
-        PROGRAM
+    fn update_argv(&self) -> (&'static str, &'static [&'static str]) {
+        (PROGRAM, &["update"])
     }
 
     /// `codex update` は npm を通るので、**走っている codex が掴んでいる
     /// `codex.exe` を unlink できないと npm が作業ディレクトリごと諦める**
-    /// （実測: `EPERM` を warn 扱いにして exit 0 を返し、`@openai/.codex-<乱数>` が
-    /// 285MB 残った）。npm 自身は次の更新でも消しに来ない。
+    /// （実測 2026-08-27: `EPERM` を warn 扱いにして exit 0 を返し、
+    /// `@openai/.codex-<ハッシュ>` が数百 MB 残った）。npm 自身は次の更新でも
+    /// 消しに来ない。
     ///
-    /// 拾うのは `@openai/` 直下の**先頭ドット付き**のものだけ。npm の作業用の名前で、
-    /// 正規のインストール（`@openai/codex`）とはドットの有無で必ず分かれる
-    fn update_leftovers(&self) -> Vec<PathBuf> {
+    /// 拾うのは `@openai/` 直下の**先頭ドット付き**のものだけ。npm の作業用の
+    /// 名前で、正規のインストール（`@openai/codex`）とはドットの有無で必ず分かれる。
+    ///
+    /// **塞ぐ**（[`Garbage::blocks_next_update`]）
+    fn garbage(&self) -> Vec<Garbage> {
         ccdesk::resolve_program(PROGRAM)
-            .map(|shim| npm_workdirs_beside(&shim))
-            .unwrap_or_default()
+            .and_then(|shim| npm_scope_beside(&shim))
+            .map(|dir| Garbage {
+                dir,
+                prefix: ".codex-".to_string(),
+                rest_ok: Box::new(|rest| rest.chars().all(|c| c.is_ascii_alphanumeric())),
+                blocks_next_update: true,
+            })
+            .into_iter()
+            .collect()
     }
 
     /// app-server へ 1 往復（[`codex_app_server`]）。**rollout は読まない**
@@ -375,24 +385,11 @@ fn parse_latest_version(body: &str) -> Option<String> {
     (version.split('.').count() >= 3).then_some(version)
 }
 
-/// `shim` の隣の npm ツリーに残った作業ディレクトリ `@openai/.codex-<乱数>`。
-///
-/// `codex update` は npm を通るので、**走っている codex が掴んでいる `codex.exe` を
-/// unlink できないと npm が作業ディレクトリごと諦める**（実測: `EPERM` を warn 扱いに
-/// して exit 0 を返し、285MB が残った）。npm 自身は次の更新でも消しに来ない。
-///
-/// **先頭ドット付きだけを拾う。** npm の作業用の名前で、正規のインストール
-/// （`@openai/codex`）とはドットの有無で必ず分かれる。
-/// **パスを引数で受ける**ので、テストが実ユーザーの npm ツリーを見ずに済む
-fn npm_workdirs_beside(shim: &Path) -> Vec<PathBuf> {
-    // npm はシムの隣に node_modules を置く（`npm prefix -g` の中身そのもの）
-    let Some(dir) = shim.parent() else {
-        return Vec::new();
-    };
-    let scope = dir.join("node_modules").join("@openai");
-    crate::backend::leftovers_in(&scope, ".codex-", |rest| {
-        rest.chars().all(|c| c.is_ascii_alphanumeric())
-    })
+/// npm のツリーで `@openai/` に当たるディレクトリ。**組み立てはここ 1 箇所**
+/// （残骸の走査と、退かした置き場の走査が別々の綴りを持たない）。
+/// npm はシムの隣に node_modules を置く（`npm prefix -g` の中身そのもの）
+fn npm_scope_beside(shim: &Path) -> Option<PathBuf> {
+    Some(shim.parent()?.join("node_modules").join("@openai"))
 }
 
 #[cfg(test)]
@@ -402,7 +399,7 @@ mod tests {
 
     /// **npm の作業ディレクトリだけを拾い、正規のインストールには触れない。**
     ///
-    /// `codex update` が EPERM で諦めると `@openai/.codex-<乱数>` が 285MB 残る。
+    /// `codex update` が EPERM で諦めると `@openai/.codex-<ハッシュ>` が残る。
     /// 拾い方を間違えると **codex 本体を消す**ので、隣に正規のインストールを
     /// 置いた状態で固定する（両者はドットの有無だけで分かれる）
     #[test]
@@ -414,19 +411,28 @@ mod tests {
             "codex-win32-x64", // 正規のプラットフォーム別パッケージ
             ".codex-g3ieL94X", // npm の作業場（消す）
             ".codex-AbC123",   // 同上
-            ".codex-",         // 乱数が無い ＝ 何か分からないので残す
-            ".codex-has.dot",  // 乱数でない ＝ 残す
+            ".codex-",         // ハッシュが無い ＝ 何か分からないので残す
+            ".codex-has.dot",  // ハッシュでない ＝ 残す
+            ".ccdesk-held",    // 退かした残骸の置き場（掃除が別で見る）
         ] {
             std::fs::create_dir_all(scope.join(name)).unwrap();
         }
-        let mut found: Vec<String> = npm_workdirs_beside(&dir.join("codex.cmd"))
-            .into_iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let spec = Garbage {
+            dir: npm_scope_beside(&dir.join("codex.cmd")).unwrap(),
+            prefix: ".codex-".to_string(),
+            rest_ok: Box::new(|rest| rest.chars().all(|c| c.is_ascii_alphanumeric())),
+            blocks_next_update: true,
+        };
+        let mut found: Vec<String> =
+            crate::backend::leftovers_in(&spec.dir, &spec.prefix, &spec.rest_ok)
+                .into_iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
         found.sort();
         assert_eq!(found, [".codex-AbC123", ".codex-g3ieL94X"]);
         // npm ツリーが無い置き方（PATH に codex が無い / 別の入れ方）でも落ちない
-        assert!(npm_workdirs_beside(&dir.join("elsewhere").join("codex.cmd")).is_empty());
+        let missing = npm_scope_beside(&dir.join("elsewhere").join("codex.cmd")).unwrap();
+        assert!(crate::backend::leftovers_in(&missing, ".codex-", |_| true).is_empty());
     }
 
     fn inject() -> Inject<'static> {

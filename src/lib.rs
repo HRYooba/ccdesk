@@ -188,7 +188,7 @@ pub fn new_parser(rows: u16, cols: u16, scrollback: usize) -> Parser {
 /// ホームディレクトリ（Windows 専用ツールなので USERPROFILE）。
 /// **環境変数を読む場所はここ 1 箇所**: フォールバック（`HOME` を見る等）を
 /// 足すことになったとき、直す場所が散らばらない
-fn home() -> Option<std::path::PathBuf> {
+pub fn home() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(std::env::var_os("USERPROFILE")?))
 }
 

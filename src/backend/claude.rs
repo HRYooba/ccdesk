@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::backend::{
-    AgentVersion, Backend, Candidate, Inject, Launch, Message, NameIndex, Span, Spawn,
+    AgentVersion, Backend, Candidate, Inject, Launch, Garbage, Message, NameIndex, Span, Spawn,
 };
 use crate::claude_format::{
     AGENT_RECORD, AI_TITLE, CONTENT_KEY, CUSTOM_TITLE, INHERITED_MARKERS, LAST_PROMPT, MESSAGE_KEY,
@@ -82,10 +82,7 @@ impl Backend for Claude {
     /// （`downloads.claude.ai/claude-code-releases/<channel>` が版番号を返す。
     /// チャネルは文書化設定 `autoUpdatesChannel` に従う。既定 latest）
     fn version(&self) -> AgentVersion {
-        // 現行版: "2.1.218 (Claude Code)" の先頭トークン
-        let current = crate::poll::out(PROGRAM, &["--version"])
-            .and_then(|s| s.split_whitespace().next().map(str::to_string))
-            .unwrap_or_default();
+        let current = current_version().unwrap_or_default();
         let channel = ccdesk::claude_settings_channel();
         // ネットワークへ出る作法（タイムアウト等）は [`crate::update::http_get`] が持つ。
         // このスレッドはアカウント取得と共用なので、応答しないネットワークで
@@ -102,21 +99,33 @@ impl Backend for Claude {
         AgentVersion { current, latest }
     }
 
-    fn update_program(&self) -> &'static str {
-        PROGRAM
+    fn update_argv(&self) -> (&'static str, &'static [&'static str]) {
+        (PROGRAM, &["update"])
     }
 
-    /// claude は更新のたびに現行の実行ファイルを `<exe>.old.<ミリ秒>` へ退避するが、
-    /// **消す側が見当たらない**（実測: 3 世代 1.1GB が、その後 2 回の更新に成功した
-    /// あとも残っていた）。1 世代あたり約 280MB あるので放置できない。
+    /// claude が置き去りにするものは **2 箇所**にある。**片方だけ見ていた。**
     ///
-    /// 拾うのは `<exe名>.old.` の後ろが**数字だけ**のものに限る。この綴りは
-    /// claude が付ける退避名そのもので、実行ファイル本体（`claude.exe`）とも
-    /// 世代を持たない `.old` とも重ならない
-    fn update_leftovers(&self) -> Vec<PathBuf> {
-        ccdesk::resolve_program(PROGRAM)
-            .map(|exe| parked_exes_beside(&exe))
-            .unwrap_or_default()
+    /// 1. `<exe>.old.<ミリ秒>`（退避した実行ファイル）
+    /// 2. `~/.local/share/claude/versions/<版>`（版ごとの実体）
+    ///
+    /// 実測は日をまたいで揺れる。2026-08-27 には `.old.*` が **0 件**で
+    /// versions に 3 世代、翌 08-28 の更新（2.1.247 → 2.1.250）では
+    /// **versions が現行 1 件へ刈られ、代わりに `.old.*` が 2 件出た**。
+    /// つまり **claude は versions を刈ることがある**（毎回かは不明）一方で、
+    /// 退避 exe が残る回もある。片方だけ見ると、その日の流儀によって
+    /// **正しく実装された空振り**になる。どちらも 1 世代 200〜400MB 台。
+    ///
+    /// `claude.exe` は versions とは別ファイル（2026-08-28、`fsutil hardlink list`
+    /// で両方ともリンク数 1 と確認）なので、versions は保管庫であり、
+    /// **現行版より古いもの**は次の更新に要らない。
+    ///
+    /// **どちらも「塞がない」**（[`Garbage::blocks_next_update`]）:
+    /// 退避名はミリ秒、versions は版名で、どちらも次の更新と衝突しない
+    fn garbage(&self) -> Vec<Garbage> {
+        let parked = ccdesk::resolve_program(PROGRAM)
+            .and_then(|exe| parked_exes_spec(&exe))
+            .into_iter();
+        parked.chain(superseded_versions_spec()).collect()
     }
 
     /// 取得から解釈まで [`crate::usage`] が一手に持つ（claude を短命な
@@ -220,23 +229,83 @@ impl Backend for Claude {
     }
 }
 
-/// `exe` の隣に溜まった退避ファイル `<exe名>.old.<ミリ秒>`。
-///
-/// claude は更新のたびにこの名前で現行版を退避するが、**消す側が見当たらない**
-/// （実測: 3 世代 1.1GB が、その後 2 回の更新に成功したあとも残っていた）。
-/// 1 世代あたり約 280MB あるので放置できない。
+/// claude が更新のたびに現行版を退避する `<exe>.old.<ミリ秒>`。
 ///
 /// **後ろが数字だけのものに限る。** その綴りは claude が付ける退避名そのもので、
-/// 実行ファイル本体（`claude.exe`）とも世代を持たない `.old` とも重ならない。
-/// **パスを引数で受ける**ので、テストが実ユーザーの `~/.local/bin` を見ずに済む
-fn parked_exes_beside(exe: &Path) -> Vec<PathBuf> {
-    let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else {
-        return Vec::new();
-    };
-    let prefix = format!("{}.old.", name.to_string_lossy());
-    crate::backend::leftovers_in(dir, &prefix, |rest| {
-        rest.chars().all(|c| c.is_ascii_digit())
+/// 実行ファイル本体（`claude.exe`）とも世代を持たない `.old` とも重ならない
+fn parked_exes_spec(exe: &Path) -> Option<Garbage> {
+    let (dir, name) = (exe.parent()?, exe.file_name()?);
+    Some(Garbage {
+        dir: dir.to_path_buf(),
+        prefix: format!("{}.old.", name.to_string_lossy()),
+        rest_ok: Box::new(|rest| rest.chars().all(|c| c.is_ascii_digit())),
+        blocks_next_update: false,
     })
+}
+
+/// `~/.local/share/claude/versions/` の、**現行版より古い**実体。
+///
+/// **「現行版以外」では消しすぎる。** claude の更新は「新版を versions へ落とす →
+/// 実行ファイルを差し替える」の 2 手で、後半だけ失敗する状態が実在する
+/// （[`crate::app::AgentUpdate::Stalled`] が検出しているのがまさにそれ）。
+/// その窓では `claude --version` は旧版のままなので、「現行版以外」を消すと
+/// **落としたばかりの新版**を消し、claude 自身の「次回起動で差し替える」復帰路を
+/// 毎回壊す。新旧の比較は版行と同じ [`ccdesk::version_newer`]。
+///
+/// **現行版が読めなければ宣言そのものを作らない。** 版が空のまま比較へ回すと
+/// 全世代が「より古い」に該当する ＝ 現行版まで消す。ここが返す `None` は
+/// 「掃除できないだけ」で、次の掃除でもう一度来る
+fn superseded_versions_spec() -> Option<Garbage> {
+    let (current, dir) = (current_version()?, versions_dir()?);
+    Some(Garbage {
+        dir,
+        prefix: String::new(),
+        // **版の形をしたものだけを積極的に同定する。** 排除で選ぶと、落とし途中の
+        // 一時ファイル・ロック・ccdesk 自身の隔離先まで巻き込む
+        rest_ok: Box::new(move |name| {
+            is_version(name) && ccdesk::version_newer(&current, name)
+        }),
+        blocks_next_update: false,
+    })
+}
+
+/// 今入っている版。**聞き方はここ 1 箇所**（版行の表示と保管庫の掃除が
+/// 別々の綴りを持つと、片方だけ直して「現行版を消す」形になる）。
+///
+/// `claude --version` は `"2.1.218 (Claude Code)"` を返すので先頭トークン。
+/// **形まで確かめる**（[`is_version`]）: [`crate::poll::out`] は終了コードを
+/// 見ないので、警告バナーやエラー文が先に出れば `"Warning:"` のような値が返る
+fn current_version() -> Option<String> {
+    crate::poll::out(PROGRAM, &["--version"])?
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+        .filter(|v| is_version(v))
+}
+
+/// 版番号の形か（空でない数字の並びをドットで 2 つ以上繋いだもの）。
+///
+/// **保管庫を触る判断はここ 1 箇所**: 現行版の妥当性と、保管庫の中身が版かどうかを
+/// 別の綴りで判定すると、片方だけ緩めたときに消しすぎる
+fn is_version(s: &str) -> bool {
+    s.split('.').count() >= 2
+        && s.split('.')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// 版の保管庫。**`resolve_program` の隣ではない**（実行ファイルは `~/.local/bin`、
+/// 実体は `~/.local/share/claude/versions`）ので、ここだけ別に組み立てる
+fn versions_dir() -> Option<PathBuf> {
+    // **`unwrap_or_default()` にしない**: ホームが引けないときに空のパスへ join すると
+    // カレントディレクトリ配下の `.local/share/claude/versions` を指す ＝
+    // 掃除が別の場所を消しに行く
+    Some(
+        ccdesk::home()?
+            .join(".local")
+            .join("share")
+            .join("claude")
+            .join("versions"),
+    )
 }
 
 /// 表示名の候補（**この並びが優先順**）。
@@ -265,11 +334,54 @@ mod tests {
     use super::*;
     use crate::backend::tests::argv;
 
+    /// **保管庫から拾うのは「現行版より古い」ものだけ。**
+    ///
+    /// 「現行版以外」にすると、更新の 2 手（新版を落とす → 実行ファイルを差し替える）の
+    /// 後半だけ失敗した窓で**落としたばかりの新版**を消す。`claude --version` は
+    /// その窓では旧版を返すので、区別できるのは新旧の比較だけ。
+    ///
+    /// **現行版が読めないときは 1 つも拾わない**ことも同時に固定する: ここが空文字に
+    /// 縮退すると全世代が「より古い」に該当し、現行版まで消える
+    #[test]
+    fn the_version_store_gives_up_only_generations_older_than_the_running_one() {
+        let dir = crate::testutil::TempDir::new("claude", "versions");
+        for name in ["2.1.242", "2.1.246", "2.1.250", "2.1.251", ".ccdesk-held", "download.tmp"] {
+            std::fs::write(dir.join(name), "BINARY").unwrap();
+        }
+        let collect = |current: &str| {
+            let spec = Garbage {
+                dir: dir.path().to_path_buf(),
+                prefix: String::new(),
+                rest_ok: Box::new({
+                    let current = current.to_string();
+                    move |name: &str| is_version(name) && ccdesk::version_newer(&current, name)
+                }),
+                blocks_next_update: false,
+            };
+            let mut found: Vec<String> = crate::backend::leftovers_in(&spec.dir, &spec.prefix, &spec.rest_ok)
+                .into_iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            found.sort();
+            found
+        };
+        // **新版（2.1.251）は残す** — 差し替え待ちかもしれない
+        assert_eq!(collect("2.1.250"), ["2.1.242", "2.1.246"]);
+        // 版の形をしていないものには触らない（隔離先・落とし途中の一時ファイル）
+        assert!(!collect("9.9.9").iter().any(|n| n.starts_with('.') || n.ends_with(".tmp")));
+
+        // **版が読めなければ宣言そのものを作らない。** ここが `None` を返す限り、
+        // 上の述語に空文字が渡る経路は存在しない
+        assert!(is_version("2.1.250") && is_version("1.2"));
+        for junk in ["", "Warning:", "2.1.250-beta", "abc", "2", "2..1", "2.1."] {
+            assert!(!is_version(junk), "accepted {junk:?} as a version");
+        }
+    }
+
     /// **退避ファイルだけを拾い、動いているインストールには触れない。**
     ///
-    /// claude が置き去りにする `<exe>.old.<ミリ秒>` は 1 世代 280MB あり、
-    /// ccdesk がセッションを常駐させるせいで消える機会を失う（掴まれたまま次の
-    /// 更新を迎える）。拾い方を間違えると **claude 本体を消す**ので、
+    /// ccdesk がセッションを常駐させるせいで、退避 exe は消える機会を失う
+    /// （掴まれたまま次の更新を迎える）。拾い方を間違えると **claude 本体を消す**ので、
     /// 隣り合う紛らわしい名前を並べて固定する
     #[test]
     fn only_the_parked_generations_next_to_the_exe_are_collected() {
@@ -284,17 +396,20 @@ mod tests {
         ] {
             std::fs::write(dir.join(name), "x").unwrap();
         }
-        let mut found: Vec<String> = parked_exes_beside(&dir.join("claude.exe"))
-            .into_iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let spec = parked_exes_spec(&dir.join("claude.exe")).unwrap();
+        let mut found: Vec<String> =
+            crate::backend::leftovers_in(&spec.dir, &spec.prefix, &spec.rest_ok)
+                .into_iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
         found.sort();
         assert_eq!(
             found,
             ["claude.exe.old.1785884570678", "claude.exe.old.1786075360017"]
         );
         // 実行ファイルが無い場所を指しても落ちない（PATH に claude が無い環境）
-        assert!(parked_exes_beside(&dir.join("nowhere").join("claude.exe")).is_empty());
+        let nowhere = parked_exes_spec(&dir.join("nowhere").join("claude.exe")).unwrap();
+        assert!(crate::backend::leftovers_in(&nowhere.dir, &nowhere.prefix, &nowhere.rest_ok).is_empty());
     }
 
     fn build(launch: Launch<'_>, inject: Option<&Inject>) -> Spawn {
