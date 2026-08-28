@@ -79,6 +79,49 @@ use crate::sessions::{SessionId, SessionRow};
 const ATTENTION_MATCHER: &str =
     "permission_prompt|elicitation_dialog|agent_needs_input|worker_permission_prompt|elicitation_url_dialog";
 
+/// hook が名乗る**ユーザーを呼ぶ出来事**。「呼ぶか」だけでなく
+/// 「その呼び出しを**開く**のか、既に立っているものを**名乗り直す**のか」を持つ。
+///
+/// **名乗り直しが要るのは、1 つの許可待ちを 2 つの hook が名乗るから。**
+/// `PermissionRequest` は待ちが出る直前に、`Notification`（`permission_prompt` 等）は
+/// claude 側の 6 秒ゲートの後に、**同じ待ち**を名乗る。どちらも `activity_at` を
+/// 進めていた頃は 1 回の許可待ちで通知が 2 回撃たれていた（時刻が違えば
+/// [`crate::app`] の `announce` は別の出来事として通す ＝ あちらは種類を見ない）。
+/// 同じ tag への `Show` は更新扱いで鳴らないので長らく無音に隠れていたが、
+/// 毎 turn 鳴らすために tag を出し直すようにした時点で音まで 2 回になった
+/// （報告された症状）。
+///
+/// **時刻を進めないだけで、state は普通に書く。** `Notification` を落とすことは
+/// できない: 待ちの黄色を出す経路がこれしか無い matcher
+/// （`worker_permission_prompt` 等）があり、[`ATTENTION_MATCHER`] は
+/// 表示と通知の両方の材料を兼ねている
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Alert {
+    /// ユーザーを呼ばない hook（未読も通知も立てない）
+    Silent,
+    /// その呼び出しを**開く**（時刻を必ず進める ＝ 撃たれる）
+    Opens(crate::notify::Kind),
+    /// 既に立っている**同じ**呼び出しを名乗り直すことがある
+    /// （立っていれば時刻を進めない ＝ [`record`]）
+    Restates(crate::notify::Kind),
+}
+
+impl Alert {
+    /// 呼び出しの種類（[`Self::Silent`] は None）。**保管へ載るのはこの値だけ**で、
+    /// 開いたのか名乗り直したのかは残さない（読む相手が居ない ＝ その判断は
+    /// 書き込みの時点で閉じる。[`record`]）。
+    ///
+    /// 本体は [`record`] の `match` が種類を直に取り出すので、これが要るのは
+    /// 「表の `alert` 列が実際に立てる呼び出し」を突き合わせるテストだけ
+    #[cfg(test)]
+    fn kind(self) -> Option<crate::notify::Kind> {
+        match self {
+            Self::Silent => None,
+            Self::Opens(kind) | Self::Restates(kind) => Some(kind),
+        }
+    }
+}
+
 /// 注入する hook 1 件。**`--settings` の生成（[`inject_settings`]）と受け口
 /// （[`run_hook`]）が同じ表を読む**ので、片方だけ増えた状態にならない。
 pub(crate) struct HookEvent {
@@ -88,19 +131,19 @@ pub(crate) struct HookEvent {
     pub(crate) matcher: Option<&'static str>,
     /// この hook が意味する state。**要約文は持たない**（行に出るのは状態だけ）
     pub(crate) state: State,
-    /// この hook は**ユーザーを呼ぶ出来事**か。None ＝ 呼ばない。
+    /// この hook は**ユーザーを呼ぶ出来事**か（[`Alert`]）。
     ///
-    /// **1 つの列が 2 つを兼ねる**: 未読 `●` の材料（`Some` の hook だけが
+    /// **1 つの列が 2 つを兼ねる**: 未読 `●` の材料（呼ぶ hook だけが
     /// `activity_at` を進める）と、OS 通知の種類（[`crate::app`] の
     /// `update_notifications`）。両者は「ユーザーの見るべき出来事か」という
     /// 同じ問いなので、別々の列に割ると片方だけ直した状態が作れてしまう。
     ///
-    /// **`SessionEnd` が None なのが効く**: 状態と未読を同じ時刻で判定していた頃は、
-    /// 終了の記録が「agent が何か言った」に数えられ、stop しただけの行が再起動後に
-    /// 未読になった。
+    /// **`SessionEnd` が [`Alert::Silent`] なのが効く**: 状態と未読を同じ時刻で
+    /// 判定していた頃は、終了の記録が「agent が何か言った」に数えられ、
+    /// stop しただけの行が再起動後に未読になった。
     ///
-    /// **`Interrupt` も None**: 中断はユーザー自身の操作なので、呼び戻す理由が無い
-    pub(crate) alert: Option<crate::notify::Kind>,
+    /// **`Interrupt` も `Silent`**: 中断はユーザー自身の操作なので、呼び戻す理由が無い
+    pub(crate) alert: Alert,
     /// このイベントを持つ agent。**知らない名前を注入すると壊れる**ので、
     /// 誰に注入するかはここが正本（claude は settings、codex は `-c` の TOML）。
     ///
@@ -146,14 +189,16 @@ pub(crate) const HOOK_EVENTS: [HookEvent; 8] = [
     // 開き直すと（止める前が Idle でも）黄「Needs input」に変わり、そのまま
     // 固着していた。claude 自身もこの状態を `idle` と報告する（`waitingFor` は無い
     // ＝ 何も待っていない）ので、[`crate::poll::state_of_status`] の写し先と一致する
-    HookEvent { event: "SessionStart", matcher: None, state: State::Idle, alert: None, agents: BOTH },
-    HookEvent { event: "UserPromptSubmit", matcher: None, state: State::Working, alert: None, agents: BOTH },
-    HookEvent { event: "Notification", matcher: Some(ATTENTION_MATCHER), state: State::Waiting, alert: Some(crate::notify::Kind::NeedsInput), agents: CLAUDE_ONLY },
+    HookEvent { event: "SessionStart", matcher: None, state: State::Idle, alert: Alert::Silent, agents: BOTH },
+    HookEvent { event: "UserPromptSubmit", matcher: None, state: State::Working, alert: Alert::Silent, agents: BOTH },
+    HookEvent { event: "Notification", matcher: Some(ATTENTION_MATCHER), state: State::Waiting, alert: Alert::Restates(crate::notify::Kind::NeedsInput), agents: CLAUDE_ONLY },
     // 道具の許可ダイアログが実際に表示されるときだけ飛ぶ（公式カタログ:
     // "Run before permission prompt"）。`Notification` の 2 つの matcher
     // （`permission_prompt` / `worker_permission_prompt`）と役割が重なるが、
     // こちらは黄（waiting）の表示が確定するまでの遅れが無い（`Notification` は
-    // 6 秒ゲートの後にしか来ない版がある）。**matcher は None（全ツール）**:
+    // 6 秒ゲートの後にしか来ない版がある）＝ **同じ待ちを名乗るのはこちらが先**
+    // なので、こちらが呼び出しを開き、あちらは名乗り直す（[`Alert`]）。
+    // **matcher は None（全ツール）**:
     // 道具ごとに絞る意味が無い（どの道具の許可でも待っているのはユーザー）
     //
     // **この hook が書いた黄は、次の観測で赤へ戻ったりしない。** claude は
@@ -162,8 +207,8 @@ pub(crate) const HOOK_EVENTS: [HookEvent; 8] = [
     // かつてはここが「未検証のリスク」だった: ダイアログを意図的に出す手段が
     // 無かったため実測できず、`waitingFor` という専用フィールドの存在を傍証に
     // 置いていた。claude 本体の実装を読んで裏が取れたので、その但し書きは外した
-    HookEvent { event: "PermissionRequest", matcher: None, state: State::Waiting, alert: Some(crate::notify::Kind::NeedsInput), agents: BOTH },
-    HookEvent { event: "Stop", matcher: None, state: State::Idle, alert: Some(crate::notify::Kind::Finished), agents: BOTH },
+    HookEvent { event: "PermissionRequest", matcher: None, state: State::Waiting, alert: Alert::Opens(crate::notify::Kind::NeedsInput), agents: BOTH },
+    HookEvent { event: "Stop", matcher: None, state: State::Idle, alert: Alert::Opens(crate::notify::Kind::Finished), agents: BOTH },
     // Stop の代わりに、API エラー（rate limit・認証失敗・max_output_tokens 等）で
     // ターンが終わったときだけ飛ぶ（claude の公式カタログに文書化: "Fires instead of
     // Stop when an API error ended the turn"）。**state は Stop と同じ idle**:
@@ -172,7 +217,7 @@ pub(crate) const HOOK_EVENTS: [HookEvent; 8] = [
     // 導入するための State 全体の設計変更になり、この 1 件のためには釣り合わない。
     // alert も Stop と同じ完了: max_output_tokens（出力が長くて打ち切られた）が
     // 含まれるのが効く経路で、ユーザーが見るべき出来事という点は Stop と変わらない
-    HookEvent { event: "StopFailure", matcher: None, state: State::Idle, alert: Some(crate::notify::Kind::Finished), agents: CLAUDE_ONLY },
+    HookEvent { event: "StopFailure", matcher: None, state: State::Idle, alert: Alert::Opens(crate::notify::Kind::Finished), agents: CLAUDE_ONLY },
     // **Esc 中断（codex 0.150 で増えた）。** これが無かった間、中断した codex の行は
     // 永久に Working のままだった（[codex#22858](https://github.com/openai/codex/issues/22858)
     // ＝ 中断のとき `Stop` は飛ばない）。
@@ -181,9 +226,9 @@ pub(crate) const HOOK_EVENTS: [HookEvent; 8] = [
     // 止めたのはユーザー自身なので呼び戻す理由が無い ＝ 「Esc で止めても
     // 完了通知が来る」（報告された症状）が表の 1 マスで消える。
     // claude には無いイベントなので codex だけに注入する
-    HookEvent { event: "Interrupt", matcher: None, state: State::Idle, alert: None, agents: CODEX_ONLY },
+    HookEvent { event: "Interrupt", matcher: None, state: State::Idle, alert: Alert::Silent, agents: CODEX_ONLY },
     // プロセスの終了は「agent が何か言った」ではない
-    HookEvent { event: "SessionEnd", matcher: None, state: State::Stopped, alert: None, agents: BOTH },
+    HookEvent { event: "SessionEnd", matcher: None, state: State::Stopped, alert: Alert::Silent, agents: BOTH },
 ];
 
 /// state 引数を持たない旧形式 `ccdesk hook <event>` の解決表。
@@ -448,7 +493,7 @@ const RENAMED_HOOK_STATES: [(&str, &str, State); 3] = [
 ///
 /// 引数の解決は 3 段: 改名された綴り（[`RENAMED_HOOK_STATES`]）→ 今の綴り →
 /// 引数なしの旧形式（[`LEGACY_HOOK_STATES`]）
-fn resolve(event: &str, state: Option<&str>) -> Option<(State, Option<crate::notify::Kind>)> {
+fn resolve(event: &str, state: Option<&str>) -> Option<(State, Alert)> {
     let state = match state {
         Some(text) => renamed(event, text).or_else(|| State::parse(text))?,
         None => {
@@ -539,7 +584,7 @@ struct HookRecord {
     /// その時点で agent が動かしている会話（再開に使う）
     conversation: String,
     state: State,
-    alert: Option<crate::notify::Kind>,
+    alert: Alert,
 }
 
 /// ccdesk が起動時に立てた行 ID（[`ROW_ENV`]）。**空文字は無いものとして扱う**
@@ -563,10 +608,18 @@ fn session_id_of(input: &str) -> Option<String> {
 /// （hook は複数のセッションから同時に走るので、読みと書きの間に他の hook の
 /// 書き込みが挟まると、その turn の state が落ちる）。
 ///
-/// 呼び出しでない hook（[`HookEvent::alert`] が None）は前回の `activity_at` と
+/// 呼び出しでない hook（[`Alert::Silent`]）は前回の `activity_at` と
 /// `alert` を**対のまま**引き継ぐ（状態の上書きで未読・通知の記録を消さない。
 /// [`Entry::activity_at`]）。片方だけ引き継ぐと「種類は分かるが時刻が古い」
 /// 呼び出しが作れてしまう。
+///
+/// **名乗り直し（[`Alert::Restates`]）も、同じ呼び出しがまだ立っているなら
+/// 引き継ぐ。** 「立っている」＝ 同じ種類で、その記録以降この行に hook が
+/// 1 つも来ていない（`at` が `activity_at` のまま）。進めてしまうと、
+/// `PermissionRequest` と `Notification` が名乗る**1 回の許可待ちで通知が
+/// 2 回撃たれる**（[`Alert`]）。逆に、間に別の hook が挟まっていれば
+/// それは新しい待ちなので進める ＝ 許可を続けて 2 回求められたときの
+/// 2 回目を黙らせない。
 ///
 /// 古い項目はここで落とす（[`KEEP`]）。掃除の契機を別に持たないのは、
 /// 書くのがこの 1 箇所だけで、**書くたびに掃除すれば積もらない**ため
@@ -574,7 +627,7 @@ fn record(
     path: &Path,
     session_id: &SessionId,
     state: State,
-    alert: Option<crate::notify::Kind>,
+    alert: Alert,
     now: u64,
     conversation: Option<&str>,
 ) {
@@ -583,11 +636,19 @@ fn record(
     };
     let mut entries = read_entries(path, now);
     entries.retain(|_, entry| now.saturating_sub(entry.at) < KEEP.as_millis() as u64);
+    // **前回の呼び出しを対のまま持つ**（引き継ぐときに片方だけ残さない）
+    let carried = entries
+        .get(session_id)
+        .map_or((None, None), |entry| (entry.activity_at, entry.alert));
+    // その呼び出しの後この行に hook が 1 つも来ていない ＝ まだ立っている
+    let standing = entries
+        .get(session_id)
+        .is_some_and(|entry| entry.activity_at == Some(entry.at));
     let (activity_at, alert) = match alert {
-        Some(kind) => (Some(now), Some(kind)),
-        None => entries
-            .get(session_id)
-            .map_or((None, None), |entry| (entry.activity_at, entry.alert)),
+        Alert::Silent => carried,
+        // 既に立っている同じ呼び出しの名乗り直しは、時刻を進めない（doc）
+        Alert::Restates(kind) if standing && carried.1 == Some(kind) => carried,
+        Alert::Opens(kind) | Alert::Restates(kind) => (Some(now), Some(kind)),
     };
     // **取れなかったら前回の値を残す**（1 回でも拾えていれば再開できる）
     let conversation = conversation.map(str::to_string).or_else(|| {
@@ -842,11 +903,11 @@ mod tests {
     const NEEDS_INPUT: crate::notify::Kind = crate::notify::Kind::NeedsInput;
     const FINISHED: crate::notify::Kind = crate::notify::Kind::Finished;
 
-    /// テスト用: 「ユーザーを呼ぶ hook だったか」だけを言う。**種類そのものが
-    /// 効くテストは [`crate::notify::Kind`] を直に渡す**（未読・保管の掃除など、
-    /// 呼ぶかどうかしか関係しないテストがほとんどなので、その形を短く書ける）
-    fn calling(yes: bool) -> Option<crate::notify::Kind> {
-        yes.then_some(FINISHED)
+    /// テスト用: 「ユーザーを呼ぶ hook だったか」だけを言う。**種類や名乗り方が
+    /// 効くテストは [`Alert`] を直に渡す**（未読・保管の掃除など、呼ぶかどうかしか
+    /// 関係しないテストがほとんどなので、その形を短く書ける）
+    fn calling(yes: bool) -> Alert {
+        if yes { Alert::Opens(FINISHED) } else { Alert::Silent }
     }
 
     /// テスト専用の保管先。**実ユーザーの `~/.ccdesk` を絶対に触らない**ための境界
@@ -932,7 +993,7 @@ mod tests {
     /// この hook を知らない旧セッションが呼ぶことは無いので、後方互換の組は要らない
     #[test]
     fn stop_failure_is_treated_like_stop() {
-        assert_eq!(resolve("StopFailure", Some(IDLE.as_str())), Some((IDLE, Some(FINISHED))));
+        assert_eq!(resolve("StopFailure", Some(IDLE.as_str())), Some((IDLE, Alert::Opens(FINISHED))));
         assert!(
             !LEGACY_HOOK_STATES.iter().any(|(event, _)| *event == "StopFailure"),
             "StopFailure does not need a legacy form (it is a new hook)"
@@ -954,7 +1015,11 @@ mod tests {
             .expect("PermissionRequest is not registered");
         assert_eq!(row.matcher, None, "PermissionRequest should not filter by tool");
         assert_eq!(row.state, WAITING);
-        assert_eq!(row.alert, Some(NEEDS_INPUT), "a permission wait is something the user should see");
+        assert_eq!(
+            row.alert,
+            Alert::Opens(NEEDS_INPUT),
+            "a permission wait is something the user should see, and this hook is the one that opens it"
+        );
         assert!(
             !LEGACY_HOOK_STATES.iter().any(|(event, _)| *event == "PermissionRequest"),
             "PermissionRequest does not need a legacy form (it is a new hook)"
@@ -1018,7 +1083,7 @@ mod tests {
             );
         }
         // 旧形式の Notification は waiting（入力待ちの通知でしか注入されていなかった）
-        assert_eq!(resolve("Notification", None), Some((WAITING, Some(NEEDS_INPUT))));
+        assert_eq!(resolve("Notification", None), Some((WAITING, Alert::Restates(NEEDS_INPUT))));
     }
 
     /// **合図は「新しく `idle` になった」こと。**
@@ -1149,9 +1214,9 @@ mod tests {
     #[test]
     fn a_state_value_from_an_older_binary_still_resolves() {
         for (event, alert) in [
-            ("SessionStart", None),
-            ("Stop", Some(FINISHED)),
-            ("StopFailure", Some(FINISHED)),
+            ("SessionStart", Alert::Silent),
+            ("Stop", Alert::Opens(FINISHED)),
+            ("StopFailure", Alert::Opens(FINISHED)),
         ] {
             let old = if event == "SessionStart" { "waiting" } else { "completed" };
             assert_eq!(
@@ -1189,8 +1254,8 @@ mod tests {
     /// セッションが呼ぶ後方互換の口も同じ値にする ＝ 片側だけ古い意味で残さない）
     #[test]
     fn starting_a_session_is_idle_not_a_request_for_input() {
-        assert_eq!(resolve("SessionStart", Some(IDLE.as_str())), Some((IDLE, None)));
-        assert_eq!(resolve("SessionStart", None), Some((IDLE, None)), "the legacy form disagrees");
+        assert_eq!(resolve("SessionStart", Some(IDLE.as_str())), Some((IDLE, Alert::Silent)));
+        assert_eq!(resolve("SessionStart", None), Some((IDLE, Alert::Silent)), "the legacy form disagrees");
         // 表そのものが「入力待ち」を名乗っていないこと（改名の読み替え
         // ([`RENAMED_HOOK_STATES`]) が下の口を開けているので、resolve では検査できない）
         assert!(
@@ -1262,7 +1327,7 @@ mod tests {
             record(&temp.path(), &id("s"), state, alert, 1_000, None);
             assert_eq!(
                 states_at(&temp.path()).alert(&id("s")),
-                row.alert.map(|kind| (kind, 1_000)),
+                row.alert.kind().map(|kind| (kind, 1_000)),
                 "{} {} armed the wrong alert",
                 row.event,
                 row.state.as_str()
@@ -1280,6 +1345,60 @@ mod tests {
         assert_eq!(states.get(&id("s"), Some(0)).map(|r| r.at), Some(2_000));
     }
 
+    /// **1 回の許可待ちは 1 回しか撃たない。**
+    ///
+    /// `PermissionRequest`（待ちが出る直前）と `Notification`（claude の 6 秒ゲートの
+    /// 後）は**同じ待ち**を名乗る。両方が `activity_at` を進めていた頃は、
+    /// [`crate::app`] の `announce` が時刻だけで重複を弾くため 2 回撃たれた
+    /// （2 発目は 6 秒遅れ ＝ 報告された症状）。
+    ///
+    /// **黙らせるのは「まだ立っている同じ呼び出し」だけ**で、間に別の hook が
+    /// 挟まっていれば新しい待ちとして通す（許可を続けて 2 回求められる場面で
+    /// 2 回目を落とさない）
+    #[test]
+    fn one_permission_wait_arms_one_call_even_though_two_hooks_announce_it() {
+        let opens = Alert::Opens(NEEDS_INPUT);
+        let restates = Alert::Restates(NEEDS_INPUT);
+
+        // 先に開いた呼び出しを、6 秒後の名乗り直しが進めない
+        let temp = TempStore::new("restated");
+        record(&temp.path(), &id("s"), WAITING, opens, 1_000, None);
+        record(&temp.path(), &id("s"), WAITING, restates, 7_000, None);
+        let states = states_at(&temp.path());
+        assert_eq!(
+            states.alert(&id("s")),
+            Some((NEEDS_INPUT, 1_000)),
+            "the restating hook moved the call and made it fire twice"
+        );
+        // state と記録時刻は名乗り直した hook のもの（表示は止めない）
+        assert_eq!(states.get(&id("s"), Some(0)).map(|r| r.at), Some(7_000));
+
+        // **開く hook が続けて 2 回来たら 2 回とも進む**（許可を 2 回求められた場面）
+        let temp = TempStore::new("twice");
+        record(&temp.path(), &id("s"), WAITING, opens, 1_000, None);
+        record(&temp.path(), &id("s"), WAITING, opens, 2_000, None);
+        assert_eq!(states_at(&temp.path()).alert(&id("s")), Some((NEEDS_INPUT, 2_000)));
+
+        // **間に別の hook が挟まれば、名乗り直しでも新しい待ち**
+        let temp = TempStore::new("after-a-turn");
+        record(&temp.path(), &id("s"), WAITING, opens, 1_000, None);
+        record(&temp.path(), &id("s"), WORKING, Alert::Silent, 2_000, None);
+        record(&temp.path(), &id("s"), WAITING, restates, 3_000, None);
+        assert_eq!(states_at(&temp.path()).alert(&id("s")), Some((NEEDS_INPUT, 3_000)));
+
+        // **種類が違えば黙らせない**（完了の後に来た待ちは別の呼び出し）
+        let temp = TempStore::new("other-kind");
+        record(&temp.path(), &id("s"), IDLE, Alert::Opens(FINISHED), 1_000, None);
+        record(&temp.path(), &id("s"), WAITING, restates, 2_000, None);
+        assert_eq!(states_at(&temp.path()).alert(&id("s")), Some((NEEDS_INPUT, 2_000)));
+
+        // **一度も記録の無い行では、名乗り直しがそのまま呼び出しを開く**
+        // （`PermissionRequest` が飛ばない経路 ＝ codex / worker の許可）
+        let temp = TempStore::new("alone");
+        record(&temp.path(), &id("s"), WAITING, restates, 1_000, None);
+        assert_eq!(states_at(&temp.path()).alert(&id("s")), Some((NEEDS_INPUT, 1_000)));
+    }
+
     /// **呼び出しの種類は保管を往復しても変わらない。** hook は別プロセスなので、
     /// 種類はファイルの綴り（[`ALERT_KEY`]）を通ってしか TUI へ届かない ＝
     /// 読みと書きで綴りがずれると**通知だけが黙って止まる**（行の表示は何も
@@ -1288,7 +1407,7 @@ mod tests {
     fn the_kind_of_call_survives_the_round_trip_through_the_file() {
         for kind in [NEEDS_INPUT, FINISHED] {
             let temp = TempStore::new("alert-round-trip");
-            record(&temp.path(), &id("s"), WAITING, Some(kind), 1_000, None);
+            record(&temp.path(), &id("s"), WAITING, Alert::Opens(kind), 1_000, None);
             assert_eq!(states_at(&temp.path()).alert(&id("s")), Some((kind, 1_000)));
         }
     }
