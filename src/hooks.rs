@@ -657,17 +657,43 @@ pub(crate) fn states_stamp() -> Option<(u64, std::time::SystemTime)> {
 /// hook と併存する（claude は設定ソースごとの hook を合成する。公式に文書化）。
 /// スカラーのキーは併存せず上書きになるので、**hook 以外は載せない**
 /// （[`settings_document`] のテストがそれを固定する）
-pub(crate) fn inject_settings() -> Option<Injection> {
-    // 内容は exe パスにしか依存せず、走っているプロセスの `current_exe()` は
-    // 自己更新でも変わらない ＝ **1 プロセス 1 回書けば足りる**。
-    // 失敗はキャッシュしない（次のセッション起動で再試行する）
-    static DONE: std::sync::OnceLock<Injection> = std::sync::OnceLock::new();
-    if let Some(done) = DONE.get() {
-        return Some(done.clone());
+///
+/// # 置き場は呼び手が渡す
+///
+/// 渡せるのは実データの供給元だけ（[`crate::source::DataSource::hook_dir`]）＝
+/// 撮影とテストはこの経路で実ユーザーのホームに触れない。以前はここが
+/// `ccdesk_dir()` を直に引いており、`open_session` を通るテストが本番の注入を
+/// そのまま走らせて、**`cargo test` が開発者の `~/.ccdesk/inject-settings.json` を
+/// libtest のテストバイナリのパスで上書きしていた**。上書きされたファイルを
+/// `--settings` として読んだ claude は、hook としてテストハーネスを起動する ＝
+/// state も会話も 1 件も記録されず、**その行は会話を確かめられないまま
+/// `-r` のピッカーで開く**（報告されたバグ）。
+///
+/// # 毎回書く
+///
+/// 内容は exe パスにしか依存しないので 1 プロセス 1 回でも足りるが、書くのは
+/// ユーザーがセッションを起こした瞬間だけで、実体は tmp → rename の 1 回。
+/// キャッシュすると、**外から壊されたファイルを ccdesk 自身が再起動まで
+/// 直せない**（上のバグが ccdesk を立て直すまで続いたのはそのため）。
+///
+/// **書き方は lib の 1 実装（tmp → rename）。** 素の `fs::write`（truncate →
+/// write）だと、複数インスタンスの同時起動で、書いている最中の空/部分 JSON を
+/// 別インスタンスが起こした claude が `--settings` として読み、そのセッションの
+/// state hook が黙って消える。
+/// 失敗も黙らない: hooks 無しで起動すると行の状態が縮退するので、ログに 1 行残す
+/// （呼び手は None を受けて下部バーにも出す。[`crate::app`]）
+pub(crate) fn inject_settings(dir: &Path) -> Option<Injection> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_fwd = exe.to_string_lossy().replace('\\', "/");
+    let path = dir.join("inject-settings.json");
+    if let Err(e) = write_json_atomically(&path, &settings_document(&exe_fwd)) {
+        ccdesk::log_error(&format!("could not write the hook settings: {e}"));
+        return None;
     }
-    let done = write_inject_settings()?;
-    let _ = DONE.set(done.clone());
-    Some(done)
+    Some(Injection {
+        exe: exe_fwd,
+        settings: path,
+    })
 }
 
 /// 書き出し済みの hook 注入。**agent ごとに使う部分が違う**
@@ -696,29 +722,6 @@ pub(crate) struct Injection {
 /// 同じ値だった頃の話で、ペインの中の `/clear` で崩れる前提だった。
 /// 立てるのは共通の口 1 箇所（[`crate::backend::Kind::spawn_command`]）
 pub(crate) const ROW_ENV: &str = "CCDESK_ROW";
-
-/// 注入ファイルの実書き込み。
-///
-/// **書き方は lib の 1 実装（tmp → rename）。** 素の `fs::write`（truncate →
-/// write）だと、複数インスタンスの同時起動で、書いている最中の空/部分 JSON を
-/// 別インスタンスが起こした claude が `--settings` として読み、そのセッションの
-/// state hook が黙って消える。
-/// 失敗も黙らない: hooks 無しで起動すると行の状態が縮退するので、ログに 1 行残す
-/// （呼び手は None を受けて下部バーにも出す。[`crate::app`]）
-fn write_inject_settings() -> Option<Injection> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = ccdesk::ccdesk_dir()?;
-    let exe_fwd = exe.to_string_lossy().replace('\\', "/");
-    let path = dir.join("inject-settings.json");
-    if let Err(e) = write_json_atomically(&path, &settings_document(&exe_fwd)) {
-        ccdesk::log_error(&format!("could not write the hook settings: {e}"));
-        return None;
-    }
-    Some(Injection {
-        exe: exe_fwd,
-        settings: path,
-    })
-}
 
 /// 注入する hook 1 本あたりのタイムアウト（秒）。claude 側の既定は 600 秒だが、
 /// ccdesk の hook は実測 170〜190ms（JSON を tmp → rename で 1 回書くだけ）なので、
@@ -903,6 +906,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **注入ファイルは渡された置き場にしか書かない。**
+    ///
+    /// 引数で受ける前は [`inject_settings`] が自分でホームを引いており、
+    /// `open_session` を通るテストが走るたびに開発者の
+    /// `~/.ccdesk/inject-settings.json` を**テストバイナリのパス**で上書きしていた
+    /// （そのファイルを読んだ claude の hook は libtest のハーネスを起動する ＝
+    /// state も会話も記録されず、行が `-r` のピッカーで開く）。
+    /// 置き場を呼び手に持たせたことがこのテストの対象
+    #[test]
+    fn the_injection_lands_only_where_the_caller_asked() {
+        let temp = crate::testutil::TempDir::new("hooks", "the_injection_lands_only_where_the_caller_asked");
+        let injection = inject_settings(temp.path()).expect("nothing was written");
+        assert_eq!(
+            injection.settings,
+            temp.join("inject-settings.json"),
+            "the injection did not land in the directory it was given"
+        );
+        assert!(injection.settings.exists(), "the injection file was not created");
+        assert!(
+            !injection.exe.contains('\\'),
+            "the command path must be / separated (claude runs hooks through bash)"
+        );
     }
 
     /// **state 引数の無い旧形式は、専用の表で解決する。** [`HOOK_EVENTS`] の並び順で
