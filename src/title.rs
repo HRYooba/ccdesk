@@ -382,8 +382,8 @@ type Stamp = (u64, Option<std::time::SystemTime>);
 /// （ファイルを 1 つも見ない）。
 ///
 /// **agent ごとの知識は 1 つも持たない。** 記録の場所・候補の並び・索引の在り処は
-/// すべて [`Backend`] に聞く（[`Backend::transcript_in`] /
-/// [`Backend::title_records`] / [`Backend::name_index`]）ので、agent を足すときに
+/// すべて [`crate::backend::Backend`] に聞く（[`crate::backend::Backend::transcript_in`] /
+/// [`crate::backend::Backend::title_records`] / [`crate::backend::Backend::name_index`]）ので、agent を足すときに
 /// このファイルは触らない
 pub(crate) struct Titles {
     /// agent ごとの記録の根。**None ＝ その agent の記録は読まない**
@@ -406,7 +406,7 @@ pub(crate) struct Titles {
     /// 撮影用の固定表。空でなければ記録より優先する
     /// （`--demo` は実セッションの名前を 1 つも出さない）
     fixed: HashMap<SessionId, String>,
-    /// agent 自身が記録の外に持っている会話名（[`Backend::name_index`]）
+    /// agent 自身が記録の外に持っている会話名（[`crate::backend::Backend::name_index`]）
     names: ConversationNames,
 }
 
@@ -463,7 +463,7 @@ impl Titles {
     ///
     /// **行を書き換えるのは `transcript` だけ**（解決した場所の記録）。表示名も
     /// `updated_at` も触らない ＝ **名前が変わってもマージの後勝ち判定は動かない**
-    /// （[`crate::sessions::merge_sessions`]。行の経過時間表示は既に廃止済みで、
+    /// （[`crate::sessions`] の `merge_sessions`。行の経過時間表示は既に廃止済みで、
     /// 今 `updated_at` が答えるのはこれだけ）。
     ///
     /// # 読む順が「どの行に名前が付くか」を決める
@@ -799,7 +799,7 @@ impl Titles {
 
     /// **その会話を再開できる cwd**（見つからない行は None ＝ 新規として起こす）。
     ///
-    /// 判断は agent が持つ（[`Backend::resume_cwd`]）。ここが渡すのは行の cwd と
+    /// 判断は agent が持つ（[`crate::backend::Backend::resume_cwd`]）。ここが渡すのは行の cwd と
     /// 解決済みの記録の場所だけで、**「その会話を確かめたか」は見ない**
     /// （判断は呼び手 1 箇所 ＝ `crate::app` の `relaunch`）
     pub(crate) fn resume_cwd(&self, row: &SessionRow) -> Option<String> {
@@ -810,7 +810,7 @@ impl Titles {
 
     /// 行の会話の記録の場所。**記録が生きている間は解決し直さない。**
     ///
-    /// 探し方そのものは agent が持つ（[`Backend::transcript_in`]）。ここが持つのは
+    /// 探し方そのものは agent が持つ（[`crate::backend::Backend::transcript_in`]）。ここが持つのは
     /// 「いつ探し直すか」と「行に書き戻すか」だけ。
     ///
     /// 戻り値の bool は「行の `transcript` 記録を書き換えたか」（呼び手が

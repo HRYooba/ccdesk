@@ -146,7 +146,7 @@ pub(crate) enum SelfUpdate {
     Idle,
     Running,
     /// 差し替え済み。反映は次回起動から（自動では再起動しない — 詳細は
-    /// [`crate::ui::UpdateState::RestartPending`]）ので、置いた先の exe パスは持たない
+    /// [`crate::ui`] の `UpdateState::RestartPending`）ので、置いた先の exe パスは持たない
     Done,
     /// 失敗。run ループが下部バーへ 1 度出して Idle へ戻す
     Failed(String),
@@ -664,7 +664,7 @@ pub(crate) struct App {
     ///
     /// **材料は 2 つ束ねている**: 行のドットの明滅（[`crate::poll::State::blinks`]）と、
     /// 使用率の取得中スピナー（[`Self::usage_fetching`]。回るのは本物のブライユ点字
-    /// アニメ ＝ [`crate::ui::usage_spinner_frame`]）。どちらも「今フレームを
+    /// アニメ ＝ [`crate::ui`] の `usage_spinner_frame`）。どちらも「今フレームを
     /// 速く描き直す必要があるか」という同じ問いに答えるので、
     /// 名前を「spinner」に寄せず両方を指せる名前にしてある
     pub(crate) animating: bool,
@@ -1730,7 +1730,8 @@ impl Enter {
 ///
 /// **キーボードの実行と下部バーの案内が読む唯一の写像。** 押しても何も起きない行は
 /// ここが `None` を返すことで表す ＝ 更新の無い版行（[`SidebarRow::Inert`]）と
-/// アカウント行（[`SidebarPos::Account`]）が同じ 1 つの答えを共有する
+/// 一覧の外を指す位置（かつてのアカウント行。[`SidebarPos::row`] が `Option` の
+/// まま残っている理由）が同じ 1 つの答えを共有する
 pub(crate) fn selected_enter(app: &App) -> Option<Enter> {
     let SidebarPos::Row(row) = app.selection;
     match app.sidebar_rows.get(row)?.action()? {
@@ -3203,7 +3204,7 @@ fn activate_popup(app: &mut App, index: usize) {
 }
 
 /// メニュー項目の実行。**副作用はここだけ**に集め、「どの項目が何を意味するか」の
-/// 判定は [`PopupKind::action`]（純関数）に置く
+/// 判定は [`PopupKind::entries`] が返す表（純関数）に置く
 fn run_popup_action(app: &mut App, action: PopupAction) {
     match action {
         // 開けたら打ち先はそのセッションなので、行クリックと同じくフォーカスを端末へ移す
@@ -3613,7 +3614,7 @@ pub(crate) fn move_selection(app: &mut App, dir: i32) {
 /// できるので、update.rs の 3 段改名（`.new` へ置く → 現行を `.old` へ退避 →
 /// `.new` を本体へ）がそのまま成立する。反映は次回起動なので、成功後は版行が
 /// "restart to update" の案内を出すだけに留める（自動では再起動しない ＝
-/// [`crate::ui::UpdateState::RestartPending`]）。利用者が自分のタイミングで
+/// [`crate::ui`] の `UpdateState::RestartPending`）。利用者が自分のタイミングで
 /// ccdesk を終了・起動し直すと新しい版が動く。`SelfUpdate::Done` はこのセッション中戻らない。
 /// 数 MB のダウンロードと SHA-256 検証が入るため別スレッドで行う
 fn start_ccdesk_update(app: &mut App) {
@@ -5910,7 +5911,7 @@ mod tests {
     /// **自動再起動はやめた**: 走ったまま自プロセスを起こすとコンソールを
     /// 親子で奪い合いマウスが効かなくなる不具合が実機で出たため、案内（"restart to update"）
     /// を出すだけに留め、利用者が自分のタイミングで終了・起動し直す運用にした
-    /// （[`crate::ui::UpdateState::RestartPending`]）。
+    /// （[`crate::ui`] の `UpdateState::RestartPending`）。
     #[test]
     fn the_done_row_offers_no_enter_and_does_nothing_when_pressed() {
         let mut app = app_with_every_row_kind();

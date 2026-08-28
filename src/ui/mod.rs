@@ -108,7 +108,7 @@ pub(crate) fn agent_glyph(kind: Kind) -> &'static str {
 const PINNED_TITLE: &str = "pinned";
 
 /// 行頭が食う桁 ＝ ペイン印 1 + ドット 1 + 名前との間の空白 1。
-/// **[`row_name_spans`] の予算と [`crate::app::MIN_SIDEBAR`] の根拠がこの値に乗る**ので、
+/// **[`row_name_spans`] の予算と [`MIN_SIDEBAR`] の根拠がこの値に乗る**ので、
 /// 行頭に何かを足したらテスト（`the_row_head_marks_are_one_column_wide`）が落ちる。
 /// `pub(crate)` なのは [`crate::source`] の撮影用サイドバー幅がここから桁を導くため
 /// （手で数えた桁を別ファイルに書き写さない）
@@ -362,7 +362,7 @@ fn usage_spans(
 ///
 /// マウスが乗っている間は帯（`hl_bg`）で「押せる」ことを示す。一覧の行の
 /// ホバーと同じ手段（[`Look`]）。**帯は背景だけ ＝ 幅を変えない**ので、
-/// 乗った瞬間に当たり判定（[`usage_hit`]）が動かない
+/// 乗った瞬間に当たり判定（[`usage_hits`]）が動かない
 fn usage_footer(app: &App) -> Vec<Vec<Span<'static>>> {
     if app.notice.is_some() {
         return Vec::new();
@@ -1047,7 +1047,7 @@ struct RowData {
     label: String,
     /// 今ペインに出ている行（[`Look::open`] の材料）
     is_active_window: bool,
-    /// 未読（[`crate::sessions::SessionRow::unread`]）＝ ドットの塗り（[`dot_glyph`]）
+    /// 未読（[`crate::hooks::HookStates::unread`]）＝ ドットの塗り（[`dot_glyph`]）
     unread: bool,
     /// ピン留め（[`PINNED_TITLE`] の節へ移す）
     pinned: bool,
@@ -1244,7 +1244,7 @@ fn account_row(status: &AccountStatus) -> (String, Style) {
 /// 記号を右端へ移したのに左端 x=1 固定のままだった頃は、画面の反対側から
 /// メニューが出ていた。
 ///
-/// 幅は内容が決める（[`crate::app::PopupKind::width`]）ので、サイドバーより広い
+/// 幅は内容が決める（[`popup_width`]）ので、サイドバーより広い
 /// メニューは記号に右端を合わせると左へはみ出す ＝ そのときは左端で止めて
 /// **右ペインへ被せる**。アカウント表示名や email を切って読めなくするより、
 /// 被せて全部読ませる方を選んだ。**この意図は描画順に依存する**（[`draw`] が
@@ -1424,7 +1424,7 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, app: &App) {
     // **無言の空白を作らない**のが要点。以前は「opt-in していない」
     // 「取得が効いていない」「枠が無いアカウント」「壊れた」が全部同じ
     // 見え方（何も出ない）で、opt-in したのに出ない人へ渡せる情報が無かった
-    // **当たり判定（[`usage_hit`]）と同じ導出**を通す
+    // **当たり判定（[`usage_hits`]）と同じ導出**を通す
     let usage_lines = usage_footer(app);
     let usage_w = usage_lines.iter().map(|l| span_width(l)).max().unwrap_or(0);
     let bar = Layout::default()
@@ -2416,7 +2416,7 @@ pub(crate) mod tests {
 
     /// **使用率はマウスが乗っている間だけ帯が乗る**（押せることを示す。
     /// 一覧の行のホバーと同じ手段）。帯は背景だけで**幅を変えない** ＝
-    /// 乗った瞬間に当たり判定（[`usage_hit`]）が動かない
+    /// 乗った瞬間に当たり判定（[`usage_hits`]）が動かない
     #[test]
     fn the_usage_gauge_is_banded_only_while_hovered() {
         let mut app = App {

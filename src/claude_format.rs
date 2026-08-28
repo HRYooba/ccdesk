@@ -212,11 +212,11 @@ pub(crate) const AGENT_KIND_INTERACTIVE: &str = "interactive";
 // **値が載らないセッションが実在する**（古い版・別の entrypoint で実測）。
 // 未観測との区別が付かないので、読み手は「status が無い」経路を必ず持つこと
 
-/// 応答生成中（[`crate::poll::WORKING`] へ写る）
+/// 応答生成中（[`crate::poll::State::Working`] へ写る）
 pub(crate) const AGENT_STATUS_BUSY: &str = "busy";
-/// ダイアログが開いていてユーザーの決定を待っている（[`crate::poll::WAITING`] へ写る）
+/// ダイアログが開いていてユーザーの決定を待っている（[`crate::poll::State::Waiting`] へ写る）
 pub(crate) const AGENT_STATUS_WAITING: &str = "waiting";
-/// プロンプトで待機（[`crate::poll::IDLE`] へ写る）
+/// プロンプトで待機（[`crate::poll::State::Idle`] へ写る）
 pub(crate) const AGENT_STATUS_IDLE: &str = "idle";
 /// idle だがバックグラウンド bash が走っている。
 ///

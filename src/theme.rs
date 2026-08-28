@@ -14,7 +14,7 @@ pub(crate) const FOCUS_BORDER: Color = Color::Reset;
 /// 通常テキスト = 端末のデフォルト前景（claude 本文と同じ）
 pub(crate) const MUTED_FG: Color = Color::Reset;
 
-/// 明滅 1 コマの表示時間。**描き直し間隔（[`crate::app::ANIMATION_REDRAW`]）が
+/// 明滅 1 コマの表示時間。**描き直し間隔（[`crate::app`] の `ANIMATION_REDRAW`）が
 /// この値から導かれる**ので、コマを増やしてもフレームは増えない
 /// （どちらも 200ms という数字を別々に持たない）
 pub(crate) const BLINK_TICK_MS: u64 = 200;
