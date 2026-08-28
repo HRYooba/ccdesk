@@ -2148,7 +2148,12 @@ fn update_notifications(app: &mut App) {
 /// 刻む ＝ **判定と写しの更新を 1 つの関数が返す**（2 つに割ると、撃った出来事と
 /// 次の周が比べる相手が別々の規則で決まる形になる）。
 ///
-/// `alert_of` はその行で最後に起きた呼び出し（[`crate::hooks::HookStates::alert`]）
+/// `alert_of` はその行で最後に起きた呼び出し（[`crate::hooks::HookStates::alert`]）。
+///
+/// **ここが見るのは時刻だけで、種類は見ない。** 同じ待ちを 2 つの hook が名乗る
+/// （`PermissionRequest` と `Notification`）ことは起きるが、その畳み込みは
+/// 保管へ書く側が済ませてある（[`crate::hooks::Alert`]）＝ ここへ来る時点で
+/// 時刻が違えば、それは別の呼び出し
 fn announce(
     windows: &[(SessionId, u64)],
     alert_of: impl Fn(&SessionId) -> Option<(crate::notify::Kind, u64)>,
