@@ -126,10 +126,8 @@ impl Kind {
         }
     }
 
-    /// 通知の名前（tag）に混ぜる種類。**行 ID だけを tag にしてはいけない**:
-    /// 同じ名前の通知は置き換えになり、**置き換えは鳴らない**（実測: 待ちの直後に
-    /// 完了を出すと、画面の文字だけが黙って差し替わる）。種類を混ぜておけば、
-    /// 待ちと完了は別物として鳴り、**同じ種類の繰り返しだけが置き換わる**
+    /// 通知の名前（tag）に混ぜる種類。行 ID だけを tag にすると待ちの直後の完了が
+    /// 同じ通知の更新になり、鳴らない。種類を混ぜて別の通知にする。
     #[cfg(windows)]
     fn tag_suffix(self) -> &'static str {
         match self {
@@ -323,10 +321,21 @@ fn try_show(
     let xml = XmlDocument::new()?;
     xml.LoadXml(&HSTRING::from(payload))?;
     let toast = ToastNotification::CreateToastNotification(&xml)?;
-    // **行と種類で 1 枚**（[`Kind::tag_suffix`]）。同じ行の同じ種類を続けて出せば
-    // 置き換わり、待ち → 完了は別物として鳴る
-    toast.SetTag(&HSTRING::from(format!("{}-{}", id.as_str(), kind.tag_suffix())))?;
-    toast.SetGroup(&HSTRING::from(GROUP))?;
+    let tag = HSTRING::from(format!("{}-{}", id.as_str(), kind.tag_suffix()));
+    let group = HSTRING::from(GROUP);
+    let app_id = HSTRING::from(APP_ID);
+    // Windows は同じ group + tag の Show を新規通知ではなく既存 toast の更新として
+    // 扱い、その更新は鳴らない。前回ぶんを明示的に取り下げてから同じ tag で出し、
+    // 毎 turn を新規通知として鳴らしつつ通知センターには 1 枚だけ残す。
+    if let Err(error) = ToastNotificationManager::History()
+        .and_then(|history| history.RemoveGroupedTagWithId(&tag, &group, &app_id))
+    {
+        // 掃除に失敗しても Show は続ける。最悪でも従来どおり既存 toast の更新に
+        // 戻るだけで、通知経路そのものを止める理由にはならない。
+        report(&format!("could not retire the previous desktop notification: {error}"));
+    }
+    toast.SetTag(&tag)?;
+    toast.SetGroup(&group)?;
 
     let clicked = id.clone();
     toast.Activated(&TypedEventHandler::<ToastNotification, IInspectable>::new(
@@ -338,7 +347,7 @@ fn try_show(
         },
     ))?;
 
-    ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))?.Show(&toast)?;
+    ToastNotificationManager::CreateToastNotifierWithId(&app_id)?.Show(&toast)?;
     Ok(())
 }
 
