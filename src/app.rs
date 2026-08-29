@@ -2109,10 +2109,10 @@ fn observed_state(
 ///
 /// # 今の材料
 ///
-/// hook は `PermissionRequest` / `Notification` で**呼んでいる**ことを、
-/// `Stop` / `StopFailure` で**終わった**ことを、agent 自身が名乗る
-/// （[`crate::hooks::HOOK_EVENTS`] の `alert` 列）。ユーザーが開いたダイアログは
-/// hook を 1 つも撃たないので、**構造的に鳴らない**。
+/// hook は `Notification` で**呼んでいる**ことを、`Stop` / `StopFailure` で
+/// **終わった**ことを、agent 自身が名乗る（[`crate::hooks::HOOK_EVENTS`] の
+/// `alert` 列）。ユーザーが開いたダイアログは hook を 1 つも撃たないので、
+/// **構造的に鳴らない**。
 ///
 /// 補正ビットも要らなくなる:
 ///
@@ -2161,10 +2161,9 @@ fn update_notifications(app: &mut App) {
 ///
 /// `alert_of` はその行で最後に起きた呼び出し（[`crate::hooks::HookStates::alert`]）。
 ///
-/// **ここが見るのは時刻だけで、種類は見ない。** 同じ待ちを 2 つの hook が名乗る
-/// （`PermissionRequest` と `Notification`）ことは起きるが、その畳み込みは
-/// 保管へ書く側が済ませてある（[`crate::hooks::Alert`]）＝ ここへ来る時点で
-/// 時刻が違えば、それは別の呼び出し
+/// **ここが見るのは時刻だけで、種類は見ない。** 1 つの呼び出しを名乗る hook は
+/// 1 つしかない（[`crate::hooks::Alert`]）＝ 時刻が違えば、それは別の呼び出し。
+/// 「同じ待ちの 2 回目の名乗りか」をここで推し量る必要は無い
 fn announce(
     windows: &[(SessionId, u64)],
     alert_of: impl Fn(&SessionId) -> Option<(crate::notify::Kind, u64)>,

@@ -122,6 +122,7 @@ pub(crate) fn run_doctor() -> anyhow::Result<()> {
     check_account().report(&mut failed);
     check_usage().report(&mut failed);
     check_ccdesk_dir().report(&mut failed);
+    check_notifications().report(&mut failed);
     check_terminal_colors().report(&mut failed);
 
     if failed {
@@ -331,6 +332,49 @@ fn check_terminal_colors() -> Check {
     }
 }
 
+/// OS 通知の設定と、**それを黙って無効にしている環境**を報告する。
+///
+/// 診るのは設定だけでは分からない食い違い 1 つ:
+/// claude の待ち通知は claude 自身の `Notification` が撃つので、
+/// [`crate::notify::CLAUDE_PERMISSION_NOTIFY_OFF`] が立っている環境では
+/// ccdesk の設定で `waiting` を選んでいても claude では鳴らない。
+/// **画面は今までどおり黄色になる**ので、通知が出ないことにしか現れない
+/// ＝ 気づける場所がここしか無い。
+///
+/// codex は同じ env を読まない（許可待ちは codex の `PermissionRequest` が
+/// 撃つ。[`crate::hooks::HOOK_EVENTS`]）ので、警告の文面もそう書く
+fn check_notifications() -> Check {
+    let wanted = crate::notify::configured();
+    let value = std::env::var(crate::notify::CLAUDE_PERMISSION_NOTIFY_OFF).unwrap_or_default();
+    notifications_check(wanted, crate::notify::env_is_on(&value))
+}
+
+/// [`check_notifications`] の判断だけを取り出したもの（環境を触らずに検査できる）
+fn notifications_check(wanted: crate::notify::Wanted, disabled: bool) -> Check {
+    let mut on = Vec::new();
+    if wanted.waiting {
+        on.push("waiting");
+    }
+    if wanted.finished {
+        on.push("done");
+    }
+    if on.is_empty() {
+        return Check::Ok(
+            "desktop notifications: off (set \"notify\" in ~/.ccdesk/config.json)".to_string(),
+        );
+    }
+    let on = on.join(", ");
+    if wanted.waiting && disabled {
+        return Check::Warn(format!(
+            "desktop notifications: {on}; {} is set, so claude never fires the \
+             permission notification and waiting alerts stay silent for claude rows \
+             (they still turn yellow; codex rows are unaffected)",
+            crate::notify::CLAUDE_PERMISSION_NOTIFY_OFF
+        ));
+    }
+    Check::Ok(format!("desktop notifications: {on}"))
+}
+
 /// ~/.ccdesk/error.log のパスを表示し、末尾 50 行を出力する。
 /// ファイルが無ければ "no errors logged" と表示
 pub(crate) fn show_logs() -> anyhow::Result<()> {
@@ -350,4 +394,70 @@ pub(crate) fn show_logs() -> anyhow::Result<()> {
         Err(_) => println!("no errors logged"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::notify::{Wanted, CLAUDE_PERMISSION_NOTIFY_OFF};
+
+    fn shown(check: Check) -> (&'static str, String) {
+        match check {
+            Check::Ok(msg) => ("ok", msg),
+            Check::Warn(msg) => ("warn", msg),
+            Check::Fail(msg) => ("FAIL", msg),
+        }
+    }
+
+    /// **設定で待ちを選んでいるのに claude 側が黙る環境を、診断で名指しする。**
+    ///
+    /// claude の待ち通知は claude 自身の `Notification` が撃つので、この env が
+    /// 立っていると ccdesk の設定に関わらず claude 行では鳴らない。行は今までどおり
+    /// 黄色になる ＝ **通知が出ないことにしか現れない**ので、ここで言わなければ
+    /// 気づける場所が無い。完了通知だけを選んでいる人には関係が無いので黙る
+    #[test]
+    fn the_doctor_names_the_env_that_silences_claude_waiting_alerts() {
+        let waiting = Wanted { waiting: true, finished: false };
+        let done = Wanted { waiting: false, finished: true };
+
+        let (level, msg) = shown(notifications_check(waiting, true));
+        assert_eq!(level, "warn", "a silenced waiting alert was reported as fine");
+        assert!(msg.contains(CLAUDE_PERMISSION_NOTIFY_OFF), "the env is not named: {msg}");
+
+        assert_eq!(shown(notifications_check(waiting, false)).0, "ok");
+
+        // **claude 自身の読み方に合わせる**（`env_is_on`）: 値があるだけでは
+        // 立っていない ＝ `=""` や `=0` の人へ、出ているはずの通知を探させない
+        for off in ["", " ", "0", "false", "no", "off"] {
+            assert_eq!(
+                shown(notifications_check(waiting, crate::notify::env_is_on(off))).0,
+                "ok",
+                "{off:?} was read as a set flag"
+            );
+        }
+        for on in ["1", "true", " TRUE ", "yes", "on"] {
+            assert_eq!(
+                shown(notifications_check(waiting, crate::notify::env_is_on(on))).0,
+                "warn",
+                "{on:?} was not read as a set flag"
+            );
+        }
+        // 完了だけを選んでいる人には効かない env なので、立っていても黙る
+        assert_eq!(shown(notifications_check(done, true)).0, "ok");
+    }
+
+    /// **何を出す設定なのかがそのまま出る**（通知が出ない、の相談で最初に見る行）。
+    /// 1 つも選んでいなければ、切れていること自体と設定の場所を答える
+    #[test]
+    fn the_doctor_reports_which_notifications_are_configured() {
+        let both = Wanted { waiting: true, finished: true };
+        let (level, msg) = shown(notifications_check(both, false));
+        assert_eq!(level, "ok");
+        assert!(msg.contains("waiting, done"), "the configured events are missing: {msg}");
+
+        let (level, msg) = shown(notifications_check(Wanted::default(), false));
+        assert_eq!(level, "ok");
+        assert!(msg.contains("notify"), "the setting to write is not named: {msg}");
+    }
 }
