@@ -261,6 +261,7 @@ fn main() -> anyhow::Result<()> {
         fixed_states,
         notify,
         announced: std::collections::HashMap::new(),
+        typed_at: std::collections::HashMap::new(),
         // 起動時の見え方を先に控える（run ループの 1 周目が「変わった」と誤解しない）
         hook_stamp: source.hook_stamp(),
         titles: source.titles(),

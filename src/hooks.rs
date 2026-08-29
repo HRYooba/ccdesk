@@ -633,7 +633,23 @@ pub(crate) fn run_hook(
     let fired_at = now_ms();
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
-    let Some(entry) = hook_entry(event, state, alert, &input) else {
+    let entry = hook_entry(event, state, alert, &input);
+    // **追跡ログは受理できなかった回も残す**（`CCDESK_ROW` の抜けや表に無い組は、
+    // 保管に何も現れないので保管を見ても分からない）。既定では 1 行も書かない
+    // （`ccdesk::hook_log_enabled`）
+    ccdesk::log_hook_event(&json!({
+        "at": fired_at,
+        "wrote_at": now_ms(),
+        "event": event,
+        "state_arg": state,
+        "alert_arg": alert,
+        // **claude が名乗る通知の種別**（`Notification` の payload だけが持つ）。
+        // どの待ちで撃たれたのかは、これでしか後から言えない
+        "notification_type": notification_type_of(&input),
+        "row": entry.as_ref().map(|entry| entry.row.as_str()),
+        "alert": entry.as_ref().and_then(|entry| entry.alert.kind()).map(crate::notify::Kind::as_str),
+    }));
+    let Some(entry) = entry else {
         return Ok(());
     };
     if let Some(path) = ccdesk::hook_states_path() {
@@ -647,6 +663,23 @@ pub(crate) fn run_hook(
         );
     }
     Ok(())
+}
+
+/// hook 入力の `notification_type`（`Notification` の payload にだけある）。
+///
+/// **公式ドキュメントには載っていないが実在する。** claude 本体（2.1.251）の
+/// スキーマがこの形:
+/// `{hook_event_name:"Notification", message, title?, notification_type}`。
+/// matcher が突き合わせているのもこの値なので、**どの待ちで撃たれたのか**は
+/// これでしか後から言えない（載っていないと読んで消す前に、`claude` の
+/// バイナリで `hook_event_name:N("Notification")` を引くこと）。
+///
+/// **追跡ログ専用**で、行の状態にも通知にも使わない: 何を撃つかは表
+/// （[`HOOK_EVENTS`]）と matcher が決めており、ここで種別を読み直すと
+/// **同じ判断が 2 箇所**になる
+fn notification_type_of(input: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(input).ok()?;
+    Some(value.get("notification_type")?.as_str()?.to_string())
 }
 
 /// hook 1 回で保管へ載せるもの（イベント名・state 引数・stdin・環境から決まる）。
