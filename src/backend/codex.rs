@@ -430,10 +430,15 @@ fn hook_toml(exe: &str) -> Option<String> {
         } else {
             HOOK_TIMEOUT_SECS
         };
+        // **alert まで運ぶ。** 同じ (event, state) でも呼び出しは agent ごとに
+        // 違う（`PermissionRequest` は codex だけが開く）＝ hook の子プロセスは
+        // 自分がどちらの下に居るかを知らないので、注入する側が答えを載せる
+        // （[`crate::hooks::Alert`]）
         by_event.entry(row.event).or_default().push(format!(
-            "{{hooks=[{{type='command',command='{exe} hook {} {}',timeout={timeout}}}]}}",
+            "{{hooks=[{{type='command',command='{exe} hook {} {} {}',timeout={timeout}}}]}}",
             row.event,
             row.state.as_str(),
+            row.alert.as_str(),
         ));
     }
     if by_event.is_empty() {
@@ -598,20 +603,56 @@ mod tests {
     /// 読み込みに失敗し、hook が 1 つも効かなくなる。
     ///
     /// **誰が持つかの正本は [`HOOK_EVENTS`] の 1 表**（かつてはここに部分集合の
-    /// 一覧を別に持っていて、表と 2 箇所で食い違い得た）
+    /// 一覧を別に持っていて、表と 2 箇所で食い違い得た）。
+    ///
+    /// **問うのは行ごとではなくイベントごと。** 同じイベントが agent 別に
+    /// 2 枚並ぶことがある（`PermissionRequest` は claude 用と codex 用で
+    /// `alert` だけが違う）ので、行ごとに聞くと codex 用の 1 枚で載った
+    /// イベントを claude 用の 1 枚が「載っていないはず」と言うことになる
     #[test]
     fn only_the_events_codex_has_are_injected() {
         let toml = hook_toml("C:/ccdesk.exe").expect("no hooks were built");
         for row in HOOK_EVENTS {
             let present = toml.contains(&format!("{}=[", row.event));
+            let wanted = HOOK_EVENTS
+                .iter()
+                .any(|other| other.event == row.event && other.has(Kind::Codex));
             assert_eq!(
                 present,
-                row.has(Kind::Codex),
+                wanted,
                 "{} is {} in the injected TOML",
                 row.event,
                 if present { "present" } else { "missing" }
             );
         }
+    }
+
+    /// **codex の `PermissionRequest` は呼び出しを開いたまま**（`needs_input` を
+    /// 引数として運ぶ）。claude 側は 6 秒ゲート付きの `Notification` が呼び出しを
+    /// 開くのでこの hook を `silent` へ降ろしたが、codex にその受け皿は無く、
+    /// ここを黙らせると**許可待ちが 1 度も通知されない**
+    #[test]
+    fn the_codex_permission_hook_still_opens_a_call() {
+        let row = HOOK_EVENTS
+            .iter()
+            .find(|row| row.event == "PermissionRequest" && row.has(Kind::Codex))
+            .expect("codex lost its permission hook");
+        assert_eq!(
+            row.alert.kind(),
+            Some(crate::notify::Kind::NeedsInput),
+            "codex's permission wait no longer calls the user"
+        );
+        // その答えが実際にコマンドへ載る（載らなければ受け口は静かな方を採る）
+        let toml = hook_toml("C:/ccdesk.exe").expect("no hooks were built");
+        assert!(
+            toml.contains(&format!(
+                "hook {} {} {}",
+                row.event,
+                row.state.as_str(),
+                row.alert.as_str()
+            )),
+            "{toml}"
+        );
     }
 
     /// **Esc 中断は `Interrupt` が名乗る**（codex 0.150 で増えたイベント）。

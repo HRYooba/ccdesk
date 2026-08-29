@@ -59,13 +59,15 @@ fn main() -> anyhow::Result<()> {
         }
         Some("doctor") => return run_doctor(),
         Some("logs") => return show_logs(),
-        // セッションの状態を受け取る内部フック（`--settings` で注入し、
-        // 子の claude が turn ごとに `ccdesk hook <event> <state>` として起こす。
-        // state 無しは旧 settings で起きたセッションからの呼び出し）
+        // セッションの状態を受け取る内部フック（`--settings` / `-c` で注入し、
+        // 子の agent が turn ごとに `ccdesk hook <event> <state> <alert>` として
+        // 起こす。引数が足りないのは更新前の ccdesk が注入した設定で起きている
+        // セッションからの呼び出し ＝ 受け口側が補う）
         Some("hook") => {
             let event = std::env::args().nth(2).unwrap_or_default();
             let state = std::env::args().nth(3);
-            return hooks::run_hook(&event, state.as_deref());
+            let alert = std::env::args().nth(4);
+            return hooks::run_hook(&event, state.as_deref(), alert.as_deref());
         }
         // セッション間の受け渡し（[`crate::relay`]）。**セッションの中の agent が叩く**
         // 前提なので、TUI を起こさずここで終わる
@@ -165,16 +167,13 @@ fn main() -> anyhow::Result<()> {
     // 表示と違い、他の作業へ割り込む ＝ 入れた覚えのない割り込みを誰にも起こさない。
     // **撮影用の供給元では常に off**（画面を撮っている最中にトーストを出さない）。
     //
-    // **単値でも読む。** 配列で書く設定はこれが最初なので、`"notify": "on"` と
-    // 書いた人の config を黙って無効にしない（意味は [`crate::notify::wanted`] が持つ）。
-    // **判断はここ 1 箇所**で、以降は `App::notify` が答える
+    // 設定の読み方（単値も配列も受ける）は [`crate::notify::configured`] が持つ ＝
+    // `ccdesk doctor` の診断と同じ答えを見る。
+    // **撮影用かどうかの判断はここ 1 箇所**で、以降は `App::notify` が答える
     let notify = if demo {
         notify::Wanted::default()
     } else {
-        let settings = ccdesk::settings_snapshot();
-        let mut values = settings.list("notify");
-        values.extend(settings.string("notify"));
-        notify::wanted(&values)
+        notify::configured()
     };
     // 使用率の更新を run ループへ伝える旗と、クリック起点の取得が進行中か。
     // 供給元と App が同じものを持つ

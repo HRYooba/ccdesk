@@ -323,7 +323,7 @@ pub fn sessions_store_path() -> Option<std::path::PathBuf> {
 }
 
 /// hook が書いた state の受け渡し先 ~/.ccdesk/hook-states.json。
-/// 子の claude へ `--settings` で注入した hook（`ccdesk hook <event>`）が書き、
+/// 子の agent へ注入した hook（`ccdesk hook …`。引数の形は `crate::hooks` が決める）が書き、
 /// TUI が周期的に読む（`crate::hooks` が形式の正本）
 pub fn hook_states_path() -> Option<std::path::PathBuf> {
     Some(ccdesk_dir()?.join("hook-states.json"))

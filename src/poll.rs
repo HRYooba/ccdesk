@@ -697,7 +697,8 @@ impl Grouping {
 /// **行の状態。これ 1 つが語彙の正本**で、3 つの顔を持つ:
 ///
 /// - **保存と CLI 引数**（[`Self::as_str`] / [`Self::parse`]）: hook は
-///   `ccdesk hook <event> <state>` として飛び、`hook-states.json` に文字列で残る
+///   hook の引数として飛び（形は [`crate::hooks::HOOK_EVENTS`] が決める）、
+///   `hook-states.json` に文字列で残る
 /// - **画面**（[`Self::title`] / [`Self::color`] / [`Self::blinks`]）: 行のドット・
 ///   節の見出しが同じここを読む
 /// - **並び**（[`Self::ORDER`] と [`Ord`]）: 上ほどユーザーがすることがある

@@ -186,6 +186,41 @@ pub(crate) fn wanted(values: &[String]) -> Wanted {
     wanted
 }
 
+/// 設定（`~/.ccdesk/config.json` の `"notify"`）を読んで [`Wanted`] を作る。
+///
+/// **設定を読むのはここ 1 箇所**（TUI の起動と `ccdesk doctor` が同じ答えを見る）。
+/// 2 箇所で読むと、診断が「出る」と言った通知が実際には出ない状態を作れてしまう。
+///
+/// **単値でも読む**（`"notify": "on"`）: 配列で書く設定はこれが最初なので、
+/// 単値で書いた人の config を黙って無効にしない。値の意味は [`wanted`]
+pub(crate) fn configured() -> Wanted {
+    let settings = ccdesk::settings_snapshot();
+    let mut values = settings.list("notify");
+    values.extend(settings.string("notify"));
+    wanted(&values)
+}
+
+/// claude 側で**許可待ちの通知そのものを止める** env（claude が読む値。実測で
+/// バイナリ内に確認）。
+///
+/// これが立っている環境では claude が `Notification`（`permission_prompt`）を
+/// 一度も撃たない ＝ ccdesk の待ち通知は claude では鳴らない
+/// （黄色の表示は `PermissionRequest` が出すので残る。[`crate::hooks::HOOK_EVENTS`]）。
+/// **ccdesk からは外せない**（外すと「ユーザーが自分で切ったもの」を勝手に戻すことになる）
+/// ので、診断で伝えるだけにする（`ccdesk doctor`）
+pub(crate) const CLAUDE_PERMISSION_NOTIFY_OFF: &str =
+    "CLAUDE_CODE_DISABLE_PERMISSION_PROMPT_NOTIFY_HOOKS";
+
+/// claude の env 旗が**立っているか**（[`CLAUDE_PERMISSION_NOTIFY_OFF`] の読み方）。
+///
+/// **claude 自身の解釈に合わせる**（実測: 前後の空白を落として小文字化し、
+/// `1` / `true` / `yes` / `on` だけを真と読む）。「値があるかどうか」で判定すると、
+/// `=""` や `=0` で**切っていない**人にまで診断が警告を出す ＝ 出ていない通知を
+/// 探させる。無い旗を有ると読む方が、有る旗を見落とすより害が大きい
+pub(crate) fn env_is_on(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
 /// 行の出来事を 1 件知らせる。`project` は行の cwd の末端、`session` は
 /// 行の表示名、`id` は**クリックされたときに開く行**。
 ///
