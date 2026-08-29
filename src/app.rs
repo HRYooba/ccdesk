@@ -546,6 +546,17 @@ pub(crate) struct App {
     /// **覚えるのはこれだけ**（前の周の state の写しは持たない）。同じ出来事を
     /// 毎周撃たないための 1 本で、窓の無くなった行は落とすので行数で有界
     pub(crate) announced: std::collections::HashMap<SessionId, u64>,
+    /// その行へ**ユーザーが最後に打鍵した時刻**（epoch ms。[`send_to_active`]）。
+    ///
+    /// **通知は「呼び戻す相手が居ない」ときに撃たない**ための材料。agent 側の
+    /// ゲート（claude は許可待ちの通知を 6 秒のタイマーで予約し、答えられたら
+    /// 取り消す）は**撃つ前**にしか効かず、撃った後の配送
+    /// （hook のプロセス起動 → 保管 → TUI の周回）に 0.2〜0.5 秒かかる ＝ その間に
+    /// 答えたユーザーには、答えた直後にトーストが出る（報告された症状）。
+    /// 打鍵したのは ccdesk 自身なので、この 1 本だけは agent に聞かずに答えられる。
+    ///
+    /// **窓の無くなった行は落とす**（[`update_notifications`]）＝ 行数で有界
+    pub(crate) typed_at: std::collections::HashMap<SessionId, u64>,
     /// 最後に見た hook 受け渡しファイルの見え方（長さ・更新時刻）。
     /// **中身ではなく「変わったか」だけを持つ**ので、run ループが毎周見ても安い。
     /// 変わった周は周期を待たずに一覧を読み直す ＝ ペイン内の `/resume` `/clear` が
@@ -716,6 +727,7 @@ impl Default for App {
             fixed_states: std::collections::HashMap::new(),
             notify: crate::notify::Wanted::default(),
             announced: std::collections::HashMap::new(),
+            typed_at: std::collections::HashMap::new(),
             hook_stamp: None,
             titles: Titles::default(),
             last_scan: std::time::Instant::now(),
@@ -1279,6 +1291,12 @@ fn send_to_active(app: &mut App, bytes: &[u8]) {
     // **マウス転送はここを通らない**ので、ホイールで戻した位置は保たれる
     window.parser.lock_recover().screen_mut().set_scrollback(0);
     if window.send(bytes).is_ok() {
+        // **打鍵した行は「見ている行」**（[`App::typed_at`]）。通知はこれより
+        // 古い呼び出しを撃たない ＝ 自分で答えた待ちで呼び戻されない。
+        // **`ccdesk send`（別プロセスからの中継）はここを通らない**:
+        // あちらは人が端末の前に居る証拠にならない
+        let id = window.session_id.clone();
+        app.typed_at.insert(id, ccdesk::now_ms());
         return;
     }
     let id = window.session_id.clone();
@@ -2138,16 +2156,34 @@ fn update_notifications(app: &mut App) {
                 .then(|| (window.session_id.clone(), window.started_at))
         })
         .collect();
+    // 窓の無くなった行の打鍵は覚えておく理由が無い（`announced` と同じ有界化）
+    app.typed_at
+        .retain(|id, _| windows.iter().any(|(open, _)| open == id));
     let hook_states = std::mem::take(&mut app.hook_states);
+    let typed_at = std::mem::take(&mut app.typed_at);
     let fired = announce(
         &windows,
         |id| hook_states.alert(id),
+        |id| typed_at.get(id).copied(),
         &mut app.announced,
         app.notify,
     );
     app.hook_states = hook_states;
+    app.typed_at = typed_at;
     for (id, kind) in fired {
-        let Some(row) = app.sessions.iter().find(|row| row.session_id == id) else {
+        let row = app.sessions.iter().find(|row| row.session_id == id);
+        // **撃った側の記録**（既定では書かない。`ccdesk::hook_log_enabled`）。
+        // hook 側の記録と対で読むと「鳴った通知がどの hook から来たか」が
+        // 推測なしで言える ＝ 通知の相談を証跡で閉じられる。
+        // **一覧にまだ行が無くて出せなかった回も残す**（そこを黙ると、
+        // 「TUI が見なかった」と「見たが出せなかった」が同じ空白に見える）
+        ccdesk::log_hook_event(&serde_json::json!({
+            "posted": kind.as_str(),
+            "row": id.as_str(),
+            "alert_at": app.announced.get(&id),
+            "dropped": row.is_none().then_some("row is not in the list yet"),
+        }));
+        let Some(row) = row else {
             continue;
         };
         let project = crate::ui::leaf_name(&row.cwd).unwrap_or_else(|| row.cwd.clone());
@@ -2167,6 +2203,7 @@ fn update_notifications(app: &mut App) {
 fn announce(
     windows: &[(SessionId, u64)],
     alert_of: impl Fn(&SessionId) -> Option<(crate::notify::Kind, u64)>,
+    typed_at: impl Fn(&SessionId) -> Option<u64>,
     announced: &mut std::collections::HashMap<SessionId, u64>,
     wanted: crate::notify::Wanted,
 ) -> Vec<(SessionId, crate::notify::Kind)> {
@@ -2189,6 +2226,14 @@ fn announce(
         // ではなく「見た出来事」なら、設定を途中で入れ替えても過去の出来事が
         // 遡って鳴らない
         announced.insert(id.clone(), at);
+        // **その呼び出しの後にユーザーがその行へ打鍵していたら撃たない。**
+        // 呼び戻す相手は既にその行を見ている ＝ 呼ぶ理由が無い。agent 側の
+        // ゲートでは埋まらない差（[`App::typed_at`]）で、これが「答えた瞬間に
+        // 鳴る」の最後の 1 本。**撃たなくても `announced` には刻む**ので、
+        // 同じ出来事が後の周で蒸し返されない
+        if typed_at(id).is_some_and(|typed| typed >= at) {
+            continue;
+        }
         if wanted.wants(kind) {
             fired.push((id.clone(), kind));
         }
@@ -4354,7 +4399,7 @@ mod tests {
             let mut out = Vec::new();
             for alert in rounds {
                 out.extend(
-                    announce(windows, |_| *alert, &mut announced, wanted)
+                    announce(windows, |_| *alert, |_| None, &mut announced, wanted)
                         .into_iter()
                         .map(|(_, kind)| kind),
                 );
@@ -4402,6 +4447,7 @@ mod tests {
         let two = announce(
             &[row("b", 0), row("a", 0)],
             |_| Some((Kind::Finished, 1_000)),
+            |_| None,
             &mut announced,
             all,
         );
@@ -4410,8 +4456,38 @@ mod tests {
             vec!["a", "b"]
         );
         // 窓の無くなった行の記録は残さない（覚えるのは今動いている行だけ）
-        announce(&[], |_| Some((Kind::Finished, 1_000)), &mut announced, all);
+        announce(&[], |_| Some((Kind::Finished, 1_000)), |_| None, &mut announced, all);
         assert!(announced.is_empty(), "the memo outlived the windows");
+    }
+
+    /// **自分で答えた待ちで呼び戻されない。**
+    ///
+    /// agent 側のゲート（claude は許可待ちの通知を 6 秒のタイマーで予約し、
+    /// 答えられたら取り消す）は撃つ前にしか効かない。撃った後の配送に
+    /// 0.2〜0.5 秒かかるので、その間に答えた人には**答えた直後にトーストが出る**
+    /// （報告された症状）。打鍵は ccdesk 自身が書いているので、そこで止める。
+    ///
+    /// **止めた回も「見た」ことにする**（`announced` に刻む）＝ 打鍵の記録が
+    /// 消えた後の周で、同じ出来事が蒸し返されない
+    #[test]
+    fn a_call_the_user_already_answered_is_not_announced() {
+        use crate::notify::{Kind, Wanted};
+
+        let all = Wanted { waiting: true, finished: true };
+        let one = [(SessionId::new("s"), 0u64)];
+        let fired = |typed: Option<u64>, announced: &mut std::collections::HashMap<_, _>| {
+            announce(&one, |_| Some((Kind::NeedsInput, 2_000)), |_| typed, announced, all)
+        };
+
+        // 呼び出しの後に打鍵している ＝ 端末の前に居る
+        let mut announced = std::collections::HashMap::new();
+        assert!(fired(Some(2_001), &mut announced).is_empty());
+        // **蒸し返さない**: 打鍵の記録が消えても、その出来事はもう見たもの
+        assert!(fired(None, &mut announced).is_empty(), "a suppressed call came back");
+
+        // 呼び出しより前の打鍵は関係が無い（席を立った後に呼ばれた）
+        let mut announced = std::collections::HashMap::new();
+        assert_eq!(fired(Some(1_999), &mut announced).len(), 1);
     }
 
     /// ポップアップ・ヒットテスト判定に必要な最小の App。

@@ -263,6 +263,68 @@ pub fn error_log_path() -> Option<std::path::PathBuf> {
     Some(ccdesk_dir()?.join("error.log"))
 }
 
+/// hook の追跡ログ ~/.ccdesk/hook-log.jsonl のパス。
+///
+/// **通知が「鳴った・鳴らない」を後から決着させるための記録**で、既定では 1 行も
+/// 書かない（`config.json` の `"hook_log": "on"` で入る。[`hook_log_enabled`]）。
+/// error.log と分けるのは、こちらが**正常時にも毎ターン書く**ため
+pub fn hook_log_path() -> Option<std::path::PathBuf> {
+    Some(ccdesk_dir()?.join("hook-log.jsonl"))
+}
+
+/// 追跡ログを書くか（`config.json` の `"hook_log"`）。
+///
+/// **hook の子プロセスと TUI の両方が読む**ので、env ではなく設定に置く
+/// （env だと、TUI から起こした agent の hook にしか渡らない）。
+///
+/// **書けるのはユーザーの手だけ**（ccdesk はこのキーを保存しない）＝ 読みは
+/// 寛容にする: 文字列の `"on"` / `"true"` / `"1"` / `"yes"` と、**JSON の真偽値
+/// `true`** を受ける。ここを `"on"` だけにすると、`true` と書いた人には
+/// 「診断の口そのものが壊れている」ようにしか見えない（エラーも出ない）
+pub fn hook_log_enabled() -> bool {
+    let Some(value) = settings_path().as_deref().and_then(read_json) else {
+        return false;
+    };
+    match value.get("hook_log") {
+        Some(serde_json::Value::Bool(on)) => *on,
+        Some(serde_json::Value::String(text)) => matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "on" | "true" | "1" | "yes"
+        ),
+        _ => false,
+    }
+}
+
+/// 追跡ログへ 1 行追記する（有効なときだけ。[`hook_log_enabled`]）。
+///
+/// **1 行 1 JSON**（jsonl）で、書き手は hook の子プロセスと TUI の 2 つ。
+/// 大きくなり続けないよう、[`HOOK_LOG_LIMIT`] を超えたら書くのをやめる
+/// （消して回すより、超えたことが分かる方が診断としては素直）
+pub fn log_hook_event(line: &serde_json::Value) {
+    if !hook_log_enabled() {
+        return;
+    }
+    let Some(path) = hook_log_path() else {
+        return;
+    };
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > HOOK_LOG_LIMIT {
+        return;
+    }
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        // **1 行 = 1 回の write。** `writeln!` は Display の断片ごとに write を出すので、
+        // hook の子プロセスが同時に走った回（＝ まさに診断したい混み合った瞬間）に
+        // 行が混ざり、jsonl として読めなくなる。組み立ててから 1 回で書く
+        let mut line = line.to_string();
+        line.push('\n');
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 追跡ログの上限（バイト）。超えたら書かない ＝ 診断のために付けた口が
+/// ディスクを埋めない
+const HOOK_LOG_LIMIT: u64 = 4 * 1024 * 1024;
+
 /// ccdesk のユーザー設定（グルーピング選択・使用率表示の opt-in 等）。~/.ccdesk/config.json
 fn settings_path() -> Option<std::path::PathBuf> {
     Some(ccdesk_dir()?.join("config.json"))
