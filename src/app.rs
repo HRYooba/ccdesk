@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use crate::backend::{Inject, Kind, Launch};
 use crate::session::Session;
 use crate::sessions::{SessionId, SessionRow};
-use crate::source::{DataSource, PollSinks, WindowItem, PROJECTS_LIMIT};
+use crate::source::{DataSource, PollSinks, SlotView, WindowItem, PROJECTS_LIMIT};
 use crate::title::Titles;
 use crate::ui::new_view::{handle_new_view_key, NewState};
 use crate::ui::{
@@ -904,8 +904,19 @@ impl App {
         save_layout(self);
     }
 
-    /// フォーカス中のスロットへ new session 画面を出す
+    /// フォーカス中のスロットへ new session 画面を出す。
+    ///
+    /// **既に出ているなら作り直さない。** この操作の意味は「この画面を出す」で、
+    /// 出ているものを捨てることではない: 作り直すと打ちかけのプロンプトと
+    /// 参照中のフォルダが黙って消える（`+ new session` を押し直しただけで
+    /// 書きかけが失われていた）。
+    ///
+    /// **フォルダを名指しして出す入口（ドラッグ＆ドロップ ＝ [`drop_new_view`]）は
+    /// ここを通らない**: あちらは「このフォルダの画面をここへ」なので作り直しが意味を持つ
     pub(crate) fn open_new_view(&mut self) {
+        if self.focus_is_new() {
+            return;
+        }
         let state = NewState::browse(&self.dispatch_cwd);
         self.put_in_focus(Slot::New(state));
     }
@@ -4172,6 +4183,47 @@ pub(crate) fn open_session(app: &mut App, id: &SessionId) -> bool {
     }
     app.show_session(id);
     true
+}
+
+/// 前回の並びを復元する（起動列の最後。呼ぶ前に [`App::set_layout`] で
+/// スロットの枚数を配置へ合わせておく）。
+///
+/// **スロットごとに `focus_slot` を移してから開く**ので、「開いたものは
+/// フォーカススロットへ入る」という規則 1 つで復元まで賄える。
+///
+/// **保存どおりに戻すだけ**で、空スロットを new session 画面で埋めない:
+/// 空の `no session` は「ここには今なにも無い」という状態そのもの
+/// （stop / close が残すのと同じもの。[`remove_window`]）なので、再起動のたびに
+/// 書きかけのフォームへ化けるのは、閉じたという操作の結果として読めない。
+/// 以前は「窓が 1 つも開かなかったら New 画面」という条件で塞いでいたため、
+/// **全スロットを空にして終了すると次の起動で New 画面が出ていた**。
+///
+/// New 画面を出すのは**保存された並びが 1 つも無いとき ＝ 初回起動**だけ
+/// （そこは戻すべき「前回」が無い ＝ 入口を出す以外にできることが無い）
+pub(crate) fn restore_slots(app: &mut App, saved: Vec<SlotView>) {
+    // 保存が無い ＝ 初回起動（並びを 1 度でも書いていれば、全部空でも "-" が残る）
+    let first_run = saved.is_empty();
+    for (at, view) in saved.into_iter().enumerate() {
+        if at >= app.slots.len() {
+            break;
+        }
+        app.focus_slot = at;
+        match view {
+            SlotView::Session(id) => {
+                let id = SessionId::new(id);
+                // 行が消えているセッションは開けない ＝ そのスロットは空のまま
+                if app.row(&id).is_some() {
+                    open_session(app, &id);
+                }
+            }
+            SlotView::New => app.open_new_view(),
+            SlotView::Empty => {}
+        }
+    }
+    app.focus_slot = 0;
+    if first_run {
+        app.open_new_view();
+    }
 }
 
 /// **その行を動かす窓を用意する**（生きていればそのまま、無ければ起こし直す）。
@@ -8472,5 +8524,66 @@ mod tests {
         assert_eq!(app.sessions.len(), 1, "Ctrl+X still drops the row from the list");
         assert!(app.popup.is_none(), "a removed shortcut opened a menu");
     }
-}
 
+    /// **`no session` のまま終了したら、次の起動も `no session`。**
+    /// 空スロットは「ここには今なにも無い」という状態そのものなので、
+    /// 再起動が勝手に書きかけのフォームへ差し替えてはいけない
+    /// （窓が 1 つも開かなかったことを入口の不在と見なしていた頃のバグ）
+    #[test]
+    fn restoring_empty_slots_keeps_the_no_session_panes() {
+        let mut app = test_app(34, TERM);
+        app.set_layout(crate::panes::Layout::TwoColumns);
+        restore_slots(&mut app, vec![SlotView::Empty, SlotView::Empty]);
+        assert!(
+            app.slots.iter().all(|s| matches!(s, Slot::Empty)),
+            "the restore replaced a no session pane"
+        );
+    }
+
+    /// 保存が 1 つも無い ＝ 初回起動。戻すべき「前回」が無いので入口を出す
+    #[test]
+    fn the_first_run_opens_the_new_session_form() {
+        let mut app = test_app(34, TERM);
+        app.dispatch_cwd = std::env::temp_dir().to_string_lossy().to_string();
+        restore_slots(&mut app, Vec::new());
+        assert!(matches!(app.slots[0], Slot::New(_)), "the first run had no entry point");
+    }
+
+    /// 開いていた new session 画面は開いたまま戻る
+    #[test]
+    fn a_saved_new_session_form_comes_back() {
+        let mut app = test_app(34, TERM);
+        app.dispatch_cwd = std::env::temp_dir().to_string_lossy().to_string();
+        restore_slots(&mut app, vec![SlotView::New]);
+        assert!(matches!(app.slots[0], Slot::New(_)), "the form did not come back");
+    }
+
+    /// **行の消えたセッションは空スロットになる**（フォームへは化けない）。
+    /// 一覧から外れた会話は復元しようがないだけで、`+ new session` を押させる
+    /// 場面ではない（入口はサイドバーに常にある）
+    #[test]
+    fn a_session_whose_row_is_gone_leaves_the_slot_empty() {
+        let mut app = test_app(34, TERM);
+        restore_slots(&mut app, vec![SlotView::Session("gone".to_string())]);
+        assert!(matches!(app.slots[0], Slot::Empty), "the missing row opened a form");
+        assert!(app.windows.is_empty(), "a window was started for a row that is gone");
+    }
+
+    /// **`+ new session` を押し直しても、開いている画面は作り直さない。**
+    /// 打ちかけのプロンプトと参照中のフォルダが黙って消えるのを防ぐ
+    /// （この行の意味は「この画面を出す」で、出ているものを捨てる操作ではない）
+    #[test]
+    fn pressing_new_session_again_keeps_the_open_form() {
+        let mut app = test_app(34, TERM);
+        app.dispatch_cwd = std::env::temp_dir().to_string_lossy().to_string();
+        app.open_new_view();
+        app.focused_new().unwrap().prompt.text = "half typed".to_string();
+        run_row_action(&mut app, RowAction::New, 0);
+        assert_eq!(
+            app.focused_new().map(|s| s.prompt.text.as_str()),
+            Some("half typed"),
+            "the form was rebuilt and the typed prompt was lost"
+        );
+        assert_eq!(app.focus, Focus::Terminal, "the row no longer hands the form the keys");
+    }
+}

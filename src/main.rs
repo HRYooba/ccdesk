@@ -35,10 +35,10 @@ mod ui;
 mod update;
 mod usage;
 
-use app::{open_session, run, App, Focus, SelfUpdate};
+use app::{run, App, Focus, SelfUpdate};
 use cli::{print_usage, print_usage_error, run_doctor, show_logs, update_self};
 use poll::FooterInfo;
-use source::{DataSource, DemoSource, LiveSource, SlotView};
+use source::{DataSource, DemoSource, LiveSource};
 use theme::{HOST_COLORS, HOST_PALETTE};
 
 fn main() -> anyhow::Result<()> {
@@ -339,30 +339,10 @@ fn main() -> anyhow::Result<()> {
     // 全部の行が `new session` に見える。未記録の行の解決し直しも同じ 1 回で済む
     // （読む量は予算で有界。[`crate::title::SCAN_BUDGET`]）
     app::refresh_transcripts(&mut app);
-    // 前回の並びを復元。**スロットごとに `focus_slot` を移してから開く**ので、
-    // 「開いたものはフォーカススロットへ入る」という規則 1 つで復元まで賄える
+    // 前回の並びを復元（枚数を配置へ合わせてから中身を戻す）。
+    // 何を戻し、どこで New 画面を出すかは [`app::restore_slots`]
     app.set_layout(window.layout);
-    for (at, view) in window.slots.into_iter().enumerate() {
-        if at >= app.slots.len() {
-            break;
-        }
-        app.focus_slot = at;
-        match view {
-            SlotView::Session(id) => {
-                let id = sessions::SessionId::new(id);
-                if app.row(&id).is_some() {
-                    open_session(&mut app, &id);
-                }
-            }
-            SlotView::New => app.open_new_view(),
-            SlotView::Empty => {}
-        }
-    }
-    app.focus_slot = 0;
-    // 1 枚も開けなかった（初回起動 / 前回の行が全部消えている）ときの入口
-    if app.windows.is_empty() && !app.focus_is_new() {
-        app.open_new_view();
-    }
+    app::restore_slots(&mut app, window.slots);
     // 端末フォーカスを伝えるのはここ 1 回だけ（受け取るのはフォーカススロットの窓）
     app.set_focus(Focus::Terminal);
 
