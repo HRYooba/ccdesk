@@ -45,18 +45,19 @@ const LATEST_VERSION_API: &str = "https://registry.npmjs.org/@openai/codex/lates
 /// 代償: ペインに警告が毎回出る。ユーザー自身の hook も無審査で走る
 const BYPASS_TRUST: &str = "--dangerously-bypass-hook-trust";
 
-/// `SessionEnd` の hook に codex が許すタイムアウトの上限（秒）。
+/// 終了系の hook に codex が許すタイムアウトの上限（秒）。
 ///
 /// **超えると codex が黙って詰めたうえで警告を 1 行出す**（実測:
-/// `clamping SessionEnd hook timeout to 3s in …`）。ccdesk の hook は実測
+/// `clamping Interrupt hook timeout to 3s in …` / `clamping SessionEnd hook
+/// timeout to 3s in …`）。ccdesk の hook は実測
 /// 170〜190ms なので 3 秒で足り、警告を出させる理由が無い。
-/// **セッションを閉じる経路なので codex 側が短く切っているのは妥当**
-/// （ここで待たされると終了が遅れる）
-const SESSION_END_TIMEOUT_SECS: u64 = 3;
+/// **中断・終了の経路なので codex 側が短く切っているのは妥当**
+/// （ここで待たされると操作や終了が遅れる）
+const TERMINAL_HOOK_TIMEOUT_SECS: u64 = 3;
 
 /// この詰めが意味を持つのは共通のタイムアウトより短い間だけ。
 /// **コンパイル時に固定する**（共通側を 3 秒以下へ下げたらここは要らなくなる）
-const _: () = assert!(SESSION_END_TIMEOUT_SECS < HOOK_TIMEOUT_SECS);
+const _: () = assert!(TERMINAL_HOOK_TIMEOUT_SECS < HOOK_TIMEOUT_SECS);
 
 pub(crate) struct Codex;
 
@@ -424,9 +425,10 @@ fn hook_toml(exe: &str) -> Option<String> {
     // 前着を潰さない。並びを固定するため BTreeMap を使う ＝ 同じ入力で同じ文字列）
     let mut by_event: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for row in HOOK_EVENTS.iter().filter(|row| row.has(Kind::Codex)) {
-        // SessionEnd だけ codex 側の上限が短い（[`SESSION_END_TIMEOUT_SECS`]）
-        let timeout = if row.event == "SessionEnd" {
-            HOOK_TIMEOUT_SECS.min(SESSION_END_TIMEOUT_SECS)
+        // 中断・終了系は codex 側の上限が短い
+        // （[`TERMINAL_HOOK_TIMEOUT_SECS`]）
+        let timeout = if matches!(row.event, "Interrupt" | "SessionEnd") {
+            HOOK_TIMEOUT_SECS.min(TERMINAL_HOOK_TIMEOUT_SECS)
         } else {
             HOOK_TIMEOUT_SECS
         };
@@ -716,16 +718,21 @@ mod tests {
 
     /// **codex が詰め直す形で渡さない。** 上限を超えると codex は黙って詰めたうえで
     /// 警告を 1 行出し、それがセッションのたびにペインへ残る（実測:
-    /// `clamping SessionEnd hook timeout to 3s in …`）
+    /// `clamping Interrupt hook timeout to 3s in …` / `clamping SessionEnd hook
+    /// timeout to 3s in …`）
     #[test]
-    fn the_session_end_hook_stays_within_the_timeout_codex_allows() {
+    fn terminal_hooks_stay_within_the_timeout_codex_allows() {
         let toml = hook_toml("C:/ccdesk.exe").expect("no hooks were built");
-        let at = toml.find("SessionEnd=").expect("SessionEnd is not injected");
-        assert!(
-            toml[at..].contains(&format!("timeout={SESSION_END_TIMEOUT_SECS}")),
-            "SessionEnd asks for a timeout codex will clamp: {}",
-            &toml[at..]
-        );
+        for event in ["Interrupt", "SessionEnd"] {
+            let at = toml
+                .find(&format!("{event}="))
+                .unwrap_or_else(|| panic!("{event} is not injected"));
+            assert!(
+                toml[at..].contains(&format!("timeout={TERMINAL_HOOK_TIMEOUT_SECS}")),
+                "{event} asks for a timeout codex will clamp: {}",
+                &toml[at..]
+            );
+        }
     }
 
     /// リテラル文字列にエスケープは無い（`'` は文字列を閉じてしまう）。
