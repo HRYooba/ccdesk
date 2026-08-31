@@ -647,6 +647,10 @@ pub(crate) fn run_hook(
         // どの待ちで撃たれたのかは、これでしか後から言えない
         "notification_type": notification_type_of(&input),
         "row": entry.as_ref().map(|entry| entry.row.as_str()),
+        // **行と会話を対で残す**（行 ID は `CCDESK_ROW`、会話 ID は payload）。
+        // 「別のセッションの通知が来た」を、行の取り違え（同じ行 ID に別の会話が
+        // 書いている）と正当な同時発生とに分けられるのはこの対だけ
+        "conversation": entry.as_ref().map(|entry| entry.conversation.as_str()),
         "alert": entry.as_ref().and_then(|entry| entry.alert.kind()).map(crate::notify::Kind::as_str),
     }));
     let Some(entry) = entry else {
