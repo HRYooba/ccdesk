@@ -2182,6 +2182,10 @@ fn update_notifications(app: &mut App) {
             "row": id.as_str(),
             "alert_at": app.announced.get(&id),
             "dropped": row.is_none().then_some("row is not in the list yet"),
+            // **トーストに出るのと同じ名前**（どのセッションの通知として
+            // 見えたかは、行 ID ではなくこれで突き合わせる）
+            "session": row.map(|row| app.titles.of(row)),
+            "conversation": row.and_then(|row| row.conversation.observed()),
         }));
         let Some(row) = row else {
             continue;
