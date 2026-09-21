@@ -21,6 +21,38 @@ use crate::claude_format::{
 /// 変わっても追随する）
 const PROGRAM: &str = "claude";
 
+/// fullscreen レンダラを指す env。claude の設定説明が `tui` の
+/// `"fullscreen"` と等価であると明記している
+const FULLSCREEN_ENV: &str = "CLAUDE_CODE_NO_FLICKER";
+/// 同・classic レンダラ（代替画面へ入らせない）
+const CLASSIC_ENV: &str = "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN";
+
+/// 子へ渡すレンダラ指定（理由は [`ccdesk::claude_settings_renderer`]）
+fn renderer_env(cwd: &str) -> Option<(&'static str, &'static str)> {
+    let named_by_user =
+        std::env::var_os(FULLSCREEN_ENV).is_some() || std::env::var_os(CLASSIC_ENV).is_some();
+    renderer_env_for(named_by_user, ccdesk::claude_settings_renderer(Path::new(cwd)))
+}
+
+/// 上の判断そのもの（env と設定の読みは呼び手が済ませる ＝ プロセス環境を
+/// 触らずに検査できる）。
+///
+/// **ユーザーが自分で立てている env には触らない**（設定ファイルより強い指定）。
+/// 設定が無いときは fullscreen へ寄せる: ccdesk のペインは claude が
+/// 代替画面で自前スクロールする前提で組んである（[`crate::session`]）
+fn renderer_env_for(
+    named_by_user: bool,
+    setting: Option<ccdesk::Renderer>,
+) -> Option<(&'static str, &'static str)> {
+    if named_by_user {
+        return None;
+    }
+    match setting.unwrap_or(ccdesk::Renderer::Fullscreen) {
+        ccdesk::Renderer::Fullscreen => Some((FULLSCREEN_ENV, "1")),
+        ccdesk::Renderer::Classic => Some((CLASSIC_ENV, "1")),
+    }
+}
+
 pub(crate) struct Claude;
 
 impl Backend for Claude {
@@ -31,6 +63,10 @@ impl Backend for Claude {
         // 継承した親セッションの印を落とす（落とさないと transcript が保存されない）
         for key in INHERITED_MARKERS {
             cmd.env_remove(key);
+        }
+        // レンダラは設定ファイルを読んで env で明示する
+        if let Some((key, value)) = renderer_env(cwd) {
+            cmd.env(key, value);
         }
         // state を戻す hook の注入（中身は [`crate::hooks::inject_settings`]）
         if let Some(inject) = inject {
@@ -528,6 +564,60 @@ mod tests {
             cmd.iter_full_env_as_str()
                 .any(|(k, _)| k.eq_ignore_ascii_case("PATH")),
             "PATH was dropped too — claude cannot start"
+        );
+    }
+
+    /// **レンダラは必ず env で名指しして渡す。**
+    ///
+    /// 渡さないと claude は設定から自分で決め、fullscreen なら起動の印を
+    /// `~/.claude.json` へ残す。ccdesk はペインの子を kill するので、その印は
+    /// 消えないまま次の起動に読まれて classic へ落ちる
+    /// （[`ccdesk::claude_settings_renderer`]）。
+    ///
+    /// **親のプロセス環境を一時的に空にする**（開発機に指定が居ると
+    /// 「ユーザーの指定を尊重する」側へ分岐して検査が空振りする）
+    #[test]
+    fn the_renderer_is_always_named_in_the_child_env() {
+        let saved = [FULLSCREEN_ENV, CLASSIC_ENV].map(std::env::var_os);
+        for key in [FULLSCREEN_ENV, CLASSIC_ENV] {
+            unsafe { std::env::remove_var(key) };
+        }
+        let cmd = build(Launch::Resume { id: "8a1c0f52-0b3e" }, None).cmd;
+        for (key, value) in [FULLSCREEN_ENV, CLASSIC_ENV].iter().zip(saved) {
+            if let Some(value) = value {
+                unsafe { std::env::set_var(key, value) };
+            }
+        }
+        let named = [FULLSCREEN_ENV, CLASSIC_ENV]
+            .iter()
+            .filter(|key| cmd.get_env(key).is_some())
+            .count();
+        assert_eq!(named, 1, "the child is left to decide the renderer itself");
+    }
+
+    /// 設定の `tui` はそのまま env へ移し、**未設定は fullscreen**
+    /// （ccdesk のペインが前提にしている形）。
+    /// **ユーザーが自分で立てた env は上書きしない**（設定ファイルより強い指定）
+    #[test]
+    fn the_setting_picks_the_renderer_unless_the_user_named_one() {
+        assert_eq!(
+            renderer_env_for(false, None),
+            Some((FULLSCREEN_ENV, "1")),
+            "an unset tui left the renderer to the child"
+        );
+        assert_eq!(
+            renderer_env_for(false, Some(ccdesk::Renderer::Fullscreen)),
+            Some((FULLSCREEN_ENV, "1"))
+        );
+        assert_eq!(
+            renderer_env_for(false, Some(ccdesk::Renderer::Classic)),
+            Some((CLASSIC_ENV, "1")),
+            "the classic setting was turned into fullscreen"
+        );
+        assert_eq!(
+            renderer_env_for(true, Some(ccdesk::Renderer::Classic)),
+            None,
+            "the user's own env was overridden"
         );
     }
 
