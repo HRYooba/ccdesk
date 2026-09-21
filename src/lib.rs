@@ -214,6 +214,58 @@ pub fn claude_settings_channel() -> String {
         .unwrap_or_else(|| "latest".to_string())
 }
 
+/// ペインで起こす claude のレンダラ
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Renderer {
+    /// 代替画面へ入り、スクロールも自前で持つ（claude の `"fullscreen"`）
+    Fullscreen,
+    /// 通常画面へ履歴を流す（claude の `"default"`）
+    Classic,
+}
+
+/// `tui` を探す設定ファイルの列。**後ろが勝つ**（claude の優先順位が
+/// user < project < project local）。enterprise の managed policy は読まないので、
+/// そこで `tui` を固定している環境では外れる
+pub fn claude_settings_chain(cwd: &Path) -> Vec<PathBuf> {
+    let project = cwd.join(".claude");
+    let mut chain = Vec::new();
+    if let Some(dir) = claude_dir() {
+        chain.push(dir.join("settings.json"));
+    }
+    chain.push(project.join("settings.json"));
+    chain.push(project.join("settings.local.json"));
+    chain
+}
+
+/// 設定列から `tui`（文書化された設定。`"fullscreen"` / `"default"`）を解決する。
+/// 綴りが未知の値は**無かったものとして扱う**（後ろの未知が前の指定を消さない）
+pub fn renderer_in(chain: &[PathBuf]) -> Option<Renderer> {
+    let mut found = None;
+    for path in chain {
+        let value = read_json(path)
+            .and_then(|v| v.get("tui").and_then(|t| t.as_str()).map(str::to_string));
+        match value.as_deref() {
+            Some("fullscreen") => found = Some(Renderer::Fullscreen),
+            Some("default") => found = Some(Renderer::Classic),
+            _ => {}
+        }
+    }
+    found
+}
+
+/// ペインの claude のレンダラ設定（未設定は None ＝ 既定は呼び手が決める）。
+///
+/// **ccdesk がこれを読むのは、レンダラを env で子へ明示するため。** claude は
+/// fullscreen で起動するたび自分の pid を `~/.claude.json` の
+/// `fullscreenBootPending` へ書き、初フレームから 10 秒後か正常終了で消す。
+/// ccdesk は子を kill する ＝ 終了フックが走らないので、その窓の中で閉じた
+/// ペインは印を残し、次の claude 起動が「前回 fullscreen が立ち上がり切らなかった」
+/// と判定して classic へ落ちる（2 回でマシン全体の fullscreen が自動オフ）。
+/// env で渡した指定はこの判定の対象外なので、印そのものが残らない
+pub fn claude_settings_renderer(cwd: &Path) -> Option<Renderer> {
+    renderer_in(&claude_settings_chain(cwd))
+}
+
 /// バージョン文字列 "2.1.218" の数値比較（比較不能なら等価扱い）
 pub fn version_newer(latest: &str, current: &str) -> bool {
     let parse = |s: &str| -> Vec<u64> {
@@ -1462,6 +1514,72 @@ mod tests {
         let before = size();
         log_error("this line must never reach the user's log");
         assert_eq!(size(), before, "wrote to the real error log from a test");
+    }
+
+    /// **`tui` は後ろが勝つ**（claude の優先順位が user < project < project local）。
+    /// 綴りが未知の値は無かったものとして扱う ＝ 後ろの未知が前の指定を消さない。
+    /// どこにも無ければ None（既定の判断は呼び手が持つ）
+    #[test]
+    fn the_renderer_setting_is_resolved_with_the_last_file_winning() {
+        let dir = std::env::temp_dir().join(format!(
+            "ccdesk-test-{}-renderer-chain",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let user = write("user.json", r#"{"tui":"fullscreen"}"#);
+        let project = write("project.json", r#"{"tui":"default"}"#);
+        let unknown = write("unknown.json", r#"{"tui":"kitty"}"#);
+        let silent = write("silent.json", r#"{"model":"opus"}"#);
+        let broken = write("broken.json", "{ this is not json");
+
+        assert_eq!(renderer_in(&[]), None, "claimed a setting with nothing to read");
+        assert_eq!(
+            renderer_in(&[silent.clone(), broken.clone()]),
+            None,
+            "a file without tui decided the renderer"
+        );
+        assert_eq!(
+            renderer_in(&[user.clone(), project.clone()]),
+            Some(Renderer::Classic),
+            "the project setting lost to the user setting"
+        );
+        assert_eq!(
+            renderer_in(&[project.clone(), user.clone()]),
+            Some(Renderer::Fullscreen)
+        );
+        assert_eq!(
+            renderer_in(&[user.clone(), unknown, silent, broken]),
+            Some(Renderer::Fullscreen),
+            "an unknown spelling erased the setting before it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 読む先は user（`claude_dir`）→ project → project local の順
+    #[test]
+    fn the_renderer_setting_is_read_from_the_documented_places() {
+        let cwd = std::env::temp_dir().join("ccdesk-renderer-places");
+        let chain = claude_settings_chain(&cwd);
+        let project = cwd.join(".claude");
+        assert_eq!(
+            chain.iter().rev().take(2).rev().collect::<Vec<_>>(),
+            [
+                &project.join("settings.json"),
+                &project.join("settings.local.json"),
+            ]
+        );
+        assert!(
+            chain.first().is_some_and(|p| p.ends_with("settings.json")
+                && !p.starts_with(&cwd)),
+            "the user settings are not read first: {chain:?}"
+        );
     }
 
     /// テスト専用の JSON ファイル。~/.ccdesk は触らない（開発者の state.json を踏まない）
