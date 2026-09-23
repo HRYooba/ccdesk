@@ -687,6 +687,10 @@ pub(crate) struct App {
     /// 貼り付け済みで、まだ送信の `\r` を出していないセッション（[`SUBMIT_DELAY`]）。
     /// 積んだ時刻を一緒に持つのは、期限が来たものだけを出すため
     pub(crate) pending_submit: Vec<(SessionId, std::time::Instant)>,
+    /// このフレームで Sixel を重ねる画像（描画が積み、[`draw_frame`] が取り出す）
+    pub(crate) pictures: Vec<crate::graphics::Paint>,
+    /// 端末に出した Sixel の記録（[`crate::graphics::Painter`]）
+    pub(crate) painter: crate::graphics::Painter,
 }
 
 /// テストの土台になる中立な `App`。各テストは関心のあるフィールドだけを
@@ -779,6 +783,8 @@ impl Default for App {
             animating: false,
             published_sessions: Vec::new(),
             pending_submit: Vec::new(),
+            pictures: Vec::new(),
+            painter: crate::graphics::Painter::default(),
         }
     }
 }
@@ -1271,11 +1277,39 @@ fn draw_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow:
         }
     });
     drawn?;
+    paint_pictures(terminal, app);
     if let Some(pos) = park {
         // queue のみ（flush は SyncOutput の Drop が 1 回だけ行う）
         let _ = crossterm::queue!(std::io::stdout(), crossterm::cursor::MoveTo(pos.x, pos.y));
     }
     Ok(())
+}
+
+/// このフレームで積まれた画像（kitty graphics）を Sixel で重ねる（[`crate::graphics`]）。
+///
+/// **描く物が前のフレームから変わったら、全面を描き直してから重ねる。** 端末に
+/// 残った Sixel は、その上に文字が書かれるまで消えない。ratatui は変わったセルしか
+/// 書かないので、画像が動いた・消えた跡の空白セルは書き直されず、古い絵が残る
+fn paint_pictures(terminal: &mut ratatui::DefaultTerminal, app: &mut App) {
+    let mut pictures = std::mem::take(&mut app.pictures);
+    if !app.painter.changed(&pictures) {
+        return;
+    }
+    if app.painter.has_shown() {
+        let _ = terminal.clear();
+        let _ = terminal.draw(|frame| {
+            let cursor = draw(frame, app);
+            if cursor.visible {
+                frame.set_cursor_position(cursor.pos);
+            }
+        });
+        pictures = std::mem::take(&mut app.pictures);
+    }
+    let cell = crate::graphics::CELL_PIXELS
+        .get()
+        .copied()
+        .unwrap_or(crate::graphics::FALLBACK_CELL);
+    app.painter.paint(&mut std::io::stdout(), &pictures, cell);
 }
 
 /// アクティブ窓へバイト列を送る。**書き込みエラーで run ループを抜けない**:

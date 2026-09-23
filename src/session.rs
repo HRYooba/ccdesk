@@ -224,6 +224,9 @@ pub(crate) struct Session {
     /// 窓に写しを置くと同じ知識が 2 箇所に増える
     pub(crate) session_id: SessionId,
     pub(crate) parser: Arc<Mutex<Parser>>,
+    /// 子が kitty graphics で送ってきた画像（[`crate::graphics`]）。PTY リーダーが
+    /// 書き、描画が読む
+    pub(crate) graphics: Arc<Mutex<crate::graphics::Graphics>>,
     pub(crate) writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub(crate) master: Box<dyn MasterPty + Send>,
     pub(crate) child: Box<dyn Child + Send + Sync>,
@@ -292,6 +295,8 @@ impl Session {
         let started = Arc::new(AtomicBool::new(false));
         let updating = Arc::new(AtomicBool::new(false));
         let parser_clone = parser.clone();
+        let graphics = Arc::new(Mutex::new(crate::graphics::Graphics::default()));
+        let graphics_clone = graphics.clone();
         let writer_clone = writer.clone();
         let last_output_clone = last_output.clone();
         let dirty_clone = dirty.clone();
@@ -301,6 +306,8 @@ impl Session {
         let _ = reader_thread.spawn(move || {
             let mut buf = [0u8; 8192];
             let mut scan = SyncScan::default();
+            let mut apc = crate::graphics::ApcFilter::default();
+            let (mut clean, mut commands) = (Vec::new(), Vec::new());
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -316,6 +323,22 @@ impl Session {
                         if scan.feed(&buf[..n]) {
                             updating_clone.store(true, Ordering::Relaxed);
                         }
+                        // kitty graphics の APC は vt100 へ渡す前に抜き、画像として覚える。
+                        // 照会への応答は他の応答と同じく PTY へ書き戻す
+                        clean.clear();
+                        commands.clear();
+                        apc.feed(&buf[..n], &mut clean, &mut commands);
+                        if !commands.is_empty() {
+                            let mut g = graphics_clone.lock_recover();
+                            let replies: Vec<u8> =
+                                commands.iter().filter_map(|c| g.apply(c)).flatten().collect();
+                            drop(g);
+                            if !replies.is_empty() {
+                                let mut writer = writer_clone.lock_recover();
+                                let _ = writer.write_all(&replies);
+                                let _ = writer.flush();
+                            }
+                        }
                         // vt100 0.16 は「右端の全角文字 + リサイズ」で内部 unwrap が
                         // panic する既知バグがある。捕捉してパーサを作り直し継続する
                         // （claude は全面再描画するので画面はすぐ復元される）
@@ -323,7 +346,7 @@ impl Session {
                             || {
                                 let mut parser = parser_clone
                                     .lock_recover();
-                                parser.process(&buf[..n]);
+                                parser.process(&clean);
                                 parser.callbacks_mut().take()
                             },
                         ));
@@ -399,6 +422,7 @@ impl Session {
         Ok(Self {
             session_id: session_id.clone(),
             parser,
+            graphics,
             writer,
             master: pair.master,
             child,
@@ -518,6 +542,7 @@ impl Session {
         let window = Self {
             session_id: session_id.clone(),
             parser: Arc::new(Mutex::new(new_parser(rows, cols, SCROLLBACK))),
+            graphics: Arc::default(),
             writer,
             master: pair.master,
             child: Box::new(NoChild),

@@ -2158,7 +2158,9 @@ fn draw_slot(frame: &mut Frame, rect: Rect, app: &mut App, at: usize, focused: b
         Some(Slot::New(state)) => draw_new_view(frame, rect, state, focused, starting, can_leave),
         Some(Slot::Session(_)) => {
             let title = title.unwrap_or_else(|| crate::title::UNTITLED.to_string());
-            draw_session_slot(frame, rect, app, at, focused, title)
+            let (cursor, pictures) = draw_session_slot(frame, rect, app, at, focused, title);
+            app.pictures.extend(pictures);
+            cursor
         }
         // 空スロット（起動時・stop / close の直後）。枠だけだと「壊れている」
         // のか「ただ空」なのか見分かないので、案内を 1 行出す
@@ -2188,7 +2190,8 @@ fn draw_slot(frame: &mut Frame, rect: Rect, app: &mut App, at: usize, focused: b
     }
 }
 
-/// セッションを映しているスロット。窓が見つからない（起こし損ねた）ときは空扱い
+/// セッションを映しているスロット。窓が見つからない（起こし損ねた）ときは空扱い。
+/// 画面に kitty graphics の画像があれば、Sixel を重ねる場所も返す
 fn draw_session_slot(
     frame: &mut Frame,
     rect: Rect,
@@ -2196,7 +2199,7 @@ fn draw_session_slot(
     at: usize,
     focused: bool,
     title: String,
-) -> FrameCursor {
+) -> (FrameCursor, Vec<crate::graphics::Paint>) {
     let Some(window) = app
         .slots
         .get(at)
@@ -2214,7 +2217,7 @@ fn draw_session_slot(
             ),
             rect,
         );
-        return FrameCursor::hidden_at(pane_fallback_pos(rect));
+        return (FrameCursor::hidden_at(pane_fallback_pos(rect)), Vec::new());
     };
     let parser = window.parser.lock_recover();
     let screen = parser.screen();
@@ -2242,6 +2245,7 @@ fn draw_session_slot(
         .cursor(tui_term::widget::Cursor::default().visibility(false))
         .block(block);
     frame.render_widget(widget, rect);
+    let pictures = blank_pictures(frame, &window.graphics, screen, inner);
 
     // カーソル位置を反映。フォーカス外・子が非表示指定のときも「隠すだけ」で
     // 位置は必ず確定させる（描かないとサイドバーに置き去りになる。FrameCursor 参照）。
@@ -2250,11 +2254,67 @@ fn draw_session_slot(
     let pos = terminal_cursor_pos(rect, inner, crow, ccol);
     // 遡っている間はカーソルを出さない（座標は「今の画面」のもので、
     // 表示している行とは無関係 ＝ 出すと無関係な位置で点滅する）
-    if focused && !screen.hide_cursor() && scrolled == 0 {
+    let cursor = if focused && !screen.hide_cursor() && scrolled == 0 {
         FrameCursor::shown_at(pos)
     } else {
         FrameCursor::hidden_at(pos)
+    };
+    (cursor, pictures)
+}
+
+/// 子の画面に並んだ kitty graphics の placeholder を空白にし、その矩形を
+/// このフレームで Sixel を重ねる場所として返す（[`crate::graphics`]）。
+/// placeholder の字そのものはホスト端末で描けない（私用領域の字＋結合文字）
+fn blank_pictures(
+    frame: &mut ratatui::Frame,
+    graphics: &std::sync::Mutex<crate::graphics::Graphics>,
+    screen: &vt100::Screen,
+    inner: Rect,
+) -> Vec<crate::graphics::Paint> {
+    let found = crate::graphics::visible(screen);
+    let mut pictures = Vec::new();
+    if found.is_empty() {
+        return pictures;
     }
+    let buffer = frame.buffer_mut();
+    for v in &found {
+        for y in v.row..v.row + v.rows {
+            for x in v.col..v.col + v.cols {
+                let (ax, ay) = (inner.x + x, inner.y + y);
+                if ax < inner.right()
+                    && ay < inner.bottom()
+                    && let Some(cell) = buffer.cell_mut((ax, ay))
+                    && cell.symbol().starts_with(crate::graphics::PLACEHOLDER)
+                {
+                    cell.set_symbol(" ");
+                }
+            }
+        }
+    }
+    let graphics = graphics.lock_recover();
+    for v in found {
+        let Some((picture, size)) = graphics.picture(v.id) else {
+            continue;
+        };
+        // ペインからはみ出す分は切り詰める（ペインは子の画面より狭くなり得る）
+        let rows = v.rows.min(inner.height.saturating_sub(v.row));
+        let cols = v.cols.min(inner.width.saturating_sub(v.col));
+        if rows == 0 || cols == 0 {
+            continue;
+        }
+        pictures.push(crate::graphics::Paint {
+            picture,
+            visible: crate::graphics::Visible {
+                row: inner.y + v.row,
+                col: inner.x + v.col,
+                rows,
+                cols,
+                ..v
+            },
+            size,
+        });
+    }
+    pictures
 }
 
 /// カーソルの安全な退避先。「見せるものが無い / クランプの前提が崩れた」経路は

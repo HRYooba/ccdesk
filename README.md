@@ -35,6 +35,11 @@ conversation. OpenAI's `codex` CLI works the same way — [opt in](#codex-opt-in
   reserves
   `Ctrl+Q`, `Alt+←/→` (sidebar ⇄ main view) and `Alt+Shift+←/→/↑/↓` (move between
   slots) — and **every other key goes to the agent untouched**
+- **Images from Claude Code show up in the pane.** Claude Code draws images with the
+  kitty graphics protocol, which Windows Terminal lacks; ccdesk redraws them as Sixel
+  (Windows Terminal 1.22+). For this ccdesk carries Microsoft's newer ConPTY
+  (`assets/conpty/`, MIT) and unpacks it to `~/.ccdesk/conpty/`, since the ConPTY that
+  ships with Windows drops the image data
 - **ccdesk never modifies your agent's config or files.** It installs its status hooks
   per session only, and sessions you open outside ccdesk are unaffected
 
@@ -181,4 +186,6 @@ Three limits come from Windows, not ccdesk:
 
 ## License
 
-MIT
+MIT. `assets/conpty/` is Microsoft's ConPTY from the
+[Microsoft.Windows.Console.ConPTY](https://www.nuget.org/packages/Microsoft.Windows.Console.ConPTY)
+package, under its own MIT license (`assets/conpty/LICENSE`).
