@@ -53,6 +53,9 @@ fn renderer_env_for(
     }
 }
 
+/// claude に端末の判定を飛ばして画像（kitty graphics）を出させる env
+const FORCE_IMAGES_ENV: &str = "CLAUDE_CODE_FORCE_TERMINAL_IMAGES";
+
 pub(crate) struct Claude;
 
 impl Backend for Claude {
@@ -67,6 +70,12 @@ impl Backend for Claude {
         // レンダラは設定ファイルを読んで env で明示する
         if let Some((key, value)) = renderer_env(cwd) {
             cmd.env(key, value);
+        }
+        // 画像を kitty graphics で出させる。ccdesk がそれを Sixel へ描き替える
+        // （[`crate::graphics`]）。APC が PTY を通るのは新しい ConPTY だけなので、
+        // それを使えないときは求めない（求めると画像の欄が空白になる）
+        if crate::graphics::images_enabled() {
+            cmd.env(FORCE_IMAGES_ENV, "1");
         }
         // state を戻す hook の注入（中身は [`crate::hooks::inject_settings`]）
         if let Some(inject) = inject {

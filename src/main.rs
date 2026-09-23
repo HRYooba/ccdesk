@@ -18,6 +18,7 @@ mod backend;
 mod claude_format;
 mod cli;
 mod git;
+mod graphics;
 mod hooks;
 mod keys;
 mod notify;
@@ -210,6 +211,13 @@ fn main() -> anyhow::Result<()> {
     let host = theme::query_host_colors();
     let _ = HOST_COLORS.set(host);
     let _ = HOST_PALETTE.set(theme::query_palette(host));
+    // 画像（kitty graphics → Sixel）の支度。新しい ConPTY は最初の PTY より先に
+    // 据える。セルの画素寸法は画像を出させるときだけ聞く
+    if graphics::install_conpty()
+        && let Some(cell) = graphics::query_cell_pixels()
+    {
+        let _ = graphics::CELL_PIXELS.set(cell);
+    }
 
     let mut terminal = ratatui::init();
     // panic は ~/.ccdesk/error.log へ記録（TUI は画面ごと消えて panic 表示が読めない）。
@@ -322,6 +330,8 @@ fn main() -> anyhow::Result<()> {
         // 起動時は何も公開していない（run ループの 1 周目が必ず書く）
         published_sessions: Vec::new(),
         pending_submit: Vec::new(),
+        pictures: Vec::new(),
+        painter: graphics::Painter::default(),
         source,
     };
     // バックグラウンド取得の起動。**起動列の重い処理（埋め戻し・transcript の
