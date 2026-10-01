@@ -106,11 +106,12 @@ fail and print the candidates rather than pick one.
 - **`new` prints the id it minted**, so the next command can address it. It takes
   `--agent claude|codex` and `--cwd <dir>`, both defaulting to the caller's. It does
   not steal the pane: what you were watching stays on screen.
-- **`view` opens the image in a pane of its own**, beside the calling session
-  (PNG, JPEG, GIF, WebP, BMP). It reuses the viewer if one is open, takes an empty pane
-  next, and otherwise splits the caller's pane — the caller and the pane you are typing
-  in stay where they are. In the viewer the wheel zooms around the cursor, dragging
-  pans, the cross between panes resizes it, and `✕` or `Esc` closes it.
+- **`view` opens the image in a window floating over the panes** (PNG, JPEG, GIF,
+  WebP, BMP). The layout is left alone; the window first covers the half away from the
+  calling session, and a second `view` reuses it where you left it. Inside it the wheel
+  zooms around the cursor and dragging pans; drag its title to move it, its left, right
+  or bottom edge to resize it, and `✕` closes it (so does `Esc`, right after you click
+  the window — otherwise `Esc` still goes to the agent).
 - **None of them can target the calling session.** `stop` and `close` would kill the
   process running the command, which cannot then report what happened.
 

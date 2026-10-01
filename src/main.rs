@@ -338,7 +338,8 @@ fn main() -> anyhow::Result<()> {
         pending_submit: Vec::new(),
         pictures: Vec::new(),
         painter: graphics::Painter::default(),
-        image_drag: None,
+        viewer: None,
+        viewer_drag: None,
         source,
     };
     // バックグラウンド取得の起動。**起動列の重い処理（埋め戻し・transcript の

@@ -1,7 +1,6 @@
-//! 画像ビューアー。スロットの中身の 1 つ（[`crate::app::Slot::Image`]）で、
-//! `ccdesk view <path>` が開く。
+//! 画像ビューアー。`ccdesk view <path>` が開く、ペインの上に浮かぶ窓（[`Overlay`]）。
 //!
-//! **持つのは画像とカメラ（倍率・中心）だけ。** どのスロットに出すかは
+//! **持つのは画像・カメラ（倍率・中心）・窓の位置と大きさ。** いつ開くかは
 //! [`crate::app`]、Sixel への書き出しは [`crate::graphics`] が持つ。
 //!
 //! 座標は 3 種類ある: 画像の画素・ビューポートの画素（内寸のセル × セルの画素寸法）・
@@ -139,10 +138,6 @@ impl ImageView {
         }
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        &self.image.path
-    }
-
     /// カメラ `(倍率, 中心)`（検査用）
     #[cfg(test)]
     pub(crate) fn camera(&self) -> (f64, (f64, f64)) {
@@ -212,15 +207,150 @@ impl ImageView {
     }
 
     /// このフレームで描くもの。`area` は内寸（端末の絶対セル座標）
-    pub(crate) fn shot(&mut self, area: Rect, cell: (u16, u16)) -> Shot {
+    pub(crate) fn shot(&mut self, area: Rect, cell: (u16, u16), background: [u8; 3]) -> Shot {
         self.clamp(Viewport::of(area, cell));
         Shot {
             image: Arc::clone(&self.image),
             area,
             zoom: self.zoom,
             center: self.center,
+            background,
         }
     }
+}
+
+/// 窓の最小の外寸（枠を含む）。これより小さくすると掴む場所が無くなる
+const MIN_COLS: u16 = 16;
+const MIN_ROWS: u16 = 6;
+
+/// 浮かぶ窓としてのビューアー。**スロットの配置には入らない**: セッションの
+/// 並びを崩さず、その上に重ねる。位置と大きさはペイン（右側の矩形）に対する比で
+/// 持つので、端末やサイドバーの幅が変わっても同じ辺りに留まる
+pub(crate) struct Overlay {
+    pub(crate) view: ImageView,
+    /// ペインに対する比 `(x, y, 幅, 高さ)`
+    place: (f64, f64, f64, f64),
+    /// 押されてから他を押すまで。`Esc` で閉じるのはこの間だけ
+    /// （それ以外の `Esc` はセッションの agent のもの）
+    pub(crate) focused: bool,
+}
+
+/// 窓のどこを押したか
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Hit {
+    Close,
+    /// 上辺（見出し）を掴んで動かす
+    Move,
+    /// 左・右・下の辺（と下の角）を掴んで大きさを変える
+    Resize { left: bool, right: bool, bottom: bool },
+    /// 内側（ホイールで拡大縮小・ドラッグで画像を動かす）
+    Inside,
+}
+
+impl Overlay {
+    /// 初めて開くときの置き場所。**全部は隠さない**: `avoid`（呼んだセッションの
+    /// スロット）の中心から遠い側の半分に、上下に少し余白を残して置く。
+    /// 大きさは画像の縦横比に詰める（全体表示で余る帯のぶん、下を隠さない）
+    pub(crate) fn new(view: ImageView, pane: Rect, avoid: Option<Rect>, cell: (u16, u16)) -> Self {
+        let center = avoid.map_or(f64::from(pane.x), |r| f64::from(r.x) + f64::from(r.width) / 2.0);
+        let left_half = center >= f64::from(pane.x) + f64::from(pane.width) / 2.0;
+        let (pw, ph) = (f64::from(pane.width).max(1.0), f64::from(pane.height).max(1.0));
+        let (cw, ch) = (f64::from(cell.0), f64::from(cell.1));
+        // 枠の 2 桁・2 行を除いた内寸で、画像を収めたときに要るセル数
+        let (max_cols, max_rows) = ((pw * 0.5 - 2.0).max(1.0), (ph * 0.86 - 2.0).max(1.0));
+        let (iw, ih) = view.image.size();
+        let fit = (max_cols * cw / iw).min(max_rows * ch / ih);
+        let cols = ((iw * fit / cw).ceil() + 2.0).max(f64::from(MIN_COLS));
+        let rows = ((ih * fit / ch).ceil() + 2.0).max(f64::from(MIN_ROWS));
+        let (w, h) = ((cols / pw).min(0.5), (rows / ph).min(0.86));
+        let x = if left_half { 0.0 } else { 1.0 - w };
+        Self {
+            view,
+            place: (x, 0.07, w, h),
+            focused: false,
+        }
+    }
+
+    /// 今の外寸（端末の絶対セル座標）。ペインの内側へ収め、最小の大きさを守る
+    pub(crate) fn rect(&self, pane: Rect) -> Rect {
+        let (x, y, w, h) = self.place;
+        let size = |frac: f64, total: u16, min: u16| ((frac * f64::from(total)).round() as u16).clamp(min.min(total), total);
+        let (width, height) = (size(w, pane.width, MIN_COLS), size(h, pane.height, MIN_ROWS));
+        let at = |frac: f64, total: u16, size: u16| ((frac * f64::from(total)).round() as u16).min(total - size);
+        Rect::new(pane.x + at(x, pane.width, width), pane.y + at(y, pane.height, height), width, height)
+    }
+
+    /// 外寸を置き直す（ペインに対する比へ戻して持つ）
+    pub(crate) fn set_rect(&mut self, rect: Rect, pane: Rect) {
+        if pane.width == 0 || pane.height == 0 {
+            return;
+        }
+        let (pw, ph) = (f64::from(pane.width), f64::from(pane.height));
+        self.place = (
+            f64::from(rect.x.saturating_sub(pane.x)) / pw,
+            f64::from(rect.y.saturating_sub(pane.y)) / ph,
+            f64::from(rect.width) / pw,
+            f64::from(rect.height) / ph,
+        );
+    }
+
+    /// 内寸（枠の内側 ＝ Sixel を置く範囲）
+    pub(crate) fn inner(&self, pane: Rect) -> Rect {
+        let r = self.rect(pane);
+        Rect::new(r.x + 1, r.y + 1, r.width.saturating_sub(2), r.height.saturating_sub(2))
+    }
+
+    /// `(column, row)` が窓のどこか（窓の外なら `None`）
+    pub(crate) fn hit(&self, pane: Rect, column: u16, row: u16) -> Option<Hit> {
+        let r = self.rect(pane);
+        if !r.contains(ratatui::layout::Position::new(column, row)) {
+            return None;
+        }
+        if crate::ui::close_zone(r).is_some_and(|(cols, at)| row == at && cols.contains(&column)) {
+            return Some(Hit::Close);
+        }
+        let (left, right, bottom) = (column == r.x, column == r.right() - 1, row == r.bottom() - 1);
+        if row == r.y {
+            return Some(Hit::Move);
+        }
+        if left || right || bottom {
+            return Some(Hit::Resize { left, right, bottom });
+        }
+        Some(Hit::Inside)
+    }
+}
+
+/// 辺や見出しを掴んで `(dx, dy)` セル動かした後の外寸。`start` は掴んだときの外寸。
+/// **ペインの外へは出さず、最小の大きさより小さくしない**（掴む場所が消えない）
+pub(crate) fn dragged(start: Rect, hit: Hit, (dx, dy): (i32, i32), pane: Rect) -> Rect {
+    let (px0, py0) = (i32::from(pane.x), i32::from(pane.y));
+    let (px1, py1) = (px0 + i32::from(pane.width), py0 + i32::from(pane.height));
+    let (mut x0, mut y0) = (i32::from(start.x), i32::from(start.y));
+    let (mut x1, mut y1) = (x0 + i32::from(start.width), y0 + i32::from(start.height));
+    let (min_w, min_h) = (i32::from(MIN_COLS).min(px1 - px0), i32::from(MIN_ROWS).min(py1 - py0));
+    match hit {
+        Hit::Move => {
+            let w = x1 - x0;
+            let h = y1 - y0;
+            x0 = (x0 + dx).clamp(px0, px1 - w);
+            y0 = (y0 + dy).clamp(py0, py1 - h);
+            x1 = x0 + w;
+            y1 = y0 + h;
+        }
+        Hit::Resize { left, right, bottom } => {
+            if left {
+                x0 = (x0 + dx).clamp(px0, x1 - min_w);
+            }
+            if right {
+                x1 = (x1 + dx).clamp(x0 + min_w, px1);
+            }
+            if bottom {
+                y1 = (y1 + dy).clamp(y0 + min_h, py1);
+            }
+        }
+        Hit::Close | Hit::Inside => {}
+    }
+    Rect::new(x0 as u16, y0 as u16, (x1 - x0) as u16, (y1 - y0) as u16)
 }
 
 /// 1 フレームぶんのビューアーの絵（カメラの写し）
@@ -230,6 +360,8 @@ pub(crate) struct Shot {
     area: Rect,
     zoom: f64,
     center: (f64, f64),
+    /// 画像の載らない余白の色
+    background: [u8; 3],
 }
 
 /// 同じ絵かどうか（[`crate::graphics::Painter`] が描き直しを省く判断）
@@ -239,6 +371,7 @@ pub(crate) struct ShotKey {
     area: (u16, u16, u16, u16),
     zoom: u64,
     center: (u64, u64),
+    background: [u8; 3],
 }
 
 /// 描いた絵。`row` / `col` は Sixel を置く端末のセル（左上）
@@ -257,43 +390,37 @@ impl Shot {
             area: (self.area.x, self.area.y, self.area.width, self.area.height),
             zoom: self.zoom.to_bits(),
             center: (self.center.0.to_bits(), self.center.1.to_bits()),
+            background: self.background,
         }
     }
 
-    /// ビューポートのうち画像が載る範囲だけを描く。**左上はセルの境目に揃える**
-    /// （Sixel はセルの左上からしか置けない）。揃えて余った画素は透明にする
+    /// 内寸の全面を描く。**余白も不透明に塗る**: ビューアーはセッションの上に
+    /// 浮かぶので、透かすと下のセッションの画像（Sixel）が覗く
     pub(crate) fn render(&self, (cw, ch): (u16, u16)) -> Option<Rendered> {
         let vp = Viewport::of(self.area, (cw, ch));
+        let (width, height) = (vp.w as u32, vp.h as u32);
+        if width == 0 || height == 0 {
+            return None;
+        }
         let (iw, ih) = self.image.size();
         let s = (vp.w / iw).min(vp.h / ih) * self.zoom;
         // 画像の左上がビューポートのどこに来るか（画素）
         let x0 = vp.w / 2.0 - self.center.0 * s;
         let y0 = vp.h / 2.0 - self.center.1 * s;
-        let span = |start: f64, size: f64, view: f64, cell: u16| -> Option<(u32, u32)> {
-            let from = start.max(0.0).floor();
-            let to = (start + size * s).min(view).ceil();
-            if to <= from {
-                return None;
-            }
-            let first_cell = (from as u32) / u32::from(cell);
-            let begin = first_cell * u32::from(cell);
-            Some((begin, to as u32 - begin))
-        };
-        let (px, width) = span(x0, iw, vp.w, cw)?;
-        let (py, height) = span(y0, ih, vp.h, ch)?;
         let level = self.level(s);
         let picture = &self.image.levels[level];
         // 段の画素へ写す比（段は丸めて半分にしているので、元の大きさとの比で取る）
         let (lx, ly) = (f64::from(picture.width) / iw, f64::from(picture.height) / ih);
         let nearest = s >= NEAREST_FROM;
-        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        let [r, g, b] = self.background;
+        let mut rgba: Vec<u8> = [r, g, b, 255].repeat((width * height) as usize);
         for oy in 0..height {
-            let v = (f64::from(py + oy) + 0.5 - y0) / s;
+            let v = (f64::from(oy) + 0.5 - y0) / s;
             if v < 0.0 || v >= ih {
                 continue;
             }
             for ox in 0..width {
-                let u = (f64::from(px + ox) + 0.5 - x0) / s;
+                let u = (f64::from(ox) + 0.5 - x0) / s;
                 if u < 0.0 || u >= iw {
                     continue;
                 }
@@ -303,14 +430,17 @@ impl Shot {
                 } else {
                     sample_bilinear(picture, u * lx, v * ly)
                 };
-                rgba[out..out + 3].copy_from_slice(&pixel[..3]);
-                // 画像そのものの透明は落とす（下のセルが透けると、前の絵の跡が残る）
-                rgba[out + 3] = 255;
+                // 画像そのものの透明は背景の上に合成する（透かすと下が覗く）
+                let a = u32::from(pixel[3]);
+                for c in 0..3 {
+                    let bg = u32::from(self.background[c]);
+                    rgba[out + c] = ((u32::from(pixel[c]) * a + bg * (255 - a) + 127) / 255) as u8;
+                }
             }
         }
         Some(Rendered {
-            row: self.area.y + (py / u32::from(ch)) as u16,
-            col: self.area.x + (px / u32::from(cw)) as u16,
+            row: self.area.y,
+            col: self.area.x,
             width,
             height,
             rgba,
@@ -369,7 +499,7 @@ mod tests {
         let picture = Picture {
             width: 200,
             height: 100,
-            rgba: vec![200; 200 * 100 * 4],
+            rgba: [200, 200, 200, 255].repeat(200 * 100),
         };
         ImageView::new(Image::from_picture(PathBuf::from("C:/x/wide.png"), picture))
     }
@@ -442,35 +572,92 @@ mod tests {
         assert!((v.center.1 - half).abs() < 1e-9, "y {} not at the top edge", v.center.1);
     }
 
-    /// 全体表示は横いっぱい・縦は中央。**左上はセルの境目に揃う**
+    /// 内寸を全面描く。画像の載らない余白は背景色で不透明に塗る
+    /// （浮かぶ窓の下にあるセッションの画像を覗かせない）
     #[test]
-    fn a_fitted_render_covers_only_the_image_and_starts_on_a_cell() {
+    fn a_render_covers_the_whole_inside_with_the_background_around_the_image() {
         let mut v = view();
         let area = Rect::new(10, 5, 40, 20); // 400×400 px（10×20 のセル）
-        let shot = v.shot(area, (10, 20));
-        let r = shot.render((10, 20)).expect("nothing drawn");
-        // 画像は 400×200 で縦 100..300 px に載る ＝ 行 5 のセル（100 px）から
-        assert_eq!((r.col, r.row, r.width, r.height), (10, 10, 400, 200));
-        assert!(r.rgba.chunks(4).all(|p| p == [200, 200, 200, 255]));
+        let r = v.shot(area, (10, 20), [1, 2, 3]).render((10, 20)).expect("nothing drawn");
+        assert_eq!((r.col, r.row, r.width, r.height), (10, 5, 400, 400));
+        let at = |x: usize, y: usize| &r.rgba[(y * 400 + x) * 4..(y * 400 + x) * 4 + 4];
+        // 画像は 400×200 で縦 100..300 px に載る
+        assert_eq!(at(200, 50), [1, 2, 3, 255], "the margin is not the background");
+        assert_eq!(at(200, 200), [200, 200, 200, 255], "the image is missing");
+        assert!(r.rgba.chunks(4).all(|p| p[3] == 255), "part of the render is transparent");
     }
 
-    /// 揃えで余った画素は透明（前の絵の上に塗らない）
+    fn overlay() -> Overlay {
+        Overlay::new(view(), PANE, None, CELL)
+    }
+
+    const PANE: Rect = Rect { x: 30, y: 0, width: 100, height: 50 };
+    const CELL: (u16, u16) = (10, 20);
+
+    /// 初めの窓は画像の縦横比に詰める（横長の画像で下の帯まで隠さない）
     #[test]
-    fn the_cell_padding_is_transparent() {
-        let mut v = view();
-        let area = Rect::new(0, 0, 40, 21); // 縦 420 px ＝ 画像は 110..310 px
-        let r = v.shot(area, (10, 20)).render((10, 20)).expect("nothing drawn");
-        assert_eq!((r.row, r.height), (5, 210));
-        let first_row_alpha: Vec<u8> = r.rgba.chunks(4).take(r.width as usize).map(|p| p[3]).collect();
-        assert!(first_row_alpha.iter().all(|&a| a == 0), "the padding above the image is painted");
-        assert_eq!(r.rgba[(10 * r.width as usize) * 4 + 3], 255, "the image itself is transparent");
+    fn a_new_overlay_is_trimmed_to_the_image_shape() {
+        // 200×100 の画像を幅 48 桁（480 px）に収めると高さ 240 px ＝ 12 行 + 枠
+        let r = overlay().rect(PANE);
+        assert_eq!((r.width, r.height), (50, 14));
+    }
+
+    /// **全部は隠さない**: 呼んだセッションのスロットと反対側の半分に置く
+    #[test]
+    fn a_new_overlay_sits_on_the_half_away_from_the_caller() {
+        let left_slot = Rect::new(30, 0, 50, 50);
+        let r = Overlay::new(view(), PANE, Some(left_slot), CELL).rect(PANE);
+        assert!(r.x >= 80 && r.right() <= PANE.right(), "{r:?} covers the caller");
+        assert!(r.y > PANE.y && r.bottom() < PANE.bottom(), "{r:?} leaves no margin");
+        let right_slot = Rect::new(80, 0, 50, 50);
+        let r = Overlay::new(view(), PANE, Some(right_slot), CELL).rect(PANE);
+        assert!(r.right() <= 80, "{r:?} covers the caller");
+    }
+
+    #[test]
+    fn the_overlay_tells_its_title_edges_and_inside_apart() {
+        let o = overlay();
+        let r = o.rect(PANE);
+        assert_eq!(o.hit(PANE, r.x + 3, r.y), Some(Hit::Move));
+        assert_eq!(o.hit(PANE, r.x, r.y + 3), Some(Hit::Resize { left: true, right: false, bottom: false }));
+        assert_eq!(
+            o.hit(PANE, r.right() - 1, r.bottom() - 1),
+            Some(Hit::Resize { left: false, right: true, bottom: true })
+        );
+        assert_eq!(o.hit(PANE, r.x + 3, r.y + 3), Some(Hit::Inside));
+        let (cols, row) = crate::ui::close_zone(r).unwrap();
+        assert_eq!(o.hit(PANE, *cols.end(), row), Some(Hit::Close));
+        assert_eq!(o.hit(PANE, r.x - 1, r.y + 3), None);
+    }
+
+    /// 動かしても大きさを変えても、ペインの外へ出ず最小より小さくならない
+    #[test]
+    fn dragging_the_frame_stays_inside_the_pane_and_above_the_minimum() {
+        let start = Rect::new(80, 5, 40, 30);
+        assert_eq!(dragged(start, Hit::Move, (-5, 2), PANE), Rect::new(75, 7, 40, 30));
+        assert_eq!(dragged(start, Hit::Move, (100, 100), PANE), Rect::new(90, 20, 40, 30));
+        let grow = Hit::Resize { left: true, right: false, bottom: true };
+        assert_eq!(dragged(start, grow, (-10, 4), PANE), Rect::new(70, 5, 50, 34));
+        let shrink = Hit::Resize { left: false, right: true, bottom: true };
+        let r = dragged(start, shrink, (-100, -100), PANE);
+        assert_eq!((r.width, r.height), (MIN_COLS, MIN_ROWS));
+    }
+
+    /// 位置と大きさはペインに対する比で残る（端末が広がれば一緒に広がる）
+    #[test]
+    fn the_overlay_keeps_its_place_relative_to_the_pane() {
+        let mut o = overlay();
+        o.set_rect(Rect::new(40, 10, 50, 25), PANE);
+        assert_eq!(o.rect(PANE), Rect::new(40, 10, 50, 25));
+        let wider = Rect::new(30, 0, 200, 100);
+        assert_eq!(o.rect(wider), Rect::new(50, 20, 100, 50));
     }
 
     /// 縮小は半分ずつの段から拾う（元画像を間引かない）
     #[test]
     fn shrinking_reads_from_a_smaller_level() {
         let v = view();
-        let shot = Shot { image: Arc::clone(&v.image), area: Rect::new(0, 0, 1, 1), zoom: 1.0, center: (0.0, 0.0) };
+        let shot = Shot { image: Arc::clone(&v.image), area: Rect::new(0, 0, 1, 1), zoom: 1.0, center: (0.0, 0.0), background: [0; 3] };
         assert_eq!(shot.level(1.0), 0);
         assert_eq!(shot.level(0.6), 0);
         assert_eq!(shot.level(0.5), 1);
