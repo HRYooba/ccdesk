@@ -2162,6 +2162,11 @@ fn draw_slot(frame: &mut Frame, rect: Rect, app: &mut App, at: usize, focused: b
             app.pictures.extend(pictures);
             cursor
         }
+        Some(Slot::Image(view)) => {
+            let shot = draw_image_slot(frame, rect, view, focused);
+            app.pictures.push(crate::graphics::Paint::View(shot));
+            FrameCursor::hidden_at(pane_fallback_pos(rect))
+        }
         // 空スロット（起動時・stop / close の直後）。枠だけだと「壊れている」
         // のか「ただ空」なのか見分かないので、案内を 1 行出す
         _ => {
@@ -2188,6 +2193,39 @@ fn draw_slot(frame: &mut Frame, rect: Rect, app: &mut App, at: usize, focused: b
             FrameCursor::hidden_at(pane_fallback_pos(rect))
         }
     }
+}
+
+/// 画像ビューアーのスロット。**セルには何も描かない**（内側は Sixel が覆う）。
+/// 見出しは名前と、元の画素に対する今の倍率
+fn draw_image_slot(
+    frame: &mut Frame,
+    rect: Rect,
+    view: &mut crate::viewer::ImageView,
+    focused: bool,
+) -> crate::viewer::Shot {
+    let cell = crate::graphics::cell_pixels();
+    let inner = Block::default().borders(Borders::ALL).inner(rect);
+    // 描くたびにホイールの段数の上限を数え直す（[`crate::viewer::STEPS_PER_FRAME`]）
+    view.begin_frame();
+    let shot = view.shot(inner, cell);
+    let percent = (view.scale(crate::viewer::Viewport::of(inner, cell)) * 100.0).round();
+    let title = clip_to_width(
+        &format!("{}{PANE_TITLE_SEP}{percent}%", view.image.name()),
+        (rect.width as usize)
+            .saturating_sub(PANE_TITLE_MARGIN)
+            .saturating_sub(close_cols(rect.width)) as u16,
+    );
+    let block = with_close_mark(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(border_style(focused)),
+        rect,
+        focused,
+    );
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    frame.render_widget(block, rect);
+    shot
 }
 
 /// セッションを映しているスロット。窓が見つからない（起こし損ねた）ときは空扱い。
@@ -2302,7 +2340,7 @@ fn blank_pictures(
         if rows == 0 || cols == 0 {
             continue;
         }
-        pictures.push(crate::graphics::Paint {
+        pictures.push(crate::graphics::Paint::Placement(crate::graphics::Placement {
             picture,
             visible: crate::graphics::Visible {
                 row: inner.y + v.row,
@@ -2312,7 +2350,7 @@ fn blank_pictures(
                 ..v
             },
             size,
-        });
+        }));
     }
     pictures
 }

@@ -376,6 +376,8 @@ pub(crate) enum Slot {
     Empty,
     Session(SessionId),
     New(NewState),
+    /// 画像ビューアー（`ccdesk view`）
+    Image(crate::viewer::ImageView),
 }
 
 impl Slot {
@@ -691,6 +693,17 @@ pub(crate) struct App {
     pub(crate) pictures: Vec<crate::graphics::Paint>,
     /// 端末に出した Sixel の記録（[`crate::graphics::Painter`]）
     pub(crate) painter: crate::graphics::Painter,
+    /// 画像ビューアーをドラッグで動かしている最中か（[`ImageDrag`]）
+    pub(crate) image_drag: Option<ImageDrag>,
+}
+
+/// 画像ビューアーのドラッグ。**掴んだスロットとカーソルの直前の位置**を持つ
+/// （スロットの外へ出ても、離すまで同じ画像を動かす）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ImageDrag {
+    pub(crate) slot: usize,
+    pub(crate) column: u16,
+    pub(crate) row: u16,
 }
 
 /// テストの土台になる中立な `App`。各テストは関心のあるフィールドだけを
@@ -785,6 +798,7 @@ impl Default for App {
             pending_submit: Vec::new(),
             pictures: Vec::new(),
             painter: crate::graphics::Painter::default(),
+            image_drag: None,
         }
     }
 }
@@ -981,6 +995,9 @@ impl App {
                 Slot::Empty => crate::source::SlotView::Empty,
                 Slot::New(_) => crate::source::SlotView::New,
                 Slot::Session(id) => crate::source::SlotView::Session(id.as_str().to_string()),
+                Slot::Image(view) => {
+                    crate::source::SlotView::Image(view.path().to_string_lossy().to_string())
+                }
             })
             .collect();
         self.source.save_window(WindowItem::Slots(&views));
@@ -1139,6 +1156,11 @@ impl App {
     /// フォーカス中のスロットが new session 画面か
     pub(crate) fn focus_is_new(&self) -> bool {
         matches!(self.slots.get(self.focus_slot), Some(Slot::New(_)))
+    }
+
+    /// フォーカス中のスロットが画像ビューアーか
+    pub(crate) fn focus_is_image(&self) -> bool {
+        matches!(self.slots.get(self.focus_slot), Some(Slot::Image(_)))
     }
 
     /// フォーカス中のスロットの new session 画面
@@ -1305,11 +1327,8 @@ fn paint_pictures(terminal: &mut ratatui::DefaultTerminal, app: &mut App) {
         });
         pictures = std::mem::take(&mut app.pictures);
     }
-    let cell = crate::graphics::CELL_PIXELS
-        .get()
-        .copied()
-        .unwrap_or(crate::graphics::FALLBACK_CELL);
-    app.painter.paint(&mut std::io::stdout(), &pictures, cell);
+    app.painter
+        .paint(&mut std::io::stdout(), &pictures, crate::graphics::cell_pixels());
 }
 
 /// アクティブ窓へバイト列を送る。**書き込みエラーで run ループを抜けない**:
@@ -1596,101 +1615,123 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
         if !crossterm::event::poll(wait)? {
             continue;
         }
-        force_draw = true; // イベントを処理したら必ず描画
-        match crossterm::event::read()? {
-            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                // 予約キー（claude へ渡さない唯一の打鍵）は [`reserved_key`] が答える
-                match reserved_key(&key) {
-                    Some(Reserved::Quit) => return Ok(()),
-                    Some(Reserved::Focus(to)) => {
-                        app.set_focus(to);
+        // **届いているイベントはまとめて処理してから描く。** 1 つごとに描くと、
+        // ホイールを回した段数だけ画像ビューアーの Sixel を作り直す（1 枚に数十 ms）。
+        // 上限は、イベントが途切れなくても描画が止まり続けないため
+        let mut redraw = false;
+        for n in 0..EVENT_BATCH {
+            if n > 0 && !crossterm::event::poll(Duration::ZERO)? {
+                break;
+            }
+            let event = crossterm::event::read()?;
+            // マウスの移動だけは、ホバーが変わったときしか描かない（下の Mouse の腕）
+            redraw |= !matches!(event, Event::Mouse(_));
+            match event {
+                Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                    // 予約キー（claude へ渡さない唯一の打鍵）は [`reserved_key`] が答える
+                    match reserved_key(&key) {
+                        Some(Reserved::Quit) => return Ok(()),
+                        Some(Reserved::Focus(to)) => {
+                            app.set_focus(to);
+                            continue;
+                        }
+                        // 行き先が無い向きは何もしない（配置の端）
+                        Some(Reserved::Slot(dir)) => {
+                            if let Some(to) = app.layout.neighbor(app.focus_slot, dir) {
+                                app.set_focus_slot(to);
+                            }
+                            continue;
+                        }
+                        None => {}
+                    }
+                    // サイドバーフォーカス中のキー操作（入力欄は名前の変更中だけ）
+                    if app.focus == Focus::Sidebar {
+                        handle_sidebar_key(app, &key);
                         continue;
                     }
-                    // 行き先が無い向きは何もしない（配置の端）
-                    Some(Reserved::Slot(dir)) => {
-                        if let Some(to) = app.layout.neighbor(app.focus_slot, dir) {
-                            app.set_focus_slot(to);
+                    // 新規セッション画面のキー操作
+                    if app.focus_is_new() {
+                        handle_new_view_key(app, &key)?;
+                        continue;
+                    }
+                    // 画像ビューアーが受けるキーは閉じる Esc だけ（打鍵の宛先になる窓が無い）
+                    if app.focus_is_image() {
+                        if key.code == KeyCode::Esc {
+                            app.close_slot(app.focus_slot);
                         }
                         continue;
                     }
-                    None => {}
+                    // 起動処理中の打鍵は溜める（子が掴んだ時点でその宛先へ流れる）
+                    if hold_input_while_starting(app, || HeldInput::Key(key)) {
+                        continue;
+                    }
+                    // フォーカスがターミナル側にあるときだけ PTY へ流す
+                    if app.windows.is_empty() {
+                        continue;
+                    }
+                    let Some(at) = app.focused_window() else {
+                        continue;
+                    };
+                    let bytes = encode_key(&key, &app.windows[at].parser.lock_recover());
+                    if !bytes.is_empty() {
+                        send_to_active(app, &bytes);
+                    }
                 }
-                // サイドバーフォーカス中のキー操作（入力欄は名前の変更中だけ）
-                if app.focus == Focus::Sidebar {
-                    handle_sidebar_key(app, &key);
-                    continue;
-                }
-                // 新規セッション画面のキー操作
-                if app.focus_is_new() {
-                    handle_new_view_key(app, &key)?;
-                    continue;
-                }
-                // 起動処理中の打鍵は溜める（子が掴んだ時点でその宛先へ流れる）
-                if hold_input_while_starting(app, || HeldInput::Key(key)) {
-                    continue;
-                }
-                // フォーカスがターミナル側にあるときだけ PTY へ流す
-                if app.windows.is_empty() {
-                    continue;
-                }
-                let Some(at) = app.focused_window() else {
-                    continue;
-                };
-                let bytes = encode_key(&key, &app.windows[at].parser.lock_recover());
-                if !bytes.is_empty() {
+                Event::Paste(text) => {
+                    // New 画面の D&D/貼り付けの解釈は new_view 側（キー・マウスと同じ場所）
+                    if let Some(state) = app.focused_new() {
+                        state.handle_paste(&text);
+                        continue;
+                    }
+                    if app.focus != Focus::Terminal {
+                        continue;
+                    }
+                    // 打鍵と同じ門番（貼り付けのほうが 1 回で送る量が多い ＝ 素通しの害が大きい）。
+                    // **同じ列に積む**ので、打鍵と貼り付けの順序は打った順のまま
+                    if hold_input_while_starting(app, || HeldInput::Paste(text.clone())) {
+                        continue;
+                    }
+                    if app.windows.is_empty() {
+                        continue;
+                    }
+                    // sanitize と bracketed paste の包みはキー入力と同じ keys 側
+                    // （「入力を VT バイト列にする」知識を run ループに置かない）
+                    let Some(at) = app.focused_window() else {
+                        continue;
+                    };
+                    let bytes =
+                        crate::keys::encode_paste(&text, &app.windows[at].parser.lock_recover());
                     send_to_active(app, &bytes);
                 }
+                Event::Mouse(mouse) => {
+                    let prev_hover = (app.hovered, app.usage_hovered);
+                    if handle_mouse(app, &mouse)? {
+                        return Ok(());
+                    }
+                    if mouse_needs_redraw(mouse.kind, prev_hover, (app.hovered, app.usage_hovered)) {
+                        redraw = true;
+                    }
+                }
+                Event::Resize(w, h) => resize_terminal(app, w, h),
+                // ホスト端末のフォーカス変化をアクティブ PTY へ中継
+                // （ターミナルペインがフォーカス中のときだけ意味を持つ）
+                Event::FocusGained => {
+                    // **前面に居るウィンドウを控える唯一の契機。** 端末がフォーカスを
+                    // 得た瞬間なら、前面のウィンドウは ccdesk を映しているそれ
+                    // （通知クリックで戻す先。[`crate::notify`]）
+                    crate::notify::remember_terminal_window();
+                    forward_host_focus(app, true);
+                }
+                Event::FocusLost => forward_host_focus(app, false),
+                _ => {}
             }
-            Event::Paste(text) => {
-                // New 画面の D&D/貼り付けの解釈は new_view 側（キー・マウスと同じ場所）
-                if let Some(state) = app.focused_new() {
-                    state.handle_paste(&text);
-                    continue;
-                }
-                if app.focus != Focus::Terminal {
-                    continue;
-                }
-                // 打鍵と同じ門番（貼り付けのほうが 1 回で送る量が多い ＝ 素通しの害が大きい）。
-                // **同じ列に積む**ので、打鍵と貼り付けの順序は打った順のまま
-                if hold_input_while_starting(app, || HeldInput::Paste(text.clone())) {
-                    continue;
-                }
-                if app.windows.is_empty() {
-                    continue;
-                }
-                // sanitize と bracketed paste の包みはキー入力と同じ keys 側
-                // （「入力を VT バイト列にする」知識を run ループに置かない）
-                let Some(at) = app.focused_window() else {
-                    continue;
-                };
-                let bytes =
-                    crate::keys::encode_paste(&text, &app.windows[at].parser.lock_recover());
-                send_to_active(app, &bytes);
-            }
-            Event::Mouse(mouse) => {
-                let prev_hover = (app.hovered, app.usage_hovered);
-                if handle_mouse(app, &mouse)? {
-                    return Ok(());
-                }
-                if !mouse_needs_redraw(mouse.kind, prev_hover, (app.hovered, app.usage_hovered)) {
-                    force_draw = false;
-                }
-            }
-            Event::Resize(w, h) => resize_terminal(app, w, h),
-            // ホスト端末のフォーカス変化をアクティブ PTY へ中継
-            // （ターミナルペインがフォーカス中のときだけ意味を持つ）
-            Event::FocusGained => {
-                // **前面に居るウィンドウを控える唯一の契機。** 端末がフォーカスを
-                // 得た瞬間なら、前面のウィンドウは ccdesk を映しているそれ
-                // （通知クリックで戻す先。[`crate::notify`]）
-                crate::notify::remember_terminal_window();
-                forward_host_focus(app, true);
-            }
-            Event::FocusLost => forward_host_focus(app, false),
-            _ => {}
         }
+        force_draw |= redraw;
     }
 }
+
+/// 描く前にまとめて処理するイベントの上限（[`run`]）
+const EVENT_BATCH: usize = 64;
 
 /// **ccdesk が横取りする打鍵。ここに無いキーは 1 つ残らず claude へ渡る。**
 ///
@@ -2657,6 +2698,10 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
     if app.drag.is_some() && handle_session_drag(app, mouse) {
         return Ok(false);
     }
+    // 画像を掴んでいる間も同じ（離すまで、スロットの外でも同じ画像を動かす）
+    if app.image_drag.is_some() && handle_image_drag(app, mouse) {
+        return Ok(false);
+    }
     if app.popup.is_some() && !app.dragging {
         let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
             return Ok(false);
@@ -2835,6 +2880,14 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
                 app.set_focus_slot(on);
             }
         }
+        // 画像ビューアーは**フォーカスに関わらず**ホイールを受ける。裏のスロットへ
+        // 渡さない理由（見ていない画面が勝手に動く）は、打鍵の宛先を持たない
+        // ビューアーには当たらない
+        if let Some(on) = on
+            && handle_image_mouse(app, on, rects[on], mouse)
+        {
+            return Ok(false);
+        }
         // **フォーカススロット以外へのイベントは中身へ渡さない。** 裏のスロットの
         // claude にホイールやクリックが届くと、見ていない画面が勝手に動く
         if on != Some(app.focus_slot) {
@@ -2858,6 +2911,82 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
         forward_mouse(app, mouse);
     }
     Ok(false)
+}
+
+/// 画像ビューアーのスロット `at` へのマウス。ビューアーでなければ false
+/// （呼び手はいつもの経路へ流す）。**ビューアーへのイベントはどれも子へ渡さない**
+fn handle_image_mouse(app: &mut App, at: usize, rect: Rect, mouse: &MouseEvent) -> bool {
+    let Some(Slot::Image(view)) = app.slots.get_mut(at) else {
+        return false;
+    };
+    let cell = crate::graphics::cell_pixels();
+    let inner = image_inner(rect);
+    let vp = crate::viewer::Viewport::of(inner, cell);
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            // カーソルのセルの中心（画素）
+            let at_px = (
+                (f64::from(mouse.column.saturating_sub(inner.x)) + 0.5) * f64::from(cell.0),
+                (f64::from(mouse.row.saturating_sub(inner.y)) + 0.5) * f64::from(cell.1),
+            );
+            view.wheel(mouse.kind == MouseEventKind::ScrollUp, at_px, vp);
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.image_drag = Some(ImageDrag {
+                slot: at,
+                column: mouse.column,
+                row: mouse.row,
+            });
+        }
+        _ => {}
+    }
+    true
+}
+
+/// ビューアーの内寸（枠の内側 ＝ [`crate::ui`] が Sixel を置く範囲）
+fn image_inner(rect: Rect) -> Rect {
+    ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .inner(rect)
+}
+
+/// 画像を掴んでいる間のマウス。戻り値 true ＝ このイベントは掴みが受け取った
+fn handle_image_drag(app: &mut App, mouse: &MouseEvent) -> bool {
+    let Some(drag) = app.image_drag else {
+        return false;
+    };
+    match mouse.kind {
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let rect = app.slot_rects().get(drag.slot).copied();
+            // 掴んでいる間に配置が変わった（`ccdesk view` が割った等）なら離す
+            let (Some(rect), Some(Slot::Image(view))) = (rect, app.slots.get_mut(drag.slot)) else {
+                app.image_drag = None;
+                return true;
+            };
+            let cell = crate::graphics::cell_pixels();
+            let delta = (
+                (f64::from(mouse.column) - f64::from(drag.column)) * f64::from(cell.0),
+                (f64::from(mouse.row) - f64::from(drag.row)) * f64::from(cell.1),
+            );
+            view.pan(delta, crate::viewer::Viewport::of(image_inner(rect), cell));
+            app.image_drag = Some(ImageDrag {
+                column: mouse.column,
+                row: mouse.row,
+                ..drag
+            });
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.image_drag = None;
+            true
+        }
+        // 離したイベントを取り逃がした（押している間は Drag しか来ない）
+        MouseEventKind::Moved => {
+            app.image_drag = None;
+            false
+        }
+        _ => false,
+    }
 }
 
 /// 十字の境界ドラッグ。**掴んだ・動かした・離した周は true**（呼び手はそこで打ち切る）。
@@ -3167,6 +3296,17 @@ fn make_room(app: &mut App, target: DropAt) -> Option<usize> {
             if let Some(slot) = before.get_mut(at) {
                 next[grown.halves[1 - half]] = std::mem::replace(slot, Slot::Empty);
             }
+            // **フォーカスも中身と一緒に写す**（番号を据え置くと、見ていたのと違う
+            // スロットへ焦点が移る）。`apply_layout` が既読を合わせるので、その前に載せる
+            app.focus_slot = if app.focus_slot == at {
+                grown.halves[1 - half]
+            } else {
+                grown
+                    .moved
+                    .iter()
+                    .find(|(from, _)| *from == app.focus_slot)
+                    .map_or(app.focus_slot, |(_, to)| *to)
+            };
             app.apply_layout(grown.layout, next);
             // **配置ごと書き残す**（スロットだけ保存すると、次の起動で古い配置の
             // 枚数しか復元されず、割って増えたペインが消える）
@@ -3649,7 +3789,70 @@ fn apply_relay_request(
             menu_close(app, to);
             None
         }
+        crate::relay::Request::View { path, from, reply } => {
+            let shown = crate::viewer::Image::open(std::path::Path::new(path))
+                .map(|image| show_image(app, image, from.as_ref()));
+            Some((*reply, crate::relay::shown_answer(shown)))
+        }
     }
+}
+
+/// `ccdesk view` の画像をスロットへ出す。
+///
+/// **フォーカスは動かさない**（[`start_unattended`] と同じ理由: 押した人が居ない
+/// 操作が、打っている最中の打鍵の宛先を奪わない）
+fn show_image(app: &mut App, image: crate::viewer::Image, from: Option<&SessionId>) {
+    let to = image_slot(app, image.size(), from);
+    if let Some(slot) = app.slots.get_mut(to) {
+        *slot = Slot::Image(crate::viewer::ImageView::new(image));
+    }
+    app.save_slots();
+}
+
+/// 画像を出すスロット（要れば配置を育てる）。先に当たったものを採る:
+///
+/// 1. 既にビューアーが出ているスロット（中身を差し替える ＝ ビューアーは増えない）
+/// 2. 空のスロット
+/// 3. 呼んだセッションのスロット（出ていなければフォーカススロット）を割った片方。
+///    **割り方は画像が大きく出る方**で、割られたセッションはもう片方に残る
+///    ＝ 触っていないセッションは画面から消えない
+/// 4. 割れない（4 枚・端末が狭い）なら、呼んだセッションでもフォーカスでもない
+///    スロットを読み順で最後から（そこのセッションは表示から外れるだけで走り続ける）。
+///    それも無い（1 枚で割れない）なら、その 1 枚
+fn image_slot(app: &mut App, (iw, ih): (f64, f64), from: Option<&SessionId>) -> usize {
+    if let Some(at) = app.slots.iter().position(|s| matches!(s, Slot::Image(_))) {
+        return at;
+    }
+    if let Some(at) = app.slots.iter().position(|s| matches!(s, Slot::Empty)) {
+        return at;
+    }
+    let anchor = from
+        .and_then(|id| app.slot_of(id))
+        .unwrap_or(app.focus_slot);
+    let pane = crate::ui::pane_rect(app);
+    let (cw, ch) = crate::graphics::cell_pixels();
+    let best = [crate::panes::Axis::Vertical, crate::panes::Axis::Horizontal]
+        .into_iter()
+        .filter_map(|axis| {
+            let grown = app.layout.split_slot(anchor, axis)?;
+            if !grown.layout.fits(pane, app.split) {
+                return None;
+            }
+            let rect = *grown.layout.rects(pane, app.split).get(grown.halves[1])?;
+            let (rows, cols) = App::inner_size(rect);
+            let fit = (f64::from(cols) * f64::from(cw) / iw).min(f64::from(rows) * f64::from(ch) / ih);
+            Some((axis, fit))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1));
+    if let Some((axis, _)) = best
+        && let Some(to) = make_room(app, DropAt::Split { at: anchor, axis, half: 1 })
+    {
+        return to;
+    }
+    (0..app.slots.len())
+        .rev()
+        .find(|&at| at != anchor && at != app.focus_slot)
+        .unwrap_or(anchor)
 }
 
 /// **押した人が居ない**セッションの起動（`ccdesk new`）。
@@ -4303,6 +4506,12 @@ pub(crate) fn restore_slots(app: &mut App, saved: Vec<SlotView>) {
                 }
             }
             SlotView::New => app.open_new_view(),
+            // 開けない画像（消えた・壊れた）のスロットは空のまま
+            SlotView::Image(path) => {
+                if let Ok(image) = crate::viewer::Image::open(std::path::Path::new(&path)) {
+                    app.slots[at] = Slot::Image(crate::viewer::ImageView::new(image));
+                }
+            }
             SlotView::Empty => {}
         }
     }
@@ -8702,5 +8911,188 @@ mod tests {
             "the form was rebuilt and the typed prompt was lost"
         );
         assert_eq!(app.focus, Focus::Terminal, "the row no longer hands the form the keys");
+    }
+
+    // ── 画像ビューアー（`ccdesk view`） ──────────────────────────────
+
+    /// 横長の単色画像（ファイルを読まない）
+    fn picture(name: &str) -> crate::viewer::Image {
+        crate::viewer::Image::from_picture(
+            std::path::PathBuf::from(format!("C:/shots/{name}")),
+            crate::graphics::Picture {
+                width: 400,
+                height: 200,
+                rgba: vec![128; 400 * 200 * 4],
+            },
+        )
+    }
+
+    fn shows_image(slot: &Slot, name: &str) -> bool {
+        matches!(slot, Slot::Image(view) if view.image.name() == name)
+    }
+
+    /// **2 列のときは呼んだセッションの列を割る。** 呼んだセッションは割った片方に
+    /// 残り、もう 1 列のセッションも、フォーカスも動かない
+    #[test]
+    fn a_view_splits_the_callers_slot_and_leaves_the_rest_alone() {
+        let mut app = test_app(34, TERM);
+        app.set_layout(crate::panes::Layout::TwoColumns);
+        let (caller, other) = (SessionId::new("caller"), SessionId::new("other"));
+        app.slots[0] = Slot::Session(caller.clone());
+        app.slots[1] = Slot::Session(other.clone());
+        app.focus_slot = 1;
+        show_image(&mut app, picture("a.png"), Some(&caller));
+        assert_eq!(app.layout.slots(), 3, "the layout did not grow");
+        let image = app
+            .slots
+            .iter()
+            .position(|s| shows_image(s, "a.png"))
+            .expect("no viewer");
+        let (caller_at, other_at) = (app.slot_of(&caller).unwrap(), app.slot_of(&other).unwrap());
+        // 呼んだセッションと同じ列（左右の位置が同じ）に出る
+        let rects = app.slot_rects();
+        assert_eq!(rects[image].x, rects[caller_at].x, "the viewer is not beside the caller");
+        assert_eq!(rects[other_at].height, crate::ui::pane_rect(&app).height, "the other column was cut");
+        assert_eq!(app.focus_slot, other_at, "the focus moved with the new viewer");
+    }
+
+    /// 2 枚目の画像は**同じビューアーへ**入る（ビューアーは増えない）
+    #[test]
+    fn a_second_view_replaces_the_image_in_the_viewer() {
+        let mut app = test_app(34, TERM);
+        app.slots[0] = Slot::Session(SessionId::new("s"));
+        show_image(&mut app, picture("a.png"), None);
+        let layout = app.layout;
+        show_image(&mut app, picture("b.png"), None);
+        assert_eq!(app.layout, layout, "a second image grew the layout again");
+        assert_eq!(app.slots.iter().filter(|s| matches!(s, Slot::Image(_))).count(), 1);
+        assert!(app.slots.iter().any(|s| shows_image(s, "b.png")), "the viewer still shows the first image");
+    }
+
+    /// 空きがあれば割らずにそこへ出す
+    #[test]
+    fn a_view_takes_an_empty_slot_before_splitting_anything() {
+        let mut app = test_app(34, TERM);
+        app.set_layout(crate::panes::Layout::TwoColumns);
+        app.slots[0] = Slot::Session(SessionId::new("s"));
+        show_image(&mut app, picture("a.png"), None);
+        assert_eq!(app.layout, crate::panes::Layout::TwoColumns);
+        assert!(shows_image(&app.slots[1], "a.png"));
+    }
+
+    /// 1 枚の盤面は画像が大きく出る向きに割る（横長の画像を横長の端末で ＝ 上下）
+    #[test]
+    fn a_single_pane_is_split_the_way_the_image_comes_out_larger() {
+        let mut app = test_app(34, (200, 60));
+        app.slots[0] = Slot::Session(SessionId::new("s"));
+        let wide = crate::viewer::Image::from_picture(
+            std::path::PathBuf::from("C:/shots/wide.png"),
+            crate::graphics::Picture { width: 1600, height: 200, rgba: vec![0; 1600 * 200 * 4] },
+        );
+        show_image(&mut app, wide, None);
+        assert_eq!(app.layout, crate::panes::Layout::TwoRows);
+    }
+
+    /// 割れない 4 枚では、呼んだセッションでもフォーカスでもないスロットへ出す
+    #[test]
+    fn a_full_grid_gives_up_a_slot_that_is_neither_the_caller_nor_the_focus() {
+        let mut app = test_app(34, TERM);
+        app.set_layout(crate::panes::Layout::Four);
+        for (at, id) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            app.slots[at] = Slot::Session(SessionId::new(id));
+        }
+        app.focus_slot = 2;
+        show_image(&mut app, picture("x.png"), Some(&SessionId::new("d")));
+        assert!(shows_image(&app.slots[1], "x.png"), "the viewer went somewhere else");
+        assert_eq!(app.layout, crate::panes::Layout::Four);
+    }
+
+    fn wheel(column: u16, row: u16, up: bool) -> MouseEvent {
+        MouseEvent {
+            kind: if up { MouseEventKind::ScrollUp } else { MouseEventKind::ScrollDown },
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn camera(app: &App, at: usize) -> (f64, (f64, f64)) {
+        match &app.slots[at] {
+            Slot::Image(view) => view.camera(),
+            _ => panic!("slot {at} is not a viewer"),
+        }
+    }
+
+    /// **ビューアーはフォーカスが無くてもホイールを受ける**（打鍵の宛先を持たない）
+    #[test]
+    fn the_wheel_zooms_the_viewer_under_the_cursor_without_focusing_it() {
+        let mut app = test_app(34, TERM);
+        app.set_layout(crate::panes::Layout::TwoColumns);
+        app.slots[1] = Slot::Image(crate::viewer::ImageView::new(picture("a.png")));
+        app.focus_slot = 0;
+        let r = app.slot_rects()[1];
+        handle_mouse(&mut app, &wheel(r.x + r.width / 2, r.y + r.height / 2, true)).unwrap();
+        assert!(camera(&app, 1).0 > 1.0, "the wheel did not zoom");
+        assert_eq!(app.focus_slot, 0, "the wheel moved the focus");
+    }
+
+    /// 掴んで動かすと画像が付いてくる。**スロットの外へ出ても離すまで動く**
+    #[test]
+    fn dragging_pans_the_image_until_the_button_is_released() {
+        let mut app = test_app(34, TERM);
+        app.slots[0] = Slot::Image(crate::viewer::ImageView::new(picture("a.png")));
+        let r = app.slot_rects()[0];
+        let (x, y) = (r.x + r.width / 2, r.y + r.height / 2);
+        // 全体表示では動かない ＝ 先に寄せる
+        for _ in 0..10 {
+            if let Slot::Image(view) = &mut app.slots[0] {
+                view.begin_frame();
+            }
+            handle_mouse(&mut app, &wheel(x, y, true)).unwrap();
+        }
+        let before = camera(&app, 0).1;
+        handle_mouse(&mut app, &click(x, y)).unwrap();
+        handle_mouse(&mut app, &drag_to(x - 5, y)).unwrap();
+        let moved = camera(&app, 0).1;
+        assert!(moved.0 > before.0, "dragging left did not move the view right: {before:?} -> {moved:?}");
+        // 左の外（サイドバーの上）まで引いても掴んだまま
+        handle_mouse(&mut app, &drag_to(2, y)).unwrap();
+        assert!(camera(&app, 0).1 .0 > moved.0, "the drag stopped at the slot edge");
+        handle_mouse(&mut app, &release(2, y)).unwrap();
+        assert_eq!(app.image_drag, None, "the image stayed grabbed after release");
+    }
+
+    /// ✕ は他のスロットと同じく枠ごと閉じる（割って増えた配置が元に戻る）
+    #[test]
+    fn closing_the_viewer_gives_the_space_back() {
+        let mut app = test_app(34, TERM);
+        app.slots[0] = Slot::Session(SessionId::new("s"));
+        show_image(&mut app, picture("a.png"), None);
+        let at = app.slots.iter().position(|s| matches!(s, Slot::Image(_))).unwrap();
+        let (cols, row) = crate::ui::close_zone(app.slot_rects()[at]).expect("no close mark");
+        handle_mouse(&mut app, &click(*cols.end(), row)).unwrap();
+        assert_eq!(app.layout, crate::panes::Layout::One);
+        assert_eq!(app.slot_of(&SessionId::new("s")), Some(0));
+    }
+
+    /// 描くとビューアーの Sixel が 1 枚積まれる（枠の内側に収まる）
+    #[test]
+    fn drawing_a_viewer_queues_its_picture_inside_the_frame() {
+        let mut app = test_app(34, TERM);
+        app.slots[0] = Slot::Image(crate::viewer::ImageView::new(picture("a.png")));
+        let (w, h) = app.term_size;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
+            .expect("test terminal");
+        terminal.draw(|frame| {
+            draw(frame, &mut app);
+        })
+        .expect("draw");
+        assert_eq!(app.pictures.len(), 1, "the viewer queued no picture");
+        let title: String = {
+            let r = app.slot_rects()[0];
+            let buffer = terminal.backend().buffer();
+            (r.x..r.x + r.width).map(|x| buffer[(x, r.y)].symbol()).collect()
+        };
+        assert!(title.contains("a.png"), "the frame does not name the image: {title}");
     }
 }

@@ -20,6 +20,7 @@ fn usage_text() -> String {
          \x20                                   that session's last messages, or its screen\n\
          \x20 ccdesk new [--agent <name>] [--cwd <dir>] [prompt]\n\
          \x20                                   start another session and print its id\n\
+         \x20 ccdesk view <path>                show an image in this ccdesk's image viewer\n\
          \x20 ccdesk stop <session>             end its process, keep the row\n\
          \x20 ccdesk close <session>            end its process and drop the row",
         env!("CARGO_PKG_VERSION")

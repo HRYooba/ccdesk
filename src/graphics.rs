@@ -384,28 +384,72 @@ pub(crate) fn visible(screen: &vt100::Screen) -> Vec<Visible> {
     out
 }
 
-/// 1 フレームで描く画像。`visible` の座標は**端末の絶対座標**へ移してある
+/// 1 フレームで描く画像
 #[derive(Clone)]
-pub(crate) struct Paint {
+pub(crate) enum Paint {
+    /// 子の画面の placeholder に重ねる画像（kitty graphics）
+    Placement(Placement),
+    /// 画像ビューアーのスロット（[`crate::viewer`]）
+    View(crate::viewer::Shot),
+}
+
+/// placeholder に重ねる画像。`visible` の座標は**端末の絶対座標**へ移してある
+#[derive(Clone)]
+pub(crate) struct Placement {
     pub(crate) picture: Arc<Picture>,
     pub(crate) visible: Visible,
     /// 画像全体の大きさ（列, 行）
     pub(crate) size: (u16, u16),
 }
 
-type PaintKey = (usize, Visible, (u16, u16));
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum PaintKey {
+    Placement(usize, Visible, (u16, u16)),
+    View(crate::viewer::ShotKey),
+}
 
 impl Paint {
     fn key(&self) -> PaintKey {
-        (Arc::as_ptr(&self.picture) as usize, self.visible, self.size)
+        match self {
+            Self::Placement(p) => PaintKey::Placement(Arc::as_ptr(&p.picture) as usize, p.visible, p.size),
+            Self::View(shot) => PaintKey::View(shot.key()),
+        }
+    }
+
+    fn encode(&self, cell: (u16, u16)) -> Option<Encoded> {
+        let (row, col, sixel) = match self {
+            Self::Placement(p) => (p.visible.row, p.visible.col, encode(p, cell)?),
+            Self::View(shot) => {
+                let r = shot.render(cell)?;
+                let sixel = icy_sixel::SixelImage::from_rgba(r.rgba, r.width as usize, r.height as usize)
+                    .encode()
+                    .ok()?;
+                (r.row, r.col, sixel)
+            }
+        };
+        Some(Encoded { row, col, sixel })
     }
 }
+
+/// Sixel と、それを置く端末のセル（左上）
+struct Encoded {
+    row: u16,
+    col: u16,
+    sixel: String,
+}
+
+/// 覚えておく Sixel の数。ビューアーは拡大・移動のたびに別の絵になり、1 枚が
+/// 数百 KB あるので、多く持っても当たらないまま場所だけ食う
+const CACHE_LIMIT: usize = 16;
+
+type CacheKey = (PaintKey, (u16, u16));
 
 /// 画面に出した Sixel の記録。**同じ物を毎フレーム送らない**（Sixel は重い）
 #[derive(Default)]
 pub(crate) struct Painter {
     shown: Vec<PaintKey>,
-    cache: HashMap<(PaintKey, (u16, u16)), Arc<String>>,
+    /// 鍵はセルの画素寸法込み。**描けなかった物も覚える**（毎フレーム試し直さない）
+    cache: HashMap<CacheKey, Option<Arc<Encoded>>>,
 }
 
 impl Painter {
@@ -422,25 +466,31 @@ impl Painter {
     /// 画像を Sixel で送る（queue のみ）。`cell` はセルの画素寸法 (幅, 高さ)
     pub(crate) fn paint(&mut self, out: &mut impl Write, paints: &[Paint], cell: (u16, u16)) {
         self.shown = paints.iter().map(Paint::key).collect();
-        if self.cache.len() > 64 {
+        if self.cache.len() > CACHE_LIMIT {
             self.cache.clear();
         }
         for p in paints {
-            let sixel = self
+            let encoded = self
                 .cache
                 .entry((p.key(), cell))
-                .or_insert_with(|| Arc::new(encode(p, cell).unwrap_or_default()))
+                .or_insert_with(|| p.encode(cell).map(Arc::new))
                 .clone();
-            if sixel.is_empty() {
+            let Some(encoded) = encoded else {
                 continue;
-            }
-            let _ = write!(out, "\x1b7\x1b[{};{}H{}\x1b8", p.visible.row + 1, p.visible.col + 1, sixel);
+            };
+            let _ = write!(
+                out,
+                "\x1b7\x1b[{};{}H{}\x1b8",
+                encoded.row + 1,
+                encoded.col + 1,
+                encoded.sixel
+            );
         }
     }
 }
 
 /// 画像を配置の大きさ（セル × セル画素）へ縮め、見えている部分だけ切り出して Sixel にする
-fn encode(p: &Paint, (cw, ch): (u16, u16)) -> Option<String> {
+fn encode(p: &Placement, (cw, ch): (u16, u16)) -> Option<String> {
     let (cols, rows) = p.size;
     let (w, h) = (u32::from(cols) * u32::from(cw), u32::from(rows) * u32::from(ch));
     let source = image::RgbaImage::from_raw(p.picture.width, p.picture.height, p.picture.rgba.clone())?;
@@ -461,6 +511,11 @@ pub(crate) static CELL_PIXELS: std::sync::OnceLock<(u16, u16)> = std::sync::Once
 
 /// セルの画素寸法を聞けなかったときの仮の値（Windows Terminal 既定の字の大きさ相当）
 pub(crate) const FALLBACK_CELL: (u16, u16) = (9, 19);
+
+/// 今使うセルの画素寸法（聞けていなければ仮の値）
+pub(crate) fn cell_pixels() -> (u16, u16) {
+    CELL_PIXELS.get().copied().unwrap_or(FALLBACK_CELL)
+}
 
 /// ホスト端末のセルの画素寸法を聞く（CSI 16 t。答えなければ CSI 14 t を桁数で割る）。
 /// **raw mode / alt screen に入る前に呼ぶ**（[`crate::theme::query_palette`] と同じ作法。

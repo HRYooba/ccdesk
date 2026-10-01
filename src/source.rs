@@ -107,21 +107,29 @@ pub(crate) enum SlotView {
     /// new session 画面
     New,
     Session(String),
+    /// 画像ビューアー（画像の絶対パス）
+    Image(String),
 }
 
 /// 「new session 画面」を表す保存表記。UUID と衝突しない値なら何でもよい
 const LAST_VIEW_NEW: &str = "new";
+/// 画像ビューアーの保存表記の頭（後ろにパス）。UUID はこの形で始まらない
+const LAST_VIEW_IMAGE: &str = "image:";
 /// 「空スロット」を表す保存表記
 const LAST_VIEW_EMPTY: &str = "-";
 /// スロットの区切り
 const SLOT_SEP: char = ',';
 
 impl SlotView {
-    fn encode(&self) -> &str {
+    /// **パスは区切り（`,`）を含み得る**ので、`%` と `,` を逃がして書く
+    fn encode(&self) -> String {
         match self {
-            Self::Empty => LAST_VIEW_EMPTY,
-            Self::New => LAST_VIEW_NEW,
-            Self::Session(id) => id,
+            Self::Empty => LAST_VIEW_EMPTY.to_string(),
+            Self::New => LAST_VIEW_NEW.to_string(),
+            Self::Session(id) => id.clone(),
+            Self::Image(path) => {
+                format!("{LAST_VIEW_IMAGE}{}", path.replace('%', "%25").replace(SLOT_SEP, "%2C"))
+            }
         }
     }
 
@@ -132,6 +140,11 @@ impl SlotView {
         match text {
             LAST_VIEW_EMPTY | "" => Self::Empty,
             LAST_VIEW_NEW => Self::New,
+            text if text.starts_with(LAST_VIEW_IMAGE) => Self::Image(
+                text[LAST_VIEW_IMAGE.len()..]
+                    .replace("%2C", &SLOT_SEP.to_string())
+                    .replace("%25", "%"),
+            ),
             id => Self::Session(id.to_string()),
         }
     }
@@ -945,6 +958,19 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         move |key: &str| map.get(key).cloned()
+    }
+
+    /// 画像のパスは区切りや `%` を含んでも、並び全体を壊さずに戻る
+    #[test]
+    fn an_image_slot_survives_the_saved_list_even_with_separators_in_its_path() {
+        let slots = [
+            SlotView::Session("aaaa".to_string()),
+            SlotView::Image(r"C:\shots\a,b %2C 100%.png".to_string()),
+            SlotView::Empty,
+        ];
+        let text = slots.iter().map(SlotView::encode).collect::<Vec<_>>().join(&SLOT_SEP.to_string());
+        let back: Vec<SlotView> = text.split(SLOT_SEP).map(SlotView::decode).collect();
+        assert_eq!(back, slots);
     }
 
     /// 旧版の値（config.json）は state.json へ引き取り、**引き取れなくても降ろす**
