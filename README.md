@@ -107,8 +107,9 @@ fail and print the candidates rather than pick one.
   `--agent claude|codex` and `--cwd <dir>`, both defaulting to the caller's. It does
   not steal the pane: what you were watching stays on screen.
 - **`view` opens the image in a window floating over the panes** (PNG, JPEG, GIF,
-  WebP, BMP). The layout is left alone; the window first covers the half away from the
-  calling session, and a second `view` reuses it where you left it. Inside it the wheel
+  WebP, BMP). The layout is left alone; the window opens in the top-right corner of the
+  calling session's pane, sized to the image, and a second `view` reuses it where you
+  left it. Inside it the wheel
   zooms around the cursor and dragging pans; drag its title to move it, its left, right
   or bottom edge to resize it, and `✕` closes it (so does `Esc`, right after you click
   the window — otherwise `Esc` still goes to the agent).

@@ -248,27 +248,29 @@ pub(crate) enum Hit {
 }
 
 impl Overlay {
-    /// 初めて開くときの置き場所。**全部は隠さない**: `avoid`（呼んだセッションの
-    /// スロット）の中心から遠い側の半分に、上下に少し余白を残して置く。
-    /// 大きさは画像の縦横比に詰める（全体表示で余る帯のぶん、下を隠さない）
-    pub(crate) fn new(view: ImageView, pane: Rect, avoid: Option<Rect>, cell: (u16, u16)) -> Self {
-        let center = avoid.map_or(f64::from(pane.x), |r| f64::from(r.x) + f64::from(r.width) / 2.0);
-        let left_half = center >= f64::from(pane.x) + f64::from(pane.width) / 2.0;
-        let (pw, ph) = (f64::from(pane.width).max(1.0), f64::from(pane.height).max(1.0));
+    /// 初めて開くときの置き場所 ＝ `slot`（呼んだセッションのスロット）の**右上**、
+    /// スロットの枠の内側。**全部は隠さない**: 幅も高さもスロットの半分までに留め、
+    /// 画像の縦横比に詰める（claude の出力は左寄せなので、右上がいちばん読む邪魔をしない）
+    pub(crate) fn new(view: ImageView, pane: Rect, slot: Rect, cell: (u16, u16)) -> Self {
         let (cw, ch) = (f64::from(cell.0), f64::from(cell.1));
-        // 枠の 2 桁・2 行を除いた内寸で、画像を収めたときに要るセル数
-        let (max_cols, max_rows) = ((pw * 0.5 - 2.0).max(1.0), (ph * 0.86 - 2.0).max(1.0));
+        // スロットの枠の内側。ここに窓の外寸を収める
+        let room = Rect::new(slot.x + 1, slot.y + 1, slot.width.saturating_sub(2), slot.height.saturating_sub(2));
+        // 窓の枠の 2 桁・2 行を除いた内寸の上限
+        let max_cols = (f64::from(room.width) * 0.5 - 2.0).max(1.0);
+        let max_rows = (f64::from(room.height) * 0.5 - 2.0).max(1.0);
         let (iw, ih) = view.image.size();
         let fit = (max_cols * cw / iw).min(max_rows * ch / ih);
-        let cols = ((iw * fit / cw).ceil() + 2.0).max(f64::from(MIN_COLS));
-        let rows = ((ih * fit / ch).ceil() + 2.0).max(f64::from(MIN_ROWS));
-        let (w, h) = ((cols / pw).min(0.5), (rows / ph).min(0.86));
-        let x = if left_half { 0.0 } else { 1.0 - w };
-        Self {
+        let cols = ((iw * fit / cw).ceil() as u16 + 2).max(MIN_COLS).min(pane.width);
+        let rows = ((ih * fit / ch).ceil() as u16 + 2).max(MIN_ROWS).min(pane.height);
+        let x = room.right().saturating_sub(cols).max(pane.x);
+        let y = room.y.min(pane.bottom().saturating_sub(rows));
+        let mut overlay = Self {
             view,
-            place: (x, 0.07, w, h),
+            place: (0.0, 0.0, 0.0, 0.0),
             focused: false,
-        }
+        };
+        overlay.set_rect(Rect::new(x, y, cols, rows), pane);
+        overlay
     }
 
     /// 今の外寸（端末の絶対セル座標）。ペインの内側へ収め、最小の大きさを守る
@@ -588,30 +590,26 @@ mod tests {
     }
 
     fn overlay() -> Overlay {
-        Overlay::new(view(), PANE, None, CELL)
+        Overlay::new(view(), PANE, PANE, CELL)
     }
 
     const PANE: Rect = Rect { x: 30, y: 0, width: 100, height: 50 };
     const CELL: (u16, u16) = (10, 20);
 
-    /// 初めの窓は画像の縦横比に詰める（横長の画像で下の帯まで隠さない）
+    /// 初めの窓はスロットの枠の内側の**右上**に、画像の縦横比に詰めて出る。
+    /// 200×100 の画像を内寸 47 桁（470 px）に収めると高さ 235 px ＝ 12 行 + 枠
     #[test]
-    fn a_new_overlay_is_trimmed_to_the_image_shape() {
-        // 200×100 の画像を幅 48 桁（480 px）に収めると高さ 240 px ＝ 12 行 + 枠
-        let r = overlay().rect(PANE);
-        assert_eq!((r.width, r.height), (50, 14));
+    fn a_new_overlay_sits_in_the_top_right_of_the_slot_trimmed_to_the_image() {
+        assert_eq!(overlay().rect(PANE), Rect::new(80, 1, 49, 14));
     }
 
-    /// **全部は隠さない**: 呼んだセッションのスロットと反対側の半分に置く
+    /// 呼んだスロットが左列なら、その左列の右上（右列には出ない）
     #[test]
-    fn a_new_overlay_sits_on_the_half_away_from_the_caller() {
+    fn a_new_overlay_stays_inside_the_callers_slot() {
         let left_slot = Rect::new(30, 0, 50, 50);
-        let r = Overlay::new(view(), PANE, Some(left_slot), CELL).rect(PANE);
-        assert!(r.x >= 80 && r.right() <= PANE.right(), "{r:?} covers the caller");
-        assert!(r.y > PANE.y && r.bottom() < PANE.bottom(), "{r:?} leaves no margin");
-        let right_slot = Rect::new(80, 0, 50, 50);
-        let r = Overlay::new(view(), PANE, Some(right_slot), CELL).rect(PANE);
-        assert!(r.right() <= 80, "{r:?} covers the caller");
+        let r = Overlay::new(view(), PANE, left_slot, CELL).rect(PANE);
+        assert_eq!((r.right(), r.y), (left_slot.right() - 1, 1), "{r:?} is not at the top-right");
+        assert!(r.x > left_slot.x && r.width <= left_slot.width / 2, "{r:?} covers too much");
     }
 
     #[test]

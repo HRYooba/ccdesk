@@ -3819,13 +3819,14 @@ fn show_image(app: &mut App, image: crate::viewer::Image, from: Option<&SessionI
         return;
     }
     let pane = crate::ui::pane_rect(app);
-    // 避ける相手は呼んだセッションのスロット（出ていなければフォーカススロット）
+    // 出す先は呼んだセッションのスロット（出ていなければフォーカススロット）の右上
     let rects = app.slot_rects();
-    let avoid = from
+    let slot = from
         .and_then(|id| app.slot_of(id))
-        .or(Some(app.focus_slot))
-        .and_then(|at| rects.get(at).copied());
-    app.viewer = Some(crate::viewer::Overlay::new(view, pane, avoid, crate::graphics::cell_pixels()));
+        .and_then(|at| rects.get(at).copied())
+        .or_else(|| rects.get(app.focus_slot).copied())
+        .unwrap_or(pane);
+    app.viewer = Some(crate::viewer::Overlay::new(view, pane, slot, crate::graphics::cell_pixels()));
 }
 
 /// **押した人が居ない**セッションの起動（`ccdesk new`）。
@@ -8911,7 +8912,7 @@ mod tests {
     }
 
     /// **配置には入らない。** スロットの数も中身もフォーカスもそのままで、
-    /// 呼んだセッションと反対側に浮かぶ
+    /// 呼んだセッションのスロットの右上に浮かぶ
     #[test]
     fn a_view_floats_over_the_layout_without_touching_it() {
         let mut app = test_app(34, TERM);
@@ -8925,7 +8926,8 @@ mod tests {
         assert_eq!((app.slot_of(&caller), app.slot_of(&other)), (Some(0), Some(1)));
         assert_eq!(app.focus_slot, 1, "the focus moved");
         let r = viewer_rect(&app);
-        assert!(r.x >= app.slot_rects()[1].x, "{r:?} covers the caller");
+        let caller_rect = app.slot_rects()[0];
+        assert_eq!((r.right(), r.y), (caller_rect.right() - 1, caller_rect.y + 1), "{r:?} is not at the caller's top-right");
     }
 
     /// 2 枚目は同じ窓へ入る。**動かした場所と大きさは保つ**
