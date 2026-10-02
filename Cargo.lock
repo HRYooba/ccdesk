@@ -187,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "ccdesk"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
