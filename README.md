@@ -85,6 +85,7 @@ ccdesk send <session> <text>       # type text into another session and submit i
 ccdesk read <session> [-n 20]      # that session's last messages
 ccdesk read <session> --screen     # what that session looks like right now
 ccdesk new [prompt]                # start another session and print its id
+ccdesk view <path>                 # show an image in ccdesk's image viewer
 ccdesk stop <session>              # end its process, keep the row
 ccdesk close <session>             # end its process and drop the row
 ```
@@ -105,6 +106,12 @@ fail and print the candidates rather than pick one.
 - **`new` prints the id it minted**, so the next command can address it. It takes
   `--agent claude|codex` and `--cwd <dir>`, both defaulting to the caller's. It does
   not steal the pane: what you were watching stays on screen.
+- **`view` opens the image in a window floating over the panes** (PNG, JPEG, GIF,
+  WebP, BMP). The layout is left alone; the window first covers the half away from the
+  calling session, and a second `view` reuses it where you left it. Inside it the wheel
+  zooms around the cursor and dragging pans; drag its title to move it, its left, right
+  or bottom edge to resize it, and `✕` closes it (so does `Esc`, right after you click
+  the window — otherwise `Esc` still goes to the agent).
 - **None of them can target the calling session.** `stop` and `close` would kill the
   process running the command, which cannot then report what happened.
 

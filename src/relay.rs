@@ -72,6 +72,9 @@ const TO_KEY: &str = "to";
 const TEXT_KEY: &str = "text";
 const PROMPT_KEY: &str = "prompt";
 const REPLY_KEY: &str = "reply";
+const PATH_KEY: &str = "path";
+const FROM_KEY: &str = "from";
+const SHOWN_KEY: &str = "shown";
 
 fn open_path(instance: u32) -> Option<PathBuf> {
     Some(ccdesk::ipc_dir()?.join(format!("open-{instance}.json")))
@@ -251,6 +254,14 @@ pub(crate) enum Request {
     Stop { to: SessionId },
     /// プロセスを終わらせ、行も消す（＝ メニューの `close`）
     Close { to: SessionId },
+    /// 画像をビューアーのスロットへ出し、出せたかを `reply` の pid 宛に置く
+    View {
+        /// 画像の絶対パス（相対パスは CLI が呼ばれた場所で解いてから渡す）
+        path: String,
+        /// 呼んだセッション（ビューアーをその隣へ出す。分からなければ `None`）
+        from: Option<SessionId>,
+        reply: u32,
+    },
 }
 
 /// 要求の種類。**綴りの正本はここ 1 箇所**（[`Request::to_json`] と
@@ -264,6 +275,7 @@ const SCREEN: &str = "screen";
 const NEW: &str = "new";
 const STOP: &str = "stop";
 const CLOSE: &str = "close";
+const VIEW: &str = "view";
 /// 種類を運ぶ鍵
 const DO_KEY: &str = "do";
 
@@ -290,6 +302,12 @@ impl Request {
             }),
             Self::Stop { to } => json!({ DO_KEY: STOP, TO_KEY: to.as_str() }),
             Self::Close { to } => json!({ DO_KEY: CLOSE, TO_KEY: to.as_str() }),
+            Self::View { path, from, reply } => json!({
+                DO_KEY: VIEW,
+                PATH_KEY: path,
+                FROM_KEY: from.as_ref().map(SessionId::as_str),
+                REPLY_KEY: reply,
+            }),
         }
     }
 
@@ -316,6 +334,11 @@ impl Request {
             }),
             STOP => Some(Self::Stop { to: to()? }),
             CLOSE => Some(Self::Close { to: to()? }),
+            VIEW => Some(Self::View {
+                path: text(PATH_KEY)?.to_string(),
+                from: text(FROM_KEY).map(SessionId::new),
+                reply: reply()?,
+            }),
             _ => None,
         }
     }
@@ -378,6 +401,14 @@ pub(crate) fn answer(caller: u32, value: &Value) {
 /// 画面の写しの応答
 pub(crate) fn screen_answer(screen: &str) -> Value {
     json!({ SCREEN_KEY: screen })
+}
+
+/// 画像を出せたかの応答（出せなかった理由を運ぶ）
+pub(crate) fn shown_answer(shown: Result<(), String>) -> Value {
+    match shown {
+        Ok(()) => json!({ SHOWN_KEY: true }),
+        Err(error) => json!({ ERROR_KEY: error }),
+    }
 }
 
 /// 起動の応答（採番された ID か、起こせなかった理由）
@@ -654,6 +685,35 @@ pub(crate) fn run_new(kind: Option<Kind>, cwd: Option<&str>, prompt: &str) -> an
     Ok(())
 }
 
+/// `ccdesk view <path>` — 画像を ccdesk の画像ビューアーへ出す。
+///
+/// **出せたかを待って返す**（読めない画像は理由つきで失敗する）。出し先は TUI が
+/// 決め、呼んだセッションの画面は奪わない（[`crate::app`] の `image_slot`）
+pub(crate) fn run_view(path: &str) -> anyhow::Result<()> {
+    let instance = instance()?;
+    let path = path.trim();
+    if path.is_empty() {
+        anyhow::bail!("usage: ccdesk view <path>");
+    }
+    // **TUI の作業場所は呼んだセッションと違う**ので、相対パスはここで解く
+    let path = std::path::absolute(path)?;
+    if !path.is_file() {
+        anyhow::bail!("no such file: {}", path.display());
+    }
+    let open = load(instance);
+    push(
+        instance,
+        &Request::View {
+            path: path.to_string_lossy().to_string(),
+            from: caller(&open).map(|session| session.id.clone()),
+            reply: std::process::id(),
+        },
+    )?;
+    wait_answer()?;
+    println!("showing {}", path.display());
+    Ok(())
+}
+
 /// transcript の末尾 `last` 発言。
 ///
 /// **丸ごと読んでから末尾を取る。** 記録は 1 MB を超えることがあるが、これを
@@ -755,6 +815,16 @@ mod tests {
             Request::Close {
                 to: SessionId::new("dddd"),
             },
+            Request::View {
+                path: "C:/work/shot, final.png".to_string(),
+                from: Some(SessionId::new("eeee")),
+                reply: 2468,
+            },
+            Request::View {
+                path: "C:/work/shot.png".to_string(),
+                from: None,
+                reply: 1357,
+            },
         ] {
             assert_eq!(Request::from_json(&request.to_json()), Some(request));
         }
@@ -837,6 +907,14 @@ mod tests {
     #[test]
     fn a_session_without_an_id_is_dropped() {
         assert_eq!(Open::from_json(&json!({ NAME_KEY: "nameless" })), None);
+    }
+
+    /// 出せなかった画像の理由は要求元へ渡る（[`wait_answer`] が失敗にする）
+    #[test]
+    fn an_image_that_could_not_be_shown_is_answered_with_its_reason() {
+        let answer = shown_answer(Err("could not decode x.png".to_string()));
+        assert_eq!(answer.get(ERROR_KEY).and_then(Value::as_str), Some("could not decode x.png"));
+        assert!(shown_answer(Ok(())).get(ERROR_KEY).is_none());
     }
 
     /// 起こせなかった理由は要求元へ渡り、そこで失敗として出る

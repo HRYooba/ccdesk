@@ -35,6 +35,7 @@ mod title;
 mod ui;
 mod update;
 mod usage;
+mod viewer;
 
 use app::{run, App, Focus, SelfUpdate};
 use cli::{print_usage, print_usage_error, run_doctor, show_logs, update_self};
@@ -84,6 +85,11 @@ fn main() -> anyhow::Result<()> {
             return relay::run_send(target, &text.join(" "));
         }
         Some("read") => return read_session(),
+        Some("view") => {
+            // 送信の本文と同じく、残りを 1 つに繋ぐ（引用符を付け忘れた空白入りのパス）
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            return relay::run_view(&args.join(" "));
+        }
         Some("new") => return new_session(),
         Some(verb @ ("stop" | "close")) => {
             let target = std::env::args()
@@ -332,6 +338,8 @@ fn main() -> anyhow::Result<()> {
         pending_submit: Vec::new(),
         pictures: Vec::new(),
         painter: graphics::Painter::default(),
+        viewer: None,
+        viewer_drag: None,
         source,
     };
     // バックグラウンド取得の起動。**起動列の重い処理（埋め戻し・transcript の

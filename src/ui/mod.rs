@@ -1817,7 +1817,14 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // （見た目は claude の画面なのに押すと new session が走る）。
     // クリック判定と描画は同じ [`popup_rect`] を見ているので、最後に描けば
     // 「見えているものが効く」が回復する
-    let cursor = draw_right_pane(frame, chunks[1], app);
+    let mut cursor = draw_right_pane(frame, chunks[1], app);
+    // ビューアーはスロットの上、メニューの下（メニューはビューアーの上でも読める）
+    if let Some(area) = draw_viewer(frame, chunks[1], app)
+        && area.contains(cursor.pos)
+    {
+        // 窓に隠れたカーソルを窓の上で点滅させない
+        cursor = FrameCursor::hidden_at(cursor.pos);
+    }
     draw_popup(frame, app);
     cursor
 }
@@ -2190,6 +2197,50 @@ fn draw_slot(frame: &mut Frame, rect: Rect, app: &mut App, at: usize, focused: b
     }
 }
 
+/// ペインの上に浮かぶ画像ビューアー（開いていれば、その外寸を返す）。
+///
+/// **Sixel はセッションの画像より後に積む**（最後に描いたものが上に残る）。
+/// 内側は Sixel が不透明に覆うので、セルには何も描かない。
+/// 見出しは名前と、元の画素に対する今の倍率
+fn draw_viewer(frame: &mut Frame, pane: Rect, app: &mut App) -> Option<Rect> {
+    let viewer = app.viewer.as_mut()?;
+    let rect = viewer.rect(pane);
+    let inner = viewer.inner(pane);
+    let focused = viewer.focused;
+    let view = &mut viewer.view;
+    let cell = crate::graphics::cell_pixels();
+    // 描くたびにホイールの段数の上限を数え直す（[`crate::viewer::STEPS_PER_FRAME`]）
+    view.begin_frame();
+    let shot = view.shot(inner, cell, background());
+    let percent = (view.scale(crate::viewer::Viewport::of(inner, cell)) * 100.0).round();
+    let title = clip_to_width(
+        &format!("{}{PANE_TITLE_SEP}{percent}%", view.image.name()),
+        (rect.width as usize)
+            .saturating_sub(PANE_TITLE_MARGIN)
+            .saturating_sub(close_cols(rect.width)) as u16,
+    );
+    let block = with_close_mark(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(border_style(focused)),
+        rect,
+        focused,
+    );
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    frame.render_widget(block, rect);
+    app.pictures.push(crate::graphics::Paint::View(shot));
+    Some(rect)
+}
+
+/// ビューアーの余白の色 ＝ ホスト端末の背景（聞けていなければ黒）
+fn background() -> [u8; 3] {
+    crate::theme::HOST_COLORS
+        .get()
+        .and_then(|(_, bg)| *bg)
+        .map_or([0, 0, 0], |c| c.map(|v| (v >> 8) as u8))
+}
+
 /// セッションを映しているスロット。窓が見つからない（起こし損ねた）ときは空扱い。
 /// 画面に kitty graphics の画像があれば、Sixel を重ねる場所も返す
 fn draw_session_slot(
@@ -2302,7 +2353,7 @@ fn blank_pictures(
         if rows == 0 || cols == 0 {
             continue;
         }
-        pictures.push(crate::graphics::Paint {
+        pictures.push(crate::graphics::Paint::Placement(crate::graphics::Placement {
             picture,
             visible: crate::graphics::Visible {
                 row: inner.y + v.row,
@@ -2312,7 +2363,7 @@ fn blank_pictures(
                 ..v
             },
             size,
-        });
+        }));
     }
     pictures
 }
