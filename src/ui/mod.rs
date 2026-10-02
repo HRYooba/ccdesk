@@ -1819,7 +1819,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // 「見えているものが効く」が回復する
     let mut cursor = draw_right_pane(frame, chunks[1], app);
     // ビューアーはスロットの上、メニューの下（メニューはビューアーの上でも読める）
-    if let Some(area) = draw_viewer(frame, chunks[1], app)
+    if let Some(area) = draw_viewer(frame, crate::app::viewer_area(app), app)
         && area.contains(cursor.pos)
     {
         // 窓に隠れたカーソルを窓の上で点滅させない
