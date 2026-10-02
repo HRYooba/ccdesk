@@ -110,7 +110,10 @@ fail and print the candidates rather than pick one.
   WebP, BMP). The layout is left alone; the window opens in the top-right corner of the
   calling session's pane, sized to the image, and never leaves that pane — moving or
   resizing it stops at the pane's frame, and it follows the session if the session
-  moves. A second `view` reuses it where you left it. Inside it the wheel
+  moves. Each session has its own window, so sessions side by side can each show
+  one at once; switching a session out of its pane hides its window, and bringing it
+  back shows it again. A second `view` from the same session reuses its window where
+  you left it. Inside it the wheel
   zooms around the cursor and dragging pans; drag its title to move it, its left, right
   or bottom edge to resize it, and `✕` closes it (so does `Esc`, right after you click
   the window — otherwise `Esc` still goes to the agent).

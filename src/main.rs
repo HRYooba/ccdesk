@@ -338,7 +338,7 @@ fn main() -> anyhow::Result<()> {
         pending_submit: Vec::new(),
         pictures: Vec::new(),
         painter: graphics::Painter::default(),
-        viewer: None,
+        viewers: Vec::new(),
         viewer_drag: None,
         source,
     };

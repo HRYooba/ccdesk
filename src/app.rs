@@ -692,14 +692,17 @@ pub(crate) struct App {
     /// 端末に出した Sixel の記録（[`crate::graphics::Painter`]）
     pub(crate) painter: crate::graphics::Painter,
     /// 画像ビューアー（`ccdesk view`）。**スロットには入らず、ペインの上に浮かぶ**
-    pub(crate) viewer: Option<crate::viewer::Overlay>,
+    /// **持ち主（[`crate::viewer::Host`]）ごとに 1 枚。** 並びは描く順（後ろほど上）
+    pub(crate) viewers: Vec<crate::viewer::Overlay>,
     /// ビューアーを掴んでいる最中（[`ViewerDrag`]）
     pub(crate) viewer_drag: Option<ViewerDrag>,
 }
 
 /// ビューアーの掴み。**離すまで同じ操作を続ける**（窓の外へ出ても）
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct ViewerDrag {
+    /// 掴んだ窓の持ち主
+    pub(crate) host: crate::viewer::Host,
     /// 掴んだ場所（見出し ＝ 移動、辺 ＝ 大きさ、内側 ＝ 画像を動かす）
     pub(crate) hit: crate::viewer::Hit,
     /// 掴んだときの外寸
@@ -801,7 +804,7 @@ impl Default for App {
             pending_submit: Vec::new(),
             pictures: Vec::new(),
             painter: crate::graphics::Painter::default(),
-            viewer: None,
+            viewers: Vec::new(),
             viewer_drag: None,
         }
     }
@@ -1642,8 +1645,8 @@ pub(crate) fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
                     }
                     // ビューアーを押した直後の Esc は閉じる。**それ以外の Esc は agent のもの**
                     // （claude の中断キー）なので、押していないときは横取りしない
-                    if key.code == KeyCode::Esc && app.viewer.as_ref().is_some_and(|v| v.focused) {
-                        app.viewer = None;
+                    if key.code == KeyCode::Esc && app.viewers.iter().any(|v| v.focused) {
+                        app.viewers.retain(|v| !v.focused);
                         continue;
                     }
                     // サイドバーフォーカス中のキー操作（入力欄は名前の変更中だけ）
@@ -2910,21 +2913,22 @@ fn handle_mouse(app: &mut App, mouse: &MouseEvent) -> anyhow::Result<bool> {
 ///
 /// ホイールは**押していなくても**効く（打鍵の宛先を持たないので、先に押させる理由が無い）
 fn handle_viewer_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
-    let pane = viewer_area(app);
-    let Some(viewer) = app.viewer.as_mut() else {
-        return false;
-    };
-    let Some(hit) = viewer.hit(pane, mouse.column, mouse.row) else {
-        // 窓の外を押したら、Esc はまた agent へ渡る
-        if let MouseEventKind::Down(_) = mouse.kind {
-            viewer.focused = false;
+    // 押したら、押した窓だけが Esc を受ける（窓の外なら Esc はまた agent へ渡る）
+    let pressed = matches!(mouse.kind, MouseEventKind::Down(_));
+    let found = viewer_at(app, mouse.column, mouse.row);
+    if pressed {
+        for v in &mut app.viewers {
+            v.focused = false;
         }
+    }
+    let Some((at, area, hit)) = found else {
         return false;
     };
+    let viewer = &mut app.viewers[at];
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let cell = crate::graphics::cell_pixels();
-            let inner = viewer.inner(pane);
+            let inner = viewer.inner(area);
             // カーソルのセルの中心（画素）
             let at = (
                 (f64::from(mouse.column.saturating_sub(inner.x)) + 0.5) * f64::from(cell.0),
@@ -2934,14 +2938,15 @@ fn handle_viewer_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
             viewer.view.wheel(mouse.kind == MouseEventKind::ScrollUp, at, vp);
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            viewer.focused = true;
             if hit == crate::viewer::Hit::Close {
-                app.viewer = None;
+                app.viewers.remove(at);
                 return true;
             }
+            viewer.focused = true;
             app.viewer_drag = Some(ViewerDrag {
+                host: viewer.host.clone(),
                 hit,
-                start: viewer.rect(pane),
+                start: viewer.rect(area),
                 column: mouse.column,
                 row: mouse.row,
             });
@@ -2952,16 +2957,28 @@ fn handle_viewer_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
     true
 }
 
+/// `(column, row)` にある見えている窓 `(添字, 載っている area, どこか)`。
+/// **上に描いたもの（後ろ）から探す**
+fn viewer_at(app: &App, column: u16, row: u16) -> Option<(usize, Rect, crate::viewer::Hit)> {
+    app.viewers.iter().enumerate().rev().find_map(|(at, v)| {
+        let area = viewer_area(app, &v.host)?;
+        Some((at, area, v.hit(area, column, row)?))
+    })
+}
+
 /// ビューアーを掴んでいる間のマウス。戻り値 true ＝ このイベントは掴みが受け取った
 fn handle_viewer_drag(app: &mut App, mouse: &MouseEvent) -> bool {
-    let Some(drag) = app.viewer_drag else {
+    let Some(drag) = app.viewer_drag.clone() else {
         return false;
     };
-    let pane = viewer_area(app);
-    let Some(viewer) = app.viewer.as_mut() else {
+    // 掴んでいる間に窓が消えた・隠れた（持ち主が画面から外れた）なら離す
+    let area = viewer_area(app, &drag.host);
+    let found = app.viewers.iter().position(|v| v.host == drag.host);
+    let (Some(area), Some(at)) = (area, found) else {
         app.viewer_drag = None;
         return false;
     };
+    let viewer = &mut app.viewers[at];
     match mouse.kind {
         MouseEventKind::Drag(MouseButton::Left) => {
             let (dx, dy) = (
@@ -2970,7 +2987,7 @@ fn handle_viewer_drag(app: &mut App, mouse: &MouseEvent) -> bool {
             );
             if drag.hit == crate::viewer::Hit::Inside {
                 let cell = crate::graphics::cell_pixels();
-                let vp = crate::viewer::Viewport::of(viewer.inner(pane), cell);
+                let vp = crate::viewer::Viewport::of(viewer.inner(area), cell);
                 viewer.view.pan(
                     (f64::from(dx) * f64::from(cell.0), f64::from(dy) * f64::from(cell.1)),
                     vp,
@@ -2981,8 +2998,8 @@ fn handle_viewer_drag(app: &mut App, mouse: &MouseEvent) -> bool {
                     ..drag
                 });
             } else {
-                let rect = crate::viewer::dragged(drag.start, drag.hit, (dx, dy), pane);
-                viewer.set_rect(rect, pane);
+                let rect = crate::viewer::dragged(drag.start, drag.hit, (dx, dy), area);
+                viewer.set_rect(rect, area);
             }
             true
         }
@@ -3545,6 +3562,9 @@ pub(crate) fn kill_sessions_on_exit(app: &mut App) {
 /// 動いていれば先にプロセスを終わらせる（窓の無い行になってプロセスだけが残らない）
 fn menu_close(app: &mut App, id: &SessionId) {
     close_window_of(app, id);
+    // 行ごと消えるセッションの窓は、もう出す先が無い
+    app.viewers
+        .retain(|v| v.host != crate::viewer::Host::Session(id.clone()));
     let before = app.sessions.len();
     app.sessions.retain(|row| &row.session_id != id);
     if app.sessions.len() != before {
@@ -3814,46 +3834,43 @@ fn apply_relay_request(
 /// 操作が、打っている最中の打鍵の宛先を奪わない）
 fn show_image(app: &mut App, image: crate::viewer::Image, from: Option<&SessionId>) {
     let view = crate::viewer::ImageView::new(image);
-    // 載せる先は呼んだセッションのスロット（出ていなければフォーカススロット）
-    let shown = from.filter(|id| app.slot_of(id).is_some()).cloned();
-    let slot = shown
-        .as_ref()
-        .and_then(|id| app.slot_of(id))
-        .unwrap_or(app.focus_slot);
-    // 開いていれば画像だけ差し替え、呼んだスロットへ載せ替える
-    // （置き場所と大きさはスロットに対する比なので、新しいスロットの同じ辺りに出る）
-    if let Some(viewer) = app.viewer.as_mut() {
+    // 持ち主は呼んだセッション。**画面に出ていなくても持ち主にする**（出したときに見える）。
+    // 呼び手が分からなければフォーカススロットのセッション、それも無ければそのスロット
+    let host = match from.or_else(|| app.shown_session()) {
+        Some(id) => crate::viewer::Host::Session(id.clone()),
+        None => crate::viewer::Host::Slot(app.focus_slot),
+    };
+    // 持ち主の窓が開いていれば画像だけ差し替える（動かした場所と大きさは保つ）
+    if let Some(viewer) = app.viewers.iter_mut().find(|v| v.host == host) {
         viewer.view = view;
-        viewer.host = shown;
-        viewer.slot = slot;
         return;
     }
-    let area = host_area(app, shown.as_ref(), slot);
-    app.viewer = Some(crate::viewer::Overlay::new(
+    // 出す先が今は画面に無い持ち主も、置き場所はスロットの大きさから決める
+    // （比で持つので、出したスロットの同じ辺りに出る）
+    let area = viewer_area(app, &host).unwrap_or_else(|| slot_inner(app, app.focus_slot));
+    app.viewers.push(crate::viewer::Overlay::new(
         view,
-        shown,
-        slot,
+        host,
         area,
         crate::graphics::cell_pixels(),
     ));
 }
 
-/// ビューアーが載るスロットの枠の内側（**窓はここから出ない**）
-pub(crate) fn viewer_area(app: &App) -> Rect {
-    match app.viewer.as_ref() {
-        Some(viewer) => host_area(app, viewer.host.as_ref(), viewer.slot),
-        None => crate::ui::pane_rect(app),
-    }
+/// 窓が載るスロットの枠の内側（**窓はここから出ない**）。
+/// 持ち主が画面に出ていなければ `None` ＝ **その窓は隠れる**
+pub(crate) fn viewer_area(app: &App, host: &crate::viewer::Host) -> Option<Rect> {
+    let at = match host {
+        crate::viewer::Host::Session(id) => app.slot_of(id)?,
+        crate::viewer::Host::Slot(at) => {
+            (app.slots.get(*at)?.session().is_none()).then_some(*at)?
+        }
+    };
+    Some(slot_inner(app, at))
 }
 
-/// `host` のセッションを映すスロットの枠の内側。そのセッションが画面に無ければ
-/// 番号 `slot` のスロット（配置が縮んでいれば最後の 1 枚）
-fn host_area(app: &App, host: Option<&SessionId>, slot: usize) -> Rect {
-    let rects = app.slot_rects();
-    let at = host
-        .and_then(|id| app.slot_of(id))
-        .unwrap_or_else(|| slot.min(rects.len().saturating_sub(1)));
-    rects.get(at).map_or_else(
+/// スロット `at` の枠の内側（無いスロットならペイン全体）
+fn slot_inner(app: &App, at: usize) -> Rect {
+    app.slot_rects().get(at).map_or_else(
         || crate::ui::pane_rect(app),
         |r| Rect::new(r.x + 1, r.y + 1, r.width.saturating_sub(2), r.height.saturating_sub(2)),
     )
@@ -8925,11 +8942,21 @@ mod tests {
         )
     }
 
-    fn viewer_rect(app: &App) -> Rect {
-        app.viewer
-            .as_ref()
+    fn host(id: &str) -> crate::viewer::Host {
+        crate::viewer::Host::Session(SessionId::new(id))
+    }
+
+    /// その持ち主の窓（見えていなければ `None`）の外寸
+    fn shown_rect(app: &App, id: &str) -> Option<Rect> {
+        let v = app.viewers.iter().find(|v| v.host == host(id))?;
+        Some(v.rect(viewer_area(app, &v.host)?))
+    }
+
+    fn viewer_of<'a>(app: &'a mut App, id: &str) -> &'a mut crate::viewer::Overlay {
+        app.viewers
+            .iter_mut()
+            .find(|v| v.host == host(id))
             .expect("no viewer")
-            .rect(viewer_area(app))
     }
 
     fn wheel(column: u16, row: u16, up: bool) -> MouseEvent {
@@ -8941,145 +8968,190 @@ mod tests {
         }
     }
 
+    /// 2 列で並べたセッションそれぞれに出す
+    fn two_callers() -> App {
+        let mut app = test_app(34, TERM);
+        app.set_layout(crate::panes::Layout::TwoColumns);
+        app.slots[0] = Slot::Session(SessionId::new("a"));
+        app.slots[1] = Slot::Session(SessionId::new("b"));
+        app
+    }
+
     /// **配置には入らない。** スロットの数も中身もフォーカスもそのままで、
     /// 呼んだセッションのスロットの右上に浮かぶ
     #[test]
-    fn a_view_floats_over_the_layout_without_touching_it() {
-        let mut app = test_app(34, TERM);
-        app.set_layout(crate::panes::Layout::TwoColumns);
-        let (caller, other) = (SessionId::new("caller"), SessionId::new("other"));
-        app.slots[0] = Slot::Session(caller.clone());
-        app.slots[1] = Slot::Session(other.clone());
+    fn a_view_floats_in_the_top_right_of_the_callers_slot() {
+        let mut app = two_callers();
         app.focus_slot = 1;
-        show_image(&mut app, picture("a.png"), Some(&caller));
+        show_image(&mut app, picture("a.png"), Some(&SessionId::new("a")));
         assert_eq!(app.layout, crate::panes::Layout::TwoColumns, "the layout changed");
-        assert_eq!((app.slot_of(&caller), app.slot_of(&other)), (Some(0), Some(1)));
         assert_eq!(app.focus_slot, 1, "the focus moved");
-        let r = viewer_rect(&app);
-        let caller_rect = app.slot_rects()[0];
-        assert_eq!((r.right(), r.y), (caller_rect.right() - 1, caller_rect.y + 1), "{r:?} is not at the caller's top-right");
+        let (r, slot) = (shown_rect(&app, "a").unwrap(), app.slot_rects()[0]);
+        assert_eq!((r.right(), r.y), (slot.right() - 1, slot.y + 1), "{r:?} is not at the top-right");
     }
 
-    /// 2 枚目は同じ窓へ入る。**動かした場所と大きさは保つ**
+    /// **並べたセッションそれぞれに同時に出せる**（持ち主ごとに 1 枚）
     #[test]
-    fn a_second_view_keeps_the_window_where_it_was_put() {
-        let mut app = test_app(34, TERM);
-        show_image(&mut app, picture("a.png"), None);
-        let pane = viewer_area(&app);
-        let moved = Rect::new(pane.x + 2, pane.y + 3, 30, 12);
-        app.viewer.as_mut().unwrap().set_rect(moved, pane);
-        show_image(&mut app, picture("b.png"), None);
-        let viewer = app.viewer.as_ref().unwrap();
-        assert_eq!(viewer.view.image.name(), "b.png");
-        assert_eq!(viewer.rect(pane), moved);
+    fn each_session_on_screen_gets_its_own_viewer() {
+        let mut app = two_callers();
+        show_image(&mut app, picture("a.png"), Some(&SessionId::new("a")));
+        show_image(&mut app, picture("b.png"), Some(&SessionId::new("b")));
+        assert_eq!(app.viewers.len(), 2);
+        let (ra, rb) = (shown_rect(&app, "a").unwrap(), shown_rect(&app, "b").unwrap());
+        let rects = app.slot_rects();
+        assert!(rects[0].contains(ra.into()) && rects[1].contains(rb.into()), "{ra:?} {rb:?}");
+        assert_eq!(viewer_of(&mut app, "b").view.image.name(), "b.png");
     }
 
-    /// 窓の上のホイールは**押していなくても**画像を寄せ、下のセッションへは行かない
+    /// 同じセッションの 2 枚目は同じ窓へ入る。**動かした場所と大きさは保つ**
     #[test]
-    fn the_wheel_zooms_the_viewer_and_reaches_nothing_below() {
-        let mut app = test_app(34, TERM);
-        show_image(&mut app, picture("a.png"), None);
-        let r = viewer_rect(&app);
+    fn a_second_view_from_the_same_session_keeps_its_window() {
+        let mut app = two_callers();
+        show_image(&mut app, picture("a.png"), Some(&SessionId::new("a")));
+        let area = viewer_area(&app, &host("a")).unwrap();
+        let moved = Rect::new(area.x + 2, area.y + 3, 30, 12);
+        viewer_of(&mut app, "a").set_rect(moved, area);
+        show_image(&mut app, picture("b.png"), Some(&SessionId::new("a")));
+        assert_eq!(app.viewers.len(), 1);
+        assert_eq!(viewer_of(&mut app, "a").view.image.name(), "b.png");
+        assert_eq!(shown_rect(&app, "a"), Some(moved));
+    }
+
+    /// **セッションを画面から外すと窓も隠れ、戻すとまた出る**
+    #[test]
+    fn switching_the_session_away_hides_its_viewer_and_back_shows_it() {
+        let mut app = two_callers();
+        show_image(&mut app, picture("a.png"), Some(&SessionId::new("a")));
+        let before = shown_rect(&app, "a");
+        app.slots[0] = Slot::Session(SessionId::new("c"));
+        assert_eq!(shown_rect(&app, "a"), None, "the viewer stayed over another session");
+        app.slots[0] = Slot::Session(SessionId::new("a"));
+        assert_eq!(shown_rect(&app, "a"), before, "the viewer did not come back");
+    }
+
+    /// 画面に出ていないセッションが呼んでも、出したときに見える
+    #[test]
+    fn a_view_from_a_hidden_session_appears_once_it_is_shown() {
+        let mut app = two_callers();
+        show_image(&mut app, picture("a.png"), Some(&SessionId::new("hidden")));
+        assert_eq!(shown_rect(&app, "hidden"), None);
+        app.slots[1] = Slot::Session(SessionId::new("hidden"));
+        let (r, slot) = (shown_rect(&app, "hidden").unwrap(), app.slot_rects()[1]);
+        assert!(slot.contains(r.into()), "{r:?} is not inside {slot:?}");
+    }
+
+    /// 窓の上のホイールは**押していなくても**画像を寄せる（その窓だけ）
+    #[test]
+    fn the_wheel_zooms_only_the_viewer_under_the_cursor() {
+        let mut app = two_callers();
+        show_image(&mut app, picture("a.png"), Some(&SessionId::new("a")));
+        show_image(&mut app, picture("b.png"), Some(&SessionId::new("b")));
+        let r = shown_rect(&app, "b").unwrap();
         handle_mouse(&mut app, &wheel(r.x + r.width / 2, r.y + r.height / 2, true)).unwrap();
-        assert!(app.viewer.as_ref().unwrap().view.camera().0 > 1.0, "the wheel did not zoom");
+        assert!(viewer_of(&mut app, "b").view.camera().0 > 1.0, "the wheel did not zoom");
+        assert_eq!(viewer_of(&mut app, "a").view.camera().0, 1.0, "the other viewer zoomed too");
     }
 
     /// 内側を掴むと画像、見出しを掴むと窓、辺を掴むと大きさが動く
     #[test]
     fn dragging_moves_the_image_the_window_or_its_size_by_where_it_was_grabbed() {
         let mut app = test_app(34, TERM);
-        show_image(&mut app, picture("a.png"), None);
+        app.slots[0] = Slot::Session(SessionId::new("a"));
+        show_image(&mut app, picture("a.png"), Some(&SessionId::new("a")));
         // 端から離して置く（端では移動が止まる）
-        let pane = viewer_area(&app);
-        app.viewer
-            .as_mut()
-            .unwrap()
-            .set_rect(Rect::new(pane.x + 10, pane.y + 5, 40, 20), pane);
-        let r = viewer_rect(&app);
+        let area = viewer_area(&app, &host("a")).unwrap();
+        viewer_of(&mut app, "a").set_rect(Rect::new(area.x + 10, area.y + 5, 40, 20), area);
+        let r = shown_rect(&app, "a").unwrap();
         let (x, y) = (r.x + r.width / 2, r.y + r.height / 2);
         for _ in 0..10 {
-            app.viewer.as_mut().unwrap().view.begin_frame();
+            viewer_of(&mut app, "a").view.begin_frame();
             handle_mouse(&mut app, &wheel(x, y, true)).unwrap();
         }
-        let before = app.viewer.as_ref().unwrap().view.camera().1;
+        let before = viewer_of(&mut app, "a").view.camera().1;
         handle_mouse(&mut app, &click(x, y)).unwrap();
         handle_mouse(&mut app, &drag_to(x - 5, y)).unwrap();
         handle_mouse(&mut app, &release(x - 5, y)).unwrap();
-        assert!(app.viewer.as_ref().unwrap().view.camera().1 .0 > before.0, "the image did not pan");
-        assert_eq!(viewer_rect(&app), r, "panning moved the window");
+        assert!(viewer_of(&mut app, "a").view.camera().1 .0 > before.0, "the image did not pan");
+        assert_eq!(shown_rect(&app, "a"), Some(r), "panning moved the window");
 
         handle_mouse(&mut app, &click(r.x + 3, r.y)).unwrap();
         handle_mouse(&mut app, &drag_to(r.x, r.y + 2)).unwrap();
         handle_mouse(&mut app, &release(r.x, r.y + 2)).unwrap();
-        let moved = viewer_rect(&app);
+        let moved = shown_rect(&app, "a").unwrap();
         assert_eq!(moved, Rect::new(r.x - 3, r.y + 2, r.width, r.height), "the title did not move the window");
 
         handle_mouse(&mut app, &click(moved.right() - 1, moved.y + 4)).unwrap();
         handle_mouse(&mut app, &drag_to(moved.right() - 6, moved.y + 4)).unwrap();
         handle_mouse(&mut app, &release(moved.right() - 6, moved.y + 4)).unwrap();
-        assert_eq!(viewer_rect(&app).width, moved.width - 5, "the right edge did not resize");
+        assert_eq!(shown_rect(&app, "a").unwrap().width, moved.width - 5, "the right edge did not resize");
         assert_eq!(app.viewer_drag, None);
     }
 
-    /// **窓は載っているスロットから出ない。** 動かしても大きさを変えても、
-    /// 隣のスロットへは被さらない
+    /// **窓は載っているスロットから出ない**（動かしても大きさを変えても）
     #[test]
     fn the_viewer_never_leaves_its_slot() {
-        let mut app = test_app(34, TERM);
-        app.set_layout(crate::panes::Layout::TwoColumns);
-        let caller = SessionId::new("caller");
-        app.slots[0] = Slot::Session(caller.clone());
-        show_image(&mut app, picture("a.png"), Some(&caller));
+        let mut app = two_callers();
+        show_image(&mut app, picture("a.png"), Some(&SessionId::new("a")));
         let left = app.slot_rects()[0];
-        let r = viewer_rect(&app);
+        let r = shown_rect(&app, "a").unwrap();
         handle_mouse(&mut app, &click(r.x + 3, r.y)).unwrap();
         handle_mouse(&mut app, &drag_to(r.x + 200, r.y + 200)).unwrap();
         handle_mouse(&mut app, &release(r.x + 200, r.y + 200)).unwrap();
-        let moved = viewer_rect(&app);
+        let moved = shown_rect(&app, "a").unwrap();
         assert!(moved.right() < left.right() && moved.bottom() < left.bottom(), "{moved:?} left {left:?}");
         handle_mouse(&mut app, &click(moved.right() - 1, moved.y + 2)).unwrap();
         handle_mouse(&mut app, &drag_to(moved.right() + 200, moved.y + 2)).unwrap();
         handle_mouse(&mut app, &release(moved.right() + 200, moved.y + 2)).unwrap();
-        assert!(viewer_rect(&app).right() < left.right(), "resizing pushed into the next slot");
+        assert!(shown_rect(&app, "a").unwrap().right() < left.right(), "resizing pushed into the next slot");
     }
 
-    /// 呼んだセッションが別のスロットへ移ると、窓も付いていく
+    /// セッションが別のスロットへ移ると、窓も付いていく
     #[test]
     fn the_viewer_follows_its_session_to_another_slot() {
-        let mut app = test_app(34, TERM);
-        app.set_layout(crate::panes::Layout::TwoColumns);
-        let caller = SessionId::new("caller");
-        app.slots[0] = Slot::Session(caller.clone());
-        show_image(&mut app, picture("a.png"), Some(&caller));
+        let mut app = two_callers();
+        show_image(&mut app, picture("a.png"), Some(&SessionId::new("a")));
         app.slots[0] = Slot::Empty;
-        app.slots[1] = Slot::Session(caller);
-        let (r, right) = (viewer_rect(&app), app.slot_rects()[1]);
+        app.slots[1] = Slot::Session(SessionId::new("a"));
+        let (r, right) = (shown_rect(&app, "a").unwrap(), app.slot_rects()[1]);
         assert!(r.x > right.x && r.right() < right.right(), "{r:?} stayed behind");
     }
 
-    /// ✕ で閉じる。窓の外を押すと Esc は agent へ戻る
+    /// ✕ はその窓だけ閉じる。窓の外を押すと Esc は agent へ戻る
     #[test]
-    fn the_close_mark_closes_the_viewer_and_an_outside_press_releases_esc() {
-        let mut app = test_app(34, TERM);
-        show_image(&mut app, picture("a.png"), None);
-        let r = viewer_rect(&app);
+    fn the_close_mark_closes_only_that_viewer_and_an_outside_press_releases_esc() {
+        let mut app = two_callers();
+        show_image(&mut app, picture("a.png"), Some(&SessionId::new("a")));
+        show_image(&mut app, picture("b.png"), Some(&SessionId::new("b")));
+        let r = shown_rect(&app, "a").unwrap();
         handle_mouse(&mut app, &click(r.x + 3, r.y + 3)).unwrap();
         handle_mouse(&mut app, &release(r.x + 3, r.y + 3)).unwrap();
-        assert!(app.viewer.as_ref().unwrap().focused);
-        let pane = viewer_area(&app);
-        let outside = if r.x > pane.x + 2 { pane.x + 1 } else { pane.right() - 2 };
-        handle_mouse(&mut app, &click(outside, r.y + 3)).unwrap();
-        assert!(!app.viewer.as_ref().unwrap().focused, "Esc still belongs to the viewer");
+        assert!(viewer_of(&mut app, "a").focused);
+        let left = app.slot_rects()[0];
+        handle_mouse(&mut app, &click(left.x + 2, left.bottom() - 3)).unwrap();
+        assert!(!viewer_of(&mut app, "a").focused, "Esc still belongs to the viewer");
         let (cols, row) = crate::ui::close_zone(r).expect("no close mark");
         handle_mouse(&mut app, &click(*cols.end(), row)).unwrap();
-        assert!(app.viewer.is_none(), "the close mark did not close the viewer");
+        assert_eq!(app.viewers.len(), 1, "the close mark closed the wrong number of viewers");
+        assert!(shown_rect(&app, "b").is_some(), "the other viewer went away");
     }
 
-    /// 描くとビューアーの Sixel が**最後に**積まれる（セッションの画像の上に重なる）
+    /// 行ごと閉じたセッションの窓は残さない
     #[test]
-    fn drawing_the_viewer_queues_its_picture_last_and_names_the_image() {
-        let mut app = test_app(34, TERM);
-        show_image(&mut app, picture("a.png"), None);
+    fn closing_a_session_drops_its_viewer() {
+        let mut app = app_with_row("s");
+        app.slots[0] = Slot::Session(SessionId::new("s"));
+        show_image(&mut app, picture("a.png"), Some(&SessionId::new("s")));
+        menu_close(&mut app, &SessionId::new("s"));
+        assert!(app.viewers.is_empty(), "the viewer of a closed session stayed");
+    }
+
+    /// 描くと見えている窓の Sixel が**最後に**積まれる（セッションの画像の上に重なる）。
+    /// 画面に出ていないセッションの窓は描かない
+    #[test]
+    fn drawing_queues_only_the_visible_viewers_last() {
+        let mut app = two_callers();
+        show_image(&mut app, picture("a.png"), Some(&SessionId::new("a")));
+        show_image(&mut app, picture("b.png"), Some(&SessionId::new("hidden")));
         let (w, h) = app.term_size;
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
             .expect("test terminal");
@@ -9088,14 +9160,16 @@ mod tests {
                 draw(frame, &mut app);
             })
             .expect("draw");
-        assert!(
-            matches!(app.pictures.last(), Some(crate::graphics::Paint::View(_))),
-            "the viewer is not painted last"
-        );
-        let r = viewer_rect(&app);
+        let views = app
+            .pictures
+            .iter()
+            .filter(|p| matches!(p, crate::graphics::Paint::View(_)))
+            .count();
+        assert_eq!(views, 1, "a hidden viewer was drawn, or a shown one was not");
+        assert!(matches!(app.pictures.last(), Some(crate::graphics::Paint::View(_))));
+        let r = shown_rect(&app, "a").unwrap();
         let buffer = terminal.backend().buffer();
         let title: String = (r.x..r.x + r.width).map(|x| buffer[(x, r.y)].symbol()).collect();
         assert!(title.contains("a.png"), "the frame does not name the image: {title}");
     }
-
 }

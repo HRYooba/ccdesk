@@ -1818,12 +1818,17 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) -> FrameCursor {
     // クリック判定と描画は同じ [`popup_rect`] を見ているので、最後に描けば
     // 「見えているものが効く」が回復する
     let mut cursor = draw_right_pane(frame, chunks[1], app);
-    // ビューアーはスロットの上、メニューの下（メニューはビューアーの上でも読める）
-    if let Some(area) = draw_viewer(frame, crate::app::viewer_area(app), app)
-        && area.contains(cursor.pos)
-    {
-        // 窓に隠れたカーソルを窓の上で点滅させない
-        cursor = FrameCursor::hidden_at(cursor.pos);
+    // ビューアーはスロットの上、メニューの下（メニューはビューアーの上でも読める）。
+    // **持ち主が画面に出ている窓だけ描く**（[`crate::app::viewer_area`]）
+    for at in 0..app.viewers.len() {
+        let Some(area) = crate::app::viewer_area(app, &app.viewers[at].host) else {
+            continue;
+        };
+        let rect = draw_viewer(frame, area, &mut app.viewers[at], &mut app.pictures);
+        if rect.contains(cursor.pos) {
+            // 窓に隠れたカーソルを窓の上で点滅させない
+            cursor = FrameCursor::hidden_at(cursor.pos);
+        }
     }
     draw_popup(frame, app);
     cursor
@@ -2197,13 +2202,17 @@ fn draw_slot(frame: &mut Frame, rect: Rect, app: &mut App, at: usize, focused: b
     }
 }
 
-/// ペインの上に浮かぶ画像ビューアー（開いていれば、その外寸を返す）。
+/// ペインの上に浮かぶ画像ビューアー 1 枚（描いた外寸を返す）。
 ///
 /// **Sixel はセッションの画像より後に積む**（最後に描いたものが上に残る）。
 /// 内側は Sixel が不透明に覆うので、セルには何も描かない。
 /// 見出しは名前と、元の画素に対する今の倍率
-fn draw_viewer(frame: &mut Frame, pane: Rect, app: &mut App) -> Option<Rect> {
-    let viewer = app.viewer.as_mut()?;
+fn draw_viewer(
+    frame: &mut Frame,
+    pane: Rect,
+    viewer: &mut crate::viewer::Overlay,
+    pictures: &mut Vec<crate::graphics::Paint>,
+) -> Rect {
     let rect = viewer.rect(pane);
     let inner = viewer.inner(pane);
     let focused = viewer.focused;
@@ -2229,8 +2238,8 @@ fn draw_viewer(frame: &mut Frame, pane: Rect, app: &mut App) -> Option<Rect> {
     );
     frame.render_widget(ratatui::widgets::Clear, rect);
     frame.render_widget(block, rect);
-    app.pictures.push(crate::graphics::Paint::View(shot));
-    Some(rect)
+    pictures.push(crate::graphics::Paint::View(shot));
+    rect
 }
 
 /// ビューアーの余白の色 ＝ ホスト端末の背景（聞けていなければ黒）
