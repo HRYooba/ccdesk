@@ -4153,7 +4153,7 @@ fn expire_notice(app: &mut App) -> bool {
 
 /// 下部バーに数秒表示する通知（起動失敗など、無反応に見せないため）。
 /// あわせて ~/.ccdesk/error.log にも残す
-fn set_notice(app: &mut App, msg: String) {
+pub(crate) fn set_notice(app: &mut App, msg: String) {
     log_error(&msg);
     set_hint(app, msg);
 }

@@ -23,13 +23,18 @@ pub(crate) enum NewFocus {
     Prompt,  // 下部のプロンプト入力（初期フォーカス。Enter で起動）
     Browser, // フォルダ一覧（↑↓ で行移動・→← で潜る/上がる。Enter は選択行の実行）
     Path,    // Folder 行のテキストフィールド
+    /// 一覧の `+ new folder` 行の中の名前入力（Enter で作って起動 / Esc で一覧へ戻る）
+    FolderName,
 }
 
-/// フォルダ一覧の行。先頭の Launch は「今開いているフォルダで起動する」ボタン行。
+/// フォルダ一覧の行。先頭の NewFolder と Launch はボタン行。
 /// 行の意味を型で持つことで、`entry == ".."` の文字列比較と
 /// 「index 0 は必ず ..」という暗黙の前提を無くす
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum BrowseRow {
+    /// 現在のフォルダの下にフォルダを作り、そこで起動（起動ボタンの上に常設。
+    /// フィルタでも消えない）。実行すると行が名前入力欄に変わる
+    NewFolder,
     /// 現在のフォルダで起動（`..` の上に常設。フィルタでも消えない）
     Launch,
     /// 親フォルダへ
@@ -58,6 +63,8 @@ pub(crate) struct NewState {
     pub(crate) shown: usize,  // 直近 draw で表示した行数（マウス判定用）
     pub(crate) path: TextField,
     pub(crate) prompt: TextField,
+    /// `+ new folder` 行で打つ新しいフォルダ名
+    pub(crate) folder_name: TextField,
     pub(crate) focus: NewFocus,
     /// 今の選択行が「一覧の作り直しで既定へ戻った結果」か（＝利用者が選んだ行ではない）。
     ///
@@ -91,19 +98,22 @@ impl NewState {
     pub(crate) fn browse(dir: &str) -> Self {
         let mut path = TextField::default();
         path.set_text(dir);
-        Self {
+        let mut state = Self {
             kind: Kind::default(),
             cur_dir: dir.to_string(),
             filter: String::new(),
-            entries: Self::list_entries(dir),
+            entries: Vec::new(),
             dir_idx: 0,
             scroll: 0,
             shown: 0,
             path,
             prompt: TextField::default(),
+            folder_name: TextField::default(),
             focus: NewFocus::Prompt,
             selection_from_rebuild: true,
-        }
+        };
+        state.rebuild(dir.to_string(), String::new());
+        state
     }
 
     pub(crate) fn set_dir(&mut self, dir: String) {
@@ -122,20 +132,23 @@ impl NewState {
         if !self.filter.is_empty() {
             let frag = self.filter.clone();
             self.entries.retain(|row| match row {
-                BrowseRow::Launch => true, // 起動ボタンはフィルタで消さない
+                // ボタン行はフィルタで消さない
+                BrowseRow::NewFolder | BrowseRow::Launch => true,
                 BrowseRow::Parent => false,
                 BrowseRow::Dir(n) => n.to_lowercase().starts_with(&frag),
             });
         }
-        // 断片を打鍵中は最初の一致フォルダを選ぶ。index 0 は常設の起動ボタン
-        // なので 0 のままにすると、絞り込んだ直後の → / Enter が何も起こらない
+        // 既定の選択は起動ボタン（Enter の意味 ＝ 現在のフォルダで起動と一致する）。
+        // 断片を打鍵中は最初の一致フォルダを選ぶ: 起動ボタンのままにすると、
+        // 絞り込んだ直後の → / Enter が何も起こらない
+        let launch = self.launch_idx();
         let idx = if self.filter.is_empty() {
-            0
+            launch
         } else {
             self.entries
                 .iter()
                 .position(|row| matches!(row, BrowseRow::Dir(_)))
-                .unwrap_or(0)
+                .unwrap_or(launch)
         };
         self.reset_selection(idx);
     }
@@ -156,6 +169,37 @@ impl NewState {
         let cur = self.cur_dir.clone();
         self.path.set_text(&cur);
         self.rebuild_if_changed(cur, String::new());
+    }
+
+    /// 起動ボタン行の位置（常設なので必ずある）
+    fn launch_idx(&self) -> usize {
+        self.entries
+            .iter()
+            .position(|row| *row == BrowseRow::Launch)
+            .unwrap_or(0)
+    }
+
+    /// `+ new folder` 行を名前入力欄にする（選択もその行へ載せる）
+    fn begin_folder_name(&mut self) {
+        if let Some(idx) = self.entries.iter().position(|row| *row == BrowseRow::NewFolder) {
+            self.select(idx);
+        }
+        self.folder_name.set_text("");
+        self.focus = NewFocus::FolderName;
+    }
+
+    /// 打った名前で現在のフォルダの下にフォルダを作り、そこへ移る。
+    /// 起動は App を持つ呼び手が続けて行う。失敗の文言は呼び手が利用者へ出す
+    fn create_folder(&mut self) -> Result<(), String> {
+        let name = self.folder_name.text.trim().to_string();
+        if !is_creatable_name(&name) {
+            return Err(format!("cannot use \"{name}\" as a folder name"));
+        }
+        let path = std::path::Path::new(&self.cur_dir).join(&name);
+        std::fs::create_dir(&path).map_err(|e| format!("could not create folder {name}: {e}"))?;
+        self.set_dir(path.to_string_lossy().to_string());
+        self.folder_name.set_text("");
+        Ok(())
     }
 
     /// 一覧を作り直したときの選択リセット。`selection_from_rebuild` の立て忘れを
@@ -272,6 +316,10 @@ impl NewState {
                     let row_in = (mouse.row - layout.list_top) as usize;
                     if row_in < self.shown {
                         let idx = self.scroll + row_in;
+                        // 名前を打っている行そのもののクリックは入力を続ける
+                        if self.focus == NewFocus::FolderName && idx == self.dir_idx {
+                            return None;
+                        }
                         // 起動ボタン行もフォルダ行と同じ 2 段階（選択 → 再クリック）にする。
                         // 1 クリックで起動すると、プロンプト入力中に一覧へフォーカスを
                         // 移すだけのクリックが書きかけのプロンプトでセッションを起動して
@@ -282,10 +330,11 @@ impl NewState {
                         self.select(idx);
                         self.focus = NewFocus::Browser;
                         if reclick {
-                            if self.selected_is_launch() {
-                                return Some(NewAction::Launch);
+                            match self.entries.get(idx) {
+                                Some(BrowseRow::Launch) => return Some(NewAction::Launch),
+                                Some(BrowseRow::NewFolder) => self.begin_folder_name(),
+                                _ => self.descend(), // 選択済みを再クリック = 潜る
                             }
-                            self.descend(); // 選択済みを再クリック = 潜る
                         }
                     } else {
                         self.focus = NewFocus::Browser;
@@ -311,7 +360,9 @@ impl NewState {
     /// Folder → フォルダ切替（一覧も更新）/ それ以外 → プロンプトへ挿入
     /// （パスを最初のメッセージ本文に書きたいケースがあるため）
     pub(crate) fn handle_paste(&mut self, text: &str) {
-        if self.focus == NewFocus::Path {
+        if self.focus == NewFocus::FolderName {
+            self.folder_name.insert_str(text.trim());
+        } else if self.focus == NewFocus::Path {
             if let Some(dir) = Self::extract_dir(text) {
                 self.set_dir(dir); // パスは丸ごと置き換える
             } else {
@@ -325,7 +376,7 @@ impl NewState {
     }
 
     fn list_entries(dir: &str) -> Vec<BrowseRow> {
-        let mut out = vec![BrowseRow::Launch, BrowseRow::Parent];
+        let mut out = vec![BrowseRow::NewFolder, BrowseRow::Launch, BrowseRow::Parent];
         if let Ok(read) = std::fs::read_dir(dir) {
             let mut subdirs: Vec<String> = read
                 .flatten()
@@ -338,7 +389,7 @@ impl NewState {
         out
     }
 
-    /// 選択行が指すフォルダへ移動する。起動ボタン行は移動対象ではない
+    /// 選択行が指すフォルダへ移動する。ボタン行は移動対象ではない
     pub(crate) fn descend(&mut self) {
         let next = match self.entries.get(self.dir_idx) {
             Some(BrowseRow::Parent) => match std::path::Path::new(&self.cur_dir).parent() {
@@ -349,7 +400,7 @@ impl NewState {
                 .join(name)
                 .to_string_lossy()
                 .to_string(),
-            Some(BrowseRow::Launch) | None => return,
+            Some(BrowseRow::NewFolder | BrowseRow::Launch) | None => return,
         };
         self.set_dir(next);
     }
@@ -365,7 +416,7 @@ impl NewState {
     }
 
     /// 一覧にフォルダ行（`..` / サブフォルダ）が 1 つも無いか。
-    /// 起動ボタンは常設なので `entries.is_empty()` では判定できない
+    /// ボタン行は常設なので `entries.is_empty()` では判定できない
     pub(crate) fn no_folder_rows(&self) -> bool {
         !self
             .entries
@@ -373,8 +424,9 @@ impl NewState {
             .any(|row| matches!(row, BrowseRow::Parent | BrowseRow::Dir(_)))
     }
 
-    /// 選択行が起動ボタンか（クリック 1 回で起動するかの判定に使う）
-    pub(crate) fn selected_is_launch(&self) -> bool {
+    /// 選択行が起動ボタンか
+    #[cfg(test)]
+    fn selected_is_launch(&self) -> bool {
         matches!(self.entries.get(self.dir_idx), Some(BrowseRow::Launch))
     }
 
@@ -441,6 +493,21 @@ fn dir_of(text: &str) -> Option<String> {
     }
 }
 
+/// `+ new folder` 行が名前入力欄になったときの前置き（カーソル位置の計算と共有する）
+const NEW_FOLDER_PROMPT: &str = "+ new folder: ";
+
+/// 新しいフォルダの名前として受け付けるか。Windows が名前に許さない文字と、
+/// 黙って削られる末尾の `.` / 空白を弾く（作った名前と打った名前を食い違わせない）
+fn is_creatable_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.ends_with(['.', ' '])
+        && !name.chars().any(|c| {
+            c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+        })
+}
+
 /// New 画面のマウス処理が呼び手（App を持つ側）へ返す指示。
 /// 起動そのもの（`start_new_session`）は state の借用を抜けてから実行する
 #[derive(PartialEq, Debug)]
@@ -464,7 +531,8 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
                 NewFocus::Prompt => NewFocus::Agent,
                 NewFocus::Agent => NewFocus::Path,
                 NewFocus::Path => NewFocus::Browser,
-                NewFocus::Browser => NewFocus::Prompt,
+                // 名前入力は一覧の中の欄なので、一覧と同じく次は Prompt
+                NewFocus::Browser | NewFocus::FolderName => NewFocus::Prompt,
             };
             return Ok(());
         }
@@ -474,6 +542,11 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
                     // 編集を破棄して現在のフォルダに戻す（一覧の絞り込みも解除する）
                     state.cancel_path_edit();
                     state.focus = NewFocus::Prompt;
+                }
+                // 名前入力を取りやめて一覧へ戻る（打ちかけの名前は捨てる）
+                NewFocus::FolderName => {
+                    state.folder_name.set_text("");
+                    state.focus = NewFocus::Browser;
                 }
                 // 戻れる窓があるなら、このスロットを空へ戻す（no session 画面）
                 _ if can_leave => {
@@ -510,17 +583,26 @@ pub(crate) fn handle_new_view_key(app: &mut App, key: &KeyEvent) -> anyhow::Resu
                 state.prompt.handle_key(key);
             }
         }
+        NewFocus::FolderName => {
+            if key.code == KeyCode::Enter {
+                match state.create_folder() {
+                    Ok(()) => start_new_session(app)?,
+                    Err(msg) => crate::app::set_notice(app, msg),
+                }
+            } else {
+                state.folder_name.handle_key(key);
+            }
+        }
         NewFocus::Browser => match key.code {
             KeyCode::Up => state.select_prev(),
             KeyCode::Down => state.select_next(),
-            // Enter = 選択行の実行。起動ボタン行なら起動、フォルダ行なら → と同じく移動
-            KeyCode::Enter => {
-                if state.selected_is_launch() {
-                    start_new_session(app)?;
-                } else {
-                    state.descend();
-                }
-            }
+            // Enter = 選択行の実行。起動ボタン行なら起動、new folder 行なら名前入力、
+            // フォルダ行なら → と同じく移動
+            KeyCode::Enter => match state.entries.get(state.dir_idx) {
+                Some(BrowseRow::Launch) => start_new_session(app)?,
+                Some(BrowseRow::NewFolder) => state.begin_folder_name(),
+                _ => state.descend(),
+            },
             KeyCode::Right => state.descend(),
             KeyCode::Left => state.go_up(),
             _ => {}
@@ -807,7 +889,10 @@ pub(crate) fn new_view_cursor(
             ),
             true,
         ),
-        NewFocus::Browser => (Position::new(layout.input_text_x, layout.input_y), false),
+        // 名前入力の行は一覧のスクロールで動くので、ここでは決めずに描画が上書きする
+        NewFocus::Browser | NewFocus::FolderName => {
+            (Position::new(layout.input_text_x, layout.input_y), false)
+        }
     };
     if focused && in_field {
         FrameCursor::shown_at(pos)
@@ -853,6 +938,7 @@ fn new_view_hint(focus: NewFocus, can_leave: bool) -> &'static str {
             "Tab: next field · ↑↓ select · Enter: run row · ←→ move · Esc: back to sessions"
         }
         NewFocus::Browser => "Tab: next field · ↑↓ select · Enter: run row · ←→ move",
+        NewFocus::FolderName => "Enter: create folder & start · Esc: cancel",
     }
 }
 
@@ -882,7 +968,7 @@ pub(crate) fn draw_new_view(
     // 描画とマウス判定で同一のジオメトリを使う（フォーム型レイアウト）
     let layout = NewLayout::compute(area);
     // カーソル位置は描画結果に依存しないので先に決める（!fits の早期 return と共有する）
-    let cursor = new_view_cursor(
+    let mut cursor = new_view_cursor(
         area,
         state.focus,
         state.path.cursor_x(),
@@ -913,7 +999,10 @@ pub(crate) fn draw_new_view(
     let path_focused = state.focus == NewFocus::Path;
     let prompt_focused = state.focus == NewFocus::Prompt;
     // セクション見出しは、そのセクションにフォーカスがあるときだけ emph+BOLD で「今どこ」を示す
-    let folder_focused = matches!(state.focus, NewFocus::Path | NewFocus::Browser);
+    let folder_focused = matches!(
+        state.focus,
+        NewFocus::Path | NewFocus::Browser | NewFocus::FolderName
+    );
     let heading_style = |on: bool| {
         if on {
             Style::default().fg(ui().emph).add_modifier(Modifier::BOLD)
@@ -1005,7 +1094,26 @@ pub(crate) fn draw_new_view(
         let selected = virt == state.dir_idx;
         let marker = if selected { "▸ " } else { "  " };
         let is_launch = state.entries[virt] == BrowseRow::Launch;
+        let is_new_folder = state.entries[virt] == BrowseRow::NewFolder;
+        let naming = is_new_folder && state.focus == NewFocus::FolderName;
         let label = match &state.entries[virt] {
+            BrowseRow::NewFolder if naming => {
+                // 名前入力中はこの行がテキスト欄。カーソルもここへ置く
+                let x = inner.x as usize
+                    + list_indent.chars().count()
+                    + marker.chars().count()
+                    + NEW_FOLDER_PROMPT.chars().count()
+                    + state.folder_name.cursor_x() as usize;
+                let x = (x.min(u16::MAX as usize) as u16).min(inner.right().saturating_sub(1));
+                let y = layout.list_top + (virt - state.scroll) as u16;
+                cursor = if focused {
+                    FrameCursor::shown_at(Position::new(x, y))
+                } else {
+                    FrameCursor::hidden_at(Position::new(x, y))
+                };
+                format!("{NEW_FOLDER_PROMPT}{}", state.folder_name.text)
+            }
+            BrowseRow::NewFolder => format!("+ new folder in {launch_leaf}"),
             BrowseRow::Launch => format!("+ start in {launch_leaf}"),
             BrowseRow::Parent => "..".to_string(),
             BrowseRow::Dir(name) => name.clone(),
@@ -1015,9 +1123,12 @@ pub(crate) fn draw_new_view(
         // 移る = browser_focused が真になり、後段だと MUTED_FG に負けて dim が
         // 一度も効かないため。dim にするのは起動ボタン行だけ: 多重ディスパッチで
         // 止まるのは起動だけで、フォルダ行の移動（↑↓ →← / クリック）は生きている
-        let base = if is_launch && starting {
+        let is_button = is_launch || is_new_folder;
+        let base = if is_button && starting {
             ui().dim
-        } else if is_launch {
+        } else if naming {
+            ui().emph
+        } else if is_button {
             ui().ok
         } else if browser_focused {
             MUTED_FG
@@ -1027,9 +1138,9 @@ pub(crate) fn draw_new_view(
         let mut style = Style::default().fg(base);
         if selected {
             style = style.add_modifier(Modifier::BOLD);
-            if browser_focused {
+            if browser_focused || naming {
                 style = style.bg(ui().hl_bg);
-                if !is_launch {
+                if !is_button {
                     style = style.fg(ui().emph);
                 }
             }
@@ -1406,6 +1517,7 @@ mod tests {
         assert_eq!(
             state.entries,
             vec![
+                BrowseRow::NewFolder,
                 BrowseRow::Launch,
                 BrowseRow::Parent,
                 BrowseRow::Dir("sub_a".into()),
@@ -1431,10 +1543,10 @@ mod tests {
         let tmp = TempDir::new("move");
         let root = tmp.path();
         let mut state = NewState::browse(&root.to_string_lossy());
-        state.dir_idx = 2; // sub_a
+        state.dir_idx = 3; // sub_a
         state.descend();
         assert_eq!(state.cur_dir, root.join("sub_a").to_string_lossy());
-        state.dir_idx = 1; // ..
+        state.dir_idx = 2; // ..
         state.descend();
         assert_eq!(state.cur_dir, root.to_string_lossy());
     }
@@ -1450,6 +1562,7 @@ mod tests {
         assert_eq!(
             state.entries,
             vec![
+                BrowseRow::NewFolder,
                 BrowseRow::Launch,
                 BrowseRow::Dir("sub_a".into()),
                 BrowseRow::Dir("sub_b".into()),
@@ -1485,10 +1598,10 @@ mod tests {
         let tmp = TempDir::new("filter-select-none");
         let root = tmp.path();
         let mut state = NewState::browse(&root.to_string_lossy());
-        // 一致フォルダが無い断片。選ぶ先が無いので起動ボタン（index 0）へ落とす
+        // 一致フォルダが無い断片。選ぶ先が無いので起動ボタンへ落とす
         state.path.set_text(&root.join("zzz").to_string_lossy());
         state.refresh_from_input();
-        assert_eq!(state.dir_idx, 0);
+        assert_eq!(state.dir_idx, state.launch_idx());
         assert!(state.selected_is_launch());
     }
 
@@ -1503,26 +1616,26 @@ mod tests {
         state.focus = NewFocus::Browser;
         // 初期表示の選択も「利用者が選んだ行」ではない
         assert!(state.selected_is_launch());
-        assert!(!state.click_activates(0));
+        assert!(!state.click_activates(state.launch_idx()));
 
         // フォルダ行のクリックで選択が動く → 再クリックで潜れる
-        state.select(2);
+        state.select(3);
         assert_eq!(state.entries[state.dir_idx], BrowseRow::Dir("sub_a".into()));
-        assert!(state.click_activates(2));
+        assert!(state.click_activates(3));
         state.descend();
 
-        // 潜った先では dir_idx が 0 = 起動ボタンへ戻るが focus は Browser のまま。
+        // 潜った先では dir_idx が起動ボタンへ戻るが focus は Browser のまま。
         // ここが 1 クリックで起動すると取り消せない誤発火になる
         assert_eq!(state.cur_dir, root.join("sub_a").to_string_lossy());
         assert!(state.selected_is_launch());
         assert!(
-            !state.click_activates(0),
+            !state.click_activates(state.launch_idx()),
             "the launch button right after a rebuild fires on a single click"
         );
 
         // 起動ボタン行を明示的にクリック（1 回目）した後は次のクリックで起動する
-        state.select(0);
-        assert!(state.click_activates(0));
+        state.select(state.launch_idx());
+        assert!(state.click_activates(state.launch_idx()));
     }
 
     /// 一覧の作り直しはすべて選択を無効化する（set_dir / refresh_from_input の両分岐）。
@@ -1624,7 +1737,7 @@ mod tests {
         state.path.set_text(&format!("{root}\\zzz"));
         state.refresh_from_input();
         assert_eq!(state.cur_dir, root);
-        assert_eq!(state.entries, vec![BrowseRow::Launch]);
+        assert_eq!(state.entries, vec![BrowseRow::NewFolder, BrowseRow::Launch]);
 
         // テキストが cur_dir と完全一致まで戻った = 絞り込み解除
         state.path.set_text(&root);
@@ -1632,6 +1745,7 @@ mod tests {
         assert_eq!(
             state.entries,
             vec![
+                BrowseRow::NewFolder,
                 BrowseRow::Launch,
                 BrowseRow::Parent,
                 BrowseRow::Dir("sub_a".into()),
@@ -1665,6 +1779,7 @@ mod tests {
         assert_eq!(
             state.entries,
             vec![
+                BrowseRow::NewFolder,
                 BrowseRow::Launch,
                 BrowseRow::Parent,
                 BrowseRow::Dir("sub_a".into()),
@@ -1696,7 +1811,7 @@ mod tests {
             if !state.filter.is_empty() {
                 let frag = state.filter.clone();
                 expected.retain(|row| match row {
-                    BrowseRow::Launch => true,
+                    BrowseRow::NewFolder | BrowseRow::Launch => true,
                     BrowseRow::Parent => false,
                     BrowseRow::Dir(n) => n.to_lowercase().starts_with(&frag),
                 });
@@ -1774,8 +1889,53 @@ mod tests {
         // 一致するサブフォルダが無い断片。起動ボタンだけが残る
         state.path.set_text(&root.join("zzz").to_string_lossy());
         state.refresh_from_input();
-        assert_eq!(state.entries, vec![BrowseRow::Launch]);
+        assert_eq!(state.entries, vec![BrowseRow::NewFolder, BrowseRow::Launch]);
         // entries は空でないので、0 件判定は no_folder_rows() でしか出せない
         assert!(state.no_folder_rows());
+    }
+
+    /// `+ new folder` 行は起動ボタンの上にあり、実行すると名前入力になる。
+    /// 打った名前でフォルダができ、起動先（cur_dir）がその中へ移る
+    #[test]
+    fn the_new_folder_row_creates_the_folder_and_moves_into_it() {
+        let tmp = TempDir::new("new-folder");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        assert_eq!(state.entries[0], BrowseRow::NewFolder);
+        assert_eq!(state.entries[1], BrowseRow::Launch);
+
+        state.begin_folder_name();
+        assert_eq!(state.focus, NewFocus::FolderName);
+        assert_eq!(state.entries[state.dir_idx], BrowseRow::NewFolder);
+
+        state.folder_name.insert_str("fresh");
+        state.create_folder().unwrap();
+        assert!(root.join("fresh").is_dir());
+        assert_eq!(state.cur_dir, root.join("fresh").to_string_lossy());
+        assert_eq!(state.path.text, root.join("fresh").to_string_lossy());
+    }
+
+    /// 作れない名前・既にある名前は失敗を返し、起動先を動かさない
+    #[test]
+    fn a_bad_folder_name_fails_without_moving() {
+        let tmp = TempDir::new("new-folder-bad");
+        let root = tmp.path();
+        let mut state = NewState::browse(&root.to_string_lossy());
+        for name in ["", "a?b", "trail.", "sub_a"] {
+            state.begin_folder_name();
+            state.folder_name.insert_str(name);
+            assert!(state.create_folder().is_err(), "{name:?} was accepted");
+            assert_eq!(state.cur_dir, root.to_string_lossy());
+        }
+    }
+
+    #[test]
+    fn rejects_names_windows_cannot_hold_as_typed() {
+        for bad in ["", ".", "..", "a?", "a*b", "a:b", "a<", "trail.", "trail "] {
+            assert!(!is_creatable_name(bad), "{bad:?}");
+        }
+        for good in ["proj", "my proj", ".hidden"] {
+            assert!(is_creatable_name(good), "{good:?}");
+        }
     }
 }
