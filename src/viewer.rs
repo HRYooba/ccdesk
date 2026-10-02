@@ -223,19 +223,28 @@ impl ImageView {
 const MIN_COLS: u16 = 16;
 const MIN_ROWS: u16 = 6;
 
+/// 窓の持ち主。**窓は持ち主が画面に出ている間だけ見える**
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Host {
+    /// そのセッション（`ccdesk view` を呼んだもの）。**スロットの番号ではなく
+    /// セッションで持つ**: 別のスロットへ移れば窓も付いていき、画面から外せば
+    /// 窓も隠れ、戻せばまた出る
+    Session(crate::sessions::SessionId),
+    /// 呼んだセッションが分からないときに載せたスロット。そのスロットが
+    /// セッションを映していない間だけ見える
+    Slot(usize),
+}
+
 /// 浮かぶ窓としてのビューアー。**スロットの配置には入らない**: セッションの
-/// 並びを崩さず、1 枚のスロット（[`Self::host`]）の上に重ねる。
+/// 並びを崩さず、持ち主（[`Self::host`]）を映すスロットの上に重ねる。
+/// **持ち主ごとに 1 枚**なので、並べたセッションそれぞれに同時に出せる。
 ///
 /// **窓はそのスロットの枠の内側から出ない**（隣のスロットへ被さらない）。
 /// 以下で `area` と書く矩形がその内側で、位置と大きさは `area` に対する比で持つ
 /// ＝ 端末・サイドバー・十字が動いても、そのスロットの同じ辺りに留まる
 pub(crate) struct Overlay {
     pub(crate) view: ImageView,
-    /// 載っているスロットが映すセッション。**スロットの番号ではなくセッションで追う**
-    /// （セッションが別のスロットへ移れば、窓も付いていく）
-    pub(crate) host: Option<crate::sessions::SessionId>,
-    /// セッションが画面から外れたとき（または名指しが無いとき）に載るスロット
-    pub(crate) slot: usize,
+    pub(crate) host: Host,
     /// `area` に対する比 `(x, y, 幅, 高さ)`
     place: (f64, f64, f64, f64),
     /// 押されてから他を押すまで。`Esc` で閉じるのはこの間だけ
@@ -259,13 +268,7 @@ impl Overlay {
     /// 初めて開くときの置き場所 ＝ `area` の**右上**。**全部は隠さない**:
     /// 幅も高さも `area` の半分までに留め、画像の縦横比に詰める
     /// （claude の出力は左寄せなので、右上がいちばん読む邪魔をしない）
-    pub(crate) fn new(
-        view: ImageView,
-        host: Option<crate::sessions::SessionId>,
-        slot: usize,
-        area: Rect,
-        cell: (u16, u16),
-    ) -> Self {
+    pub(crate) fn new(view: ImageView, host: Host, area: Rect, cell: (u16, u16)) -> Self {
         let (cw, ch) = (f64::from(cell.0), f64::from(cell.1));
         // 窓の枠の 2 桁・2 行を除いた内寸の上限
         let max_cols = (f64::from(area.width) * 0.5 - 2.0).max(1.0);
@@ -277,7 +280,6 @@ impl Overlay {
         let mut overlay = Self {
             view,
             host,
-            slot,
             place: (0.0, 0.0, 0.0, 0.0),
             focused: false,
         };
@@ -602,7 +604,7 @@ mod tests {
     }
 
     fn overlay() -> Overlay {
-        Overlay::new(view(), None, 0, PANE, CELL)
+        Overlay::new(view(), Host::Slot(0), PANE, CELL)
     }
 
     const PANE: Rect = Rect { x: 30, y: 0, width: 100, height: 50 };
