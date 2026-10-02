@@ -224,11 +224,19 @@ const MIN_COLS: u16 = 16;
 const MIN_ROWS: u16 = 6;
 
 /// 浮かぶ窓としてのビューアー。**スロットの配置には入らない**: セッションの
-/// 並びを崩さず、その上に重ねる。位置と大きさはペイン（右側の矩形）に対する比で
-/// 持つので、端末やサイドバーの幅が変わっても同じ辺りに留まる
+/// 並びを崩さず、1 枚のスロット（[`Self::host`]）の上に重ねる。
+///
+/// **窓はそのスロットの枠の内側から出ない**（隣のスロットへ被さらない）。
+/// 以下で `area` と書く矩形がその内側で、位置と大きさは `area` に対する比で持つ
+/// ＝ 端末・サイドバー・十字が動いても、そのスロットの同じ辺りに留まる
 pub(crate) struct Overlay {
     pub(crate) view: ImageView,
-    /// ペインに対する比 `(x, y, 幅, 高さ)`
+    /// 載っているスロットが映すセッション。**スロットの番号ではなくセッションで追う**
+    /// （セッションが別のスロットへ移れば、窓も付いていく）
+    pub(crate) host: Option<crate::sessions::SessionId>,
+    /// セッションが画面から外れたとき（または名指しが無いとき）に載るスロット
+    pub(crate) slot: usize,
+    /// `area` に対する比 `(x, y, 幅, 高さ)`
     place: (f64, f64, f64, f64),
     /// 押されてから他を押すまで。`Esc` で閉じるのはこの間だけ
     /// （それ以外の `Esc` はセッションの agent のもの）
@@ -248,32 +256,36 @@ pub(crate) enum Hit {
 }
 
 impl Overlay {
-    /// 初めて開くときの置き場所 ＝ `slot`（呼んだセッションのスロット）の**右上**、
-    /// スロットの枠の内側。**全部は隠さない**: 幅も高さもスロットの半分までに留め、
-    /// 画像の縦横比に詰める（claude の出力は左寄せなので、右上がいちばん読む邪魔をしない）
-    pub(crate) fn new(view: ImageView, pane: Rect, slot: Rect, cell: (u16, u16)) -> Self {
+    /// 初めて開くときの置き場所 ＝ `area` の**右上**。**全部は隠さない**:
+    /// 幅も高さも `area` の半分までに留め、画像の縦横比に詰める
+    /// （claude の出力は左寄せなので、右上がいちばん読む邪魔をしない）
+    pub(crate) fn new(
+        view: ImageView,
+        host: Option<crate::sessions::SessionId>,
+        slot: usize,
+        area: Rect,
+        cell: (u16, u16),
+    ) -> Self {
         let (cw, ch) = (f64::from(cell.0), f64::from(cell.1));
-        // スロットの枠の内側。ここに窓の外寸を収める
-        let room = Rect::new(slot.x + 1, slot.y + 1, slot.width.saturating_sub(2), slot.height.saturating_sub(2));
         // 窓の枠の 2 桁・2 行を除いた内寸の上限
-        let max_cols = (f64::from(room.width) * 0.5 - 2.0).max(1.0);
-        let max_rows = (f64::from(room.height) * 0.5 - 2.0).max(1.0);
+        let max_cols = (f64::from(area.width) * 0.5 - 2.0).max(1.0);
+        let max_rows = (f64::from(area.height) * 0.5 - 2.0).max(1.0);
         let (iw, ih) = view.image.size();
         let fit = (max_cols * cw / iw).min(max_rows * ch / ih);
-        let cols = ((iw * fit / cw).ceil() as u16 + 2).max(MIN_COLS).min(pane.width);
-        let rows = ((ih * fit / ch).ceil() as u16 + 2).max(MIN_ROWS).min(pane.height);
-        let x = room.right().saturating_sub(cols).max(pane.x);
-        let y = room.y.min(pane.bottom().saturating_sub(rows));
+        let cols = ((iw * fit / cw).ceil() as u16 + 2).max(MIN_COLS).min(area.width);
+        let rows = ((ih * fit / ch).ceil() as u16 + 2).max(MIN_ROWS).min(area.height);
         let mut overlay = Self {
             view,
+            host,
+            slot,
             place: (0.0, 0.0, 0.0, 0.0),
             focused: false,
         };
-        overlay.set_rect(Rect::new(x, y, cols, rows), pane);
+        overlay.set_rect(Rect::new(area.right().saturating_sub(cols), area.y, cols, rows), area);
         overlay
     }
 
-    /// 今の外寸（端末の絶対セル座標）。ペインの内側へ収め、最小の大きさを守る
+    /// 今の外寸（端末の絶対セル座標）。`area` の内側へ収め、最小の大きさを守る
     pub(crate) fn rect(&self, pane: Rect) -> Rect {
         let (x, y, w, h) = self.place;
         let size = |frac: f64, total: u16, min: u16| ((frac * f64::from(total)).round() as u16).clamp(min.min(total), total);
@@ -282,7 +294,7 @@ impl Overlay {
         Rect::new(pane.x + at(x, pane.width, width), pane.y + at(y, pane.height, height), width, height)
     }
 
-    /// 外寸を置き直す（ペインに対する比へ戻して持つ）
+    /// 外寸を置き直す（`area` に対する比へ戻して持つ）
     pub(crate) fn set_rect(&mut self, rect: Rect, pane: Rect) {
         if pane.width == 0 || pane.height == 0 {
             return;
@@ -323,7 +335,7 @@ impl Overlay {
 }
 
 /// 辺や見出しを掴んで `(dx, dy)` セル動かした後の外寸。`start` は掴んだときの外寸。
-/// **ペインの外へは出さず、最小の大きさより小さくしない**（掴む場所が消えない）
+/// **`area` の外へは出さず、最小の大きさより小さくしない**（掴む場所が消えない）
 pub(crate) fn dragged(start: Rect, hit: Hit, (dx, dy): (i32, i32), pane: Rect) -> Rect {
     let (px0, py0) = (i32::from(pane.x), i32::from(pane.y));
     let (px1, py1) = (px0 + i32::from(pane.width), py0 + i32::from(pane.height));
@@ -590,26 +602,17 @@ mod tests {
     }
 
     fn overlay() -> Overlay {
-        Overlay::new(view(), PANE, PANE, CELL)
+        Overlay::new(view(), None, 0, PANE, CELL)
     }
 
     const PANE: Rect = Rect { x: 30, y: 0, width: 100, height: 50 };
     const CELL: (u16, u16) = (10, 20);
 
-    /// 初めの窓はスロットの枠の内側の**右上**に、画像の縦横比に詰めて出る。
-    /// 200×100 の画像を内寸 47 桁（470 px）に収めると高さ 235 px ＝ 12 行 + 枠
+    /// 初めの窓は `area` の**右上**に、画像の縦横比に詰めて出る。
+    /// 200×100 の画像を内寸 48 桁（480 px）に収めると高さ 240 px ＝ 12 行 + 枠
     #[test]
-    fn a_new_overlay_sits_in_the_top_right_of_the_slot_trimmed_to_the_image() {
-        assert_eq!(overlay().rect(PANE), Rect::new(80, 1, 49, 14));
-    }
-
-    /// 呼んだスロットが左列なら、その左列の右上（右列には出ない）
-    #[test]
-    fn a_new_overlay_stays_inside_the_callers_slot() {
-        let left_slot = Rect::new(30, 0, 50, 50);
-        let r = Overlay::new(view(), PANE, left_slot, CELL).rect(PANE);
-        assert_eq!((r.right(), r.y), (left_slot.right() - 1, 1), "{r:?} is not at the top-right");
-        assert!(r.x > left_slot.x && r.width <= left_slot.width / 2, "{r:?} covers too much");
+    fn a_new_overlay_sits_in_the_top_right_trimmed_to_the_image() {
+        assert_eq!(overlay().rect(PANE), Rect::new(80, 0, 50, 14));
     }
 
     #[test]
